@@ -1,4 +1,4 @@
-import { Telegraf, Context } from 'telegraf';
+import { Telegraf, Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { storage } from './storage';
 import { claudeManager } from './claudeManager';
@@ -26,10 +26,6 @@ if (allowedUsers.length === 0) {
 }
 
 const maxMessageLength = 4000;
-const minUpdateInterval = 1500;
-
-const currentMessages: Map<number, number> = new Map();
-const lastMessageUpdate: Map<number, number> = new Map();
 
 const bot = new Telegraf(botToken);
 
@@ -49,57 +45,42 @@ function truncateOutput(text: string, maxLen: number = maxMessageLength): string
     + '\n\n... (truncated)';
 }
 
-function formatOutput(output: string): string {
+interface ParsedOutput {
+  text: string;
+  options: Array<{ num: string; label: string }>;
+}
+
+function parseOutput(output: string): ParsedOutput {
+  const options: Array<{ num: string; label: string }> = [];
+
+  const optionRegex = /^\s*(\d+)[.\)]\s*(.+)$/gm;
+  let match;
+  while ((match = optionRegex.exec(output)) !== null) {
+    const label = match[2].trim().slice(0, 30);
+    if (label.length > 0) {
+      options.push({ num: match[1], label });
+    }
+  }
+
+  return { text: output, options };
+}
+
+async function sendOutput(userId: number, output: string): Promise<void> {
   const truncated = truncateOutput(output);
-  if (truncated.includes('```')) {
-    return truncated;
-  }
-  return `<pre>${escapeHtml(truncated)}</pre>`;
-}
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-async function updateOrSendMessage(
-  ctx: Context,
-  userId: number,
-  text: string,
-  forceNew: boolean = false
-): Promise<number> {
-  const now = Date.now();
-  const lastUpdate = lastMessageUpdate.get(userId) || 0;
-  const currentMsgId = currentMessages.get(userId);
-
-  if (!forceNew && currentMsgId && (now - lastUpdate) < minUpdateInterval) {
-    return currentMsgId;
-  }
+  const { options } = parseOutput(output);
 
   try {
-    if (!forceNew && currentMsgId) {
-      await ctx.telegram.editMessageText(userId, currentMsgId, undefined, text, { parse_mode: 'HTML' });
-      lastMessageUpdate.set(userId, now);
-      return currentMsgId;
+    if (options.length >= 2 && options.length <= 6) {
+      const buttons = options.map(opt =>
+        Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
+      );
+      const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
+      await bot.telegram.sendMessage(userId, truncated, keyboard);
     } else {
-      const msg = await ctx.telegram.sendMessage(userId, text, { parse_mode: 'HTML' });
-      currentMessages.set(userId, msg.message_id);
-      lastMessageUpdate.set(userId, now);
-      return msg.message_id;
+      await bot.telegram.sendMessage(userId, truncated);
     }
   } catch (err) {
-    const error = err as { description?: string };
-    if (error.description?.includes('message to edit not found') ||
-        error.description?.includes('message is not modified')) {
-      try {
-        const msg = await ctx.telegram.sendMessage(userId, text, { parse_mode: 'HTML' });
-        currentMessages.set(userId, msg.message_id);
-        lastMessageUpdate.set(userId, now);
-        return msg.message_id;
-      } catch {
-        // ignore
-      }
-    }
-    return currentMsgId || 0;
+    console.error('[sendOutput error]', err);
   }
 }
 
@@ -200,7 +181,6 @@ bot.command('claude', async (ctx) => {
   const userConfig = storage.getUser(userId);
   const workDir = userConfig?.workDir || defaultWorkDir;
 
-  currentMessages.delete(userId);
   await ctx.reply(`Starting Claude in ${workDir}...`);
 
   try {
@@ -223,7 +203,6 @@ bot.command('stop', async (ctx) => {
   }
 
   await claudeManager.stopSession(userId);
-  currentMessages.delete(userId);
   await ctx.reply('Claude stopped');
 });
 
@@ -267,7 +246,6 @@ bot.command('clear', async (ctx) => {
   }
 
   storage.deleteUser(userId);
-  currentMessages.delete(userId);
   await ctx.reply('Configuration deleted');
 });
 
@@ -281,7 +259,6 @@ bot.on(message('text'), async (ctx) => {
   if (text.startsWith('/')) return;
 
   if (claudeManager.checkIsActive(userId)) {
-    currentMessages.delete(userId);
     claudeManager.clearBuffer(userId);
     claudeManager.sendInput(userId, text);
     return;
@@ -290,14 +267,24 @@ bot.on(message('text'), async (ctx) => {
   await ctx.reply('Claude not running. /claude to start');
 });
 
+bot.action(/^opt_(\d+)$/, async (ctx) => {
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const optNum = ctx.match[1];
+
+  if (claudeManager.checkIsActive(userId)) {
+    claudeManager.clearBuffer(userId);
+    claudeManager.sendInput(userId, optNum);
+    await ctx.answerCbQuery(`Sent: ${optNum}`);
+  } else {
+    await ctx.answerCbQuery('Claude not running');
+  }
+});
+
 function handleClaudeOutput(userId: number, output: string): void {
   if (!output.trim()) return;
-  updateOrSendMessage(
-    { telegram: bot.telegram } as Context,
-    userId,
-    formatOutput(output),
-    false
-  ).catch(err => {
+  sendOutput(userId, output).catch(err => {
     console.error('[Claude output error]', err);
   });
 }
@@ -306,7 +293,6 @@ function handleClaudeClosed(userId: number): void {
   bot.telegram.sendMessage(userId, 'Claude session ended').catch(() => {
     // ignore
   });
-  currentMessages.delete(userId);
 }
 
 function handleClaudeError(userId: number, err: Error): void {
@@ -320,8 +306,12 @@ claudeManager.on('closed', handleClaudeClosed);
 claudeManager.on('error', handleClaudeError);
 
 export async function startBot(): Promise<void> {
-  console.log('Starting bot...');
+  console.log('');
+  console.log('=================================');
+  console.log('  Telegram Claude Bot starting...');
+  console.log('=================================');
   console.log(`Allowed users: ${allowedUsers.join(', ')}`);
+  console.log(`Work dir: ${defaultWorkDir}`);
 
   const shutdown = async (signal: string) => {
     console.log(`\n${signal} received, shutting down...`);
@@ -339,7 +329,10 @@ export async function startBot(): Promise<void> {
   process.once('SIGTERM', () => shutdown('SIGTERM'));
 
   await bot.launch();
-  console.log('Bot started!');
+  console.log('');
+  console.log('Bot is running! Waiting for messages...');
+  console.log('Press Ctrl+C to stop');
+  console.log('');
 }
 
 export { bot };

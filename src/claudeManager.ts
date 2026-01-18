@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import * as pty from 'node-pty';
 import type { ClaudeSessionState } from './types';
 import { EventEmitter } from 'events';
 
@@ -25,15 +25,21 @@ export class ClaudeManager extends EventEmitter {
   async startSession(userId: number, workDir: string): Promise<void> {
     await this.stopSession(userId);
 
-    const claudeProcess = spawn('claude', ['--dangerously-skip-permissions'], {
+    console.log(`[Claude] Starting session for user ${userId} in ${workDir}`);
+
+    const ptyProcess = pty.spawn('claude', ['--dangerously-skip-permissions'], {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
       cwd: workDir,
-      env: { ...process.env },
-      shell: true,
+      env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
     });
+
+    console.log(`[Claude] PTY process spawned, PID: ${ptyProcess.pid}`);
 
     const sessionState: ClaudeSessionState = {
       userId,
-      process: claudeProcess,
+      ptyProcess,
       outputBuffer: '',
       lastUpdate: 0,
       isActive: true,
@@ -41,22 +47,14 @@ export class ClaudeManager extends EventEmitter {
 
     this.sessions.set(userId, sessionState);
 
-    claudeProcess.stdout?.on('data', (data: Buffer) => {
-      this.handleOutput(userId, data.toString());
+    ptyProcess.onData((data: string) => {
+      console.log(`[Claude] data: ${data.slice(0, 100)}...`);
+      this.handleOutput(userId, data);
     });
 
-    claudeProcess.stderr?.on('data', (data: Buffer) => {
-      this.handleOutput(userId, data.toString());
-    });
-
-    claudeProcess.on('close', (code) => {
-      console.log(`[Claude] Process exited with code ${code} for user ${userId}`);
+    ptyProcess.onExit(({ exitCode }) => {
+      console.log(`[Claude] Process exited with code ${exitCode} for user ${userId}`);
       this.handleClose(userId);
-    });
-
-    claudeProcess.on('error', (err) => {
-      console.error(`[Claude] Process error for user ${userId}:`, err);
-      this.emit('error', userId, err);
     });
 
     this.emit('started', userId);
@@ -72,10 +70,10 @@ export class ClaudeManager extends EventEmitter {
       clearTimeout(session.updateTimer);
     }
 
-    if (session.process) {
-      session.process.stdin?.write('\x03');
+    if (session.ptyProcess) {
+      session.ptyProcess.write('\x03');
       await this.delay(100);
-      session.process.kill('SIGTERM');
+      session.ptyProcess.kill();
     }
 
     this.sessions.delete(userId);
@@ -89,10 +87,14 @@ export class ClaudeManager extends EventEmitter {
 
   sendInput(userId: number, input: string): void {
     const session = this.sessions.get(userId);
-    if (!session?.isActive) return;
+    if (!session?.isActive) {
+      console.log(`[Claude] sendInput: no active session for user ${userId}`);
+      return;
+    }
 
+    console.log(`[Claude] sendInput: sending "${input}" to user ${userId}`);
     session.outputBuffer = '';
-    session.process.stdin?.write(input + '\n');
+    session.ptyProcess.write(input + '\n');
 
     this.emit('input', userId, input);
   }
@@ -102,7 +104,7 @@ export class ClaudeManager extends EventEmitter {
     if (!session?.isActive) return;
 
     if (signal === 'SIGINT') {
-      session.process.stdin?.write('\x03');
+      session.ptyProcess.write('\x03');
     }
   }
 

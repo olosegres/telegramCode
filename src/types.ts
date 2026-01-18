@@ -1,4 +1,4 @@
-import type { ChildProcess } from 'child_process';
+import type { IPty } from 'node-pty';
 
 /**
  * User configuration - maps Telegram user to workdir
@@ -15,7 +15,7 @@ export interface UserConfig {
  */
 export interface ClaudeSessionState {
   userId: number;
-  process: ChildProcess;
+  ptyProcess: IPty;
   outputBuffer: string;
   lastUpdate: number;
   updateTimer?: NodeJS.Timeout;

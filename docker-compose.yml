@@ -1,0 +1,33 @@
+services:
+  # Development: run Claude CLI to work on this bot code
+  claude:
+    build:
+      context: .
+      dockerfile: Dockerfile.claude
+    image: claude-node-git
+    container_name: claude-cli
+    user: root
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:rw
+      - /workspace/node_modules/@biomejs
+      - /workspace/node_modules/.bin
+      - yarn_state:/workspace/.yarn
+      - ./.yarn/patches:/workspace/.yarn/patches:ro
+      - agent_home:/home/agent:rw
+      - ~/.gitconfig:/tmp/host-gitconfig:ro
+      - ~/.ssh:/tmp/host-ssh:ro
+      - ./.docker-entrypoint.sh:/docker-entrypoint.sh:ro
+    environment:
+      - HOME=/home/agent
+      - TERM=xterm-256color
+      - TARGET_UID=${UID:-501}
+      - TARGET_GID=${GID:-20}
+    entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
+    command: ["claude", "--dangerously-skip-permissions"]
+
+volumes:
+  agent_home:
+  yarn_state:

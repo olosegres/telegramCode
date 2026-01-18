@@ -1,0 +1,39 @@
+# Example: add this service to your project's docker-compose.yml
+# Requires: image "claude-node-git" built in telegram-code (yarn claude)
+
+services:
+  telegram-code:
+    image: claude-node-git
+    container_name: telegram-code-bot
+    user: root
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      # Your project
+      - .:/workspace:rw
+      # telegram-code source (adjust path)
+      - ../telegram-code:/telegram-code:ro
+      - ../telegram-code/.docker-entrypoint.sh:/docker-entrypoint.sh:ro
+      # Persist home and data
+      - telegram_code_home:/home/agent:rw
+      - telegram_code_data:/data
+      # Host configs
+      - ~/.gitconfig:/tmp/host-gitconfig:ro
+      - ~/.ssh:/tmp/host-ssh:ro
+    environment:
+      - HOME=/home/agent
+      - TERM=xterm-256color
+      - TARGET_UID=${UID:-501}
+      - TARGET_GID=${GID:-20}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USERS=${ALLOWED_USERS}
+      - WORK_DIR=/workspace
+      - DATA_DIR=/data
+    entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
+    command: ["node", "/telegram-code/dist/index.js"]
+    restart: unless-stopped
+
+volumes:
+  telegram_code_home:
+  telegram_code_data:

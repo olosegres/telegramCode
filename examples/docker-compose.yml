@@ -1,5 +1,5 @@
 # Example: add this service to your project's docker-compose.yml
-# Requires: image "claude-node-git" built in telegram-code (yarn claude)
+# Requires: image "claude-node-git" (run "yarn claude" in telegram-code once to build it)
 
 services:
   telegram-code:
@@ -31,7 +31,7 @@ services:
       - WORK_DIR=/workspace
       - DATA_DIR=/data
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
-    command: ["node", "/telegram-code/dist/index.js"]
+    command: ["npx", "tsx", "/telegram-code/src/index.ts"]
     restart: unless-stopped
 
 volumes:

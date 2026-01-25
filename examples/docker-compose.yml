@@ -15,9 +15,8 @@ services:
       # telegram-code source (adjust path)
       - ../telegram-code:/telegram-code:ro
       - ../telegram-code/.docker-entrypoint.sh:/docker-entrypoint.sh:ro
-      # Persist home and data
+      # Persist home
       - telegram_code_home:/home/agent:rw
-      - telegram_code_data:/data
       # Host configs
       - ~/.gitconfig:/tmp/host-gitconfig:ro
       - ~/.ssh:/tmp/host-ssh:ro
@@ -29,11 +28,9 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ALLOWED_USERS=${ALLOWED_USERS}
       - WORK_DIR=/workspace
-      - DATA_DIR=/data
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
     command: ["npx", "tsx", "/telegram-code/src/index.ts"]
     restart: unless-stopped
 
 volumes:
   telegram_code_home:
-  telegram_code_data:

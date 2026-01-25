@@ -34,6 +34,7 @@
 - Before saying "done", verify the complete flow: check all scripts in the chain, not just the entry point
 - always check all call chain for possible errors, in a code, in a scripts, commands
 - do not roll back changes, try to see things through to the end
+- avoid code duplication: if same logic appears in 2+ places, extract into a reusable function immediately
 
 ### TypeScript, eslint rules
 - do NOT use `@ts-nocheck` or `@ts-ignore`

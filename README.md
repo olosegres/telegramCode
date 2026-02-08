@@ -1,8 +1,8 @@
-# Telegram Claude Bot
+<table border="0">
+  <tr>
+    <td><h2> Telegram bot server for interacting with Claude CLI via tmux session</h2>
 
-Telegram bot for interacting with Claude CLI via tmux session.
-
-## Features
+### Features
 
 - Run Claude CLI through Telegram messages
 - Voice messages support (transcription via Groq/OpenAI Whisper)
@@ -11,6 +11,10 @@ Telegram bot for interacting with Claude CLI via tmux session.
 - Filter TUI elements (status line, input field, spinners, thinking indicators)
 - Message update instead of spam (edit in place)
 - Inline buttons for numbered options
+    </td>
+<td width="280"><img src="./demo.gif" width="320" /></td>
+  </tr>
+</table>
 
 ## How It Works
 

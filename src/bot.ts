@@ -264,12 +264,13 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
 }
 
 function escapeMarkdownChars(text: string): string {
-  // Escape markdown special characters including unpaired asterisks
+  // Escape markdown special characters including unpaired asterisks and backticks
   return text
     .replace(/\*/g, '\\*')
     .replace(/_/g, '\\_')
     .replace(/\[/g, '\\[')
-    .replace(/\]/g, '\\]');
+    .replace(/\]/g, '\\]')
+    .replace(/`/g, '\\`');
 }
 
 function escapeMarkdown(text: string): string {

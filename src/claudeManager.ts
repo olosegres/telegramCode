@@ -188,8 +188,11 @@ function stripTuiElements(text: string): string {
       continue;
     }
 
-    // Skip installer/update notices
+    // Skip installer/update notices (may be split across lines due to terminal wrapping)
     if (/claude code has switched|native installer|Run.*install.*or see/i.test(line)) {
+      continue;
+    }
+    if (/^install`?\s*(or see)?/i.test(trimmedLine)) {
       continue;
     }
     if (/docs\.anthropic\.com/i.test(line)) {

@@ -30,6 +30,7 @@ if (allowedUsers.length === 0) {
 }
 
 const maxMessageLength = 4000;
+const messageIdsFile = path.join(process.env.HOME || '/tmp', '.telegram-bot-messages.json');
 
 const bot = new Telegraf(botToken);
 
@@ -37,6 +38,10 @@ interface UserMessageState {
   lastMessageId: number | null;
   needsNewMessage: boolean;
   messageIds: number[];
+}
+
+interface StoredMessageIds {
+  [userId: string]: number[];
 }
 
 /**
@@ -58,6 +63,36 @@ const outputQueues = new Map<number, OutputQueueState>();
 
 /** Debounce delay in ms - wait this long for more updates before sending */
 const outputDebounceMs = 150;
+
+function loadMessageIds(): void {
+  try {
+    if (fs.existsSync(messageIdsFile)) {
+      const data = JSON.parse(fs.readFileSync(messageIdsFile, 'utf-8')) as StoredMessageIds;
+      for (const [userIdStr, messageIds] of Object.entries(data)) {
+        const userId = Number(userIdStr);
+        const state = getUserMessageState(userId);
+        state.messageIds = messageIds;
+      }
+      console.log(`[Bot] Loaded message IDs from ${messageIdsFile}`);
+    }
+  } catch (err) {
+    console.error('[Bot] Failed to load message IDs:', err);
+  }
+}
+
+function saveMessageIds(): void {
+  try {
+    const data: StoredMessageIds = {};
+    for (const [userId, state] of userMessageStates.entries()) {
+      if (state.messageIds.length > 0) {
+        data[userId.toString()] = state.messageIds;
+      }
+    }
+    fs.writeFileSync(messageIdsFile, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('[Bot] Failed to save message IDs:', err);
+  }
+}
 
 function getUserMessageState(userId: number): UserMessageState {
   let state = userMessageStates.get(userId);
@@ -85,10 +120,11 @@ function markNeedsNewMessage(userId: number): void {
 function trackMessageId(userId: number, messageId: number): void {
   const state = getUserMessageState(userId);
   state.messageIds.push(messageId);
-  // Keep only last 100 messages to avoid memory issues
-  if (state.messageIds.length > 100) {
-    state.messageIds = state.messageIds.slice(-100);
+  // Keep only last 500 messages to avoid memory issues
+  if (state.messageIds.length > 500) {
+    state.messageIds = state.messageIds.slice(-500);
   }
+  saveMessageIds();
 }
 
 async function clearAllMessages(userId: number): Promise<number> {
@@ -597,37 +633,41 @@ bot.command('clear', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
+  const state = getUserMessageState(userId);
   const currentMsgId = ctx.message.message_id;
+  
+  // Add current message to deletion list
+  const allMsgIds = [...state.messageIds, currentMsgId];
+  
+  if (allMsgIds.length === 0) {
+    await ctx.reply('No tracked messages to delete');
+    return;
+  }
 
-  // Build array of message IDs to delete (up to 1000 messages back)
-  const maxMessages = 1000;
-  const batchSize = 100; // Telegram limit per request
   let totalDeleted = 0;
+  const batchSize = 100; // Telegram limit per request
 
-  for (let start = currentMsgId; start > currentMsgId - maxMessages && start > 0; start -= batchSize) {
-    const msgIds: number[] = [];
-    for (let i = 0; i < batchSize && start - i > 0; i++) {
-      msgIds.push(start - i);
-    }
-
+  // Delete in batches
+  for (let i = 0; i < allMsgIds.length; i += batchSize) {
+    const batch = allMsgIds.slice(i, i + batchSize);
     try {
       await bot.telegram.callApi('deleteMessages', {
         chat_id: userId,
-        message_ids: msgIds,
+        message_ids: batch,
       });
-      totalDeleted += msgIds.length;
+      totalDeleted += batch.length;
     } catch {
-      // Some messages might not exist or be too old
+      // Some messages might be too old (>48h) or already deleted
     }
   }
 
   // Reset message state
-  const state = getUserMessageState(userId);
   state.messageIds = [];
   state.lastMessageId = null;
   state.needsNewMessage = true;
+  saveMessageIds();
 
-  console.log(`[Bot] Cleared ~${totalDeleted} messages for user ${userId}`);
+  console.log(`[Bot] Cleared ${totalDeleted}/${allMsgIds.length} messages for user ${userId}`);
 });
 
 const botCommands = new Set(['start', 'claude', 'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear']);
@@ -806,6 +846,9 @@ export async function startBot(): Promise<void> {
   console.log('=================================');
   console.log(`Allowed users: ${allowedUsers.join(', ')}`);
   console.log(`Work dir: ${defaultWorkDir}`);
+  
+  // Load saved message IDs for /clear command
+  loadMessageIds();
 
   const shutdown = async (signal: string) => {
     console.log(`\n${signal} received, shutting down...`);

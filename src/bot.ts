@@ -1,4 +1,4 @@
-import { Telegraf, Context, Markup } from 'telegraf';
+import { Telegraf, type Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { claudeManager } from './claudeManager';
 import * as fs from 'fs';
@@ -39,13 +39,40 @@ interface UserMessageState {
   messageIds: number[];
 }
 
+/**
+ * Output queue state per user.
+ * Prevents race conditions when multiple outputs arrive faster than Telegram API can handle.
+ * Uses debounce to batch rapid updates into single message edits.
+ */
+interface OutputQueueState {
+  /** Pending output text waiting to be sent */
+  pendingOutput: string | null;
+  /** Whether queue is currently being processed */
+  isProcessing: boolean;
+  /** Debounce timer for batching rapid updates */
+  debounceTimer: NodeJS.Timeout | null;
+}
+
 const userMessageStates = new Map<number, UserMessageState>();
+const outputQueues = new Map<number, OutputQueueState>();
+
+/** Debounce delay in ms - wait this long for more updates before sending */
+const outputDebounceMs = 150;
 
 function getUserMessageState(userId: number): UserMessageState {
   let state = userMessageStates.get(userId);
   if (!state) {
     state = { lastMessageId: null, needsNewMessage: true, messageIds: [] };
     userMessageStates.set(userId, state);
+  }
+  return state;
+}
+
+function getOutputQueueState(userId: number): OutputQueueState {
+  let state = outputQueues.get(userId);
+  if (!state) {
+    state = { pendingOutput: null, isProcessing: false, debounceTimer: null };
+    outputQueues.set(userId, state);
   }
   return state;
 }
@@ -200,6 +227,15 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
   });
 }
 
+function escapeMarkdownChars(text: string): string {
+  // Escape markdown special characters including unpaired asterisks
+  return text
+    .replace(/\*/g, '\\*')
+    .replace(/_/g, '\\_')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]');
+}
+
 function escapeMarkdown(text: string): string {
   // Escape markdown special characters except our intentional *bold* markers
   // Process character by character to handle bold markers properly
@@ -219,18 +255,18 @@ function escapeMarkdown(text: string): string {
   let lastIndex = 0;
 
   for (const m of boldMatches) {
-    // Escape the part before this bold marker
+    // Escape the part before this bold marker (including unpaired asterisks)
     const before = text.slice(lastIndex, m.start);
-    result += before.replace(/_/g, '\\_').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
-    // Add bold marker with escaped content (but keep the * markers)
+    result += escapeMarkdownChars(before);
+    // Add bold marker with escaped content (but keep the * markers for bold)
     const escapedContent = m.content.replace(/_/g, '\\_').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
     result += `*${escapedContent}*`;
     lastIndex = m.end;
   }
 
-  // Escape the remaining part
+  // Escape the remaining part (including unpaired asterisks)
   const remaining = text.slice(lastIndex);
-  result += remaining.replace(/_/g, '\\_').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+  result += escapeMarkdownChars(remaining);
 
   return result;
 }
@@ -243,7 +279,7 @@ interface ParsedOutput {
 function parseOutput(output: string): ParsedOutput {
   const options: Array<{ num: string; label: string }> = [];
 
-  const optionRegex = /^\s*(\d+)[.\)]\s*(.+)$/gm;
+  const optionRegex = /^\s*(\d+)[.)]\s*(.+)$/gm;
   let match;
   while ((match = optionRegex.exec(output)) !== null) {
     const label = match[2].trim().slice(0, 30);
@@ -255,18 +291,82 @@ function parseOutput(output: string): ParsedOutput {
   return { text: output, options };
 }
 
-async function sendOutput(userId: number, output: string): Promise<void> {
+/**
+ * Queue output for sending with debounce.
+ * Multiple rapid outputs will be batched into single message updates.
+ */
+function queueOutput(userId: number, output: string): void {
+  const queueState = getOutputQueueState(userId);
+
+  // Update pending output (latest wins)
+  queueState.pendingOutput = output;
+
+  // Clear existing debounce timer
+  if (queueState.debounceTimer) {
+    clearTimeout(queueState.debounceTimer);
+  }
+
+  // Set new debounce timer
+  queueState.debounceTimer = setTimeout(() => {
+    queueState.debounceTimer = null;
+    processOutputQueue(userId);
+  }, outputDebounceMs);
+}
+
+/**
+ * Process the output queue for a user.
+ * Ensures sequential processing - only one send operation at a time.
+ */
+async function processOutputQueue(userId: number): Promise<void> {
+  const queueState = getOutputQueueState(userId);
+
+  // Skip if already processing (will be called again when current processing finishes)
+  if (queueState.isProcessing) {
+    return;
+  }
+
+  // Skip if no pending output
+  if (!queueState.pendingOutput) {
+    return;
+  }
+
+  queueState.isProcessing = true;
+
+  try {
+    // Take the pending output and clear it
+    const output = queueState.pendingOutput;
+    queueState.pendingOutput = null;
+
+    await sendOutputImmediate(userId, output);
+  } finally {
+    queueState.isProcessing = false;
+
+    // Check if more output arrived while we were processing
+    if (queueState.pendingOutput) {
+      // Process again after a small delay
+      setTimeout(() => processOutputQueue(userId), outputDebounceMs);
+    }
+  }
+}
+
+/**
+ * Immediately send output to user (internal function).
+ * Handles new message vs edit logic and markdown fallback.
+ */
+async function sendOutputImmediate(userId: number, output: string): Promise<void> {
   const truncated = truncateOutput(output);
   const escaped = escapeMarkdown(truncated);
   const { options } = parseOutput(output);
-  const state = getUserMessageState(userId);
+  const msgState = getUserMessageState(userId);
+
+  const hasButtons = options.length >= 2 && options.length <= 6;
+  const parseMode = 'Markdown' as const;
+
+  // Capture needsNewMessage state before any async operations
+  const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;
 
   try {
-    const hasButtons = options.length >= 2 && options.length <= 6;
-
-    const parseMode = 'Markdown' as const;
-
-    if (state.needsNewMessage || !state.lastMessageId) {
+    if (shouldSendNew) {
       // Send new message
       let sentMessage;
       if (hasButtons) {
@@ -278,30 +378,37 @@ async function sendOutput(userId: number, output: string): Promise<void> {
       } else {
         sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
       }
-      state.lastMessageId = sentMessage.message_id;
-      state.needsNewMessage = false;
+      msgState.lastMessageId = sentMessage.message_id;
+      msgState.needsNewMessage = false;
       trackMessageId(userId, sentMessage.message_id);
     } else {
       // Try to edit existing message
+      // At this point lastMessageId is guaranteed to exist (checked in shouldSendNew)
+      const messageId = msgState.lastMessageId as number;
       try {
         if (hasButtons) {
           const buttons = options.map(opt =>
             Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
           );
           const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
-          await bot.telegram.editMessageText(userId, state.lastMessageId, undefined, escaped, { ...keyboard, parse_mode: parseMode });
+          await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { ...keyboard, parse_mode: parseMode });
         } else {
-          await bot.telegram.editMessageText(userId, state.lastMessageId, undefined, escaped, { parse_mode: parseMode });
+          await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { parse_mode: parseMode });
         }
       } catch (editErr: unknown) {
-        // If edit fails (message too old, deleted, or content unchanged), send new message
         const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
-        if (!errMessage.includes('message is not modified')) {
-          console.log('[sendOutput] Edit failed, sending new message:', errMessage);
-          const sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
-          state.lastMessageId = sentMessage.message_id;
-          trackMessageId(userId, sentMessage.message_id);
+
+        // Content unchanged - not an error, just skip
+        if (errMessage.includes('message is not modified')) {
+          return;
         }
+
+        // Message too old or deleted - send new message
+        console.log('[sendOutput] Edit failed, sending new message:', errMessage);
+        const sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
+        msgState.lastMessageId = sentMessage.message_id;
+        msgState.needsNewMessage = false;
+        trackMessageId(userId, sentMessage.message_id);
       }
     }
   } catch (err) {
@@ -309,8 +416,8 @@ async function sendOutput(userId: number, output: string): Promise<void> {
     console.error('[sendOutput] Markdown error, falling back to plain text:', err);
     try {
       const sentMessage = await bot.telegram.sendMessage(userId, truncated);
-      state.lastMessageId = sentMessage.message_id;
-      state.needsNewMessage = false;
+      msgState.lastMessageId = sentMessage.message_id;
+      msgState.needsNewMessage = false;
       trackMessageId(userId, sentMessage.message_id);
     } catch (plainErr) {
       console.error('[sendOutput] Plain text also failed:', plainErr);
@@ -682,9 +789,7 @@ function handleClaudeOutput(userId: number, output: string): void {
   console.log(`[Bot] output (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
 
-  sendOutput(userId, output).catch(err => {
-    console.error('[Bot] sendOutput error:', err);
-  });
+  queueOutput(userId, output);
 }
 
 function handleClaudeClosed(userId: number): void {

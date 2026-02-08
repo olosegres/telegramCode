@@ -30,8 +30,8 @@ function convertAnsiToMarkdown(text: string): string {
   let result = text;
 
   // Track style state
-  let isBold = false;
-  let isItalic = false;
+  const isBold = false;
+  const isItalic = false;
 
   // Process ANSI codes and convert to markdown
   // Bold: \x1B[1m ... \x1B[0m or \x1B[22m
@@ -128,13 +128,15 @@ function stripTuiElements(text: string): string {
     }
 
     // Skip lines with only special Unicode symbols (spinners, etc)
-    if (/^[\s·✽✢✶⏵❯─━↵]+$/.test(line)) {
+    if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) {
       continue;
     }
 
-    // Skip spinner/thinking lines (Slithering, Fluttering, Thinking, etc.) but keep tool calls
+    // Skip spinner/thinking/thought lines - lines starting with spinner symbol containing thinking/thought status
+    // Examples: "· Discombobulating… (thinking)", "✽ Crunching… (thought for 2s)", 
+    // "✢ Crunching… (30s · ↓ 377 tokens · thought for 2s)"
     const trimmedLine = line.trim();
-    if (/^[·✽✢✶●○*]\s*(Slithering|Fluttering|Thinking)/i.test(trimmedLine)) {
+    if (/^[·✽✢✶✻●○*]\s*.+\((thinking|thought\s)/i.test(trimmedLine)) {
       continue;
     }
 
@@ -143,6 +145,50 @@ function stripTuiElements(text: string): string {
 
     // Skip "ctrl+c to interrupt" hint lines (but not if it's part of a tool call)
     if (!isToolCall && /ctrl\+c.*to interrupt/i.test(line)) {
+      continue;
+    }
+
+    // Skip installer/update notices
+    if (/claude code has switched|native installer|Run.*install.*or see/i.test(line)) {
+      continue;
+    }
+    if (/docs\.anthropic\.com/i.test(line)) {
+      continue;
+    }
+    if (/more options\.?\s*$/i.test(trimmedLine) && trimmedLine.length < 20) {
+      continue;
+    }
+
+    // Skip Claude Code welcome screen and ASCII art
+    // Box borders: ╭─╮│╰─╯
+    if (/^[╭─╮│╰╯\s]+$/.test(trimmedLine)) {
+      continue;
+    }
+    if (/^[▐▛▜▌▝▘█▀▄░▒▓\s]+$/.test(trimmedLine)) {
+      continue;
+    }
+    // Welcome screen elements
+    if (/Claude Code.*v\d+\.\d+/i.test(line)) {
+      continue;
+    }
+    if (/Recent activity|What's new|\/resume for more/i.test(line)) {
+      continue;
+    }
+    if (/Welcome\s*back/i.test(line)) {
+      continue;
+    }
+    if (/Opus|Sonnet|Claude Max/i.test(line)) {
+      continue;
+    }
+    // Lines that are mostly box drawing characters with some text
+    if (/[╭─╮│╰╯]/.test(line) && trimmedLine.length > 50) {
+      continue;
+    }
+    // Recent activity entries (timestamp + message)
+    if (/^\s*│.*\d+[smh]\s+ago\s+/i.test(line)) {
+      continue;
+    }
+    if (/^\s*│.*[─]+\s*│\s*$/.test(line)) {
       continue;
     }
 

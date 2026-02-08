@@ -61,6 +61,50 @@ function convertAnsiToMarkdown(text: string): string {
   return result;
 }
 
+/**
+ * Join URLs that were broken by terminal line wrapping.
+ * Terminal breaks long URLs into multiple lines, which breaks them in Telegram.
+ */
+function joinBrokenUrls(text: string): string {
+  const lines = text.split('\n');
+  const result: string[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    
+    // Check if line contains a URL that might be broken
+    const urlMatch = line.match(/(https?:\/\/\S*)$/);
+    
+    if (urlMatch) {
+      // Found a URL at the end of line - check if it continues on next lines
+      let fullUrl = urlMatch[1];
+      const prefix = line.slice(0, line.length - fullUrl.length);
+      
+      // Look ahead for continuation lines (no spaces, looks like URL parts)
+      let j = i + 1;
+      while (j < lines.length) {
+        const nextLine = lines[j].trim();
+        // URL continuation: no spaces, contains URL-like chars (letters, digits, %, =, &, /, etc.)
+        if (nextLine && !nextLine.includes(' ') && /^[\w\-._~:/?#\[\]@!$&'()*+,;=%]+$/.test(nextLine)) {
+          fullUrl += nextLine;
+          j++;
+        } else {
+          break;
+        }
+      }
+      
+      result.push(prefix + fullUrl);
+      i = j;
+    } else {
+      result.push(line);
+      i++;
+    }
+  }
+
+  return result.join('\n');
+}
+
 function cleanOutput(text: string): string {
   // Convert ANSI styles to markdown before stripping
   let cleaned = convertAnsiToMarkdown(text);
@@ -68,6 +112,8 @@ function cleanOutput(text: string): string {
   cleaned = cleaned.replace(/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/g, '');
   // Normalize newlines
   cleaned = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // Join broken URLs before other processing
+  cleaned = joinBrokenUrls(cleaned);
   // Remove excessive newlines
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
   // Remove lines that are just spaces
@@ -132,13 +178,7 @@ function stripTuiElements(text: string): string {
       continue;
     }
 
-    // Skip spinner/thinking/thought lines - lines starting with spinner symbol containing thinking/thought status
-    // Examples: "· Discombobulating… (thinking)", "✽ Crunching… (thought for 2s)", 
-    // "✢ Crunching… (30s · ↓ 377 tokens · thought for 2s)"
     const trimmedLine = line.trim();
-    if (/^[·✽✢✶✻●○*]\s*.+\((thinking|thought\s)/i.test(trimmedLine)) {
-      continue;
-    }
 
     // Check if it's a tool call line
     const isToolCall = /^[●○]?\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i.test(trimmedLine);

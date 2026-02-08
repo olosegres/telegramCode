@@ -262,7 +262,8 @@ export class ClaudeManager extends EventEmitter {
     tmux('kill-session', '-t', sessionName);
 
     // Create new detached tmux session with bash, then send claude command
-    const createCmd = `tmux new-session -d -s ${sessionName} -x 120 -y 30`;
+    // Wide terminal (300 cols) to avoid breaking long URLs
+    const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
     const claudeArgs = args ? ` ${args}` : '';
     const startClaudeCmd = `tmux send-keys -t ${sessionName} "cd ${workDir} && ${claudePath} --dangerously-skip-permissions${claudeArgs}" Enter`;
     try {

@@ -38,6 +38,7 @@ interface UserMessageState {
   lastMessageId: number | null;
   needsNewMessage: boolean;
   messageIds: number[];
+  loaderMessageId: number | null;
 }
 
 interface StoredMessageIds {
@@ -97,10 +98,27 @@ function saveMessageIds(): void {
 function getUserMessageState(userId: number): UserMessageState {
   let state = userMessageStates.get(userId);
   if (!state) {
-    state = { lastMessageId: null, needsNewMessage: true, messageIds: [] };
+    state = { lastMessageId: null, needsNewMessage: true, messageIds: [], loaderMessageId: null };
     userMessageStates.set(userId, state);
   }
   return state;
+}
+
+function setLoaderMessage(userId: number, messageId: number): void {
+  const state = getUserMessageState(userId);
+  state.loaderMessageId = messageId;
+}
+
+async function deleteLoaderMessage(userId: number): Promise<void> {
+  const state = getUserMessageState(userId);
+  if (state.loaderMessageId) {
+    try {
+      await bot.telegram.deleteMessage(userId, state.loaderMessageId);
+    } catch {
+      // Message might already be deleted
+    }
+    state.loaderMessageId = null;
+  }
 }
 
 function getOutputQueueState(userId: number): OutputQueueState {
@@ -391,6 +409,9 @@ async function processOutputQueue(userId: number): Promise<void> {
  * Handles new message vs edit logic and markdown fallback.
  */
 async function sendOutputImmediate(userId: number, output: string): Promise<void> {
+  // Delete loader message if present
+  await deleteLoaderMessage(userId);
+  
   const truncated = truncateOutput(output);
   const escaped = escapeMarkdown(truncated);
   const { options } = parseOutput(output);
@@ -740,6 +761,7 @@ bot.on(message('text'), async (ctx) => {
     markNeedsNewMessage(userId);
     const processingMsg = await ctx.reply('⏳');
     trackMessageId(userId, processingMsg.message_id);
+    setLoaderMessage(userId, processingMsg.message_id);
     claudeManager.sendInput(userId, text);
     return;
   }
@@ -804,6 +826,7 @@ bot.on(message('voice'), async (ctx) => {
     markNeedsNewMessage(userId);
     const processingMsg = await ctx.reply('⏳');
     trackMessageId(userId, processingMsg.message_id);
+    setLoaderMessage(userId, processingMsg.message_id);
     claudeManager.sendInput(userId, transcript);
   } catch (err) {
     console.error('[Bot] Voice handling error:', err);

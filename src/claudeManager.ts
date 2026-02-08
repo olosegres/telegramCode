@@ -211,17 +211,10 @@ function stripTuiElements(text: string): string {
       continue;
     }
     // Welcome screen elements
-    if (/Claude Code.*v\d+\.\d+/i.test(line)) {
-      continue;
-    }
     if (/Recent activity|What's new|\/resume for more/i.test(line)) {
       continue;
     }
     if (/Welcome\s*back/i.test(line)) {
-      continue;
-    }
-    // Model names in welcome screen box (but not in regular text)
-    if (/[│].*(?:Opus|Sonnet|Claude Max).*[│]/i.test(line)) {
       continue;
     }
     // Lines that are mostly box drawing characters with some text

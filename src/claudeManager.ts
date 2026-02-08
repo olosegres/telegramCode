@@ -220,7 +220,8 @@ function stripTuiElements(text: string): string {
     if (/Welcome\s*back/i.test(line)) {
       continue;
     }
-    if (/Opus|Sonnet|Claude Max/i.test(line)) {
+    // Model names in welcome screen box (but not in regular text)
+    if (/[│].*(?:Opus|Sonnet|Claude Max).*[│]/i.test(line)) {
       continue;
     }
     // Lines that are mostly box drawing characters with some text

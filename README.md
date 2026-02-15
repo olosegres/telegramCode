@@ -1,170 +1,219 @@
 <table border="0">
   <tr>
-    <td><h2> Telegram bot server for interacting with Claude CLI via tmux session</h2>
+    <td><h2>Telegram bot for AI coding agents (Claude Code, OpenCode)</h2>
 
 ### Features
 
-- Run Claude CLI through Telegram messages
-- Voice messages support (transcription via Groq/OpenAI Whisper)
-- Auto-accept bypass permissions dialog
-- Auto-press Enter for login prompts
-- Filter TUI elements (status line, input field, spinners, thinking indicators)
+- Multiple AI backends: Claude Code CLI, OpenCode
+- Switch between agents on the fly (`/agent`)
+- Model selection with dynamic list (`/model`)
+- Voice messages (transcription via Groq/OpenAI Whisper)
+- Session history and resume (`/sessions`)
 - Message update instead of spam (edit in place)
 - Inline buttons for numbered options
+- Auto-install tools on first use
     </td>
 <td width="280"><img src="./demo.gif" width="320" /></td>
   </tr>
 </table>
 
-## How It Works
+## Quick Start
 
-### Architecture
+### 1. Create Telegram Bot
 
+1. Message [@BotFather](https://t.me/BotFather) on Telegram
+2. Send `/newbot` and follow prompts
+3. Copy the bot token (looks like `123456789:ABCdef...`)
+
+### 2. Get Your Telegram User ID
+
+1. Message [@userinfobot](https://t.me/userinfobot) on Telegram
+2. It will reply with your user ID (a number like `123456789`)
+
+### 3. Run with Docker
+
+Create a `docker-compose.yml`:
+
+```yaml
+services:
+  telegram-code:
+    image: node:20
+    volumes:
+      # Your project directory
+      - ./my-project:/workspace:rw
+      # Persist npm global installs (claude, opencode)
+      - telegram-code-npm:/home/agent/.npm-global
+      # Host configs for git
+      - ~/.gitconfig:/home/agent/.gitconfig:ro
+      - ~/.ssh:/home/agent/.ssh:ro
+    environment:
+      - HOME=/home/agent
+      - TELEGRAM_BOT_TOKEN=your-bot-token-here
+      - ALLOWED_USERS=your-telegram-id
+      - WORK_DIR=/workspace
+      # Optional: voice transcription
+      - GROQ_API_KEY=your-groq-key
+      # Optional: for Claude (or set in container)
+      - ANTHROPIC_API_KEY=your-anthropic-key
+    working_dir: /workspace
+    command: npx -y telegram-code-bot
+    restart: unless-stopped
+
+volumes:
+  telegram-code-npm:
 ```
-Telegram <-> Bot (Node.js) <-> tmux session <-> Claude CLI
-```
-
-1. **Bot** runs as Node.js process, connects to Telegram via long polling
-2. **Claude CLI** runs inside a tmux session (one per user)
-3. **Polling** every 300ms captures tmux pane content and detects changes
-4. **Output** is filtered (TUI elements removed) and sent to Telegram
-
-### Key Components
-
-- `bot.ts` - Telegram bot logic, message handling, output queue
-- `claudeManager.ts` - tmux session management, output polling, TUI filtering
-
-## Development
-
-### No Build Required
-
-The project runs directly from TypeScript sources using `ts-node` or `tsx`. Changes to `.ts` files take effect after container restart - no build step needed.
 
 ```bash
-# Restart to apply changes
-docker compose restart telegram-code
-
-# Or full recreate if restart doesn't help
-docker compose down telegram-code && docker compose up -d telegram-code
+docker compose up -d
 ```
 
-### Local Development
+### 4. Start Using
 
-```bash
-yarn dev  # Uses tsx watch for hot reload
-```
+1. Open your bot in Telegram
+2. Send `/claude` or `/opencode` to start a session
+3. Send your coding request
+4. Use `/stop` when done
 
-### Scripts
+## Supported Agents
 
-- `yarn dev` - Development with hot reload (tsx watch)
-- `yarn build` - Compile TypeScript to dist/ (only needed for standalone deployment)
-- `yarn start` - Run compiled version from dist/
-- `yarn typecheck` - Type check without emitting
+| Agent | Command | Description |
+|-------|---------|-------------|
+| Claude Code | `/claude` | Anthropic's Claude Code CLI (tmux-based) |
+| OpenCode | `/opencode` or `/oc` | OpenCode AI agent (HTTP API) |
 
-## Message Update Logic
-
-When Claude produces output:
-1. If user hasn't sent anything yet - create a new message
-2. If user sent input - create a new message for the response
-3. Otherwise - update the existing message (edit in place)
-
-This prevents spam when Claude is "thinking" and producing multiple small updates.
-
-### How It Works Internally
-
-The bot tracks a `needsNewMessage` flag per user:
-- Set to `true` when user sends any input (text, voice, button click, commands)
-- Set to `false` after sending a new message
-- When `true` or no previous message exists - send new message
-- When `false` - edit existing message
-
-### Race Condition Prevention
-
-The bot uses a queue-based approach with debouncing to handle rapid output updates:
-- Multiple outputs arriving within 150ms are batched into a single update
-- Only one Telegram API call is in flight at a time per user
-- If new output arrives while sending, it's queued and processed after current send completes
-
-This prevents multiple new messages being created when Claude produces rapid updates.
-
-## TUI Filtering
-
-The following TUI elements are stripped from output before sending to Telegram:
-
-| Element | Example | Why Filtered |
-|---------|---------|--------------|
-| Status line | `⏵⏵ bypass permissions on` | UI chrome |
-| Input borders | `────────────────────────` | UI chrome |
-| Input prompt | `❯ ` | Not useful in Telegram |
-| Tab hints | `❯ push to origin ... ↵ send` | UI chrome |
-| Spinner-only lines | `·✽✢✶✻` | Animation artifacts |
-| Thinking indicators | `✽ Discombobulating… (thinking)` | Transient state |
-
-Tool calls (Bash, Read, Write, etc.) are preserved and normalized with status icons:
-- `⏳` - tool running
-- `✓` - tool completed
+Switch agents anytime with `/agent` command.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/claude` | Start Claude session (optionally with args: `/claude --resume`) |
-| `/stop` | Stop Claude session |
+| `/claude` | Start Claude Code session |
+| `/opencode` | Start OpenCode session |
+| `/agent` | Choose agent (shows buttons) |
+| `/model` | Switch model (shows numbered list) |
+| `/sessions` | Show previous sessions to resume |
+| `/stop` | Stop current session |
 | `/status` | Show current status |
-| `/output` | Show last 500 lines of raw output |
+| `/output` | Show last 500 lines of output |
 | `/c` | Send Ctrl+C (interrupt) |
 | `/y` | Send "y" (yes) |
 | `/n` | Send "n" (no) |
 | `/enter` | Press Enter |
-| `/up` | Arrow Up |
-| `/down` | Arrow Down |
+| `/up` / `/down` | Arrow keys |
 | `/tab` | Tab (autocomplete) |
 | `/clear` | Delete chat messages |
 
 ### Natural Language Start
 
-You can also start Claude by typing phrases like:
-- "claude", "клод", "клауд"
-- "claude fix the bug" (starts with initial prompt)
+Start agents by typing phrases like:
+- "claude", "claude fix the bug"
+- "opencode", "opencode add tests"
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token from @BotFather |
+| `TELEGRAM_BOT_TOKEN` | Yes | From @BotFather |
 | `ALLOWED_USERS` | Yes | Comma-separated Telegram user IDs |
 | `WORK_DIR` | No | Working directory (default: `/workspace`) |
-| `GROQ_API_KEY` | No | For voice transcription (free, preferred) |
-| `OPENAI_API_KEY` | No | For voice transcription (fallback) |
+| `DEFAULT_AGENT` | No | Default agent: `claude` or `opencode` |
+| `GROQ_API_KEY` | No | Voice transcription (free, preferred) |
+| `OPENAI_API_KEY` | No | Voice transcription (fallback) |
+| `ANTHROPIC_API_KEY` | No | For Claude Code |
+| `OPENCODE_URL` | No | OpenCode server URL (default: `http://localhost:4096`) |
+| `OPENCODE_BIN` | No | Custom opencode binary path |
 
-## Running with Docker
+## Architecture
 
-```bash
-docker compose up -d telegram-code
+```
+Telegram <-> Bot (Node.js) <-> Adapter <-> AI Agent
+                                  |
+                                  +-> Claude CLI (via tmux)
+                                  +-> OpenCode (via HTTP API)
 ```
 
-### Expected Behavior
+### Adapter Pattern
 
-When everything works correctly:
-1. Send a message to the bot
-2. Bot shows `⏳` processing indicator
-3. Claude processes your request
-4. Bot updates the **same message** with Claude's response as it streams
-5. When you send another message, a **new message** is created for the response
-6. Subsequent updates edit that new message
+Each AI backend implements the `AgentAdapter` interface:
+- `startSession()` / `stopSession()` - lifecycle
+- `sendInput()` / `sendSignal()` - communication
+- `setModel()` / `getAvailableModels()` - model selection
+- Events: `output`, `closed`, `error`
 
-### Troubleshooting
+### Key Files
 
-**Multiple messages appearing instead of updates:**
-- Check container logs for errors
-- Restart container: `docker compose restart telegram-code`
-- Verify the queue logic is working (look for `[Bot] output` logs)
+- `src/bot.ts` - Telegram bot, commands, message handling
+- `src/adapters/` - Agent adapters (Claude CLI, OpenCode)
+- `src/types.ts` - AgentAdapter interface
+- `src/rateLimiter.ts` - Telegram API rate limit handling
+- `src/installManager.ts` - Auto-install tools
+
+## Development
+
+### Local Development
+
+```bash
+yarn install
+yarn dev  # Uses tsx watch for hot reload
+```
+
+### Docker Development
+
+```bash
+# Restart to apply changes
+docker compose restart telegram-code
+
+# Full recreate
+docker compose down telegram-code && docker compose up -d telegram-code
+```
+
+### Scripts
+
+- `yarn dev` - Development with hot reload
+- `yarn build` - Compile TypeScript
+- `yarn start` - Run compiled version
+- `yarn typecheck` - Type check
+
+## How It Works
+
+### Message Updates
+
+The bot edits messages in place instead of spamming:
+1. User sends input -> new message created for response
+2. AI produces output -> same message is updated
+3. Rapid updates are debounced (1s batching)
+
+### Rate Limit Handling
+
+Telegram API rate limits (429) are handled automatically:
+- Waits for `retry_after` + jitter
+- Retries once, then marks user as rate-limited
+- Skips sends during cooldown period
+
+### TUI Filtering (Claude CLI)
+
+Claude CLI TUI elements are stripped from output:
+- Status lines, borders, spinners
+- Tool calls are preserved with status icons (`⏳` running, `✓` done)
+
+## Troubleshooting
+
+**Bot not responding:**
+- Check `TELEGRAM_BOT_TOKEN` is correct
+- Verify your user ID is in `ALLOWED_USERS`
+- Check container logs: `docker compose logs telegram-code`
 
 **Voice messages not working:**
 - Set `GROQ_API_KEY` (free) or `OPENAI_API_KEY`
-- Check logs for transcription errors
 
-**Claude not responding:**
-- Check if tmux session exists: `docker exec telegram-code-bot tmux list-sessions`
-- Check Claude CLI is installed in container
-- Verify `WORK_DIR` path exists and is accessible
+**Claude not starting:**
+- Check `ANTHROPIC_API_KEY` is set
+- Verify tmux is installed in container
+
+**OpenCode not starting:**
+- Check if server is running: `/status`
+- OpenCode auto-starts on first use
+
+## License
+
+MIT

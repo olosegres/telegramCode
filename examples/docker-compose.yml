@@ -20,6 +20,9 @@ services:
       # Host configs
       - ~/.gitconfig:/tmp/host-gitconfig:ro
       - ~/.ssh:/tmp/host-ssh:ro
+      # Optional: custom opencode binary (built from fork)
+      # Build: cd opencode-fork/packages/opencode && bun run build
+      # - ../opencode-fork/packages/opencode/dist/opencode-linux-x64/bin/opencode:/opt/opencode:ro
     environment:
       - HOME=/home/agent
       - TERM=xterm-256color
@@ -28,6 +31,9 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ALLOWED_USERS=${ALLOWED_USERS}
       - WORK_DIR=/workspace
+      - DEFAULT_AGENT=opencode
+      # Optional: use custom opencode binary
+      # - OPENCODE_BIN=/opt/opencode
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
     command: ["npx", "tsx", "/telegram-code/src/index.ts"]
     restart: unless-stopped

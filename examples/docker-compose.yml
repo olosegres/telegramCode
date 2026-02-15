@@ -15,11 +15,14 @@ services:
       # telegram-code source (adjust path)
       - ../telegram-code:/telegram-code:ro
       - ../telegram-code/.docker-entrypoint.sh:/docker-entrypoint.sh:ro
-      # Persist home
+      # Persist home (npm installs, CLI configs, session history)
       - telegram_code_home:/home/agent:rw
       # Host configs
       - ~/.gitconfig:/tmp/host-gitconfig:ro
       - ~/.ssh:/tmp/host-ssh:ro
+      # OpenCode config and state from host (persists model selection)
+      - ~/.config/opencode:/home/agent/.config/opencode:rw
+      - ~/.local/state/opencode:/home/agent/.local/state/opencode:rw
       # Optional: custom opencode binary (built from fork)
       # Build: cd opencode-fork/packages/opencode && bun run build
       # - ../opencode-fork/packages/opencode/dist/opencode-linux-x64/bin/opencode:/opt/opencode:ro
@@ -32,6 +35,10 @@ services:
       - ALLOWED_USERS=${ALLOWED_USERS}
       - WORK_DIR=/workspace
       - DEFAULT_AGENT=opencode
+      # API keys for providers
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # Optional: use custom opencode binary
       # - OPENCODE_BIN=/opt/opencode
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]

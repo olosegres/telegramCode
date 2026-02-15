@@ -9,7 +9,7 @@ import {
   registerAdapterEventHandlers,
 } from './adapters/createAdapter';
 import { withRateLimitRetry, checkIsRateLimited } from './rateLimiter';
-import { stopOpenCodeServer } from './installManager';
+import { stopOpenCodeServer, checkIsOpenCodeServerRunning, ensureOpenCodeServer } from './installManager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
@@ -1305,6 +1305,28 @@ export async function startBot(): Promise<void> {
   } catch (err) {
     console.error('Failed to connect to Telegram API:', err);
     throw err;
+  }
+
+  // Pre-start OpenCode server if opencode adapter is available
+  if (getAvailableAdapters().some(a => a.name === 'opencode')) {
+    try {
+      console.log('[Boot] Pre-starting OpenCode server...');
+      await ensureOpenCodeServer();
+      
+      // Diagnostic: fetch config to see what model OpenCode resolved
+      const openCodeUrl = (process.env.OPENCODE_URL || 'http://localhost:4096').replace(/\/$/, '');
+      const configResp = await fetch(`${openCodeUrl}/config`, { signal: AbortSignal.timeout(5000) });
+      if (configResp.ok) {
+        const config = await configResp.json() as Record<string, unknown>;
+        const dm = config.defaultModel as { providerID?: string; modelID?: string } | undefined;
+        console.log(`[Boot] OpenCode config.model: ${config.model || '(not set)'}`);
+        console.log(`[Boot] OpenCode defaultModel: ${dm?.providerID && dm?.modelID ? `${dm.providerID}/${dm.modelID}` : '(not resolved)'}`);
+      } else {
+        console.log(`[Boot] OpenCode /config returned ${configResp.status}`);
+      }
+    } catch (e) {
+      console.log(`[Boot] OpenCode pre-start failed:`, e instanceof Error ? e.message : e);
+    }
   }
 
   console.log('Launching Telegraf bot (long polling)...');

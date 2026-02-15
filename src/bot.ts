@@ -1,6 +1,15 @@
 import { Telegraf, type Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
-import { claudeManager } from './claudeManager';
+import {
+  getUserAdapter,
+  getUserAdapterName,
+  setUserAdapter,
+  getAvailableAdapters,
+  getDefaultAdapterName,
+  registerAdapterEventHandlers,
+} from './adapters/createAdapter';
+import { withRateLimitRetry, checkIsRateLimited } from './rateLimiter';
+import { stopOpenCodeServer } from './installManager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
@@ -62,8 +71,8 @@ interface OutputQueueState {
 const userMessageStates = new Map<number, UserMessageState>();
 const outputQueues = new Map<number, OutputQueueState>();
 
-/** Debounce delay in ms - wait this long for more updates before sending */
-const outputDebounceMs = 150;
+/** Debounce delay in ms — increased to avoid Telegram 429 rate limits */
+const outputDebounceMs = 1000;
 
 function loadMessageIds(): void {
   try {
@@ -113,7 +122,9 @@ async function deleteLoaderMessage(userId: number): Promise<void> {
   const state = getUserMessageState(userId);
   if (state.loaderMessageId) {
     try {
-      await bot.telegram.deleteMessage(userId, state.loaderMessageId);
+      await withRateLimitRetry(userId, () =>
+        bot.telegram.deleteMessage(userId, state.loaderMessageId!)
+      );
     } catch {
       // Message might already be deleted
     }
@@ -138,31 +149,10 @@ function markNeedsNewMessage(userId: number): void {
 function trackMessageId(userId: number, messageId: number): void {
   const state = getUserMessageState(userId);
   state.messageIds.push(messageId);
-  // Keep only last 500 messages to avoid memory issues
   if (state.messageIds.length > 500) {
     state.messageIds = state.messageIds.slice(-500);
   }
   saveMessageIds();
-}
-
-async function clearAllMessages(userId: number): Promise<number> {
-  const state = getUserMessageState(userId);
-  let deleted = 0;
-
-  for (const msgId of state.messageIds) {
-    try {
-      await bot.telegram.deleteMessage(userId, msgId);
-      deleted++;
-    } catch {
-      // Message might be too old or already deleted
-    }
-  }
-
-  state.messageIds = [];
-  state.lastMessageId = null;
-  state.needsNewMessage = true;
-
-  return deleted;
 }
 
 function checkIsAllowed(userId: number): boolean {
@@ -208,7 +198,6 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
 }
 
 async function transcribeAudio(filePath: string, retryCount = 0): Promise<string | null> {
-  // Prefer Groq (free), fallback to OpenAI
   const apiKey = groqApiKey || openaiApiKey;
   const isGroq = !!groqApiKey;
 
@@ -240,7 +229,6 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', async () => {
-        // Handle rate limit (429)
         if (res.statusCode === 429) {
           const retryAfter = parseInt(res.headers['retry-after'] as string) || 5;
           console.log(`[Bot] Rate limited, retry after ${retryAfter}s (attempt ${retryCount + 1}/3)`);
@@ -282,7 +270,6 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
 }
 
 function escapeMarkdownChars(text: string): string {
-  // Escape markdown special characters including unpaired asterisks and backticks
   return text
     .replace(/\*/g, '\\*')
     .replace(/_/g, '\\_')
@@ -292,8 +279,6 @@ function escapeMarkdownChars(text: string): string {
 }
 
 function escapeMarkdown(text: string): string {
-  // Escape markdown special characters except our intentional *bold* markers
-  // Process character by character to handle bold markers properly
   const boldRegex = /\*([^*\n]+)\*/g;
   const boldMatches: Array<{ start: number; end: number; content: string }> = [];
 
@@ -310,16 +295,13 @@ function escapeMarkdown(text: string): string {
   let lastIndex = 0;
 
   for (const m of boldMatches) {
-    // Escape the part before this bold marker (including unpaired asterisks)
     const before = text.slice(lastIndex, m.start);
     result += escapeMarkdownChars(before);
-    // Add bold marker with escaped content (but keep the * markers for bold)
     const escapedContent = m.content.replace(/_/g, '\\_').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
     result += `*${escapedContent}*`;
     lastIndex = m.end;
   }
 
-  // Escape the remaining part (including unpaired asterisks)
   const remaining = text.slice(lastIndex);
   result += escapeMarkdownChars(remaining);
 
@@ -349,46 +331,41 @@ function parseOutput(output: string): ParsedOutput {
 /**
  * Queue output for sending with debounce.
  * Multiple rapid outputs will be batched into single message updates.
+ * Skips sending if user is currently rate-limited by Telegram.
  */
 function queueOutput(userId: number, output: string): void {
   const queueState = getOutputQueueState(userId);
 
-  // Update pending output (latest wins)
   queueState.pendingOutput = output;
 
-  // Clear existing debounce timer
   if (queueState.debounceTimer) {
     clearTimeout(queueState.debounceTimer);
   }
 
-  // Set new debounce timer
+  // If rate-limited, use longer delay
+  const delayMs = checkIsRateLimited(userId)
+    ? Math.max(outputDebounceMs, 5000)
+    : outputDebounceMs;
+
   queueState.debounceTimer = setTimeout(() => {
     queueState.debounceTimer = null;
     processOutputQueue(userId);
-  }, outputDebounceMs);
+  }, delayMs);
 }
 
 /**
  * Process the output queue for a user.
- * Ensures sequential processing - only one send operation at a time.
+ * Ensures sequential processing — only one send operation at a time.
  */
 async function processOutputQueue(userId: number): Promise<void> {
   const queueState = getOutputQueueState(userId);
 
-  // Skip if already processing (will be called again when current processing finishes)
-  if (queueState.isProcessing) {
-    return;
-  }
-
-  // Skip if no pending output
-  if (!queueState.pendingOutput) {
-    return;
-  }
+  if (queueState.isProcessing) return;
+  if (!queueState.pendingOutput) return;
 
   queueState.isProcessing = true;
 
   try {
-    // Take the pending output and clear it
     const output = queueState.pendingOutput;
     queueState.pendingOutput = null;
 
@@ -396,22 +373,22 @@ async function processOutputQueue(userId: number): Promise<void> {
   } finally {
     queueState.isProcessing = false;
 
-    // Check if more output arrived while we were processing
     if (queueState.pendingOutput) {
-      // Process again after a small delay
-      setTimeout(() => processOutputQueue(userId), outputDebounceMs);
+      const delayMs = checkIsRateLimited(userId)
+        ? Math.max(outputDebounceMs, 5000)
+        : outputDebounceMs;
+      setTimeout(() => processOutputQueue(userId), delayMs);
     }
   }
 }
 
 /**
  * Immediately send output to user (internal function).
- * Handles new message vs edit logic and markdown fallback.
+ * Handles new message vs edit logic, markdown fallback, and rate limit retry.
  */
 async function sendOutputImmediate(userId: number, output: string): Promise<void> {
-  // Delete loader message if present
   await deleteLoaderMessage(userId);
-  
+
   const truncated = truncateOutput(output);
   const escaped = escapeMarkdown(truncated);
   const { options } = parseOutput(output);
@@ -420,68 +397,85 @@ async function sendOutputImmediate(userId: number, output: string): Promise<void
   const hasButtons = options.length >= 2 && options.length <= 6;
   const parseMode = 'Markdown' as const;
 
-  // Capture needsNewMessage state before any async operations
   const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;
 
   try {
-    if (shouldSendNew) {
-      // Send new message
-      let sentMessage;
-      if (hasButtons) {
-        const buttons = options.map(opt =>
-          Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
-        );
-        const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
-        sentMessage = await bot.telegram.sendMessage(userId, escaped, { ...keyboard, parse_mode: parseMode });
-      } else {
-        sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
-      }
-      msgState.lastMessageId = sentMessage.message_id;
-      msgState.needsNewMessage = false;
-      trackMessageId(userId, sentMessage.message_id);
-    } else {
-      // Try to edit existing message
-      // At this point lastMessageId is guaranteed to exist (checked in shouldSendNew)
-      const messageId = msgState.lastMessageId as number;
-      try {
+    await withRateLimitRetry(userId, async () => {
+      if (shouldSendNew) {
+        let sentMessage;
         if (hasButtons) {
           const buttons = options.map(opt =>
             Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
           );
           const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
-          await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { ...keyboard, parse_mode: parseMode });
+          sentMessage = await bot.telegram.sendMessage(userId, escaped, { ...keyboard, parse_mode: parseMode });
         } else {
-          await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { parse_mode: parseMode });
+          sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
         }
-      } catch (editErr: unknown) {
-        const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
-
-        // Content unchanged - not an error, just skip
-        if (errMessage.includes('message is not modified')) {
-          return;
-        }
-
-        // Message too old or deleted - send new message
-        console.log('[sendOutput] Edit failed, sending new message:', errMessage);
-        const sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
         msgState.lastMessageId = sentMessage.message_id;
         msgState.needsNewMessage = false;
         trackMessageId(userId, sentMessage.message_id);
+      } else {
+        const messageId = msgState.lastMessageId as number;
+        try {
+          if (hasButtons) {
+            const buttons = options.map(opt =>
+              Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
+            );
+            const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
+            await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { ...keyboard, parse_mode: parseMode });
+          } else {
+            await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { parse_mode: parseMode });
+          }
+        } catch (editErr: unknown) {
+          const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
+
+          if (errMessage.includes('message is not modified')) {
+            return;
+          }
+
+          console.log('[sendOutput] Edit failed, sending new message:', errMessage);
+          const sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
+          msgState.lastMessageId = sentMessage.message_id;
+          msgState.needsNewMessage = false;
+          trackMessageId(userId, sentMessage.message_id);
+        }
       }
-    }
+    });
   } catch (err) {
-    // Fallback: send without markdown if parsing fails
     console.error('[sendOutput] Markdown error, falling back to plain text:', err);
     try {
-      const sentMessage = await bot.telegram.sendMessage(userId, truncated);
-      msgState.lastMessageId = sentMessage.message_id;
-      msgState.needsNewMessage = false;
-      trackMessageId(userId, sentMessage.message_id);
+      await withRateLimitRetry(userId, async () => {
+        const sentMessage = await bot.telegram.sendMessage(userId, truncated);
+        msgState.lastMessageId = sentMessage.message_id;
+        msgState.needsNewMessage = false;
+        trackMessageId(userId, sentMessage.message_id);
+      });
     } catch (plainErr) {
       console.error('[sendOutput] Plain text also failed:', plainErr);
     }
   }
 }
+
+// ═══════════════════════════════════════════
+//  Helper for sending replies with rate limit
+// ═══════════════════════════════════════════
+
+async function safeSendMessage(userId: number, text: string, extra?: object): Promise<number | null> {
+  try {
+    const msg = await withRateLimitRetry(userId, () =>
+      bot.telegram.sendMessage(userId, text, extra)
+    );
+    return msg.message_id;
+  } catch (err) {
+    console.error('[Bot] safeSendMessage failed:', err);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Commands
+// ═══════════════════════════════════════════
 
 bot.command('start', async (ctx) => {
   if (!checkIsPrivateChat(ctx)) {
@@ -494,11 +488,16 @@ bot.command('start', async (ctx) => {
     return;
   }
 
+  const adapters = getAvailableAdapters();
+  const adapterList = adapters.map(a => `• ${a.label} (/${a.name})`).join('\n');
+
   await ctx.reply(
-    'Claude Bot\n\n' +
+    'AI Agent Bot\n\n' +
     `Work dir: ${defaultWorkDir}\n\n` +
-    '/claude - Start Claude\n' +
-    '/stop - Stop Claude\n' +
+    `Available agents:\n${adapterList}\n\n` +
+    '/agent - Choose agent\n' +
+    '/sessions - Previous sessions\n' +
+    '/stop - Stop current agent\n' +
     '/status - Show status'
   );
 });
@@ -508,9 +507,15 @@ bot.command('status', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  const isClaudeActive = claudeManager.checkIsActive(userId);
+  const adapter = getUserAdapter(userId);
+  const isActive = adapter.checkIsActive(userId);
+  const adapterName = getUserAdapterName(userId);
 
-  const status = `Status:\n\nWork dir: ${defaultWorkDir}\nClaude: ${isClaudeActive ? 'running' : 'stopped'}`;
+  const status =
+    `Status:\n\n` +
+    `Agent: ${adapter.label} (${adapterName})\n` +
+    `Work dir: ${defaultWorkDir}\n` +
+    `Session: ${isActive ? 'running' : 'stopped'}`;
 
   await ctx.reply(status);
 });
@@ -520,15 +525,263 @@ bot.command('claude', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
+  setUserAdapter(userId, 'claude');
+  const adapter = getUserAdapter(userId);
 
-  if (claudeManager.checkIsActive(userId)) {
-    await ctx.reply('Claude session active. Send a message or /stop to stop');
+  if (adapter.checkIsActive(userId)) {
+    await ctx.reply('Claude session active. Send a message or /stop');
     return;
   }
 
   const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  const msg = await startClaudeSession(userId, args || undefined);
+  const msg = await startAgentSession(userId, args || undefined);
   await ctx.reply(msg);
+});
+
+bot.command('opencode', async (ctx) => {
+  if (!checkIsPrivateChat(ctx)) return;
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  setUserAdapter(userId, 'opencode');
+  const adapter = getUserAdapter(userId);
+
+  if (adapter.checkIsActive(userId)) {
+    await ctx.reply('OpenCode session active. Send a message or /stop');
+    return;
+  }
+
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const msg = await startAgentSession(userId, args || undefined);
+  await ctx.reply(msg);
+});
+
+bot.command('oc', async (ctx) => {
+  if (!checkIsPrivateChat(ctx)) return;
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  setUserAdapter(userId, 'opencode');
+  const adapter = getUserAdapter(userId);
+
+  if (adapter.checkIsActive(userId)) {
+    await ctx.reply('OpenCode session active. Send a message or /stop');
+    return;
+  }
+
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const msg = await startAgentSession(userId, args || undefined);
+  await ctx.reply(msg);
+});
+
+/** Store model list for number-based selection */
+const userModelLists = new Map<number, string[]>();
+/** Track if user is awaiting model selection (after /model without args) */
+const awaitingModelSelection = new Set<number>();
+
+bot.command('model', async (ctx) => {
+  if (!checkIsPrivateChat(ctx)) return;
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const adapter = getUserAdapter(userId);
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+  // If number provided, select from previous list
+  if (/^\d+$/.test(args)) {
+    const num = parseInt(args, 10);
+    const modelList = userModelLists.get(userId);
+    if (!modelList || num < 1 || num > modelList.length) {
+      await ctx.reply('Invalid number. Use /model to see the list.');
+      return;
+    }
+    const selectedModel = modelList[num - 1];
+    if (!adapter.checkIsActive(userId)) {
+      await ctx.reply('No active session. Start an agent first.');
+      return;
+    }
+    if (adapter.setModel) {
+      const error = await adapter.setModel(userId, selectedModel);
+      if (error) {
+        await ctx.reply(`Error: ${error}`);
+      } else {
+        await ctx.reply(`Model set to: ${selectedModel}`);
+      }
+    }
+    return;
+  }
+
+  // If model name provided, set it directly
+  if (args) {
+    if (!adapter.checkIsActive(userId)) {
+      await ctx.reply('No active session. Start an agent first.');
+      return;
+    }
+    if (adapter.setModel) {
+      const error = await adapter.setModel(userId, args);
+      if (error) {
+        await ctx.reply(`Error: ${error}`);
+      } else {
+        const currentModel = adapter.getCurrentModel?.(userId) || args;
+        await ctx.reply(`Model set to: ${currentModel}`);
+      }
+    } else {
+      await ctx.reply(`Model switching not supported for ${adapter.label}`);
+    }
+    return;
+  }
+
+  // No args — show numbered list of models
+  const currentModel = adapter.getCurrentModel?.(userId) || 'default';
+  
+  // Get available models from adapter
+  let models: string[] = [];
+  if (adapter.getAvailableModels) {
+    try {
+      models = await adapter.getAvailableModels();
+    } catch (e) {
+      console.error('[Bot] Failed to get models:', e);
+    }
+  }
+
+  if (models.length === 0) {
+    await ctx.reply(
+      `Current: ${currentModel}\n\nNo models available. Use /model <provider/model> to set manually.`
+    );
+    return;
+  }
+
+  // Store list for number selection
+  userModelLists.set(userId, models);
+
+  // Build numbered list grouped by provider
+  const byProvider = groupModelsByProvider(models);
+  let listText = `Current: ${currentModel}\n\n`;
+  let num = 1;
+  
+  for (const [provider, providerModels] of byProvider) {
+    listText += `📦 ${provider}:\n`;
+    for (const model of providerModels) {
+      const modelName = model.slice(provider.length + 1);
+      listText += `  ${num}. ${modelName}\n`;
+      num++;
+    }
+    listText += '\n';
+  }
+  
+  listText += `Reply with number to select`;
+
+  // Mark that we're waiting for model selection
+  awaitingModelSelection.add(userId);
+  
+  await ctx.reply(listText);
+});
+
+bot.action(/^model_(.+)$/, async (ctx) => {
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const modelId = ctx.match[1];
+  const adapter = getUserAdapter(userId);
+
+  if (!adapter.checkIsActive(userId)) {
+    await ctx.answerCbQuery('No active session');
+    return;
+  }
+
+  if (adapter.setModel) {
+    const error = await adapter.setModel(userId, modelId);
+    if (error) {
+      await ctx.answerCbQuery(`Error: ${error.slice(0, 50)}`);
+      return;
+    }
+    const currentModel = adapter.getCurrentModel?.(userId) || modelId;
+    await ctx.answerCbQuery(`Model: ${currentModel.split('/').pop() || currentModel}`);
+    await safeSendMessage(userId, `Model switched to: ${currentModel}`);
+  } else {
+    await ctx.answerCbQuery(`Not supported for ${adapter.label}`);
+  }
+});
+
+bot.command('agent', async (ctx) => {
+  if (!checkIsPrivateChat(ctx)) return;
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const available = getAvailableAdapters();
+  const currentName = getUserAdapterName(ctx.from!.id);
+
+  const buttons = available.map(a => {
+    const isCurrent = a.name === currentName;
+    const label = isCurrent ? `${a.label} ✓` : a.label;
+    return Markup.button.callback(label, `agent_${a.name}`);
+  });
+
+  await ctx.reply('Choose agent:', Markup.inlineKeyboard(buttons, { columns: 2 }));
+});
+
+bot.action(/^agent_(.+)$/, async (ctx) => {
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const adapterName = ctx.match[1];
+
+  try {
+    setUserAdapter(userId, adapterName);
+    const adapter = getUserAdapter(userId);
+    await ctx.answerCbQuery(`Switched to ${adapter.label}`);
+    await safeSendMessage(userId, `Agent: ${adapter.label}\nSend a message or /${adapterName} to start`);
+  } catch {
+    await ctx.answerCbQuery('Unknown agent');
+  }
+});
+
+bot.command('sessions', async (ctx) => {
+  if (!checkIsPrivateChat(ctx)) return;
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const adapter = getUserAdapter(userId);
+
+  try {
+    const sessions = await adapter.getSessions(userId);
+
+    if (sessions.length === 0) {
+      await ctx.reply('No previous sessions');
+      return;
+    }
+
+    const buttons = sessions.slice(0, 10).map(s => {
+      const timeAgo = formatTimeAgo(s.updatedAt);
+      const title = (s.title || s.id).slice(0, 40);
+      return Markup.button.callback(`${title} (${timeAgo})`, `resume_${s.id.slice(0, 60)}`);
+    });
+
+    await ctx.reply(
+      `Previous sessions (${adapter.label}):`,
+      Markup.inlineKeyboard(buttons, { columns: 1 })
+    );
+  } catch (err) {
+    console.error('[Bot] getSessions error:', err);
+    await ctx.reply('Failed to load sessions');
+  }
+});
+
+bot.action(/^resume_(.+)$/, async (ctx) => {
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const sessionId = ctx.match[1];
+  const adapter = getUserAdapter(userId);
+
+  markNeedsNewMessage(userId);
+  await ctx.answerCbQuery('Resuming session...');
+  try {
+    await adapter.resumeSession(userId, sessionId);
+    await safeSendMessage(userId, `Session resumed. Send your message:`);
+  } catch (e) {
+    const errorMsg = e instanceof Error ? e.message : String(e);
+    await safeSendMessage(userId, `Failed to resume: ${errorMsg}`);
+  }
 });
 
 bot.command('stop', async (ctx) => {
@@ -536,14 +789,15 @@ bot.command('stop', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
+  const adapter = getUserAdapter(userId);
 
-  if (!claudeManager.checkIsActive(userId)) {
-    await ctx.reply('Claude not running');
+  if (!adapter.checkIsActive(userId)) {
+    await ctx.reply('No agent running');
     return;
   }
 
-  await claudeManager.stopSession(userId);
-  await ctx.reply('Claude stopped');
+  adapter.stopSession(userId);
+  await ctx.reply(`${adapter.label} stopped`);
 });
 
 bot.command('c', async (ctx) => {
@@ -551,8 +805,9 @@ bot.command('c', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
+  const adapter = getUserAdapter(userId);
   markNeedsNewMessage(userId);
-  claudeManager.sendSignal(userId, 'SIGINT');
+  adapter.sendSignal(userId, 'SIGINT');
   await ctx.reply('Ctrl+C sent');
 });
 
@@ -561,9 +816,10 @@ bot.command('y', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  if (claudeManager.checkIsActive(userId)) {
+  const adapter = getUserAdapter(userId);
+  if (adapter.checkIsActive(userId)) {
     markNeedsNewMessage(userId);
-    claudeManager.sendInput(userId, 'y');
+    adapter.sendInput(userId, 'y');
   }
 });
 
@@ -572,9 +828,10 @@ bot.command('n', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  if (claudeManager.checkIsActive(userId)) {
+  const adapter = getUserAdapter(userId);
+  if (adapter.checkIsActive(userId)) {
     markNeedsNewMessage(userId);
-    claudeManager.sendInput(userId, 'n');
+    adapter.sendInput(userId, 'n');
   }
 });
 
@@ -583,9 +840,12 @@ bot.command('enter', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  if (claudeManager.checkIsActive(userId)) {
+  const adapter = getUserAdapter(userId);
+  if (adapter.sendEnter) {
     markNeedsNewMessage(userId);
-    claudeManager.sendEnter(userId);
+    adapter.sendEnter(userId);
+  } else {
+    await ctx.reply(`Not supported for ${adapter.label}`);
   }
 });
 
@@ -594,8 +854,11 @@ bot.command('up', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  if (claudeManager.checkIsActive(userId)) {
-    claudeManager.sendArrow(userId, 'Up');
+  const adapter = getUserAdapter(userId);
+  if (adapter.sendArrow) {
+    adapter.sendArrow(userId, 'Up');
+  } else {
+    await ctx.reply(`Not supported for ${adapter.label}`);
   }
 });
 
@@ -604,8 +867,11 @@ bot.command('down', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  if (claudeManager.checkIsActive(userId)) {
-    claudeManager.sendArrow(userId, 'Down');
+  const adapter = getUserAdapter(userId);
+  if (adapter.sendArrow) {
+    adapter.sendArrow(userId, 'Down');
+  } else {
+    await ctx.reply(`Not supported for ${adapter.label}`);
   }
 });
 
@@ -614,8 +880,11 @@ bot.command('tab', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  if (claudeManager.checkIsActive(userId)) {
-    claudeManager.sendTab(userId);
+  const adapter = getUserAdapter(userId);
+  if (adapter.sendTab) {
+    adapter.sendTab(userId);
+  } else {
+    await ctx.reply(`Not supported for ${adapter.label}`);
   }
 });
 
@@ -624,14 +893,20 @@ bot.command('output', async (ctx) => {
   if (!checkIsAllowed(ctx.from!.id)) return;
 
   const userId = ctx.from!.id;
-  const output = claudeManager.getFullOutput(userId, 500);
+  const adapter = getUserAdapter(userId);
 
-  if (!output) {
-    await ctx.reply('Claude not running or no output');
+  if (!adapter.getFullOutput) {
+    await ctx.reply(`Not supported for ${adapter.label}`);
     return;
   }
 
-  // Split into chunks if too long (Telegram limit ~4096)
+  const output = adapter.getFullOutput(userId, 500);
+
+  if (!output) {
+    await ctx.reply('Agent not running or no output');
+    return;
+  }
+
   const chunks: string[] = [];
   let current = '';
   for (const line of output.split('\n')) {
@@ -644,9 +919,9 @@ bot.command('output', async (ctx) => {
   }
   if (current) chunks.push(current);
 
-  for (const chunk of chunks.slice(0, 5)) { // Max 5 messages
-    const msg = await ctx.reply(chunk || '(empty)');
-    trackMessageId(userId, msg.message_id);
+  for (const chunk of chunks.slice(0, 5)) {
+    const msgId = await safeSendMessage(userId, chunk || '(empty)');
+    if (msgId) trackMessageId(userId, msgId);
   }
 });
 
@@ -657,33 +932,32 @@ bot.command('clear', async (ctx) => {
   const userId = ctx.from!.id;
   const state = getUserMessageState(userId);
   const currentMsgId = ctx.message.message_id;
-  
-  // Add current message to deletion list
+
   const allMsgIds = [...state.messageIds, currentMsgId];
-  
+
   if (allMsgIds.length === 0) {
     await ctx.reply('No tracked messages to delete');
     return;
   }
 
   let totalDeleted = 0;
-  const batchSize = 100; // Telegram limit per request
+  const batchSize = 100;
 
-  // Delete in batches
   for (let i = 0; i < allMsgIds.length; i += batchSize) {
     const batch = allMsgIds.slice(i, i + batchSize);
     try {
-      await bot.telegram.callApi('deleteMessages', {
-        chat_id: userId,
-        message_ids: batch,
-      });
+      await withRateLimitRetry(userId, () =>
+        bot.telegram.callApi('deleteMessages', {
+          chat_id: userId,
+          message_ids: batch,
+        })
+      );
       totalDeleted += batch.length;
     } catch {
       // Some messages might be too old (>48h) or already deleted
     }
   }
 
-  // Reset message state
   state.messageIds = [];
   state.lastMessageId = null;
   state.needsNewMessage = true;
@@ -692,7 +966,14 @@ bot.command('clear', async (ctx) => {
   console.log(`[Bot] Cleared ${totalDeleted}/${allMsgIds.length} messages for user ${userId}`);
 });
 
-const botCommands = new Set(['start', 'claude', 'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear']);
+// ═══════════════════════════════════════════
+//  Start phrases (natural language triggers)
+// ═══════════════════════════════════════════
+
+const botCommands = new Set([
+  'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
+  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
+]);
 
 const startClaudePhrases = [
   'клод', 'клауд', 'клоуд', 'claude', 'cloud',
@@ -702,33 +983,61 @@ const startClaudePhrases = [
   'запусти claude', 'запусти cloud',
 ];
 
-interface StartClaudeMatch {
+const startOpencodePhrases = [
+  'opencode', 'опенкод', 'open code', 'опен код',
+  'запусти opencode', 'запусти опенкод',
+  'запусти open code', 'запусти опен код',
+];
+
+interface StartAgentMatch {
   isMatch: boolean;
+  adapterName?: string;
   args?: string;
 }
 
-function checkIsStartClaudePhrase(text: string): StartClaudeMatch {
+function checkIsStartAgentPhrase(text: string): StartAgentMatch {
   const normalized = text.toLowerCase().trim().replace(/[.,!?;:]+$/, '');
 
-  // Exact match
+  // Check Claude phrases
   if (startClaudePhrases.includes(normalized)) {
-    return { isMatch: true };
+    return { isMatch: true, adapterName: 'claude' };
   }
 
-  // Check for "claude <args>" pattern
+  // Check "claude <args>" pattern
   const claudeWithArgsMatch = normalized.match(/^(claude|клод|клауд|клоуд)\s+(.+)$/);
   if (claudeWithArgsMatch) {
-    return { isMatch: true, args: claudeWithArgsMatch[2] };
+    return { isMatch: true, adapterName: 'claude', args: claudeWithArgsMatch[2] };
+  }
+
+  // Check OpenCode phrases
+  if (startOpencodePhrases.includes(normalized)) {
+    return { isMatch: true, adapterName: 'opencode' };
+  }
+
+  // Check "opencode <args>" pattern
+  const opencodeWithArgsMatch = normalized.match(/^(opencode|опенкод|open code|опен код)\s+(.+)$/);
+  if (opencodeWithArgsMatch) {
+    return { isMatch: true, adapterName: 'opencode', args: opencodeWithArgsMatch[2] };
   }
 
   return { isMatch: false };
 }
 
-async function startClaudeSession(userId: number, args?: string): Promise<string> {
+async function startAgentSession(userId: number, args?: string): Promise<string> {
   markNeedsNewMessage(userId);
-  claudeManager.startSession(userId, defaultWorkDir, args);
-  return `Claude ready in ${defaultWorkDir}${args ? ` (${args})` : ''}\nSend your message:`;
+  const adapter = getUserAdapter(userId);
+  try {
+    await adapter.startSession(userId, defaultWorkDir, args);
+    return `${adapter.label} ready in ${defaultWorkDir}${args ? ` (${args})` : ''}\nSend your message:`;
+  } catch (e) {
+    const errorMsg = e instanceof Error ? e.message : String(e);
+    return `Failed to start ${adapter.label}: ${errorMsg}`;
+  }
 }
+
+// ═══════════════════════════════════════════
+//  Message handlers
+// ═══════════════════════════════════════════
 
 bot.on(message('text'), async (ctx) => {
   if (!checkIsPrivateChat(ctx)) return;
@@ -737,36 +1046,62 @@ bot.on(message('text'), async (ctx) => {
   const userId = ctx.from!.id;
   const text = ctx.message.text.trim();
 
-  // Check if it's a bot command (skip those, they're handled by bot.command)
   if (text.startsWith('/')) {
     const cmd = text.slice(1).split(' ')[0].split('@')[0].toLowerCase();
     if (botCommands.has(cmd)) {
-      return; // Let bot.command handle it
+      return;
     }
-    // Otherwise pass to Claude (e.g., /resume, /help, /compact, etc.)
+    // Otherwise pass to agent (e.g., /resume, /help, /compact, etc.)
   }
 
-  // Track user's message
   trackMessageId(userId, ctx.message.message_id);
 
-  // Check for start Claude phrases when Claude is not running
-  const startMatch = checkIsStartClaudePhrase(text);
-  if (!claudeManager.checkIsActive(userId) && startMatch.isMatch) {
-    const msg = await startClaudeSession(userId, startMatch.args);
-    await ctx.reply(msg);
-    return;
+  const adapter = getUserAdapter(userId);
+
+  // Check if this is a model selection number (after /model command)
+  if (/^\d+$/.test(text) && awaitingModelSelection.has(userId)) {
+    const num = parseInt(text, 10);
+    const modelList = userModelLists.get(userId);
+    awaitingModelSelection.delete(userId); // Clear awaiting state
+    
+    if (modelList && num >= 1 && num <= modelList.length) {
+      const selectedModel = modelList[num - 1];
+      if (adapter.setModel) {
+        const error = await adapter.setModel(userId, selectedModel);
+        if (error) {
+          await ctx.reply(`Error: ${error}`);
+        } else {
+          await ctx.reply(`Model set to: ${selectedModel}`);
+        }
+        return;
+      }
+    } else {
+      await ctx.reply(`Invalid number. Use /model to see the list.`);
+      return;
+    }
   }
 
-  if (claudeManager.checkIsActive(userId)) {
+  // Check for start phrases when no agent is running
+  if (!adapter.checkIsActive(userId)) {
+    const startMatch = checkIsStartAgentPhrase(text);
+    if (startMatch.isMatch && startMatch.adapterName) {
+      setUserAdapter(userId, startMatch.adapterName);
+      const msg = await startAgentSession(userId, startMatch.args);
+      await ctx.reply(msg);
+      return;
+    }
+  }
+
+  if (adapter.checkIsActive(userId)) {
     markNeedsNewMessage(userId);
     const processingMsg = await ctx.reply('⏳');
     trackMessageId(userId, processingMsg.message_id);
     setLoaderMessage(userId, processingMsg.message_id);
-    claudeManager.sendInput(userId, text);
+    adapter.sendInput(userId, text);
     return;
   }
 
-  await ctx.reply('Claude not running. /claude to start');
+  await ctx.reply(`No agent running. /agent to choose, /claude or /opencode to start`);
 });
 
 bot.on(message('voice'), async (ctx) => {
@@ -782,20 +1117,16 @@ bot.on(message('voice'), async (ctx) => {
   }
 
   try {
-    // Get file info
     const fileId = ctx.message.voice.file_id;
     const file = await ctx.telegram.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
 
-    // Download to temp file
     const tempDir = '/tmp';
     const tempFile = path.join(tempDir, `voice_${userId}_${Date.now()}.ogg`);
     await downloadFile(fileUrl, tempFile);
 
-    // Transcribe
     const transcript = await transcribeAudio(tempFile);
 
-    // Clean up temp file
     fs.unlink(tempFile, () => {});
 
     if (!transcript) {
@@ -805,29 +1136,32 @@ bot.on(message('voice'), async (ctx) => {
 
     console.log(`[Bot] Voice transcribed: "${transcript}"`);
 
-    // Send transcription to user
     const sentMsg = await ctx.reply(`🎤 ${transcript}`);
     trackMessageId(userId, sentMsg.message_id);
 
-    // Check for start Claude phrases when Claude is not running
-    const startMatch = checkIsStartClaudePhrase(transcript);
-    if (!claudeManager.checkIsActive(userId) && startMatch.isMatch) {
-      const msg = await startClaudeSession(userId, startMatch.args);
-      await ctx.reply(msg);
+    const adapter = getUserAdapter(userId);
+
+    // Check for start phrases when no agent is running
+    if (!adapter.checkIsActive(userId)) {
+      const startMatch = checkIsStartAgentPhrase(transcript);
+      if (startMatch.isMatch && startMatch.adapterName) {
+        setUserAdapter(userId, startMatch.adapterName);
+        const msg = await startAgentSession(userId, startMatch.args);
+        await ctx.reply(msg);
+        return;
+      }
+    }
+
+    if (!adapter.checkIsActive(userId)) {
+      await ctx.reply('No agent running. /agent to choose, /claude or /opencode to start');
       return;
     }
 
-    if (!claudeManager.checkIsActive(userId)) {
-      await ctx.reply('Claude not running. /claude to start');
-      return;
-    }
-
-    // Send to Claude with processing indicator
     markNeedsNewMessage(userId);
     const processingMsg = await ctx.reply('⏳');
     trackMessageId(userId, processingMsg.message_id);
     setLoaderMessage(userId, processingMsg.message_id);
-    claudeManager.sendInput(userId, transcript);
+    adapter.sendInput(userId, transcript);
   } catch (err) {
     console.error('[Bot] Voice handling error:', err);
     await ctx.reply('Error processing voice message');
@@ -839,48 +1173,104 @@ bot.action(/^opt_(\d+)$/, async (ctx) => {
 
   const userId = ctx.from!.id;
   const optNum = ctx.match[1];
+  const adapter = getUserAdapter(userId);
 
-  if (claudeManager.checkIsActive(userId)) {
+  if (adapter.checkIsActive(userId)) {
     markNeedsNewMessage(userId);
-    claudeManager.sendInput(userId, optNum);
+    adapter.sendInput(userId, optNum);
     await ctx.answerCbQuery(`Sent: ${optNum}`);
   } else {
-    await ctx.answerCbQuery('Claude not running');
+    await ctx.answerCbQuery('Agent not running');
   }
 });
 
-function handleClaudeOutput(userId: number, output: string): void {
+// ═══════════════════════════════════════════
+//  Adapter event handlers
+// ═══════════════════════════════════════════
+
+function handleAgentOutput(userId: number, output: string): void {
   console.log(`[Bot] output (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
 
   queueOutput(userId, output);
 }
 
-function handleClaudeClosed(userId: number): void {
-  bot.telegram.sendMessage(userId, 'Claude session ended').catch(() => {});
+function handleAgentClosed(userId: number): void {
+  const adapter = getUserAdapter(userId);
+  safeSendMessage(userId, `${adapter.label} session ended`);
 }
 
-claudeManager.on('output', handleClaudeOutput);
-claudeManager.on('closed', handleClaudeClosed);
+function handleAgentError(userId: number, error: Error): void {
+  console.error(`[Bot] Agent error for user ${userId}:`, error.message);
+  safeSendMessage(userId, `Error: ${error.message}`);
+}
+
+// ═══════════════════════════════════════════
+//  Model selection utilities
+// ═══════════════════════════════════════════
+
+function groupModelsByProvider(models: string[]): Map<string, string[]> {
+  const byProvider = new Map<string, string[]>();
+  for (const model of models) {
+    const slashIdx = model.indexOf('/');
+    if (slashIdx > 0) {
+      const provider = model.slice(0, slashIdx);
+      if (!byProvider.has(provider)) {
+        byProvider.set(provider, []);
+      }
+      byProvider.get(provider)!.push(model);
+    }
+  }
+  return byProvider;
+}
+
+// ═══════════════════════════════════════════
+//  Utilities
+// ═══════════════════════════════════════════
+
+function formatTimeAgo(date: Date): string {
+  const diffMs = Date.now() - date.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}d ago`;
+}
+
+// ═══════════════════════════════════════════
+//  Bot startup
+// ═══════════════════════════════════════════
 
 export async function startBot(): Promise<void> {
   console.log('');
   console.log('=================================');
-  console.log('  Telegram Claude Bot starting...');
+  console.log('  AI Agent Telegram Bot starting...');
   console.log('=================================');
   console.log(`Allowed users: ${allowedUsers.join(', ')}`);
   console.log(`Work dir: ${defaultWorkDir}`);
-  
-  // Load saved message IDs for /clear command
+  console.log(`Default agent: ${getDefaultAdapterName()}`);
+  console.log(`Available agents: ${getAvailableAdapters().map(a => a.name).join(', ')}`);
+
+  // Wire adapter events to bot handlers
+  registerAdapterEventHandlers({
+    onOutput: handleAgentOutput,
+    onClosed: handleAgentClosed,
+    onError: handleAgentError,
+  });
+
   loadMessageIds();
 
   const shutdown = async (signal: string) => {
     console.log(`\n${signal} received, shutting down...`);
     for (const userId of allowedUsers) {
-      if (claudeManager.checkIsActive(userId)) {
-        await claudeManager.stopSession(userId);
+      const adapter = getUserAdapter(userId);
+      if (adapter.checkIsActive(userId)) {
+        adapter.stopSession(userId);
       }
     }
+    stopOpenCodeServer();
     bot.stop(signal);
     process.exit(0);
   };
@@ -893,16 +1283,19 @@ export async function startBot(): Promise<void> {
     const botInfo = await bot.telegram.getMe();
     console.log(`Bot info: @${botInfo.username} (${botInfo.id})`);
 
-    // Set bot commands menu
     await bot.telegram.setMyCommands([
-      { command: 'claude', description: '▶️ Start Claude' },
-      { command: 'stop', description: '⏹️ Stop Claude' },
+      { command: 'claude', description: '▶️ Start Claude Code' },
+      { command: 'opencode', description: '▶️ Start OpenCode' },
+      { command: 'model', description: '🧠 Switch model' },
+      { command: 'agent', description: '🔄 Choose agent' },
+      { command: 'sessions', description: '📋 Previous sessions' },
+      { command: 'stop', description: '⏹️ Stop agent' },
       { command: 'status', description: '📊 Show status' },
       { command: 'output', description: '📜 Last 500 lines' },
       { command: 'enter', description: '↵ Press Enter' },
       { command: 'up', description: '⬆️ Arrow Up' },
       { command: 'down', description: '⬇️ Arrow Down' },
-      { command: 'tab', description: '⇥ Tab (autocomplete)' },
+      { command: 'tab', description: '⇥ Tab' },
       { command: 'y', description: '✅ Send "y"' },
       { command: 'n', description: '❌ Send "n"' },
       { command: 'c', description: '🛑 Ctrl+C' },

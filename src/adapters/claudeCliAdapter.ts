@@ -1,5 +1,9 @@
 import { execSync } from 'child_process';
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
+import type { AgentAdapter, AgentSession } from '../types';
+import { checkIsInstalled, installTool } from '../installManager';
 
 interface ClaudeSession {
   userId: number;
@@ -14,6 +18,7 @@ interface ClaudeSession {
 
 const pollInterval = 300;
 const claudePath = process.env.HOME + '/.npm-global/bin/claude';
+const sessionsFile = path.join(process.env.HOME || '/tmp', '.claude-sessions.json');
 
 function tmux(...args: string[]): string {
   try {
@@ -21,7 +26,7 @@ function tmux(...args: string[]): string {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim();
-  } catch (e) {
+  } catch {
     return '';
   }
 }
@@ -29,17 +34,9 @@ function tmux(...args: string[]): string {
 function convertAnsiToMarkdown(text: string): string {
   let result = text;
 
-  // Track style state
-  const isBold = false;
-  const isItalic = false;
-
-  // Process ANSI codes and convert to markdown
-  // Bold: \x1B[1m ... \x1B[0m or \x1B[22m
-  // We'll do a simple approach: find bold sequences and wrap in *
-
   // Replace bold sequences: \x1B[1m text \x1B[0m -> *text*
   // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x1B\[1m([^\x1B]*?)(?:\x1B\[(?:0|22)m|\x1B\[)/g, (match, content, offset) => {
+  result = result.replace(/\x1B\[1m([^\x1B]*?)(?:\x1B\[(?:0|22)m|\x1B\[)/g, (_match, content) => {
     if (content.trim()) {
       return `*${content}*`;
     }
@@ -72,20 +69,16 @@ function joinBrokenUrls(text: string): string {
 
   while (i < lines.length) {
     const line = lines[i];
-    
-    // Check if line contains a URL that might be broken
+
     const urlMatch = line.match(/(https?:\/\/\S*)$/);
-    
+
     if (urlMatch) {
-      // Found a URL at the end of line - check if it continues on next lines
       let fullUrl = urlMatch[1];
       const prefix = line.slice(0, line.length - fullUrl.length);
-      
-      // Look ahead for continuation lines (no spaces, looks like URL parts)
+
       let j = i + 1;
       while (j < lines.length) {
         const nextLine = lines[j].trim();
-        // URL continuation: no spaces, contains URL-like chars (letters, digits, %, =, &, /, etc.)
         if (nextLine && !nextLine.includes(' ') && /^[\w\-._~:/?#\[\]@!$&'()*+,;=%]+$/.test(nextLine)) {
           fullUrl += nextLine;
           j++;
@@ -93,7 +86,7 @@ function joinBrokenUrls(text: string): string {
           break;
         }
       }
-      
+
       result.push(prefix + fullUrl);
       i = j;
     } else {
@@ -106,17 +99,11 @@ function joinBrokenUrls(text: string): string {
 }
 
 function cleanOutput(text: string): string {
-  // Convert ANSI styles to markdown before stripping
   let cleaned = convertAnsiToMarkdown(text);
-  // Remove control characters except newline
   cleaned = cleaned.replace(/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/g, '');
-  // Normalize newlines
   cleaned = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  // Join broken URLs before other processing
   cleaned = joinBrokenUrls(cleaned);
-  // Remove excessive newlines
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-  // Remove lines that are just spaces
   cleaned = cleaned.split('\n').filter(line => line.trim() || line === '').join('\n');
   return cleaned.trim();
 }
@@ -130,15 +117,12 @@ function normalizeToolCallLine(line: string): string {
   if (bulletMatch) {
     const bullet = bulletMatch[1];
     const rest = trimmed.slice(bulletMatch[1].length).trimStart();
-    // ● = running, replace with ⏳
-    // ○ = done, replace with ✓
     const icon = bullet === '●' ? '⏳' : '✓';
     return `${icon} ${rest}`;
   }
 
   const toolMatch = trimmed.match(toolPattern);
   if (toolMatch) {
-    // No bullet = done, add ✓
     return `✓ ${trimmed}`;
   }
 
@@ -152,84 +136,29 @@ function stripTuiElements(text: string): string {
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
 
-    // Skip horizontal border lines (made of ─ or ━ characters)
-    if (/^[─━]+$/.test(line.trim())) {
-      continue;
-    }
-
-    // Skip status line with mode indicators
-    if (/⏵⏵\s*(bypass permissions|accept edits)\s*(on|off)/i.test(line)) {
-      continue;
-    }
-
-    // Skip all input prompt lines with cursor (❯)
-    // These are: empty prompt, suggestions, or echoed user input
-    if (/^❯/.test(line)) {
-      continue;
-    }
-
-    // Skip shift+tab hint lines
-    if (/\(shift\+tab to cycle\)/i.test(line)) {
-      continue;
-    }
-
-    // Skip lines with only special Unicode symbols (spinners, etc)
-    if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) {
-      continue;
-    }
+    if (/^[─━]+$/.test(line.trim())) continue;
+    if (/⏵⏵\s*(bypass permissions|accept edits)\s*(on|off)/i.test(line)) continue;
+    if (/^❯/.test(line)) continue;
+    if (/\(shift\+tab to cycle\)/i.test(line)) continue;
+    if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) continue;
 
     const trimmedLine = line.trim();
-
-    // Check if it's a tool call line
     const isToolCall = /^[●○]?\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i.test(trimmedLine);
 
-    // Skip "ctrl+c to interrupt" hint lines (but not if it's part of a tool call)
-    if (!isToolCall && /ctrl\+c.*to interrupt/i.test(line)) {
-      continue;
-    }
+    if (!isToolCall && /ctrl\+c.*to interrupt/i.test(line)) continue;
+    if (/claude code has switched|native installer|Run.*install.*or see/i.test(line)) continue;
+    if (/^install`?\s*(or see)?/i.test(trimmedLine)) continue;
+    if (/docs\.anthropic\.com/i.test(line)) continue;
+    if (/more options\.?\s*$/i.test(trimmedLine) && trimmedLine.length < 20) continue;
 
-    // Skip installer/update notices (may be split across lines due to terminal wrapping)
-    if (/claude code has switched|native installer|Run.*install.*or see/i.test(line)) {
-      continue;
-    }
-    if (/^install`?\s*(or see)?/i.test(trimmedLine)) {
-      continue;
-    }
-    if (/docs\.anthropic\.com/i.test(line)) {
-      continue;
-    }
-    if (/more options\.?\s*$/i.test(trimmedLine) && trimmedLine.length < 20) {
-      continue;
-    }
+    if (/^[╭─╮│╰╯\s]+$/.test(trimmedLine)) continue;
+    if (/^[▐▛▜▌▝▘█▀▄░▒▓\s]+$/.test(trimmedLine)) continue;
+    if (/Recent activity|What's new|\/resume for more/i.test(line)) continue;
+    if (/Welcome\s*back/i.test(line)) continue;
+    if (/[╭─╮│╰╯]/.test(line) && trimmedLine.length > 50) continue;
+    if (/^\s*│.*\d+[smh]\s+ago\s+/i.test(line)) continue;
+    if (/^\s*│.*[─]+\s*│\s*$/.test(line)) continue;
 
-    // Skip Claude Code welcome screen and ASCII art
-    // Box borders: ╭─╮│╰─╯
-    if (/^[╭─╮│╰╯\s]+$/.test(trimmedLine)) {
-      continue;
-    }
-    if (/^[▐▛▜▌▝▘█▀▄░▒▓\s]+$/.test(trimmedLine)) {
-      continue;
-    }
-    // Welcome screen elements
-    if (/Recent activity|What's new|\/resume for more/i.test(line)) {
-      continue;
-    }
-    if (/Welcome\s*back/i.test(line)) {
-      continue;
-    }
-    // Lines that are mostly box drawing characters with some text
-    if (/[╭─╮│╰╯]/.test(line) && trimmedLine.length > 50) {
-      continue;
-    }
-    // Recent activity entries (timestamp + message)
-    if (/^\s*│.*\d+[smh]\s+ago\s+/i.test(line)) {
-      continue;
-    }
-    if (/^\s*│.*[─]+\s*│\s*$/.test(line)) {
-      continue;
-    }
-
-    // Normalize tool call lines for consistent animation
     if (isToolCall) {
       line = normalizeToolCallLine(line);
     }
@@ -237,26 +166,65 @@ function stripTuiElements(text: string): string {
     filtered.push(line);
   }
 
-  // Remove excessive newlines after filtering
   let result = filtered.join('\n');
   result = result.replace(/\n{3,}/g, '\n\n');
   return result.trim();
 }
 
-export class ClaudeManager extends EventEmitter {
+interface StoredSession {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function loadStoredSessions(): StoredSession[] {
+  try {
+    if (fs.existsSync(sessionsFile)) {
+      return JSON.parse(fs.readFileSync(sessionsFile, 'utf-8')) as StoredSession[];
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+function saveStoredSession(session: StoredSession): void {
+  const sessions = loadStoredSessions();
+  const existingIdx = sessions.findIndex(s => s.id === session.id);
+  if (existingIdx >= 0) {
+    sessions[existingIdx] = session;
+  } else {
+    sessions.unshift(session);
+  }
+  // Keep last 50 sessions
+  const trimmed = sessions.slice(0, 50);
+  try {
+    fs.writeFileSync(sessionsFile, JSON.stringify(trimmed, null, 2));
+  } catch {
+    // ignore
+  }
+}
+
+export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
+  readonly name = 'claude';
+  readonly label = 'Claude Code';
+
   private sessions: Map<number, ClaudeSession> = new Map();
 
-  startSession(userId: number, workDir: string, args?: string): void {
+  async startSession(userId: number, workDir: string, args?: string): Promise<void> {
     this.stopSession(userId);
+
+    if (!checkIsInstalled('claude')) {
+      this.emit('output', userId, 'Installing Claude Code...');
+      await installTool('claude');
+    }
 
     const sessionName = `claude-${userId}`;
     console.log(`[Claude] Starting tmux session ${sessionName} in ${workDir}${args ? ` with args: ${args}` : ''}`);
 
-    // Kill any existing session with this name
     tmux('kill-session', '-t', sessionName);
 
-    // Create new detached tmux session with bash, then send claude command
-    // Wide terminal (300 cols) to avoid breaking long URLs
     const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
     const claudeArgs = args ? ` ${args}` : '';
     const startClaudeCmd = `tmux send-keys -t ${sessionName} "cd ${workDir} && ${claudePath} --dangerously-skip-permissions${claudeArgs}" Enter`;
@@ -271,6 +239,14 @@ export class ClaudeManager extends EventEmitter {
       return;
     }
 
+    const now = new Date().toISOString();
+    saveStoredSession({
+      id: sessionName,
+      title: args || `Session ${sessionName}`,
+      createdAt: now,
+      updatedAt: now,
+    });
+
     const session: ClaudeSession = {
       userId,
       workDir,
@@ -283,10 +259,7 @@ export class ClaudeManager extends EventEmitter {
     };
 
     this.sessions.set(userId, session);
-
-    // Start polling for output
     session.pollTimer = setInterval(() => this.pollOutput(userId), pollInterval);
-
     this.emit('started', userId);
   }
 
@@ -301,9 +274,7 @@ export class ClaudeManager extends EventEmitter {
       clearInterval(session.pollTimer);
     }
 
-    // Kill tmux session
     tmux('kill-session', '-t', session.sessionName);
-
     this.sessions.delete(userId);
     this.emit('stopped', userId);
   }
@@ -312,7 +283,6 @@ export class ClaudeManager extends EventEmitter {
     const session = this.sessions.get(userId);
     if (!session) return false;
 
-    // Check if tmux session still exists
     const sessions = tmux('list-sessions', '-F', '#{session_name}');
     return sessions.includes(session.sessionName);
   }
@@ -326,19 +296,27 @@ export class ClaudeManager extends EventEmitter {
 
     console.log(`[Claude] sendInput: "${input}"`);
 
-    // Use tmux send-keys with literal flag for special characters
     try {
       execSync(
         `tmux send-keys -t ${session.sessionName} -l ${JSON.stringify(input)}`,
         { encoding: 'utf-8', timeout: 5000 }
       );
-      // Send Enter separately
       execSync(
         `tmux send-keys -t ${session.sessionName} Enter`,
         { encoding: 'utf-8', timeout: 5000 }
       );
     } catch (e) {
       console.error(`[Claude] sendInput error:`, e);
+    }
+  }
+
+  sendSignal(userId: number, signal: string): void {
+    const session = this.sessions.get(userId);
+    if (!session?.isActive) return;
+
+    if (signal === 'SIGINT') {
+      tmux('send-keys', '-t', session.sessionName, 'C-c');
+      console.log(`[Claude] sent Ctrl+C`);
     }
   }
 
@@ -366,6 +344,18 @@ export class ClaudeManager extends EventEmitter {
     tmux('send-keys', '-t', session.sessionName, 'Tab');
   }
 
+  /**
+   * @description For Claude CLI, model switching is done via the /model slash command.
+   * Sends "/model <modelId>" as input to the tmux session.
+   */
+  setModel(userId: number, modelId: string): void {
+    this.sendInput(userId, `/model ${modelId}`);
+  }
+
+  getCurrentModel(_userId: number): string | null {
+    return null;
+  }
+
   getFullOutput(userId: number, lines: number = 500): string | null {
     const session = this.sessions.get(userId);
     if (!session?.isActive) return null;
@@ -376,27 +366,69 @@ export class ClaudeManager extends EventEmitter {
     return cleanOutput(raw);
   }
 
-  sendSignal(userId: number, signal: string): void {
-    const session = this.sessions.get(userId);
-    if (!session?.isActive) return;
+  async getSessions(): Promise<AgentSession[]> {
+    const stored = loadStoredSessions();
+    return stored.map(s => ({
+      id: s.id,
+      title: s.title,
+      createdAt: new Date(s.createdAt),
+      updatedAt: new Date(s.updatedAt),
+    }));
+  }
 
-    if (signal === 'SIGINT') {
-      tmux('send-keys', '-t', session.sessionName, 'C-c');
-      console.log(`[Claude] sent Ctrl+C`);
+  async resumeSession(userId: number, _sessionId: string): Promise<void> {
+    // For Claude CLI, --resume resumes the last conversation in the workDir
+    // sessionId is not directly used since Claude CLI resume is workDir-based
+    const session = this.sessions.get(userId);
+    const workDir = session?.workDir || process.env.WORK_DIR || '/workspace';
+
+    this.stopSession(userId);
+
+    if (!checkIsInstalled('claude')) {
+      this.emit('output', userId, 'Installing Claude Code...');
+      await installTool('claude');
     }
+
+    const sessionName = `claude-${userId}`;
+    console.log(`[Claude] Resuming session in ${workDir}`);
+
+    tmux('kill-session', '-t', sessionName);
+
+    const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
+    const startClaudeCmd = `tmux send-keys -t ${sessionName} "cd ${workDir} && ${claudePath} --dangerously-skip-permissions --resume" Enter`;
+
+    try {
+      execSync(createCmd, { encoding: 'utf-8', timeout: 5000 });
+      execSync(startClaudeCmd, { encoding: 'utf-8', timeout: 5000 });
+    } catch (e) {
+      console.error(`[Claude] Failed to resume session:`, e);
+      this.emit('error', userId, new Error('Failed to resume Claude session'));
+      return;
+    }
+
+    const claudeSession: ClaudeSession = {
+      userId,
+      workDir,
+      sessionName,
+      pollTimer: null,
+      lastContent: '',
+      isActive: true,
+      handledAutoEnter: false,
+      handledAutoAccept: false,
+    };
+
+    this.sessions.set(userId, claudeSession);
+    claudeSession.pollTimer = setInterval(() => this.pollOutput(userId), pollInterval);
+    this.emit('started', userId);
   }
 
   private pollOutput(userId: number): void {
     const session = this.sessions.get(userId);
     if (!session?.isActive) return;
 
-    // Capture current pane content
-    // -e flag preserves ANSI escape sequences (for bold, colors, etc.)
-    // -S -200 captures last 200 lines to include tool call headers even with long output
     const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-e', '-S', '-200');
 
     if (!raw) {
-      // Session might have died
       if (!this.checkIsActive(userId)) {
         console.log(`[Claude] Session died, cleaning up`);
         this.stopSession(userId);
@@ -407,13 +439,11 @@ export class ClaudeManager extends EventEmitter {
 
     const content = cleanOutput(raw);
 
-    // Check if content changed
     if (content !== session.lastContent) {
       const newPart = this.getNewContent(session.lastContent, content);
       session.lastContent = content;
 
       if (newPart) {
-        // Debug: show raw output before filtering
         console.log(`[Claude] RAW output (${newPart.length}):\n---\n${newPart}\n---`);
 
         const cleanedOutput = stripTuiElements(newPart);
@@ -425,13 +455,11 @@ export class ClaudeManager extends EventEmitter {
         }
       }
 
-      // Reset flags when content changes significantly
       if (newPart.length > 50) {
         session.handledAutoEnter = false;
         session.handledAutoAccept = false;
       }
 
-      // Auto-press Enter for "Press Enter to continue" prompts
       if (!session.handledAutoEnter && this.checkNeedsAutoEnter(content)) {
         session.handledAutoEnter = true;
         console.log(`[Claude] Auto-pressing Enter`);
@@ -440,12 +468,10 @@ export class ClaudeManager extends EventEmitter {
         }, 300);
       }
 
-      // Auto-accept bypass permissions warning
       if (!session.handledAutoAccept && this.checkNeedsAutoAccept(content)) {
         session.handledAutoAccept = true;
         console.log(`[Claude] Auto-accepting bypass permissions`);
         setTimeout(() => {
-          // Navigate to "Yes, I accept" and press Enter
           tmux('send-keys', '-t', session.sessionName, 'Down');
           setTimeout(() => {
             tmux('send-keys', '-t', session.sessionName, 'Enter');
@@ -473,7 +499,6 @@ export class ClaudeManager extends EventEmitter {
   }
 
   private normalizeForComparison(line: string): string {
-    // Remove tool status symbols for comparison (● ○ ⏳ ✓)
     return line.trim().replace(/^[●○⏳✓]\s*/, '');
   }
 
@@ -484,7 +509,6 @@ export class ClaudeManager extends EventEmitter {
     const oldLines = oldContent.split('\n');
     const newLines = newContent.split('\n');
 
-    // Build a set of old lines for quick lookup (normalized, with count for duplicates)
     const oldLinesSet = new Map<string, number>();
     for (const line of oldLines) {
       const normalized = this.normalizeForComparison(line);
@@ -493,7 +517,6 @@ export class ClaudeManager extends EventEmitter {
       }
     }
 
-    // Find lines in new content that weren't in old content
     const newParts: string[] = [];
     const usedOldLines = new Map<string, number>();
 
@@ -505,10 +528,8 @@ export class ClaudeManager extends EventEmitter {
       const usedCount = usedOldLines.get(normalized) || 0;
 
       if (usedCount < oldCount) {
-        // This line existed in old content, mark as used
         usedOldLines.set(normalized, usedCount + 1);
       } else {
-        // This is a new line
         newParts.push(line);
       }
     }
@@ -516,5 +537,3 @@ export class ClaudeManager extends EventEmitter {
     return newParts.join('\n').trim();
   }
 }
-
-export const claudeManager = new ClaudeManager();

@@ -1,6 +1,6 @@
 <table border="0">
   <tr>
-    <td><h2>Telegram bot for AI coding agents (Claude Code, OpenCode)</h2>
+    <td><h2>Bot for communicating with AI agents through Telegram</h2>
 
 ### Features
 
@@ -10,7 +10,6 @@
 - Voice messages (transcription via Groq/OpenAI Whisper)
 - Session history and resume (`/sessions`)
 - Message update instead of spam (edit in place)
-- Inline buttons for numbered options
 - Auto-install tools on first use
     </td>
 <td width="280"><img src="./demo.gif" width="320" /></td>

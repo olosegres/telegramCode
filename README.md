@@ -4,7 +4,7 @@
 
 ### Features
 
-- Multiple AI backends: Claude Code CLI, OpenCode
+- Multiple AI backends: Claude Code, OpenCode
 - Switch between agents on the fly (`/agent`)
 - Model selection with dynamic list (`/model`)
 - Voice messages (transcription via Groq/OpenAI Whisper)
@@ -66,6 +66,30 @@ volumes:
 ```bash
 docker compose up -d
 ```
+
+### Alternative: Run without Docker
+
+Docker is recommended for environment isolation, but you can run directly:
+
+```bash
+# Prerequisites: Node.js 20+, tmux (for Claude CLI)
+
+# Clone and install
+git clone https://github.com/anthropics/telegram-code-bot
+cd telegram-code-bot
+yarn install
+
+# Set environment variables
+export TELEGRAM_BOT_TOKEN=your-bot-token
+export ALLOWED_USERS=your-telegram-id
+export WORK_DIR=/path/to/your/project
+export ANTHROPIC_API_KEY=your-key  # for Claude
+
+# Run
+yarn start
+```
+
+Note: When running without Docker, ensure `claude` and/or `opencode` CLI tools are installed and available in PATH.
 
 ### 4. Start Using
 

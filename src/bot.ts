@@ -394,7 +394,7 @@ async function sendOutputImmediate(userId: number, output: string): Promise<void
   const { options } = parseOutput(output);
   const msgState = getUserMessageState(userId);
 
-  const hasButtons = options.length >= 2 && options.length <= 6;
+  const hasButtons = false; // Disabled: options.length >= 2 && options.length <= 6;
   const parseMode = 'Markdown' as const;
 
   const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;

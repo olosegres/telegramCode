@@ -476,9 +476,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Fetch default model from OpenCode config via GET /config.
-   * Looks for `defaultModel` field with { providerID, modelID } or legacy `model` string.
-   * If config doesn't return model, it will be shown on first response via SSE.
+   * @description Fetch default model from OpenCode server via GET /config.
+   * The server returns `defaultModel: { providerID, modelID }` which is the resolved
+   * model (from config.model -> model.json recent -> first available provider).
+   * Sets modelOverride so that prompts are sent with the correct model.
    */
   private async fetchModelInfo(userId: number): Promise<void> {
     const session = this.sessions.get(userId);
@@ -490,21 +491,34 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         defaultModel?: { providerID: string; modelID: string };
       }>('GET', '/config');
       
-      // Check new format first: defaultModel object
+      console.log(`[OpenCode] GET /config response: model=${config?.model || 'unset'}, defaultModel=${config?.defaultModel ? `${config.defaultModel.providerID}/${config.defaultModel.modelID}` : 'unset'}`);
+      
+      // defaultModel is the resolved model from OpenCode's priority chain
       if (config?.defaultModel?.providerID && config?.defaultModel?.modelID) {
-        const modelLabel = `${config.defaultModel.providerID}/${config.defaultModel.modelID}`;
-        session.currentModelLabel = modelLabel;
+        const label = `${config.defaultModel.providerID}/${config.defaultModel.modelID}`;
+        session.currentModelLabel = label;
+        session.modelOverride = {
+          providerID: config.defaultModel.providerID,
+          modelID: config.defaultModel.modelID,
+        };
         session.isModelInfoShown = true;
-        console.log(`[OpenCode] Default model: ${modelLabel}`);
-        this.emit('output', userId, `Model: ${modelLabel}`);
+        console.log(`[OpenCode] Default model: ${label}`);
+        this.emit('output', userId, `Model: ${label}`);
         return;
       }
       
-      // Fallback to legacy format: model string
+      // Fallback: config.model string (e.g. "provider/model")
       if (config?.model) {
+        const slashIdx = config.model.indexOf('/');
+        if (slashIdx > 0) {
+          session.modelOverride = {
+            providerID: config.model.slice(0, slashIdx),
+            modelID: config.model.slice(slashIdx + 1),
+          };
+        }
         session.currentModelLabel = config.model;
         session.isModelInfoShown = true;
-        console.log(`[OpenCode] Default model: ${config.model}`);
+        console.log(`[OpenCode] Default model (config): ${config.model}`);
         this.emit('output', userId, `Model: ${config.model}`);
         return;
       }
@@ -512,8 +526,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[OpenCode] fetchModelInfo failed:`, e instanceof Error ? e.message : e);
     }
     
-    // No model configured - show "not set"
-    console.log(`[OpenCode] Model not in config`);
+    // No model resolved
+    console.log(`[OpenCode] No default model resolved`);
     session.currentModelLabel = 'not set';
     this.emit('output', userId, `Model: not set (use /model to select)`);
   }

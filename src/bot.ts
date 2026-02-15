@@ -1136,7 +1136,7 @@ bot.on(message('voice'), async (ctx) => {
 
     console.log(`[Bot] Voice transcribed: "${transcript}"`);
 
-    const sentMsg = await ctx.reply(`🎤 ${transcript}`);
+    const sentMsg = await ctx.reply(`🎤 ${transcript}`, { reply_parameters: { message_id: ctx.message.message_id } });
     trackMessageId(userId, sentMsg.message_id);
 
     const adapter = getUserAdapter(userId);

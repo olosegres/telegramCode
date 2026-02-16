@@ -12,7 +12,8 @@ export interface AgentSession {
  * Each adapter manages sessions per user and communicates via EventEmitter.
  *
  * Events emitted:
- * - 'output'  (userId: number, text: string)
+ * - 'output'  (userId: number, text: string)   — permanent text response
+ * - 'status'  (userId: number, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'closed'  (userId: number)
  * - 'started' (userId: number)
  * - 'stopped' (userId: number)

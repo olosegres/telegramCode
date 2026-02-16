@@ -1,10 +1,45 @@
 import { EventEmitter } from 'events';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 import type { AgentAdapter, AgentSession } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand } from '../installManager';
 
 const execAsync = promisify(exec);
+
+/**
+ * Persist per-user model selection so it survives bot restarts.
+ * Stored in DATA_DIR (or HOME) as a simple JSON map: { "userId": "provider/model" }
+ */
+const modelStateFile = path.join(process.env.DATA_DIR || process.env.HOME || '/tmp', '.opencode-model-prefs.json');
+
+function loadSavedModel(userId: number): { providerID: string; modelID: string } | null {
+  try {
+    if (!fs.existsSync(modelStateFile)) return null;
+    const data = JSON.parse(fs.readFileSync(modelStateFile, 'utf-8'));
+    const saved = data[String(userId)] as string | undefined;
+    if (!saved) return null;
+    const idx = saved.indexOf('/');
+    if (idx <= 0) return null;
+    return { providerID: saved.slice(0, idx), modelID: saved.slice(idx + 1) };
+  } catch {
+    return null;
+  }
+}
+
+function saveModelPref(userId: number, label: string): void {
+  try {
+    let data: Record<string, string> = {};
+    if (fs.existsSync(modelStateFile)) {
+      data = JSON.parse(fs.readFileSync(modelStateFile, 'utf-8'));
+    }
+    data[String(userId)] = label;
+    fs.writeFileSync(modelStateFile, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.log(`[OpenCode] Failed to save model pref:`, e instanceof Error ? e.message : e);
+  }
+}
 
 interface OpenCodeModelOverride {
   providerID: string;
@@ -377,6 +412,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.isModelInfoShown = false;
     const label = `${resolved.providerID}/${resolved.modelID}`;
     session.currentModelLabel = label;
+    saveModelPref(userId, label);
     console.log(`[OpenCode] Model set to: ${label}`);
     return null;
   }
@@ -476,24 +512,36 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Fetch default model from OpenCode server via GET /config.
-   * The server returns `defaultModel: { providerID, modelID }` which is the resolved
-   * model (from config.model -> model.json recent -> first available provider).
-   * Sets modelOverride so that prompts are sent with the correct model.
+   * @description Resolve model for the session. Priority:
+   * 1. User's saved preference (from previous /model selection)
+   * 2. OpenCode server's defaultModel (config.model -> model.json recent -> first provider)
+   * 3. "not set"
    */
   private async fetchModelInfo(userId: number): Promise<void> {
     const session = this.sessions.get(userId);
     if (!session?.isActive || session.isModelInfoShown) return;
 
+    // 1. Check user's saved model preference
+    const saved = loadSavedModel(userId);
+    if (saved) {
+      const label = `${saved.providerID}/${saved.modelID}`;
+      session.currentModelLabel = label;
+      session.modelOverride = saved;
+      session.isModelInfoShown = true;
+      console.log(`[OpenCode] Restored saved model: ${label}`);
+      this.emit('output', userId, `Model: ${label}`);
+      return;
+    }
+
+    // 2. Ask OpenCode server for default model
     try {
       const config = await this.apiRequest<{
         model?: string;
         defaultModel?: { providerID: string; modelID: string };
       }>('GET', '/config');
       
-      console.log(`[OpenCode] GET /config response: model=${config?.model || 'unset'}, defaultModel=${config?.defaultModel ? `${config.defaultModel.providerID}/${config.defaultModel.modelID}` : 'unset'}`);
+      console.log(`[OpenCode] GET /config: model=${config?.model || 'unset'}, defaultModel=${config?.defaultModel ? `${config.defaultModel.providerID}/${config.defaultModel.modelID}` : 'unset'}`);
       
-      // defaultModel is the resolved model from OpenCode's priority chain
       if (config?.defaultModel?.providerID && config?.defaultModel?.modelID) {
         const label = `${config.defaultModel.providerID}/${config.defaultModel.modelID}`;
         session.currentModelLabel = label;
@@ -507,7 +555,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         return;
       }
       
-      // Fallback: config.model string (e.g. "provider/model")
       if (config?.model) {
         const slashIdx = config.model.indexOf('/');
         if (slashIdx > 0) {
@@ -526,7 +573,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[OpenCode] fetchModelInfo failed:`, e instanceof Error ? e.message : e);
     }
     
-    // No model resolved
+    // 3. No model resolved
     console.log(`[OpenCode] No default model resolved`);
     session.currentModelLabel = 'not set';
     this.emit('output', userId, `Model: not set (use /model to select)`);
@@ -615,6 +662,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     switch (eventType) {
       case 'message.part.updated':
+      case 'message.part.delta':
         this.handlePartUpdate(userId, event.properties);
         break;
 
@@ -662,7 +710,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   /**
    * @description Handle streaming text delta from assistant response.
-   * Event properties: { part: OpenCodePart, delta?: string }
+   * Two event formats:
+   *   message.part.updated: { part: OpenCodePart, delta?: string }
+   *   message.part.delta:   { sessionID, messageID, partID, field, delta }
    */
   private handlePartUpdate(userId: number, properties: Record<string, unknown>): void {
     const session = this.sessions.get(userId);
@@ -670,9 +720,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     const part = properties.part as OpenCodePart | undefined;
     const delta = properties.delta as string | undefined;
+    const field = properties.field as string | undefined;
 
-    // Only process text parts
+    // For message.part.updated: skip non-text parts
     if (part?.type && part.type !== 'text') return;
+    // For message.part.delta: only process text field deltas
+    if (field && field !== 'text') return;
 
     const text = delta || '';
     if (!text) return;

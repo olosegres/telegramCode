@@ -61,6 +61,12 @@ interface OpenCodeSession {
   modelOverride: OpenCodeModelOverride | null;
   /** Last known model label from SSE events */
   currentModelLabel: string | null;
+  /** Map partID -> part type for resolving delta events */
+  partTypes: Map<string, string>;
+  /** Timer for debouncing status (tool/reasoning) updates */
+  statusDebounceTimer: NodeJS.Timeout | null;
+  /** Latest status text pending emission */
+  pendingStatus: string | null;
 }
 
 interface OpenCodeApiSession {
@@ -89,6 +95,21 @@ interface OpenCodePart {
   messageID?: string;
   type?: string;
   text?: string;
+  /** Tool part fields */
+  tool?: string;
+  callID?: string;
+  state?: OpenCodeToolState;
+}
+
+interface OpenCodeToolState {
+  status: 'pending' | 'running' | 'completed' | 'error';
+  input?: Record<string, unknown>;
+  raw?: string;
+  title?: string;
+  output?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  time?: { start?: number; end?: number };
 }
 
 interface OpenCodeMessageInfo {
@@ -297,6 +318,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         isModelInfoShown: false,
         modelOverride: null,
         currentModelLabel: null,
+        partTypes: new Map(),
+        statusDebounceTimer: null,
+        pendingStatus: null,
       };
 
       this.sessions.set(userId, session);
@@ -477,6 +501,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         isModelInfoShown: false,
         modelOverride: null,
         currentModelLabel: null,
+        partTypes: new Map(),
+        statusDebounceTimer: null,
+        pendingStatus: null,
       };
 
       this.sessions.set(userId, session);
@@ -709,10 +736,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Handle streaming text delta from assistant response.
+   * @description Handle streaming part updates from assistant response.
    * Two event formats:
    *   message.part.updated: { part: OpenCodePart, delta?: string }
    *   message.part.delta:   { sessionID, messageID, partID, field, delta }
+   *
+   * Text parts are accumulated and emitted as 'output' (permanent messages).
+   * Tool, reasoning, step-* parts are emitted as 'status' (transient messages).
    */
   private handlePartUpdate(userId: number, properties: Record<string, unknown>): void {
     const session = this.sessions.get(userId);
@@ -721,9 +751,48 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const part = properties.part as OpenCodePart | undefined;
     const delta = properties.delta as string | undefined;
     const field = properties.field as string | undefined;
+    const partId = (properties.partID as string) || part?.id;
 
-    // For message.part.updated: skip non-text parts
-    if (part?.type && part.type !== 'text') return;
+    // Track part type from message.part.updated events (full part object)
+    if (part?.type && partId) {
+      session.partTypes.set(partId, part.type);
+    }
+
+    // Resolve the part type: from the part object or from our tracking map
+    const partType = part?.type || (partId ? session.partTypes.get(partId) : undefined) || 'text';
+
+    switch (partType) {
+      case 'text':
+        this.handleTextDelta(userId, session, delta, field);
+        break;
+      case 'tool':
+        this.handleToolPart(userId, session, part);
+        break;
+      case 'reasoning':
+        this.handleReasoningPart(userId, session, part, delta, field);
+        break;
+      case 'step-start':
+      case 'step-finish':
+        // Silently skip step markers — tool parts provide better status info
+        break;
+      default:
+        // Log unknown part types for future debugging
+        if (part?.type) {
+          console.log(`[OpenCode] Unhandled part type: ${part.type}`);
+        }
+        break;
+    }
+  }
+
+  /**
+   * @description Handle text delta — accumulate and emit as 'output'.
+   */
+  private handleTextDelta(
+    userId: number,
+    session: OpenCodeSession,
+    delta: string | undefined,
+    field: string | undefined,
+  ): void {
     // For message.part.delta: only process text field deltas
     if (field && field !== 'text') return;
 
@@ -743,6 +812,87 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         this.emit('output', userId, session.currentResponseText);
       }
     }, sseOutputBatchMs);
+  }
+
+  /**
+   * @description Handle tool part — format and emit as 'status'.
+   */
+  private handleToolPart(
+    userId: number,
+    session: OpenCodeSession,
+    part: OpenCodePart | undefined,
+  ): void {
+    if (!part) return;
+
+    const toolName = part.tool || 'tool';
+    const state = part.state;
+    if (!state) return;
+
+    let statusText: string;
+    switch (state.status) {
+      case 'pending':
+        statusText = `🔄 ${toolName}...`;
+        break;
+      case 'running':
+        statusText = `🔧 ${state.title || toolName}...`;
+        break;
+      case 'completed':
+        statusText = `✅ ${state.title || toolName}`;
+        break;
+      case 'error':
+        statusText = `❌ ${toolName}: ${state.error || 'failed'}`;
+        break;
+      default:
+        statusText = `🔧 ${toolName}`;
+        break;
+    }
+
+    this.emitStatus(userId, session, statusText);
+  }
+
+  /**
+   * @description Handle reasoning (thinking) part — format and emit as 'status'.
+   */
+  private handleReasoningPart(
+    userId: number,
+    session: OpenCodeSession,
+    part: OpenCodePart | undefined,
+    delta: string | undefined,
+    field: string | undefined,
+  ): void {
+    // For deltas on reasoning parts, show a thinking indicator
+    const text = delta || part?.text || '';
+    if (!text) return;
+
+    // Truncate thinking text for display — just show first line or 100 chars
+    const preview = text.split('\n')[0].slice(0, 100);
+    const statusText = preview ? `💭 ${preview}${text.length > 100 ? '...' : ''}` : '💭 Thinking...';
+
+    this.emitStatus(userId, session, statusText);
+  }
+
+  /** Debounce delay (ms) for status updates to avoid Telegram rate limits */
+  private static readonly statusDebounceMs = 400;
+
+  /**
+   * @description Debounced emit of 'status' event.
+   * Rapid status updates (e.g. multiple tool state changes) are batched —
+   * only the latest status text is emitted after a quiet period.
+   */
+  private emitStatus(userId: number, session: OpenCodeSession, text: string): void {
+    session.pendingStatus = text;
+
+    if (session.statusDebounceTimer) {
+      clearTimeout(session.statusDebounceTimer);
+    }
+
+    session.statusDebounceTimer = setTimeout(() => {
+      session.statusDebounceTimer = null;
+      if (session.pendingStatus) {
+        this.emit('status', userId, session.pendingStatus);
+        session.pendingStatus = null;
+      }
+    }, OpenCodeAdapter.statusDebounceMs);
   }
 
   /**
@@ -848,10 +998,21 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       session.outputTimer = null;
     }
 
+    // Flush any pending status before flushing text output
+    if (session.statusDebounceTimer) {
+      clearTimeout(session.statusDebounceTimer);
+      session.statusDebounceTimer = null;
+    }
+    if (session.pendingStatus) {
+      this.emit('status', userId, session.pendingStatus);
+      session.pendingStatus = null;
+    }
+
     if (session.currentResponseText.trim()) {
       this.emit('output', userId, session.currentResponseText);
     }
 
     session.currentResponseText = '';
+    session.partTypes.clear();
   }
 }

@@ -48,6 +48,8 @@ interface UserMessageState {
   needsNewMessage: boolean;
   messageIds: number[];
   loaderMessageId: number | null;
+  /** ID of the current transient status message (tool calls, thinking) — edited in place, deleted on text output */
+  statusMessageId: number | null;
 }
 
 interface StoredMessageIds {
@@ -107,7 +109,7 @@ function saveMessageIds(): void {
 function getUserMessageState(userId: number): UserMessageState {
   let state = userMessageStates.get(userId);
   if (!state) {
-    state = { lastMessageId: null, needsNewMessage: true, messageIds: [], loaderMessageId: null };
+    state = { lastMessageId: null, needsNewMessage: true, messageIds: [], loaderMessageId: null, statusMessageId: null };
     userMessageStates.set(userId, state);
   }
   return state;
@@ -388,6 +390,7 @@ async function processOutputQueue(userId: number): Promise<void> {
  */
 async function sendOutputImmediate(userId: number, output: string): Promise<void> {
   await deleteLoaderMessage(userId);
+  await deleteStatusMessage(userId);
 
   const truncated = truncateOutput(output);
   const escaped = escapeMarkdown(truncated);
@@ -1188,20 +1191,122 @@ bot.action(/^opt_(\d+)$/, async (ctx) => {
 //  Adapter event handlers
 // ═══════════════════════════════════════════
 
+/**
+ * Delete the transient status message for a user (if any).
+ * Called before sending a permanent text output so the chat stays clean.
+ */
+async function deleteStatusMessage(userId: number): Promise<void> {
+  const state = getUserMessageState(userId);
+  if (state.statusMessageId) {
+    const msgId = state.statusMessageId;
+    state.statusMessageId = null;
+    try {
+      await withRateLimitRetry(userId, () =>
+        bot.telegram.deleteMessage(userId, msgId)
+      );
+    } catch {
+      // Message might already be deleted or too old
+    }
+  }
+}
+
 function handleAgentOutput(userId: number, output: string): void {
   console.log(`[Bot] output (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
 
-  queueOutput(userId, output);
+  // Delete transient status message before sending permanent text
+  deleteStatusMessage(userId).then(() => {
+    queueOutput(userId, output);
+  });
+}
+
+/**
+ * Handle transient status updates (tool calls, thinking, etc.).
+ * If a status message already exists — edit it in place.
+ * If not — send a new one and track its ID.
+ */
+function handleAgentStatus(userId: number, status: string): void {
+  if (!status.trim()) return;
+  console.log(`[Bot] status: ${status.slice(0, 100)}`);
+
+  const msgState = getUserMessageState(userId);
+
+  // Also delete the loader message if it's still showing
+  deleteLoaderMessage(userId).catch(() => {});
+
+  const escaped = escapeMarkdown(status);
+  const parseMode = 'Markdown' as const;
+
+  if (msgState.statusMessageId) {
+    // Edit existing status message
+    withRateLimitRetry(userId, async () => {
+      try {
+        await bot.telegram.editMessageText(
+          userId,
+          msgState.statusMessageId!,
+          undefined,
+          escaped,
+          { parse_mode: parseMode },
+        );
+      } catch (editErr: unknown) {
+        const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
+        if (errMessage.includes('message is not modified')) return;
+        if (errMessage.includes('message to edit not found')) {
+          // Status message was deleted externally, send a new one
+          msgState.statusMessageId = null;
+          const sent = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
+          msgState.statusMessageId = sent.message_id;
+          trackMessageId(userId, sent.message_id);
+          return;
+        }
+        // Markdown failed, try plain text edit
+        try {
+          await bot.telegram.editMessageText(
+            userId,
+            msgState.statusMessageId!,
+            undefined,
+            status,
+          );
+        } catch {
+          // Give up editing, send new
+          msgState.statusMessageId = null;
+          const sent = await bot.telegram.sendMessage(userId, status);
+          msgState.statusMessageId = sent.message_id;
+          trackMessageId(userId, sent.message_id);
+        }
+      }
+    }).catch((err) => {
+      console.error('[handleAgentStatus] Failed to update status:', err);
+    });
+  } else {
+    // Send new status message
+    withRateLimitRetry(userId, async () => {
+      try {
+        const sent = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
+        msgState.statusMessageId = sent.message_id;
+        trackMessageId(userId, sent.message_id);
+      } catch {
+        // Markdown failed, try plain text
+        const sent = await bot.telegram.sendMessage(userId, status);
+        msgState.statusMessageId = sent.message_id;
+        trackMessageId(userId, sent.message_id);
+      }
+    }).catch((err) => {
+      console.error('[handleAgentStatus] Failed to send status:', err);
+    });
+  }
 }
 
 function handleAgentClosed(userId: number): void {
+  // Clean up status message on session close
+  deleteStatusMessage(userId).catch(() => {});
   const adapter = getUserAdapter(userId);
   safeSendMessage(userId, `${adapter.label} session ended`);
 }
 
 function handleAgentError(userId: number, error: Error): void {
   console.error(`[Bot] Agent error for user ${userId}:`, error.message);
+  deleteStatusMessage(userId).catch(() => {});
   safeSendMessage(userId, `Error: ${error.message}`);
 }
 
@@ -1256,6 +1361,7 @@ export async function startBot(): Promise<void> {
   // Wire adapter events to bot handlers
   registerAdapterEventHandlers({
     onOutput: handleAgentOutput,
+    onStatus: handleAgentStatus,
     onClosed: handleAgentClosed,
     onError: handleAgentError,
   });

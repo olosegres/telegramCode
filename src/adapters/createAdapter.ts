@@ -17,10 +17,12 @@ const userAdapterNames = new Map<number, string>();
 
 /** Event listener forwarder — wired up per adapter instance */
 type OutputHandler = (userId: number, output: string) => void;
+type StatusHandler = (userId: number, status: string) => void;
 type UserIdHandler = (userId: number) => void;
 type ErrorHandler = (userId: number, error: Error) => void;
 
 let onOutput: OutputHandler | null = null;
+let onStatus: StatusHandler | null = null;
 let onClosed: UserIdHandler | null = null;
 let onStarted: UserIdHandler | null = null;
 let onStopped: UserIdHandler | null = null;
@@ -28,6 +30,7 @@ let onError: ErrorHandler | null = null;
 
 function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onOutput) adapter.on('output', onOutput);
+  if (onStatus) adapter.on('status', onStatus);
   if (onClosed) adapter.on('closed', onClosed);
   if (onStarted) adapter.on('started', onStarted);
   if (onStopped) adapter.on('stopped', onStopped);
@@ -47,12 +50,14 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
  */
 export function registerAdapterEventHandlers(handlers: {
   onOutput: OutputHandler;
+  onStatus?: StatusHandler;
   onClosed: UserIdHandler;
   onStarted?: UserIdHandler;
   onStopped?: UserIdHandler;
   onError?: ErrorHandler;
 }): void {
   onOutput = handlers.onOutput;
+  onStatus = handlers.onStatus ?? null;
   onClosed = handlers.onClosed;
   onStarted = handlers.onStarted ?? null;
   onStopped = handlers.onStopped ?? null;

@@ -67,6 +67,8 @@ interface OpenCodeSession {
   statusDebounceTimer: NodeJS.Timeout | null;
   /** Latest status text pending emission */
   pendingStatus: string | null;
+  /** Pending question awaiting user's answer */
+  pendingQuestion: OpenCodePendingQuestion | null;
 }
 
 interface OpenCodeApiSession {
@@ -110,6 +112,23 @@ interface OpenCodeToolState {
   error?: string;
   metadata?: Record<string, unknown>;
   time?: { start?: number; end?: number };
+}
+
+export interface OpenCodeQuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface OpenCodeQuestion {
+  question: string;
+  header?: string;
+  options: OpenCodeQuestionOption[];
+  multiple?: boolean;
+}
+
+export interface OpenCodePendingQuestion {
+  requestId: string;
+  questions: OpenCodeQuestion[];
 }
 
 interface OpenCodeMessageInfo {
@@ -321,6 +340,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         partTypes: new Map(),
         statusDebounceTimer: null,
         pendingStatus: null,
+        pendingQuestion: null,
       };
 
       this.sessions.set(userId, session);
@@ -504,6 +524,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         partTypes: new Map(),
         statusDebounceTimer: null,
         pendingStatus: null,
+        pendingQuestion: null,
       };
 
       this.sessions.set(userId, session);
@@ -707,6 +728,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
       case 'permission.asked':
         this.handlePermissionAsked(userId, event.properties);
+        break;
+
+      case 'question.asked':
+        this.handleQuestionAsked(userId, event.properties);
         break;
 
       case 'server.connected':
@@ -965,6 +990,58 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         console.error(`[OpenCode] Failed to reply to permission:`, e);
       });
     }
+  }
+
+  /**
+   * @description Handle question.asked events from OpenCode.
+   * Stores the pending question and emits a 'question' event so the bot
+   * can display it to the user with interactive buttons.
+   *
+   * Event properties: { id, sessionID, questions: QuestionInfo[], tool? }
+   */
+  private handleQuestionAsked(userId: number, properties: Record<string, unknown>): void {
+    const session = this.sessions.get(userId);
+    if (!session?.isActive) return;
+
+    const requestId = (properties.requestID || properties.id) as string | undefined;
+    const questions = properties.questions as OpenCodeQuestion[] | undefined;
+
+    console.log(`[OpenCode] Question asked (${requestId}):`, JSON.stringify(properties).slice(0, 500));
+
+    if (!requestId || !questions || questions.length === 0) {
+      // No valid question — reply empty to unblock
+      if (requestId) {
+        this.apiRequest('POST', `/question/${requestId}/reply`, {
+          answers: [['']],
+        }).catch((e) => console.error(`[OpenCode] Failed to reply to question:`, e));
+      }
+      return;
+    }
+
+    // Store pending question so we can reply later when user answers
+    session.pendingQuestion = { requestId, questions };
+
+    // Emit question event for the bot to display to user
+    this.emit('question', userId, { requestId, questions });
+  }
+
+  /**
+   * @description Reply to a pending question with user-selected answers.
+   * Called by the bot when the user clicks an inline button or types a custom answer.
+   */
+  answerQuestion(userId: number, answers: string[][]): void {
+    const session = this.sessions.get(userId);
+    if (!session?.isActive || !session.pendingQuestion) return;
+
+    const { requestId } = session.pendingQuestion;
+    session.pendingQuestion = null;
+
+    this.apiRequest('POST', `/question/${requestId}/reply`, {
+      answers,
+    }).catch((e) => {
+      console.error(`[OpenCode] Failed to reply to question:`, e);
+      this.emit('output', userId, `Failed to send answer: ${e instanceof Error ? e.message : e}`);
+    });
   }
 
   /**

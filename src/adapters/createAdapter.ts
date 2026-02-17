@@ -1,6 +1,7 @@
 import type { AgentAdapter } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
+import type { OpenCodePendingQuestion } from './openCodeAdapter';
 
 type AdapterFactory = () => AgentAdapter;
 
@@ -18,11 +19,13 @@ const userAdapterNames = new Map<number, string>();
 /** Event listener forwarder — wired up per adapter instance */
 type OutputHandler = (userId: number, output: string) => void;
 type StatusHandler = (userId: number, status: string) => void;
+type QuestionHandler = (userId: number, question: OpenCodePendingQuestion) => void;
 type UserIdHandler = (userId: number) => void;
 type ErrorHandler = (userId: number, error: Error) => void;
 
 let onOutput: OutputHandler | null = null;
 let onStatus: StatusHandler | null = null;
+let onQuestion: QuestionHandler | null = null;
 let onClosed: UserIdHandler | null = null;
 let onStarted: UserIdHandler | null = null;
 let onStopped: UserIdHandler | null = null;
@@ -31,6 +34,7 @@ let onError: ErrorHandler | null = null;
 function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onOutput) adapter.on('output', onOutput);
   if (onStatus) adapter.on('status', onStatus);
+  if (onQuestion) adapter.on('question', onQuestion);
   if (onClosed) adapter.on('closed', onClosed);
   if (onStarted) adapter.on('started', onStarted);
   if (onStopped) adapter.on('stopped', onStopped);
@@ -51,6 +55,7 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
 export function registerAdapterEventHandlers(handlers: {
   onOutput: OutputHandler;
   onStatus?: StatusHandler;
+  onQuestion?: QuestionHandler;
   onClosed: UserIdHandler;
   onStarted?: UserIdHandler;
   onStopped?: UserIdHandler;
@@ -58,6 +63,7 @@ export function registerAdapterEventHandlers(handlers: {
 }): void {
   onOutput = handlers.onOutput;
   onStatus = handlers.onStatus ?? null;
+  onQuestion = handlers.onQuestion ?? null;
   onClosed = handlers.onClosed;
   onStarted = handlers.onStarted ?? null;
   onStopped = handlers.onStopped ?? null;

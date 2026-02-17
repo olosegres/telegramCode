@@ -12,12 +12,13 @@ export interface AgentSession {
  * Each adapter manages sessions per user and communicates via EventEmitter.
  *
  * Events emitted:
- * - 'output'  (userId: number, text: string)   — permanent text response
- * - 'status'  (userId: number, text: string)   — transient status (tool calls, thinking); shown as editable message
- * - 'closed'  (userId: number)
- * - 'started' (userId: number)
- * - 'stopped' (userId: number)
- * - 'error'   (userId: number, error: Error)
+ * - 'output'   (userId: number, text: string)   — permanent text response
+ * - 'status'   (userId: number, text: string)   — transient status (tool calls, thinking); shown as editable message
+ * - 'question' (userId: number, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
+ * - 'closed'   (userId: number)
+ * - 'started'  (userId: number)
+ * - 'stopped'  (userId: number)
+ * - 'error'    (userId: number, error: Error)
  */
 export interface AgentAdapter extends EventEmitter {
   /** Unique adapter identifier, e.g. 'claude', 'opencode' */
@@ -48,6 +49,11 @@ export interface AgentAdapter extends EventEmitter {
   getCurrentModel?(userId: number): string | null;
   /** Get available models from backend */
   getAvailableModels?(): Promise<string[]>;
+
+  // — Interactive questions (OpenCode) —
+
+  /** Reply to a pending question with selected answers */
+  answerQuestion?(userId: number, answers: string[][]): void;
 
   // — Optional TUI controls (Claude CLI specific) —
 

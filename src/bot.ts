@@ -165,11 +165,34 @@ function checkIsPrivateChat(ctx: Context): boolean {
   return ctx.chat?.type === 'private';
 }
 
-function truncateOutput(text: string, maxLen: number = maxMessageLength): string {
-  if (text.length <= maxLen) return text;
-  const truncated = text.slice(0, maxLen - 50);
-  const lastNewline = truncated.lastIndexOf('\n');
-  return lastNewline > maxLen - 300 ? truncated.slice(0, lastNewline) : truncated;
+/**
+ * Split a long message into multiple chunks that fit within Telegram's 4096 char limit.
+ * Tries to split on newline boundaries for cleaner output.
+ */
+function splitMessage(text: string, maxLen: number = maxMessageLength): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const parts: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      parts.push(remaining);
+      break;
+    }
+
+    // Try to cut at last newline within the limit
+    let cutAt = maxLen;
+    const lastNewline = remaining.lastIndexOf('\n', maxLen);
+    if (lastNewline > maxLen * 0.5) {
+      cutAt = lastNewline;
+    }
+
+    parts.push(remaining.slice(0, cutAt));
+    remaining = remaining.slice(cutAt).replace(/^\n/, ''); // skip leading newline in next chunk
+  }
+
+  return parts;
 }
 
 async function downloadFile(url: string, destPath: string): Promise<void> {
@@ -385,77 +408,86 @@ async function processOutputQueue(userId: number): Promise<void> {
 }
 
 /**
+ * Send a single chunk of text to the user, with Markdown fallback to plain text.
+ * Returns the sent message ID.
+ */
+async function sendChunk(userId: number, text: string, parseMode: 'Markdown' | undefined): Promise<number | null> {
+  try {
+    const sent = await withRateLimitRetry(userId, () =>
+      bot.telegram.sendMessage(userId, text, parseMode ? { parse_mode: parseMode } : {})
+    );
+    return (sent as { message_id: number }).message_id;
+  } catch {
+    if (parseMode) {
+      // Markdown failed, retry as plain text
+      try {
+        const sent = await withRateLimitRetry(userId, () =>
+          bot.telegram.sendMessage(userId, text)
+        );
+        return (sent as { message_id: number }).message_id;
+      } catch (plainErr) {
+        console.error('[sendChunk] Plain text also failed:', plainErr);
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+/**
  * Immediately send output to user (internal function).
- * Handles new message vs edit logic, markdown fallback, and rate limit retry.
+ * Splits long messages into multiple Telegram messages.
+ * First chunk may edit the existing message; subsequent chunks are always new messages.
  */
 async function sendOutputImmediate(userId: number, output: string): Promise<void> {
   await deleteLoaderMessage(userId);
   await deleteStatusMessage(userId);
 
-  const truncated = truncateOutput(output);
-  const escaped = escapeMarkdown(truncated);
-  const { options } = parseOutput(output);
+  const chunks = splitMessage(output);
   const msgState = getUserMessageState(userId);
-
-  const hasButtons = false; // Disabled: options.length >= 2 && options.length <= 6;
   const parseMode = 'Markdown' as const;
 
   const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;
 
-  try {
-    await withRateLimitRetry(userId, async () => {
-      if (shouldSendNew) {
-        let sentMessage;
-        if (hasButtons) {
-          const buttons = options.map(opt =>
-            Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
-          );
-          const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
-          sentMessage = await bot.telegram.sendMessage(userId, escaped, { ...keyboard, parse_mode: parseMode });
-        } else {
-          sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
-        }
-        msgState.lastMessageId = sentMessage.message_id;
-        msgState.needsNewMessage = false;
-        trackMessageId(userId, sentMessage.message_id);
-      } else {
-        const messageId = msgState.lastMessageId as number;
-        try {
-          if (hasButtons) {
-            const buttons = options.map(opt =>
-              Markup.button.callback(`${opt.num}. ${opt.label}`, `opt_${opt.num}`)
-            );
-            const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
-            await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { ...keyboard, parse_mode: parseMode });
-          } else {
-            await bot.telegram.editMessageText(userId, messageId, undefined, escaped, { parse_mode: parseMode });
-          }
-        } catch (editErr: unknown) {
-          const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
+  // --- First chunk: try editing existing message if possible ---
+  const firstChunk = chunks[0];
+  const firstEscaped = escapeMarkdown(firstChunk);
 
-          if (errMessage.includes('message is not modified')) {
-            return;
-          }
-
-          console.log('[sendOutput] Edit failed, sending new message:', errMessage);
-          const sentMessage = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
-          msgState.lastMessageId = sentMessage.message_id;
+  if (shouldSendNew) {
+    const msgId = await sendChunk(userId, firstEscaped, parseMode);
+    if (msgId) {
+      msgState.lastMessageId = msgId;
+      msgState.needsNewMessage = false;
+      trackMessageId(userId, msgId);
+    }
+  } else {
+    const messageId = msgState.lastMessageId as number;
+    try {
+      await withRateLimitRetry(userId, () =>
+        bot.telegram.editMessageText(userId, messageId, undefined, firstEscaped, { parse_mode: parseMode })
+      );
+    } catch (editErr: unknown) {
+      const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
+      if (!errMessage.includes('message is not modified')) {
+        // Edit failed — send as new message
+        const msgId = await sendChunk(userId, firstEscaped, parseMode);
+        if (msgId) {
+          msgState.lastMessageId = msgId;
           msgState.needsNewMessage = false;
-          trackMessageId(userId, sentMessage.message_id);
+          trackMessageId(userId, msgId);
         }
       }
-    });
-  } catch (err) {
-    console.error('[sendOutput] Markdown error, falling back to plain text:', err);
-    try {
-      await withRateLimitRetry(userId, async () => {
-        const sentMessage = await bot.telegram.sendMessage(userId, truncated);
-        msgState.lastMessageId = sentMessage.message_id;
-        msgState.needsNewMessage = false;
-        trackMessageId(userId, sentMessage.message_id);
-      });
-    } catch (plainErr) {
-      console.error('[sendOutput] Plain text also failed:', plainErr);
+    }
+  }
+
+  // --- Remaining chunks: always send as new messages ---
+  for (let i = 1; i < chunks.length; i++) {
+    const escaped = escapeMarkdown(chunks[i]);
+    const msgId = await sendChunk(userId, escaped, parseMode);
+    if (msgId) {
+      msgState.lastMessageId = msgId;
+      msgState.needsNewMessage = false;
+      trackMessageId(userId, msgId);
     }
   }
 }
@@ -1224,6 +1256,7 @@ function handleAgentOutput(userId: number, output: string): void {
  * Handle transient status updates (tool calls, thinking, etc.).
  * If a status message already exists — edit it in place.
  * If not — send a new one and track its ID.
+ * Long status texts are split into multiple messages.
  */
 function handleAgentStatus(userId: number, status: string): void {
   if (!status.trim()) return;
@@ -1234,67 +1267,55 @@ function handleAgentStatus(userId: number, status: string): void {
   // Also delete the loader message if it's still showing
   deleteLoaderMessage(userId).catch(() => {});
 
-  const escaped = escapeMarkdown(status);
+  const chunks = splitMessage(status);
   const parseMode = 'Markdown' as const;
 
-  if (msgState.statusMessageId) {
-    // Edit existing status message
-    withRateLimitRetry(userId, async () => {
-      try {
-        await bot.telegram.editMessageText(
-          userId,
-          msgState.statusMessageId!,
-          undefined,
-          escaped,
-          { parse_mode: parseMode },
-        );
-      } catch (editErr: unknown) {
-        const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
-        if (errMessage.includes('message is not modified')) return;
-        if (errMessage.includes('message to edit not found')) {
-          // Status message was deleted externally, send a new one
-          msgState.statusMessageId = null;
-          const sent = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
-          msgState.statusMessageId = sent.message_id;
-          trackMessageId(userId, sent.message_id);
-          return;
-        }
-        // Markdown failed, try plain text edit
+  (async () => {
+    try {
+      // --- First chunk: edit existing status or send new ---
+      const firstEscaped = escapeMarkdown(chunks[0]);
+
+      if (msgState.statusMessageId) {
         try {
-          await bot.telegram.editMessageText(
-            userId,
-            msgState.statusMessageId!,
-            undefined,
-            status,
+          await withRateLimitRetry(userId, () =>
+            bot.telegram.editMessageText(
+              userId, msgState.statusMessageId!, undefined,
+              firstEscaped, { parse_mode: parseMode },
+            )
           );
-        } catch {
-          // Give up editing, send new
-          msgState.statusMessageId = null;
-          const sent = await bot.telegram.sendMessage(userId, status);
-          msgState.statusMessageId = sent.message_id;
-          trackMessageId(userId, sent.message_id);
+        } catch (editErr: unknown) {
+          const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
+          if (!errMessage.includes('message is not modified')) {
+            // Edit failed — send as new message instead
+            msgState.statusMessageId = null;
+            const msgId = await sendChunk(userId, firstEscaped, parseMode);
+            if (msgId) {
+              msgState.statusMessageId = msgId;
+              trackMessageId(userId, msgId);
+            }
+          }
+        }
+      } else {
+        const msgId = await sendChunk(userId, firstEscaped, parseMode);
+        if (msgId) {
+          msgState.statusMessageId = msgId;
+          trackMessageId(userId, msgId);
         }
       }
-    }).catch((err) => {
-      console.error('[handleAgentStatus] Failed to update status:', err);
-    });
-  } else {
-    // Send new status message
-    withRateLimitRetry(userId, async () => {
-      try {
-        const sent = await bot.telegram.sendMessage(userId, escaped, { parse_mode: parseMode });
-        msgState.statusMessageId = sent.message_id;
-        trackMessageId(userId, sent.message_id);
-      } catch {
-        // Markdown failed, try plain text
-        const sent = await bot.telegram.sendMessage(userId, status);
-        msgState.statusMessageId = sent.message_id;
-        trackMessageId(userId, sent.message_id);
+
+      // --- Remaining chunks: send as new messages, update statusMessageId to last ---
+      for (let i = 1; i < chunks.length; i++) {
+        const escaped = escapeMarkdown(chunks[i]);
+        const msgId = await sendChunk(userId, escaped, parseMode);
+        if (msgId) {
+          msgState.statusMessageId = msgId;
+          trackMessageId(userId, msgId);
+        }
       }
-    }).catch((err) => {
-      console.error('[handleAgentStatus] Failed to send status:', err);
-    });
-  }
+    } catch (err) {
+      console.error('[handleAgentStatus] Failed:', err);
+    }
+  })();
 }
 
 function handleAgentClosed(userId: number): void {

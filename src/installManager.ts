@@ -102,6 +102,20 @@ export async function ensureInstalled(toolName: string): Promise<boolean> {
 
 let openCodeProcess: ChildProcess | null = null;
 
+/** Callback invoked when the OpenCode server process exits unexpectedly (not via stopOpenCodeServer) */
+let onServerExitCallback: ((code: number | null, signal: string | null) => void) | null = null;
+/** Whether the server is being intentionally stopped (to distinguish crash from graceful shutdown) */
+let isIntentionalStop = false;
+
+/**
+ * @description Register a callback for unexpected server process exits.
+ * Called when the server crashes or is OOM-killed (e.g. exit code 137).
+ * NOT called when stopOpenCodeServer() is used.
+ */
+export function onOpenCodeServerExit(callback: (code: number | null, signal: string | null) => void): void {
+  onServerExitCallback = callback;
+}
+
 export async function checkIsOpenCodeServerRunning(): Promise<boolean> {
   const url = process.env.OPENCODE_URL || 'http://localhost:4096';
   try {
@@ -127,6 +141,7 @@ export async function ensureOpenCodeServer(): Promise<void> {
     openCodeProcess = null;
   }
 
+  isIntentionalStop = false;
   const port = new URL(process.env.OPENCODE_URL || 'http://localhost:4096').port || '4096';
 
   const opencodeCmd = getToolCommand('opencode');
@@ -143,9 +158,12 @@ export async function ensureOpenCodeServer(): Promise<void> {
   openCodeProcess.stderr?.on('data', (data: string) => {
     console.error(`[OpenCode Server] ${data.trim()}`);
   });
-  openCodeProcess.on('exit', (code) => {
-    console.log(`[OpenCode Server] Process exited with code ${code}`);
+  openCodeProcess.on('exit', (code, signal) => {
+    console.log(`[OpenCode Server] Process exited with code ${code}, signal ${signal}`);
     openCodeProcess = null;
+    if (!isIntentionalStop && onServerExitCallback) {
+      onServerExitCallback(code, signal);
+    }
   });
 
   // Wait for server to become ready
@@ -172,7 +190,10 @@ export async function ensureOpenCodeServer(): Promise<void> {
 export function stopOpenCodeServer(): void {
   if (openCodeProcess && !openCodeProcess.killed) {
     console.log(`[OpenCode] Stopping server...`);
+    isIntentionalStop = true;
     openCodeProcess.kill();
     openCodeProcess = null;
+    // Reset after a tick to allow the exit event handler to see isIntentionalStop=true
+    setTimeout(() => { isIntentionalStop = false; }, 100);
   }
 }

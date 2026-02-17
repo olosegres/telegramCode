@@ -10,6 +10,7 @@ import {
 } from './adapters/createAdapter';
 import { withRateLimitRetry, checkIsRateLimited } from './rateLimiter';
 import { stopOpenCodeServer, checkIsOpenCodeServerRunning, ensureOpenCodeServer } from './installManager';
+import type { OpenCodePendingQuestion, OpenCodeQuestion } from './adapters/openCodeAdapter';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
@@ -72,6 +73,19 @@ interface OutputQueueState {
 
 const userMessageStates = new Map<number, UserMessageState>();
 const outputQueues = new Map<number, OutputQueueState>();
+
+/**
+ * Per-user pending question state.
+ * When a question is shown to the user, we store it here so callback handlers
+ * can look up the question data and send the answer back to the adapter.
+ */
+interface PendingQuestionState {
+  /** The question data from the adapter */
+  data: OpenCodePendingQuestion;
+  /** Message ID of the question message in Telegram (for cleanup) */
+  messageId: number | null;
+}
+const pendingQuestions = new Map<number, PendingQuestionState>();
 
 /** Debounce delay in ms — increased to avoid Telegram 429 rate limits */
 const outputDebounceMs = 1000;
@@ -1127,6 +1141,32 @@ bot.on(message('text'), async (ctx) => {
     }
   }
 
+  // If there's a pending question, treat text as a custom answer
+  const pending = pendingQuestions.get(userId);
+  if (pending && adapter.checkIsActive(userId) && adapter.answerQuestion) {
+    // Use the typed text as answer for the first question
+    const answers: string[][] = pending.data.questions.map(() => [text]);
+    pendingQuestions.delete(userId);
+
+    // Update question message to show the custom answer
+    if (pending.messageId) {
+      const q = pending.data.questions[0];
+      const header = q?.header || q?.question || 'Question';
+      try {
+        await withRateLimitRetry(userId, () =>
+          bot.telegram.editMessageText(
+            userId, pending.messageId!, undefined,
+            `✅ ${header}: ${text}`,
+          )
+        );
+      } catch { /* ignore */ }
+    }
+
+    adapter.answerQuestion(userId, answers);
+    markNeedsNewMessage(userId);
+    return;
+  }
+
   if (adapter.checkIsActive(userId)) {
     markNeedsNewMessage(userId);
     const processingMsg = await ctx.reply('⏳');
@@ -1217,6 +1257,63 @@ bot.action(/^opt_(\d+)$/, async (ctx) => {
   } else {
     await ctx.answerCbQuery('Agent not running');
   }
+});
+
+/**
+ * Handle question answer callback: qa_{questionIndex}_{optionIndex}
+ * questionIndex is the index within the questions array (usually 0).
+ * optionIndex is the index of the selected option.
+ */
+bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
+  if (!checkIsAllowed(ctx.from!.id)) return;
+
+  const userId = ctx.from!.id;
+  const qIdx = parseInt(ctx.match[1], 10);
+  const optIdx = parseInt(ctx.match[2], 10);
+
+  const pending = pendingQuestions.get(userId);
+  if (!pending) {
+    await ctx.answerCbQuery('No pending question');
+    return;
+  }
+
+  const question = pending.data.questions[qIdx];
+  if (!question || !question.options[optIdx]) {
+    await ctx.answerCbQuery('Invalid option');
+    return;
+  }
+
+  const selectedLabel = question.options[optIdx].label;
+  const adapter = getUserAdapter(userId);
+
+  // Build answers array: one answer per question, default empty for unselected
+  const answers: string[][] = pending.data.questions.map((_, i) => {
+    if (i === qIdx) return [selectedLabel];
+    return [''];
+  });
+
+  // Clean up: remove pending state and edit the question message to show selection
+  pendingQuestions.delete(userId);
+
+  try {
+    if (pending.messageId) {
+      await withRateLimitRetry(userId, () =>
+        bot.telegram.editMessageText(
+          userId, pending.messageId!, undefined,
+          `✅ ${question.header || question.question}: ${selectedLabel}`,
+        )
+      );
+    }
+  } catch {
+    // Ignore edit errors
+  }
+
+  if (adapter.answerQuestion) {
+    adapter.answerQuestion(userId, answers);
+    markNeedsNewMessage(userId);
+  }
+
+  await ctx.answerCbQuery(selectedLabel);
 });
 
 // ═══════════════════════════════════════════
@@ -1318,9 +1415,78 @@ function handleAgentStatus(userId: number, status: string): void {
   })();
 }
 
-function handleAgentClosed(userId: number): void {
-  // Clean up status message on session close
+/**
+ * Handle interactive question from agent.
+ * Shows question with inline buttons in Telegram.
+ * Also supports custom text answers — user can type a reply.
+ */
+function handleAgentQuestion(userId: number, questionData: OpenCodePendingQuestion): void {
+  console.log(`[Bot] question (${questionData.requestId}): ${questionData.questions.length} questions`);
+
+  // Delete status/loader messages to make room for the question
   deleteStatusMessage(userId).catch(() => {});
+  deleteLoaderMessage(userId).catch(() => {});
+
+  (async () => {
+    try {
+      for (let qIdx = 0; qIdx < questionData.questions.length; qIdx++) {
+        const q = questionData.questions[qIdx];
+        const header = q.header || q.question || 'Question';
+
+        // Build message text
+        const lines: string[] = [`❓ *${escapeMarkdown(header)}*`];
+        if (q.question && q.question !== header) {
+          lines.push(escapeMarkdown(q.question));
+        }
+
+        // Build inline keyboard with options
+        const buttons = q.options.map((opt, optIdx) => {
+          const label = opt.label.length > 40 ? opt.label.slice(0, 37) + '...' : opt.label;
+          return [Markup.button.callback(label, `qa_${qIdx}_${optIdx}`)];
+        });
+
+        const keyboard = buttons.length > 0
+          ? Markup.inlineKeyboard(buttons)
+          : undefined;
+
+        const msgOpts: Record<string, unknown> = { parse_mode: 'Markdown' as const };
+        if (keyboard) Object.assign(msgOpts, keyboard);
+
+        let sent;
+        try {
+          sent = await withRateLimitRetry(userId, () =>
+            bot.telegram.sendMessage(userId, lines.join('\n'), msgOpts as Parameters<typeof bot.telegram.sendMessage>[2])
+          );
+        } catch {
+          // Markdown failed, try plain text
+          const plainLines = [`❓ ${header}`];
+          if (q.question && q.question !== header) plainLines.push(q.question);
+          const plainOpts: Record<string, unknown> = {};
+          if (keyboard) Object.assign(plainOpts, keyboard);
+          sent = await withRateLimitRetry(userId, () =>
+            bot.telegram.sendMessage(userId, plainLines.join('\n'), plainOpts as Parameters<typeof bot.telegram.sendMessage>[2])
+          );
+        }
+
+        const sentMsg = sent as { message_id: number };
+        trackMessageId(userId, sentMsg.message_id);
+
+        // Store pending question so callbacks and text handler can find it
+        pendingQuestions.set(userId, {
+          data: questionData,
+          messageId: sentMsg.message_id,
+        });
+      }
+    } catch (err) {
+      console.error('[handleAgentQuestion] Failed to send question:', err);
+    }
+  })();
+}
+
+function handleAgentClosed(userId: number): void {
+  // Clean up status message and pending questions on session close
+  deleteStatusMessage(userId).catch(() => {});
+  pendingQuestions.delete(userId);
   const adapter = getUserAdapter(userId);
   safeSendMessage(userId, `${adapter.label} session ended`);
 }
@@ -1328,6 +1494,7 @@ function handleAgentClosed(userId: number): void {
 function handleAgentError(userId: number, error: Error): void {
   console.error(`[Bot] Agent error for user ${userId}:`, error.message);
   deleteStatusMessage(userId).catch(() => {});
+  pendingQuestions.delete(userId);
   safeSendMessage(userId, `Error: ${error.message}`);
 }
 
@@ -1383,6 +1550,7 @@ export async function startBot(): Promise<void> {
   registerAdapterEventHandlers({
     onOutput: handleAgentOutput,
     onStatus: handleAgentStatus,
+    onQuestion: handleAgentQuestion,
     onClosed: handleAgentClosed,
     onError: handleAgentError,
   });

@@ -864,9 +864,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const text = delta || part?.text || '';
     if (!text) return;
 
-    // Truncate thinking text for display — just show first line or 100 chars
-    const preview = text.split('\n')[0].slice(0, 100);
-    const statusText = preview ? `💭 ${preview}${text.length > 100 ? '...' : ''}` : '💭 Thinking...';
+    // Show thinking text preview — first line up to 300 chars
+    const preview = text.split('\n')[0].slice(0, 300);
+    const statusText = preview ? `💭 ${preview}${text.length > 300 ? '...' : ''}` : '💭 Thinking...';
 
     this.emitStatus(userId, session, statusText);
   }

@@ -4,7 +4,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { AgentAdapter, AgentSession } from '../types';
-import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand } from '../installManager';
+import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 
 const execAsync = promisify(exec);
 
@@ -144,6 +144,12 @@ interface OpenCodeMessageInfo {
 /** Delay (ms) to batch SSE text deltas before emitting output event */
 const sseOutputBatchMs = 500;
 
+/** Max number of SSE reconnection attempts before giving up */
+const maxSseReconnectAttempts = 5;
+
+/** Base delay (ms) for exponential backoff on SSE reconnect */
+const sseReconnectBaseDelayMs = 2000;
+
 /** Cache for available models from OpenCode CLI */
 let cachedModels: string[] | null = null;
 let modelsCacheTime = 0;
@@ -243,6 +249,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   private baseUrl: string;
   private authHeader: string | null;
 
+  /** Whether a server restart is already in progress (prevents concurrent restart attempts) */
+  private isServerRestarting = false;
+
   constructor() {
     super();
     this.baseUrl = (process.env.OPENCODE_URL || 'http://localhost:4096').replace(/\/$/, '');
@@ -253,6 +262,79 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.authHeader = 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
     } else {
       this.authHeader = null;
+    }
+
+    // Listen for unexpected server crashes (OOM kill, segfault, etc.)
+    onOpenCodeServerExit((code, signal) => {
+      console.error(`[OpenCode] Server crashed unexpectedly: code=${code}, signal=${signal}`);
+      this.handleServerCrash(code, signal);
+    });
+  }
+
+  /**
+   * @description Handle unexpected server process death.
+   * Notifies all active users and attempts to restart the server.
+   * SSE reconnect loop will detect the restart and recover automatically.
+   */
+  private handleServerCrash(code: number | null, signal: string | null): void {
+    const reason = code === 137 ? 'out of memory (OOM killed)' :
+      signal ? `signal ${signal}` : `exit code ${code}`;
+
+    // Notify all active session users about the crash
+    for (const [userId, session] of this.sessions) {
+      if (session.isActive) {
+        this.emit('output', userId, `OpenCode server crashed (${reason}). Restarting...`);
+      }
+    }
+
+    // Auto-restart the server (SSE reconnect loop will pick it up)
+    this.restartServer();
+  }
+
+  /**
+   * @description Restart the OpenCode server process.
+   * Prevents concurrent restart attempts. If restart is already in progress,
+   * waits for it to complete and returns its result.
+   */
+  private async restartServer(): Promise<boolean> {
+    if (this.isServerRestarting) {
+      console.log(`[OpenCode] Server restart already in progress, waiting...`);
+      // Wait for the in-progress restart to complete
+      while (this.isServerRestarting) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      // Check if server is now running
+      return checkIsOpenCodeServerRunning();
+    }
+
+    this.isServerRestarting = true;
+    try {
+      console.log(`[OpenCode] Attempting server restart...`);
+      await ensureOpenCodeServer();
+      console.log(`[OpenCode] Server restarted successfully`);
+
+      // Notify all active session users about recovery
+      for (const [userId, session] of this.sessions) {
+        if (session.isActive) {
+          this.emit('output', userId, `OpenCode server restarted. Session may need to be restarted (/stop then /opencode).`);
+        }
+      }
+      return true;
+    } catch (e) {
+      console.error(`[OpenCode] Server restart failed:`, e);
+      // Notify users about the failure
+      for (const [userId, session] of this.sessions) {
+        if (session.isActive) {
+          this.emit('output', userId, `Failed to restart OpenCode server: ${e instanceof Error ? e.message : String(e)}`);
+          // Mark session as inactive — no point keeping it alive
+          session.isActive = false;
+          this.sessions.delete(userId);
+          this.emit('stopped', userId);
+        }
+      }
+      return false;
+    } finally {
+      this.isServerRestarting = false;
     }
   }
 
@@ -630,10 +712,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /**
    * @description Fetch-based SSE reader. OpenCode sends all events as `data:` lines
    * with JSON payload { type, properties }. No `event:` field is used.
+   *
+   * On connection failure: checks if server is alive, attempts restart if dead,
+   * retries with exponential backoff up to maxSseReconnectAttempts.
    */
-  private async pollSse(userId: number, sseUrl: string): Promise<void> {
+  private async pollSse(userId: number, sseUrl: string, reconnectAttempt = 0): Promise<void> {
     const session = this.sessions.get(userId);
-    if (!session) return;
+    if (!session?.isActive) return;
 
     const headers: Record<string, string> = {
       'Accept': 'text/event-stream',
@@ -647,10 +732,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
       if (!response.ok || !response.body) {
         console.error(`[OpenCode] SSE connection failed: ${response.status}`);
+        await this.handleSseReconnect(userId, sseUrl, reconnectAttempt, `HTTP ${response.status}`);
         return;
       }
 
       console.log(`[OpenCode] SSE connected successfully`);
+      // Reset reconnect counter on successful connection
+      reconnectAttempt = 0;
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -673,17 +761,61 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       }
 
       reader.cancel().catch(() => {});
+
+      // If session is still active but stream ended (server-side close), try to reconnect
+      if (session.isActive) {
+        console.log(`[OpenCode] SSE stream ended while session active, reconnecting...`);
+        await this.handleSseReconnect(userId, sseUrl, 0, 'stream ended');
+      }
     } catch (e) {
       if (session.isActive) {
-        console.error(`[OpenCode] SSE error:`, e);
-        // Reconnect after delay
-        setTimeout(() => {
-          if (session.isActive) {
-            console.log(`[OpenCode] SSE reconnecting...`);
-            this.pollSse(userId, sseUrl).catch(() => {});
-          }
-        }, 3000);
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        console.error(`[OpenCode] SSE error:`, errorMessage);
+        await this.handleSseReconnect(userId, sseUrl, reconnectAttempt, errorMessage);
       }
+    }
+  }
+
+  /**
+   * @description Handle SSE reconnection with server health check, auto-restart, and exponential backoff.
+   * If the server is dead, attempts to restart it before reconnecting SSE.
+   * Gives up after maxSseReconnectAttempts and notifies the user.
+   */
+  private async handleSseReconnect(userId: number, sseUrl: string, attempt: number, reason: string): Promise<void> {
+    const session = this.sessions.get(userId);
+    if (!session?.isActive) return;
+
+    if (attempt >= maxSseReconnectAttempts) {
+      console.error(`[OpenCode] SSE reconnect failed after ${attempt} attempts, giving up`);
+      this.emit('output', userId, `Lost connection to OpenCode server after ${attempt} attempts. Use /stop and start a new session.`);
+      session.isActive = false;
+      this.sessions.delete(userId);
+      this.emit('stopped', userId);
+      return;
+    }
+
+    // Check if the server process is still alive
+    const isServerAlive = await checkIsOpenCodeServerRunning();
+
+    if (!isServerAlive) {
+      console.log(`[OpenCode] Server is not responding, attempting restart before SSE reconnect...`);
+      const restarted = await this.restartServer();
+      if (!restarted) {
+        // restartServer already notified users and cleaned up sessions
+        return;
+      }
+      // Server restarted — reset attempt counter, give it a fresh chance
+      attempt = 0;
+    }
+
+    // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+    const delay = sseReconnectBaseDelayMs * Math.pow(2, attempt);
+    console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}/${maxSseReconnectAttempts}, reason: ${reason})`);
+
+    await new Promise(resolve => setTimeout(resolve, delay));
+
+    if (session.isActive) {
+      this.pollSse(userId, sseUrl, attempt + 1).catch(() => {});
     }
   }
 

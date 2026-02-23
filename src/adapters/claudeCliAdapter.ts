@@ -14,6 +14,8 @@ interface ClaudeSession {
   isActive: boolean;
   handledAutoEnter: boolean;
   handledAutoAccept: boolean;
+  /** Normalized text of last emitted status (for deduplication of spinner updates) */
+  lastStatusText: string;
 }
 
 const pollInterval = 300;
@@ -31,29 +33,47 @@ function tmux(...args: string[]): string {
   }
 }
 
+/**
+ * @description Convert ANSI escape codes to Telegram Markdown.
+ * Uses a marker-based approach: bold-on → \x01, bold-off → \x02,
+ * then strips all remaining ANSI, then converts markers to *bold*.
+ * Previous regex approach had two bugs:
+ * 1) Bold regex consumed \x1B[ of the following sequence, leaking codes like 38;5;231m
+ * 2) Cleanup regex \*\s*\* merged adjacent bold sections, removing newlines between them
+ */
 function convertAnsiToMarkdown(text: string): string {
   let result = text;
 
-  // Replace bold sequences: \x1B[1m text \x1B[0m -> *text*
+  // Step 1: Mark bold boundaries with control characters
+  // Bold on: \x1B[1m → \x01 marker
   // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x1B\[1m([^\x1B]*?)(?:\x1B\[(?:0|22)m|\x1B\[)/g, (_match, content) => {
-    if (content.trim()) {
-      return `*${content}*`;
-    }
-    return content;
-  });
+  result = result.replace(/\x1B\[1m/g, '\x01');
 
-  // Handle remaining bold start without proper end
+  // Bold off / reset: \x1B[0m or \x1B[22m → \x02 marker
   // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x1B\[1m([^\x1B]+)$/gm, '*$1*');
+  result = result.replace(/\x1B\[(?:0|22)m/g, '\x02');
 
-  // Remove remaining ANSI escape codes
+  // Step 2: Remove ALL remaining ANSI escape codes (colors, cursor, etc.)
   // eslint-disable-next-line no-control-regex
   result = result.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 
-  // Clean up multiple consecutive asterisks
-  result = result.replace(/\*\*+/g, '*');
-  result = result.replace(/\*\s*\*/g, '');
+  // Step 3: Convert bold markers to Markdown *bold*
+  // eslint-disable-next-line no-control-regex
+  result = result.replace(/\x01([^\x01\x02]*)\x02/g, (_match, content) => {
+    const trimmed = content.trim();
+    return trimmed ? `*${trimmed}*` : content;
+  });
+
+  // Handle unclosed bold (bold start without matching end, e.g. at end of line)
+  // eslint-disable-next-line no-control-regex
+  result = result.replace(/\x01([^\x01\x02]+)$/gm, '*$1*');
+
+  // Step 4: Clean up remaining markers
+  // eslint-disable-next-line no-control-regex
+  result = result.replace(/[\x01\x02]/g, '');
+
+  // Separate adjacent bold sections: *text1**text2* → *text1* *text2*
+  result = result.replace(/\*\*/g, '* *');
 
   return result;
 }
@@ -129,6 +149,37 @@ function normalizeToolCallLine(line: string): string {
   return line;
 }
 
+/**
+ * @description Check if output consists only of transient status lines (spinners, progress).
+ * Uses generic heuristics instead of hardcoded spinner chars/words,
+ * because Claude CLI can change its TUI symbols and wording at any time.
+ *
+ * Key insight: real Claude content is substantial (> 200 chars, multi-sentence).
+ * Status/progress is short, has few lines, and contains indicators like … or time/token stats.
+ */
+function checkIsStatusOutput(text: string): boolean {
+  // Real content is always substantial
+  if (text.length > 200) return false;
+
+  const lines = text.split('\n').filter(l => l.trim());
+  if (lines.length === 0) return false;
+  // Many non-empty lines = real content
+  if (lines.length > 3) return false;
+
+  return lines.every(line => {
+    const trimmed = line.trim();
+    // Tree structure / subagent progress lines (├─, └─, │, ─)
+    if (/^[├└│─]/.test(trimmed)) return true;
+    // Contains unicode ellipsis — universal spinner/progress indicator ("Nesting…", "Reading…", "Simmering…")
+    if (/…/.test(trimmed)) return true;
+    // Contains progress stats: time patterns (3m 36s), token counts (↓ 12.2k tokens), thought duration
+    if (/\d+[smh]\b.*[·↓]|↓\s*[\d.]+k?\s*tokens|thought for \d/i.test(trimmed)) return true;
+    // Very short line without sentence-like structure (two 3+ letter words) — likely a lone spinner/icon
+    if (trimmed.length < 40 && !/[а-яёa-z]{3,}\s+[а-яёa-z]{3,}/i.test(trimmed)) return true;
+    return false;
+  });
+}
+
 function stripTuiElements(text: string): string {
   const lines = text.split('\n');
   const filtered: string[] = [];
@@ -153,6 +204,10 @@ function stripTuiElements(text: string): string {
 
     if (/^[╭─╮│╰╯\s]+$/.test(trimmedLine)) continue;
     if (/^[▐▛▜▌▝▘█▀▄░▒▓\s]+$/.test(trimmedLine)) continue;
+    // Interactive question UI: tab bar navigation (← ☐ ... →)
+    if (/^←.*→\s*$/.test(trimmedLine)) continue;
+    // Interactive question UI: selection/navigation hints
+    if (/Enter to select/i.test(line)) continue;
     if (/Recent activity|What's new|\/resume for more/i.test(line)) continue;
     if (/Welcome\s*back/i.test(line)) continue;
     if (/[╭─╮│╰╯]/.test(line) && trimmedLine.length > 50) continue;
@@ -209,6 +264,7 @@ function saveStoredSession(session: StoredSession): void {
 export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
+  readonly outputsDeltas = true;
 
   private sessions: Map<number, ClaudeSession> = new Map();
 
@@ -256,6 +312,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       isActive: true,
       handledAutoEnter: false,
       handledAutoAccept: false,
+      lastStatusText: '',
     };
 
     this.sessions.set(userId, session);
@@ -415,6 +472,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       isActive: true,
       handledAutoEnter: false,
       handledAutoAccept: false,
+      lastStatusText: '',
     };
 
     this.sessions.set(userId, claudeSession);
@@ -449,7 +507,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         const cleanedOutput = stripTuiElements(newPart);
         if (cleanedOutput) {
           console.log(`[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`);
-          this.emit('output', userId, cleanedOutput);
+
+          if (checkIsStatusOutput(cleanedOutput)) {
+            // Deduplicate spinner updates: normalize spinner character and compare
+            const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
+            if (normalized !== session.lastStatusText) {
+              session.lastStatusText = normalized;
+              this.emit('status', userId, cleanedOutput);
+            }
+          } else {
+            session.lastStatusText = '';
+            this.emit('output', userId, cleanedOutput);
+          }
         } else {
           console.log(`[Claude] Output filtered out completely`);
         }

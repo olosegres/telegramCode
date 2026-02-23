@@ -1343,8 +1343,19 @@ function handleAgentOutput(userId: number, output: string): void {
   console.log(`[Bot] output (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
 
+  const msgState = getUserMessageState(userId);
+  const hadStatusMessage = msgState.statusMessageId !== null;
+
   // Delete transient status message before sending permanent text
   deleteStatusMessage(userId).then(() => {
+    // For delta-based adapters (Claude CLI): after a status/thinking break,
+    // force next output as a new message to avoid overwriting previous substantial content
+    if (hadStatusMessage) {
+      const adapter = getUserAdapter(userId);
+      if (adapter.outputsDeltas) {
+        msgState.needsNewMessage = true;
+      }
+    }
     queueOutput(userId, output);
   });
 }

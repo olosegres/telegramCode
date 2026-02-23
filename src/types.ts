@@ -55,6 +55,15 @@ export interface AgentAdapter extends EventEmitter {
   /** Reply to a pending question with selected answers */
   answerQuestion?(userId: number, answers: string[][]): void;
 
+  // — Output mode —
+
+  /**
+   * @description When true, adapter emits incremental text deltas (not accumulated content).
+   * After a status/thinking break, the bot will force a new message to avoid
+   * overwriting previous substantial content with new delta text.
+   */
+  readonly outputsDeltas?: boolean;
+
   // — Optional TUI controls (Claude CLI specific) —
 
   sendEnter?(userId: number): void;

@@ -69,6 +69,64 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.outside_root': '❌ Путь выходит за пределы WORK_ROOT.',
     'bind.not_directory': '❌ `{subdir}` существует, но это не папка.',
 
+    // ── /ls /list /new (General-scoped) ──
+    'ls.header': '📁 Подпапки `{workRoot}`:',
+    'ls.empty': '📁 В WORK_ROOT нет подходящих подпапок.',
+    'list.header': '🧵 Привязки тредов ({count}):',
+    'list.empty': '🧵 Привязок ещё нет. Создай тред и напиши /bind.',
+    'list.row': '• {threadId}: `{subdir}` · {agent} · {status}',
+    'list.row_closed': '• {threadId}: `{subdir}` · {agent} · 🔒 closed',
+    'new.in_topic': '/new можно только в General — открой General и попробуй ещё раз.',
+    'new.usage':
+      'Использование: /new <thread-name> [subdir]\nПример: /new ovr-feature overview',
+    'new.created':
+      '✅ Создан тред `{name}` (id {threadId}), привязан к `{subdir}`.\nПерейди: {link}',
+    'new.created_unbound':
+      '✅ Создан тред `{name}` (id {threadId}).\nПривяжи папку: /bind в самом треде.\nПерейди: {link}',
+    'new.failed': '❌ Не удалось создать тред: {error}',
+    'new.bind_failed':
+      '⚠️ Тред создан, но автопривязка к `{subdir}` не удалась: {error}\nЗайди в тред и выполни /bind.',
+
+    // ── /help context-aware ──
+    'help.general':
+      '*Команды в General:*\n' +
+      '/ls — подпапки WORK_ROOT\n' +
+      '/list — список тредов\n' +
+      '/new <name> [subdir] — создать тред\n' +
+      '/where — общая сводка\n' +
+      '/status — статус всех тредов\n' +
+      '/whoami /version — debug\n\n' +
+      'Чтобы начать диалог с агентом — открой тематический тред.',
+    'help.thread_unbound':
+      '*Тред не привязан к папке.*\n' +
+      '/bind <subdir> — привязать (или выбери в списке)\n' +
+      '/where — показать состояние\n' +
+      '/ls — подпапки WORK_ROOT (в General)',
+    'help.thread_bound':
+      '*Тред привязан к `{subdir}`.*\n' +
+      '/claude /opencode — старт агента\n' +
+      '/agent /model /sessions — выбор/переключение\n' +
+      '/stop /status /output — контроль\n' +
+      '/clear — удалить сообщения треда\n' +
+      '/c /y /n /enter /up /down /tab — TUI-команды (Claude)\n' +
+      '/where /unbind — управление binding',
+
+    // ── /whoami /version /status (global) ──
+    'whoami.report':
+      '👤 user: `{userId}`\n💬 chat: `{chatId}`\n🧵 thread: `{threadId}`\n' +
+      '🔐 allowed: {allowed}\n📁 binding: {binding}',
+    'whoami.binding_unbound': '(нет привязки)',
+    'version.report':
+      '*telegramCode {bot}*\n' +
+      'Node: {node}\n' +
+      'tmux: {tmux}\n' +
+      'claude: {claude}\n' +
+      'opencode: {opencode}',
+    'version.unknown': '(недоступно)',
+    'status.global_header': '📊 *Все треды* ({total}):',
+    'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
+    'status.global_empty': '📊 Тредов пока нет.',
+
     // ── agent lifecycle ──
     'agent.ready': '{label} готов в `{subdir}`{argsSuffix}\nОтправь сообщение:',
     'agent.no_session': 'Агент не запущен. /agent — выбрать, /claude или /opencode — старт.',
@@ -143,6 +201,64 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.not_found': '❌ Folder `{subdir}` not found under WORK_ROOT (`{workRoot}`).',
     'bind.outside_root': '❌ Path escapes WORK_ROOT.',
     'bind.not_directory': '❌ `{subdir}` exists but is not a directory.',
+
+    // ── /ls /list /new (General-scoped) ──
+    'ls.header': '📁 Subfolders of `{workRoot}`:',
+    'ls.empty': '📁 No bindable subfolders under WORK_ROOT.',
+    'list.header': '🧵 Thread bindings ({count}):',
+    'list.empty': '🧵 No bindings yet. Create a thread and run /bind.',
+    'list.row': '• {threadId}: `{subdir}` · {agent} · {status}',
+    'list.row_closed': '• {threadId}: `{subdir}` · {agent} · 🔒 closed',
+    'new.in_topic': '/new only works in General — switch back to General and try again.',
+    'new.usage':
+      'Usage: /new <thread-name> [subdir]\nExample: /new ovr-feature overview',
+    'new.created':
+      '✅ Created thread `{name}` (id {threadId}), bound to `{subdir}`.\nOpen: {link}',
+    'new.created_unbound':
+      '✅ Created thread `{name}` (id {threadId}).\nBind a folder: /bind inside that thread.\nOpen: {link}',
+    'new.failed': '❌ Failed to create thread: {error}',
+    'new.bind_failed':
+      '⚠️ Thread created but auto-bind to `{subdir}` failed: {error}\nOpen the thread and run /bind.',
+
+    // ── /help context-aware ──
+    'help.general':
+      '*Commands in General:*\n' +
+      '/ls — list WORK_ROOT subfolders\n' +
+      '/list — list threads\n' +
+      '/new <name> [subdir] — create a thread\n' +
+      '/where — global summary\n' +
+      '/status — status of all threads\n' +
+      '/whoami /version — debug\n\n' +
+      'To talk to an agent — open a topical thread.',
+    'help.thread_unbound':
+      '*Thread is not bound to a folder.*\n' +
+      '/bind <subdir> — bind (or pick from the list)\n' +
+      '/where — show state\n' +
+      '/ls — WORK_ROOT subfolders (in General)',
+    'help.thread_bound':
+      '*Thread bound to `{subdir}`.*\n' +
+      '/claude /opencode — start an agent\n' +
+      '/agent /model /sessions — choose/switch\n' +
+      '/stop /status /output — control\n' +
+      '/clear — delete thread messages\n' +
+      '/c /y /n /enter /up /down /tab — TUI keys (Claude)\n' +
+      '/where /unbind — manage binding',
+
+    // ── /whoami /version /status (global) ──
+    'whoami.report':
+      '👤 user: `{userId}`\n💬 chat: `{chatId}`\n🧵 thread: `{threadId}`\n' +
+      '🔐 allowed: {allowed}\n📁 binding: {binding}',
+    'whoami.binding_unbound': '(no binding)',
+    'version.report':
+      '*telegramCode {bot}*\n' +
+      'Node: {node}\n' +
+      'tmux: {tmux}\n' +
+      'claude: {claude}\n' +
+      'opencode: {opencode}',
+    'version.unknown': '(unavailable)',
+    'status.global_header': '📊 *All threads* ({total}):',
+    'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
+    'status.global_empty': '📊 No threads yet.',
 
     'agent.ready': '{label} ready in `{subdir}`{argsSuffix}\nSend a message:',
     'agent.no_session': 'No agent running. /agent to pick, /claude or /opencode to start.',

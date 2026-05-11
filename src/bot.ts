@@ -5,6 +5,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import * as http from 'http';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 import {
   getAdapter,
@@ -1002,6 +1006,28 @@ command('start', async (_ctx, key) => {
 });
 
 command('status', async (_ctx, key) => {
+  // In General the per-thread status is meaningless (no binding ever) — so
+  // we promote /status to a workspace-wide overview there. Topical threads
+  // keep the per-thread report.
+  if (checkIsGeneral(key)) {
+    const rows = collectBindingRows();
+    if (rows.length === 0) {
+      await replyToThread(key, t('status.global_empty'));
+      return;
+    }
+    const body = rows.map(r => t('status.global_row', {
+      key: keyToString(r.key),
+      subdir: r.subdir,
+      agent: r.agentLabel,
+      status: formatBindingStatus(r),
+    })).join('\n');
+    await replyToThread(
+      key,
+      `${t('status.global_header', { total: rows.length })}\n${body}`,
+      { parse_mode: 'Markdown' },
+    );
+    return;
+  }
   const adapter = getThreadAdapter(key);
   const isActive = adapter.checkIsActive(key);
   const adapterName = getThreadAdapterName(key);
@@ -1140,6 +1166,269 @@ command('where', async (_ctx, key) => {
       agent: adapter.label,
       status: isActive ? 'running' : 'stopped',
     }),
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  /ls /list /new — General-scoped info & creation (plan §11 Этап 4)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Build the Telegram deeplink for a thread inside our private
+ * supergroup. Format `https://t.me/c/<chatid_short>/<thread_id>/1` matches
+ * what the official client uses; `chatid_short` is the chat id with the
+ * `-100` supergroup prefix stripped.
+ *
+ * Telegram requires the trailing `/1` to land on the *first* message of the
+ * topic; without it, clients sometimes open the chat root and lose context.
+ */
+function makeThreadDeeplink(chatId: number, threadId: number): string {
+  const shortId = String(chatId).replace(/^-100/, '');
+  return `https://t.me/c/${shortId}/${threadId}/1`;
+}
+
+// `/ls` is intentionally available in topical threads too — there's no
+// security reason to refuse, and it's handy when the user wants to see
+// siblings before running /bind.
+command('ls', async (_ctx, key) => {
+  const subdirs = listAvailableSubdirs(ENV.workRoot);
+  if (subdirs.length === 0) {
+    await replyToThread(key, t('ls.empty'));
+    return;
+  }
+  const body = subdirs.map(s => `• \`${s}\``).join('\n');
+  await replyToThread(
+    key,
+    `${t('ls.header', { workRoot: ENV.workRoot })}\n${body}`,
+    { parse_mode: 'Markdown' },
+  );
+});
+
+/**
+ * @description Iterate the bindings, sort them deterministically and resolve
+ * each thread's display label + activity. Shared between `/list` and the
+ * General-scoped branch of `/status` so adapter-resolution safety and
+ * sort/render rules stay aligned.
+ *
+ * `getAdapter(agent.name)` *throws* on unknown adapter names — the same
+ * binding may have been persisted with an adapter that has since been
+ * renamed or removed, so we wrap the lookup defensively and fall back to
+ * the stored name. Without this, the very first stale binding crashes the
+ * whole report (review CRITICAL #1).
+ */
+interface BindingRow {
+  key: ThreadKey;
+  subdir: string;
+  closed: boolean;
+  agentLabel: string;
+  isActive: boolean;
+}
+
+function collectBindingRows(): BindingRow[] {
+  const bindings = [...state.listBindings()];
+  bindings.sort((a, b) => a.key.threadId - b.key.threadId);
+  return bindings.map(({ key: k, data }) => {
+    const agent = state.getAgent(k);
+    let agentLabel = '—';
+    if (agent?.name) {
+      try { agentLabel = getAdapter(agent.name).label; }
+      catch { agentLabel = agent.name; }
+    }
+    let isActive = false;
+    if (agent) {
+      try { isActive = getThreadAdapter(k).checkIsActive(k); }
+      catch { /* keep false */ }
+    }
+    return {
+      key: k,
+      subdir: data.subdir,
+      closed: data.closed === true,
+      agentLabel,
+      isActive,
+    };
+  });
+}
+
+function formatBindingStatus(row: BindingRow): string {
+  if (row.closed) return '🔒 closed';
+  return row.isActive ? '🟢 running' : '⚪ stopped';
+}
+
+command('list', async (_ctx, key) => {
+  const rows = collectBindingRows();
+  if (rows.length === 0) {
+    await replyToThread(key, t('list.empty'));
+    return;
+  }
+  const body = rows.map(r => {
+    if (r.closed) {
+      return t('list.row_closed', {
+        threadId: r.key.threadId, subdir: r.subdir, agent: r.agentLabel,
+      });
+    }
+    return t('list.row', {
+      threadId: r.key.threadId,
+      subdir: r.subdir,
+      agent: r.agentLabel,
+      status: formatBindingStatus(r),
+    });
+  }).join('\n');
+  await replyToThread(
+    key,
+    `${t('list.header', { count: rows.length })}\n${body}`,
+    { parse_mode: 'Markdown' },
+  );
+});
+
+command('new', async (ctx, key) => {
+  if (!checkIsGeneral(key)) {
+    await replyToThread(key, t('new.in_topic'));
+    return;
+  }
+  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
+  if (parts.length === 0) {
+    await replyToThread(key, t('new.usage'));
+    return;
+  }
+  const name = parts[0];
+  // When `subdir` is omitted, fall back to the thread name — same logic as
+  // `forum_topic_created` auto-bind, so `/new overview` and "create topic
+  // named overview manually" produce identical state.
+  const requestedSubdir = parts[1] ?? name;
+
+  let topic: { message_thread_id: number };
+  try {
+    topic = await bot.telegram.createForumTopic(ENV.allowedGroupId, name);
+  } catch (e) {
+    const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
+    await replyToThread(key, t('new.failed', { error: desc }));
+    return;
+  }
+
+  const newKey: ThreadKey = { chatId: ENV.allowedGroupId, threadId: topic.message_thread_id };
+  const link = makeThreadDeeplink(newKey.chatId, newKey.threadId);
+
+  // Try to auto-bind to the requested subdir. If that fails (folder missing,
+  // path-traversal, etc.) we still keep the thread — user can /bind from
+  // inside it — but the General reply tells them what happened.
+  try {
+    const subdir = validateSubdir(ENV.workRoot, requestedSubdir);
+    await state.setBinding(newKey, subdir);
+    await replyToThread(
+      key,
+      t('new.created', { name, threadId: newKey.threadId, subdir, link }),
+      { parse_mode: 'Markdown' },
+    );
+    // Welcome inside the new thread mirrors `forum_topic_created` so the
+    // user doesn't get a different experience based on creation path.
+    await replyToThread(newKey, t('thread.welcome_bound', { subdir }));
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    if (parts.length >= 2) {
+      // User explicitly named a subdir → tell them why bind failed.
+      await replyToThread(key, t('new.bind_failed', { subdir: requestedSubdir, error }));
+    } else {
+      // Implicit subdir (= thread name) didn't match a folder; that's normal
+      // for ad-hoc topic names, just point at /bind.
+      await replyToThread(
+        key,
+        t('new.created_unbound', { name, threadId: newKey.threadId, link }),
+        { parse_mode: 'Markdown' },
+      );
+    }
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await replyToThread(newKey, t('thread.welcome_pick'), extra);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  /whoami /version /help /status (global) — debug & onboarding
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Best-effort version probe for an external CLI.
+ *
+ * `execFile` is used (not `exec`) to avoid shell expansion of the argument
+ * list — the binary name comes from configuration but the arg is constant.
+ * 1500ms is enough for any reasonable `--version` call and short enough to
+ * keep `/version` responsive when a binary hangs (e.g. opencode autostart
+ * during a transient netfail).
+ */
+async function getCliVersion(cmd: string, args: string[] = ['--version']): Promise<string> {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, { timeout: 1500 });
+    const out = (stdout || stderr || '').split('\n')[0].trim();
+    return out || t('version.unknown');
+  } catch {
+    return t('version.unknown');
+  }
+}
+
+command('version', async (_ctx, key) => {
+  // Read our own version from package.json so we don't drift if it ever bumps
+  // again without us updating a hardcoded string here.
+  let botVersion = t('version.unknown');
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    botVersion = pkg.version || botVersion;
+  } catch { /* fall through to unknown */ }
+
+  const [tmuxV, claudeV, opencodeV] = await Promise.all([
+    getCliVersion('tmux', ['-V']),
+    getCliVersion('claude'),
+    getCliVersion('opencode'),
+  ]);
+
+  await replyToThread(
+    key,
+    t('version.report', {
+      bot: botVersion,
+      node: process.version,
+      tmux: tmuxV,
+      claude: claudeV,
+      opencode: opencodeV,
+    }),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+command('whoami', async (ctx, key) => {
+  const userId = ctx.from?.id ?? 0;
+  const allowed = ENV.allowedUsers.includes(userId) && ctx.chat?.id === ENV.allowedGroupId;
+  const binding = state.getBinding(key);
+  await replyToThread(
+    key,
+    t('whoami.report', {
+      userId,
+      chatId: key.chatId,
+      threadId: key.threadId,
+      allowed: allowed ? 'yes' : 'no',
+      binding: binding ? `\`${binding.subdir}\`` : t('whoami.binding_unbound'),
+    }),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+command('help', async (_ctx, key) => {
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('help.general'), { parse_mode: 'Markdown' });
+    return;
+  }
+  const binding = state.getBinding(key);
+  if (!binding) {
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await replyToThread(key, t('help.thread_unbound'), {
+      parse_mode: 'Markdown',
+      ...(extra ?? {}),
+    });
+    return;
+  }
+  await replyToThread(
+    key,
+    t('help.thread_bound', { subdir: binding.subdir }),
+    { parse_mode: 'Markdown' },
   );
 });
 
@@ -1443,7 +1732,7 @@ command('clear', async (ctx, key) => {
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
-  'bind', 'unbind', 'where',
+  'bind', 'unbind', 'where', 'ls', 'list', 'new', 'whoami', 'version', 'help',
 ]);
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1979,9 +2268,13 @@ function handleAgentError(key: ThreadKey, error: Error): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const COMMANDS_MENU = [
+  { command: 'help', description: '❓ Context-aware help' },
   { command: 'bind', description: '📁 Bind thread to a subfolder' },
   { command: 'unbind', description: '🚫 Remove binding' },
   { command: 'where', description: '📍 Show current binding' },
+  { command: 'ls', description: '📂 List WORK_ROOT subfolders' },
+  { command: 'list', description: '🧵 List all bound threads' },
+  { command: 'new', description: '🆕 Create a new thread (General)' },
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
   { command: 'model', description: '🧠 Switch model' },
@@ -1990,6 +2283,8 @@ const COMMANDS_MENU = [
   { command: 'stop', description: '⏹ Stop agent' },
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
+  { command: 'whoami', description: '🪪 Show debug ids' },
+  { command: 'version', description: 'ℹ️ Versions of bot + CLI tools' },
   { command: 'enter', description: '↵ Press Enter' },
   { command: 'up', description: '⬆️ Arrow Up' },
   { command: 'down', description: '⬇️ Arrow Down' },

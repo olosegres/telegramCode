@@ -44,10 +44,30 @@ const dict: Record<Lang, Record<string, string>> = {
       '📁 Этот тред не привязан к папке. Используй /bind <subdir> или выбери из списка.',
     'thread.bound': '📁 Привязано к `{subdir}`.\nЗапусти /claude или /opencode.',
     'thread.unbound': '📁 Привязка снята.',
+    'thread.unbind_unbound': 'Тред и так не был привязан.',
     'thread.where_unbound': 'Тред не привязан к папке.',
+    'thread.where_root':
+      '📁 WORK_ROOT: `{workRoot}`\n📊 Привязок: {bindings}\n🟢 Активных сессий: {active}',
     'thread.where_bound': '📁 Папка: `{subdir}`\n🤖 Агент: {agent}\n🟢 Статус: {status}',
     'thread.general_no_agent':
       'General не привязан к папке — перейди в тематический тред для разговора с агентом.',
+    'thread.welcome_bound':
+      '👋 Тред создан и автоматически привязан к `{subdir}` (имя треда совпало с подпапкой).\nЗапусти /claude или /opencode.',
+    'thread.welcome_pick':
+      '👋 Тред создан. Привяжи папку: /bind <subdir>, или выбери из списка ниже.',
+    'thread.bind_collision':
+      '⚠️ Папка `{subdir}` уже используется в тредах: {threads}.\nПривязка добавлена; сессии независимы (свой tmux/SSE).',
+    'thread.no_agent_with_binding':
+      '📁 Папка `{subdir}` привязана. Запусти /claude или /opencode чтобы начать диалог.',
+
+    // ── /bind validation errors ──
+    'bind.usage': 'Использование: /bind <subdir>\nПример: /bind overview',
+    'bind.in_general':
+      '/bind работает только в тематических тредах, не в General.',
+    'bind.invalid_chars': '❌ В имени папки запрещены управляющие символы.',
+    'bind.not_found': '❌ Папка `{subdir}` не найдена в WORK_ROOT (`{workRoot}`).',
+    'bind.outside_root': '❌ Путь выходит за пределы WORK_ROOT.',
+    'bind.not_directory': '❌ `{subdir}` существует, но это не папка.',
 
     // ── agent lifecycle ──
     'agent.ready': '{label} готов в `{subdir}`{argsSuffix}\nОтправь сообщение:',
@@ -99,10 +119,30 @@ const dict: Record<Lang, Record<string, string>> = {
       '📁 This thread is not bound to a folder. Use /bind <subdir> or pick from the list.',
     'thread.bound': '📁 Bound to `{subdir}`.\nRun /claude or /opencode.',
     'thread.unbound': '📁 Binding cleared.',
+    'thread.unbind_unbound': 'Thread had no binding to clear.',
     'thread.where_unbound': 'Thread is not bound to a folder.',
+    'thread.where_root':
+      '📁 WORK_ROOT: `{workRoot}`\n📊 Bindings: {bindings}\n🟢 Active sessions: {active}',
     'thread.where_bound': '📁 Folder: `{subdir}`\n🤖 Agent: {agent}\n🟢 Status: {status}',
     'thread.general_no_agent':
       'General is not bound to a folder — switch to a topical thread to talk to an agent.',
+    'thread.welcome_bound':
+      '👋 Thread created and auto-bound to `{subdir}` (topic name matched a subfolder).\nRun /claude or /opencode.',
+    'thread.welcome_pick':
+      '👋 Thread created. Bind a folder: /bind <subdir>, or pick one below.',
+    'thread.bind_collision':
+      '⚠️ Folder `{subdir}` is already used by threads: {threads}.\nBinding added; sessions stay independent (own tmux/SSE).',
+    'thread.no_agent_with_binding':
+      '📁 Folder `{subdir}` is bound. Run /claude or /opencode to start the dialog.',
+
+    // ── /bind validation errors ──
+    'bind.usage': 'Usage: /bind <subdir>\nExample: /bind overview',
+    'bind.in_general':
+      '/bind only works in topical threads, not in General.',
+    'bind.invalid_chars': '❌ Folder name must not contain control characters.',
+    'bind.not_found': '❌ Folder `{subdir}` not found under WORK_ROOT (`{workRoot}`).',
+    'bind.outside_root': '❌ Path escapes WORK_ROOT.',
+    'bind.not_directory': '❌ `{subdir}` exists but is not a directory.',
 
     'agent.ready': '{label} ready in `{subdir}`{argsSuffix}\nSend a message:',
     'agent.no_session': 'No agent running. /agent to pick, /claude or /opencode to start.',

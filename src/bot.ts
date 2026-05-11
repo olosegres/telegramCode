@@ -729,6 +729,145 @@ function getWorkDir(key: ThreadKey): string {
   return ENV.workRoot;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Subdir validation + discovery (plan §13.7 / T1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Resolve a user-supplied `subdir` against `WORK_ROOT` and
+ * confirm it actually lives inside it.
+ *
+ * Defends against:
+ *  - `../etc/passwd` style traversal (resolve + strict equality / prefix
+ *    with trailing separator — naive `startsWith` would let `/work_root_evil`
+ *    match `/work_root`),
+ *  - Symlinks pointing outside the root (`realpathSync` resolves them),
+ *  - NUL bytes and control characters (some filesystems happily store them
+ *    but they trip shell-out and tmux command building downstream),
+ *  - Unicode NFD vs NFC drift (`café` typed in macOS Terminal is NFD; the
+ *    on-disk name is usually NFC).
+ *
+ * Throws an `Error` whose `.code` lets callers map to a localised reply:
+ *   - `BIND_INVALID_CHARS`, `BIND_NOT_FOUND`, `BIND_NOT_DIRECTORY`,
+ *     `BIND_OUTSIDE_ROOT`.
+ */
+class BindError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+    this.name = 'BindError';
+  }
+}
+
+function validateSubdir(workRoot: string, rawSubdir: string): string {
+  if (/[\x00-\x1f]/.test(rawSubdir)) {
+    throw new BindError('BIND_INVALID_CHARS', 'subdir contains control characters');
+  }
+
+  // Normalise to NFC — input from macOS Terminal often arrives NFD, but the
+  // on-disk entry was created NFC, so naive string compare misses it.
+  const normalised = rawSubdir.normalize('NFC').trim();
+  if (!normalised) {
+    throw new BindError('BIND_INVALID_CHARS', 'subdir is empty');
+  }
+
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(workRoot);
+  } catch (e) {
+    // The boot-time check already verified workRoot exists; treat this as a
+    // transient (e.g. user removed it) and translate to a not-found error so
+    // the caller reports a localised message rather than a stack trace.
+    throw new BindError('BIND_NOT_FOUND', `WORK_ROOT vanished: ${(e as Error).message}`);
+  }
+
+  const candidate = path.resolve(realRoot, normalised);
+  let realCandidate: string;
+  try {
+    realCandidate = fs.realpathSync(candidate);
+  } catch {
+    throw new BindError('BIND_NOT_FOUND', `subdir not found: ${normalised}`);
+  }
+
+  // Strict containment: exact equality OR proper prefix with the platform
+  // separator appended. Without the separator, `/work_root_evil` would
+  // satisfy `startsWith('/work_root')` — classic traversal trap.
+  if (
+    realCandidate !== realRoot &&
+    !realCandidate.startsWith(realRoot + path.sep)
+  ) {
+    throw new BindError('BIND_OUTSIDE_ROOT', `subdir resolves outside WORK_ROOT: ${realCandidate}`);
+  }
+
+  // Reject /bind . — binding to WORK_ROOT itself is exactly the unbound
+  // state we just spent the whole stage stopping users from sliding into.
+  // It also has no meaningful project context (no CLAUDE.md / .git scope).
+  if (realCandidate === realRoot) {
+    throw new BindError('BIND_OUTSIDE_ROOT', 'cannot bind to WORK_ROOT itself; pick a subfolder');
+  }
+
+  const stat = fs.statSync(realCandidate);
+  if (!stat.isDirectory()) {
+    throw new BindError('BIND_NOT_DIRECTORY', `${normalised} is not a directory`);
+  }
+
+  // Store the *relative* form so the on-disk record survives `WORK_ROOT`
+  // path changes (e.g. mount point rename). `getWorkDir` re-joins this with
+  // the current `ENV.workRoot` at runtime.
+  return path.relative(realRoot, realCandidate);
+}
+
+/**
+ * @description List immediate subdirectories of `WORK_ROOT` for the `/bind`
+ * inline-button picker and the `forum_topic_created` welcome message.
+ *
+ * Filters out hidden (`.*`) and synthetic (`__*`, `node_modules`, etc.) names
+ * — those are almost never project roots and would push real options off
+ * Telegram's inline-keyboard limit.
+ *
+ * Filters out names whose `bind_<name>` `callback_data` would exceed Telegram's
+ * 64-byte UTF-8 hard limit (Cyrillic / CJK / emoji names trip this fast at
+ * 2-4 bytes per char). Those folders are still bindable via the `/bind <name>`
+ * slash command — only the inline-button shortcut is hidden.
+ *
+ * `fs.readdirSync` is intentional: this is a low-cadence path (per /bind, per
+ * topic_created event), and the synchronous block is dwarfed by the Telegram
+ * round-trip that follows it.
+ */
+function listAvailableSubdirs(workRoot: string, limit = 50): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(workRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const skip = new Set(['node_modules', '.git', '.cache', '.idea', '.vscode']);
+  const callbackPrefix = 'bind_';
+  return entries
+    .filter(e => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('__') && !skip.has(e.name))
+    .map(e => e.name)
+    .filter(name => Buffer.byteLength(callbackPrefix + name, 'utf8') <= 64)
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, limit);
+}
+
+/**
+ * @description Build a `subdir`-suggestion keyboard for `/bind` and for the
+ * topic-creation welcome message. Two columns keeps the buttons readable on
+ * mobile clients. Subdirs whose callback_data exceeds 64 bytes are already
+ * filtered out upstream in `listAvailableSubdirs`.
+ */
+function buildBindKeyboard(subdirs: string[]) {
+  const rows = [];
+  for (let i = 0; i < subdirs.length; i += 2) {
+    const row = [Markup.button.callback(`📁 ${subdirs[i]}`, `bind_${subdirs[i]}`)];
+    if (subdirs[i + 1]) {
+      row.push(Markup.button.callback(`📁 ${subdirs[i + 1]}`, `bind_${subdirs[i + 1]}`));
+    }
+    rows.push(row);
+  }
+  return Markup.inlineKeyboard(rows);
+}
+
 async function startAgentSession(key: ThreadKey, args?: string): Promise<string> {
   markNeedsNewMessage(key);
   const adapter = getThreadAdapter(key);
@@ -877,6 +1016,133 @@ command('status', async (_ctx, key) => {
   );
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  /bind /unbind /where — thread ↔ subfolder binding (plan §11 Этап 4)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Persist a `key → subdir` binding and notify the user.
+ *
+ * Shared between the `/bind <subdir>` command and the `bind_<subdir>`
+ * inline-callback so both paths apply identical validation, collision
+ * checks (plan §11 Этап 4 — warn when other threads already use the same
+ * folder, decision D7) and acknowledgement formatting.
+ *
+ * Returns `null` on success or a localised error message on failure;
+ * callers decide whether to send via `replyToThread` (commands) or
+ * `editThreadMessage` (callback edits).
+ */
+async function applyBinding(key: ThreadKey, rawSubdir: string): Promise<string> {
+  let subdir: string;
+  try {
+    subdir = validateSubdir(ENV.workRoot, rawSubdir);
+  } catch (e) {
+    if (e instanceof BindError) {
+      switch (e.code) {
+        case 'BIND_INVALID_CHARS': return t('bind.invalid_chars');
+        case 'BIND_NOT_FOUND':     return t('bind.not_found', { subdir: rawSubdir, workRoot: ENV.workRoot });
+        case 'BIND_OUTSIDE_ROOT':  return t('bind.outside_root');
+        case 'BIND_NOT_DIRECTORY': return t('bind.not_directory', { subdir: rawSubdir });
+        default:                   return `❌ ${e.message}`;
+      }
+    }
+    return `❌ ${e instanceof Error ? e.message : String(e)}`;
+  }
+
+  // Collision warning: one folder may host several threads (D7), but the
+  // user should know they're about to join an existing workspace rather
+  // than start a fresh one.
+  const peers = state.listKeysForSubdir(subdir).filter(k => keyToString(k) !== keyToString(key));
+  await state.setBinding(key, subdir);
+
+  if (peers.length > 0) {
+    const peerList = peers.map(k => `\`${keyToString(k)}\``).join(', ');
+    return t('thread.bind_collision', { subdir, threads: peerList });
+  }
+  return t('thread.bound', { subdir });
+}
+
+command('bind', async (ctx, key) => {
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('bind.in_general'));
+    return;
+  }
+  // Collapse internal whitespace runs so `/bind   foo` works the same as
+  // `/bind foo` and we don't end up looking for a literal "foo  bar"
+  // directory because the user double-tapped space.
+  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
+  const arg = parts.join(' ');
+  if (!arg) {
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    if (subdirs.length === 0) {
+      await replyToThread(key, t('bind.usage'));
+      return;
+    }
+    await replyToThread(key, t('bind.usage'), buildBindKeyboard(subdirs));
+    return;
+  }
+  const reply = await applyBinding(key, arg);
+  await replyToThread(key, reply);
+});
+
+command('unbind', async (_ctx, key) => {
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('bind.in_general'));
+    return;
+  }
+  const binding = state.getBinding(key);
+  if (!binding) {
+    await replyToThread(key, t('thread.unbind_unbound'));
+    return;
+  }
+  // Stop any running session before discarding the binding so we don't leave
+  // an orphan tmux/SSE stream pointing at a directory we no longer track.
+  const adapter = getThreadAdapter(key);
+  if (adapter.checkIsActive(key)) {
+    try { adapter.stopSession(key); } catch (e) {
+      console.warn(`[unbind] stopSession failed for ${keyToString(key)}:`, e);
+    }
+  }
+  await state.removeBinding(key);
+  clearInMemoryThreadState(key);
+  await replyToThread(key, t('thread.unbound'));
+});
+
+command('where', async (_ctx, key) => {
+  if (checkIsGeneral(key)) {
+    const bindings = state.listBindings();
+    const active = bindings.filter(({ key: k }) => {
+      const a = state.getAgent(k);
+      if (!a) return false;
+      try { return getThreadAdapter(k).checkIsActive(k); } catch { return false; }
+    }).length;
+    await replyToThread(
+      key,
+      t('thread.where_root', {
+        workRoot: ENV.workRoot,
+        bindings: bindings.length,
+        active,
+      }),
+    );
+    return;
+  }
+  const binding = state.getBinding(key);
+  if (!binding) {
+    await replyToThread(key, t('thread.where_unbound'));
+    return;
+  }
+  const adapter = getThreadAdapter(key);
+  const isActive = adapter.checkIsActive(key);
+  await replyToThread(
+    key,
+    t('thread.where_bound', {
+      subdir: binding.subdir,
+      agent: adapter.label,
+      status: isActive ? 'running' : 'stopped',
+    }),
+  );
+});
+
 async function handleStartCommand(
   ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>,
   key: ThreadKey,
@@ -884,6 +1150,14 @@ async function handleStartCommand(
 ): Promise<void> {
   if (checkIsGeneral(key)) {
     await replyToThread(key, t('error.start_in_general'));
+    return;
+  }
+  // Refuse to start an agent without a binding — same rationale as the
+  // natural-language path in the text handler (plan §11 Этап 4).
+  if (!state.getBinding(key)) {
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
   setThreadAdapter(key, adapterName);
@@ -1169,6 +1443,7 @@ command('clear', async (ctx, key) => {
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
+  'bind', 'unbind', 'where',
 ]);
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1219,6 +1494,15 @@ bot.on(message('text'), async (ctx) => {
         await replyToThread(key, t('error.start_in_general'));
         return;
       }
+      // Plan §11 Этап 4: starting an agent without a binding would silently
+      // launch it against WORK_ROOT itself. That's almost never what the
+      // user wants, so refuse and offer the picker instead.
+      if (!state.getBinding(key)) {
+        const subdirs = listAvailableSubdirs(ENV.workRoot);
+        const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+        await replyToThread(key, t('thread.no_binding'), extra);
+        return;
+      }
       setThreadAdapter(key, startMatch.adapterName);
       const msg = await startAgentSession(key, startMatch.args);
       await replyToThread(key, msg);
@@ -1250,12 +1534,22 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // Idle thread — guide the user.
+  // Idle thread — guide the user. Three sub-states:
+  //   • General → it's never bindable, just point at topical threads.
+  //   • Topical without binding → offer the subdir picker (plan §20.6).
+  //   • Topical with binding → existing /claude /opencode hint.
   if (checkIsGeneral(key)) {
     await replyToThread(key, t('thread.general_no_agent'));
-  } else {
-    await replyToThread(key, t('agent.no_session'));
+    return;
   }
+  const binding = state.getBinding(key);
+  if (!binding) {
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await replyToThread(key, t('thread.no_binding'), extra);
+    return;
+  }
+  await replyToThread(key, t('thread.no_agent_with_binding', { subdir: binding.subdir }));
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1299,6 +1593,12 @@ bot.on(message('voice'), async (ctx) => {
           await replyToThread(key, t('error.start_in_general'));
           return;
         }
+        if (!state.getBinding(key)) {
+          const subdirs = listAvailableSubdirs(ENV.workRoot);
+          const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+          await replyToThread(key, t('thread.no_binding'), extra);
+          return;
+        }
         setThreadAdapter(key, startMatch.adapterName);
         const msg = await startAgentSession(key, startMatch.args);
         await replyToThread(key, msg);
@@ -1308,9 +1608,16 @@ bot.on(message('voice'), async (ctx) => {
     if (!adapter.checkIsActive(key)) {
       if (checkIsGeneral(key)) {
         await replyToThread(key, t('thread.general_no_agent'));
-      } else {
-        await replyToThread(key, t('agent.no_session'));
+        return;
       }
+      const binding = state.getBinding(key);
+      if (!binding) {
+        const subdirs = listAvailableSubdirs(ENV.workRoot);
+        const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+        await replyToThread(key, t('thread.no_binding'), extra);
+        return;
+      }
+      await replyToThread(key, t('thread.no_agent_with_binding', { subdir: binding.subdir }));
       return;
     }
 
@@ -1337,10 +1644,57 @@ bot.on('edited_message', async (ctx) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Forum service events — closed / reopened (deleted handled by send errors)
+//  Forum service events — created / deleted / closed / reopened
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// These service events are generated by *any* group admin (close/reopen
+/**
+ * @description Auto-bind a newly-created thread when its name matches an
+ * existing subdir; otherwise greet the user with the picker.
+ *
+ * Idempotent: the same event may arrive twice on bot restart, and the user's
+ * very first message can race the service message. If a binding already
+ * exists for this key we only re-send the welcome — never overwrite the
+ * chosen subdir (plan §13.9, D16).
+ */
+bot.on(message('forum_topic_created'), async (ctx) => {
+  const key = getThreadKey(ctx);
+  if (!key) return;
+  if (checkIsGeneral(key)) return; // General isn't created this way; defensive.
+
+  const topicName = ctx.message.forum_topic_created.name ?? '';
+  const existing = state.getBinding(key);
+
+  // Already bound — service event arrived after the user's first message
+  // (or on restart). Don't overwrite; quietly skip the welcome too, the
+  // user has already seen the binding ack.
+  if (existing) return;
+
+  const subdirs = listAvailableSubdirs(ENV.workRoot);
+  // NFC-normalised case-insensitive match — Telegram clients tend to send
+  // the topic name verbatim, but case drift is common (`Overview` vs
+  // `overview`). We normalise *both* sides because Linux filesystems happily
+  // preserve NFD names from older macOS/rsync sources, and the topic name
+  // from Telegram is always NFC. We auto-bind only on an exact
+  // (case-insensitive) match to keep the rule predictable.
+  const normalisedName = topicName.normalize('NFC').toLowerCase().trim();
+  const match = subdirs.find(s => s.normalize('NFC').toLowerCase() === normalisedName);
+  if (match) {
+    try {
+      const subdir = validateSubdir(ENV.workRoot, match);
+      await state.setBinding(key, subdir);
+      await replyToThread(key, t('thread.welcome_bound', { subdir }));
+      return;
+    } catch (e) {
+      console.warn(`[forum_topic_created] auto-bind failed for "${match}":`, e);
+      // Fall through to picker.
+    }
+  }
+
+  const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+  await replyToThread(key, t('thread.welcome_pick'), extra);
+});
+
+// Closed/reopened are generated by *any* group admin (close/reopen
 // requires `can_manage_topics`), who may not be in ALLOWED_USERS. We gate
 // only on group identity here so the binding's `closed` flag stays in
 // sync with reality regardless of who flipped it. (Review HIGH #2.)
@@ -1356,9 +1710,38 @@ bot.on(message('forum_topic_reopened'), async (ctx) => {
   await state.setBindingClosed(key, false);
 });
 
+// `forum_topic_deleted` is intentionally NOT handled here: Telegram doesn't
+// reliably emit a service message for topic deletion (and Telegraf 4.16.3
+// doesn't model it in its filter union), so we GC reactively via the 400
+// "message thread not found" branch in `handleSendError` (plan §13.10, E5).
+// That path also catches deletions that happen while the bot is offline,
+// which any service-message-based handler would miss anyway.
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Callback queries — model, agent switch, resume, opt buttons, qa answers
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Inline-button binding picker shown by `/bind` (without args),
+ * by the no-binding text-handler fallback, and by `forum_topic_created`.
+ *
+ * `bind_<subdir>` — subdir comes verbatim from the keyboard we just built,
+ * so it's pre-filtered to entries actually present in WORK_ROOT. We still
+ * route through `applyBinding` for validation parity with the slash command
+ * (case the disk state changes between keyboard send and callback receive).
+ */
+bot.action(/^bind_(.+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (checkIsGeneral(key)) {
+    await ctx.answerCbQuery('/bind only works in topical threads');
+    return;
+  }
+  const subdir = ctx.match[1];
+  await ctx.answerCbQuery(`Binding to ${subdir}…`);
+  const reply = await applyBinding(key, subdir);
+  await replyToThread(key, reply);
+});
 
 bot.action(/^model_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
@@ -1400,6 +1783,20 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
 bot.action(/^resume_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  // Resume must respect the same binding invariant as every other start
+  // path — otherwise picking an old session here would silently spawn an
+  // adapter against WORK_ROOT itself (review HIGH #2).
+  if (checkIsGeneral(key)) {
+    await ctx.answerCbQuery('Resume only works in topical threads');
+    return;
+  }
+  if (!state.getBinding(key)) {
+    await ctx.answerCbQuery('Bind a folder first via /bind');
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await replyToThread(key, t('thread.no_binding'), extra);
+    return;
+  }
   const sessionId = ctx.match[1];
   const adapter = getThreadAdapter(key);
   markNeedsNewMessage(key);
@@ -1582,6 +1979,9 @@ function handleAgentError(key: ThreadKey, error: Error): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const COMMANDS_MENU = [
+  { command: 'bind', description: '📁 Bind thread to a subfolder' },
+  { command: 'unbind', description: '🚫 Remove binding' },
+  { command: 'where', description: '📍 Show current binding' },
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
   { command: 'model', description: '🧠 Switch model' },

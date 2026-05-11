@@ -1,14 +1,25 @@
 import { execSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession } from '../types';
+import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
+import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
 
+/**
+ * @description Per-thread Claude CLI session state.
+ *
+ * One tmux session is spawned per `ThreadKey`. The tmux session name embeds
+ * both `chatId` and `threadId` so multiple threads sharing the same `workDir`
+ * stay fully isolated (plan §10.2, D8).
+ */
 interface ClaudeSession {
-  userId: number;
+  key: ThreadKey;
   workDir: string;
   sessionName: string;
+  /** UUID we pass via `--session-id` (or, on resume, via `--resume`). */
+  claudeSessionId: string;
   pollTimer: NodeJS.Timeout | null;
   lastContent: string;
   isActive: boolean;
@@ -21,6 +32,40 @@ interface ClaudeSession {
 const pollInterval = 300;
 const claudePath = process.env.HOME + '/.npm-global/bin/claude';
 const sessionsFile = path.join(process.env.HOME || '/tmp', '.claude-sessions.json');
+
+/**
+ * @description Tmux session name for a `ThreadKey`.
+ *
+ * Format: `claude-<chatId>-<threadId>`. Negative chat ids (forum supergroups
+ * are negative) keep their minus sign — tmux session names accept it. The
+ * format is `parse`-able back to `ThreadKey` via {@link parseTmuxSessionName}.
+ */
+function buildTmuxSessionName(key: ThreadKey): string {
+  return `claude-${key.chatId}-${key.threadId}`;
+}
+
+/**
+ * @description Inverse of {@link buildTmuxSessionName}. Returns `null` for
+ * names that don't match our format (e.g. unrelated tmux sessions a user
+ * started by hand).
+ *
+ * Carefully handles negative chat ids: `claude--1001234-42` is `chatId=-1001234, threadId=42`.
+ */
+function parseTmuxSessionName(name: string): ThreadKey | null {
+  // The numeric pair after "claude-" is "<chatId>-<threadId>".
+  // chatId may be negative (forum supergroup). We split from the right on the
+  // last '-' so the trailing token is always threadId regardless of sign.
+  if (!name.startsWith('claude-')) return null;
+  const rest = name.slice('claude-'.length);
+  const lastDash = rest.lastIndexOf('-');
+  if (lastDash <= 0) return null;
+  const chatIdStr = rest.slice(0, lastDash);
+  const threadIdStr = rest.slice(lastDash + 1);
+  const chatId = Number(chatIdStr);
+  const threadId = Number(threadIdStr);
+  if (!Number.isFinite(chatId) || !Number.isFinite(threadId)) return null;
+  return { chatId, threadId };
+}
 
 function tmux(...args: string[]): string {
   try {
@@ -261,29 +306,68 @@ function saveStoredSession(session: StoredSession): void {
   }
 }
 
+/**
+ * @description Shell-quote a path for safe inclusion in a tmux `send-keys "..."` command.
+ *
+ * The tmux command line concatenates: `tmux send-keys -t <name> "cd <dir> && claude ..."`.
+ * The dir is interpreted by the user's shell after tmux delivers the keystrokes, so we
+ * single-quote it. Embedded single quotes are escaped via the standard
+ * `'\''` close-reopen idiom. This is the path Claude will `cd` into, so paths with
+ * spaces or special chars (e.g. `~/my projects/foo`) must survive untouched.
+ */
+function shellSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
   readonly outputsDeltas = true;
 
-  private sessions: Map<number, ClaudeSession> = new Map();
+  /**
+   * Map of serialised `ThreadKey` (`"<chatId>:<threadId>"`) → live session.
+   * Keyed by string rather than `ThreadKey` object so map lookups work — JS
+   * Map compares object identity, not structural equality.
+   */
+  private sessions: Map<string, ClaudeSession> = new Map();
 
-  async startSession(userId: number, workDir: string, args?: string): Promise<void> {
-    this.stopSession(userId);
+  async startSession(
+    key: ThreadKey,
+    workDir: string,
+    args?: string,
+    sessionId?: string,
+  ): Promise<void> {
+    this.stopSession(key);
 
     if (!checkIsInstalled('claude')) {
-      this.emit('output', userId, 'Installing Claude Code...');
+      this.emit('output', key, 'Installing Claude Code...');
       await installTool('claude');
     }
 
-    const sessionName = `claude-${userId}`;
-    console.log(`[Claude] Starting tmux session ${sessionName} in ${workDir}${args ? ` with args: ${args}` : ''}`);
+    const sessionName = buildTmuxSessionName(key);
+    // If the bot didn't provide a UUID, mint one ourselves. The plan owns
+    // generation in bot.ts so it can be persisted in state.json (D14), but
+    // until §11 Этап 3 wires that up we mint here as a safe default.
+    const claudeSessionId = sessionId || randomUUID();
+    console.log(
+      `[Claude] Starting tmux session ${sessionName} in ${workDir} ` +
+      `(sessionId=${claudeSessionId})${args ? ` with args: ${args}` : ''}`,
+    );
 
+    // Make sure no stale session with the same name is lingering.
     tmux('kill-session', '-t', sessionName);
 
     const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
+    // Build the command we'll send into tmux as a single shell line.
+    // --session-id <uuid> assigns the UUID to the NEW session so we can later
+    // resume by UUID (plan §13.1). --dangerously-skip-permissions stays hardcoded
+    // by D44 (symmetry with opencode auto-approve).
     const claudeArgs = args ? ` ${args}` : '';
-    const startClaudeCmd = `tmux send-keys -t ${sessionName} "cd ${workDir} && ${claudePath} --dangerously-skip-permissions${claudeArgs}" Enter`;
+    const claudeCmd =
+      `cd ${shellSingleQuote(workDir)} && ` +
+      `${claudePath} --dangerously-skip-permissions ` +
+      `--session-id ${claudeSessionId}${claudeArgs}`;
+    const startClaudeCmd = `tmux send-keys -t ${sessionName} ${JSON.stringify(claudeCmd)} Enter`;
     try {
       execSync(createCmd, { encoding: 'utf-8', timeout: 5000 });
       console.log(`[Claude] tmux session created`);
@@ -291,7 +375,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[Claude] claude command sent`);
     } catch (e) {
       console.error(`[Claude] Failed to create tmux session:`, e);
-      this.emit('error', userId, new Error('Failed to start Claude session'));
+      this.emit('error', key, new Error('Failed to start Claude session'));
       return;
     }
 
@@ -304,9 +388,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     });
 
     const session: ClaudeSession = {
-      userId,
+      key,
       workDir,
       sessionName,
+      claudeSessionId,
       pollTimer: null,
       lastContent: '',
       isActive: true,
@@ -315,16 +400,17 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       lastStatusText: '',
     };
 
-    this.sessions.set(userId, session);
-    session.pollTimer = setInterval(() => this.pollOutput(userId), pollInterval);
-    this.emit('started', userId);
+    this.sessions.set(keyToString(key), session);
+    session.pollTimer = setInterval(() => this.pollOutput(key), pollInterval);
+    this.emit('started', key);
   }
 
-  stopSession(userId: number): void {
-    const session = this.sessions.get(userId);
+  stopSession(key: ThreadKey): void {
+    const k = keyToString(key);
+    const session = this.sessions.get(k);
     if (!session) return;
 
-    console.log(`[Claude] Stopping session for user ${userId}`);
+    console.log(`[Claude] Stopping session for ${k}`);
 
     session.isActive = false;
     if (session.pollTimer) {
@@ -332,22 +418,22 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     tmux('kill-session', '-t', session.sessionName);
-    this.sessions.delete(userId);
-    this.emit('stopped', userId);
+    this.sessions.delete(k);
+    this.emit('stopped', key);
   }
 
-  checkIsActive(userId: number): boolean {
-    const session = this.sessions.get(userId);
+  checkIsActive(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
     if (!session) return false;
 
     const sessions = tmux('list-sessions', '-F', '#{session_name}');
     return sessions.includes(session.sessionName);
   }
 
-  sendInput(userId: number, input: string): void {
-    const session = this.sessions.get(userId);
+  sendInput(key: ThreadKey, input: string): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) {
-      console.log(`[Claude] sendInput: no active session for user ${userId}`);
+      console.log(`[Claude] sendInput: no active session for ${keyToString(key)}`);
       return;
     }
 
@@ -367,8 +453,8 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
-  sendSignal(userId: number, signal: string): void {
-    const session = this.sessions.get(userId);
+  sendSignal(key: ThreadKey, signal: string): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     if (signal === 'SIGINT') {
@@ -377,24 +463,24 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
-  sendEnter(userId: number): void {
-    const session = this.sessions.get(userId);
+  sendEnter(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     console.log(`[Claude] sendEnter`);
     tmux('send-keys', '-t', session.sessionName, 'Enter');
   }
 
-  sendArrow(userId: number, direction: 'Up' | 'Down'): void {
-    const session = this.sessions.get(userId);
+  sendArrow(key: ThreadKey, direction: 'Up' | 'Down'): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     console.log(`[Claude] sendArrow: ${direction}`);
     tmux('send-keys', '-t', session.sessionName, direction);
   }
 
-  sendTab(userId: number): void {
-    const session = this.sessions.get(userId);
+  sendTab(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     console.log(`[Claude] sendTab`);
@@ -405,16 +491,16 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * @description For Claude CLI, model switching is done via the /model slash command.
    * Sends "/model <modelId>" as input to the tmux session.
    */
-  setModel(userId: number, modelId: string): void {
-    this.sendInput(userId, `/model ${modelId}`);
+  setModel(key: ThreadKey, modelId: string): void {
+    this.sendInput(key, `/model ${modelId}`);
   }
 
-  getCurrentModel(_userId: number): string | null {
+  getCurrentModel(_key: ThreadKey): string | null {
     return null;
   }
 
-  getFullOutput(userId: number, lines: number = 500): string | null {
-    const session = this.sessions.get(userId);
+  getFullOutput(key: ThreadKey, lines: number = 500): string | null {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return null;
 
     const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-S', `-${lines}`);
@@ -423,7 +509,16 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     return cleanOutput(raw);
   }
 
-  async getSessions(): Promise<AgentSession[]> {
+  /**
+   * @description Expose the Claude `--session-id` UUID for a live session.
+   * The bot calls this right after `startSession()` so the UUID can be
+   * persisted in state.json and reused on later resumes (plan §13.1, D14).
+   */
+  getClaudeSessionId(key: ThreadKey): string | null {
+    return this.sessions.get(keyToString(key))?.claudeSessionId ?? null;
+  }
+
+  async getSessions(_key: ThreadKey): Promise<AgentSession[]> {
     const stored = loadStoredSessions();
     return stored.map(s => ({
       id: s.id,
@@ -433,40 +528,58 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }));
   }
 
-  async resumeSession(userId: number, _sessionId: string): Promise<void> {
-    // For Claude CLI, --resume resumes the last conversation in the workDir
-    // sessionId is not directly used since Claude CLI resume is workDir-based
-    const session = this.sessions.get(userId);
-    const workDir = session?.workDir || process.env.WORK_DIR || '/workspace';
-
-    this.stopSession(userId);
+  /**
+   * @description Resume a Claude session by UUID.
+   *
+   * Two fixes vs. the legacy implementation:
+   *
+   * 1. **Required `workDir`.** The old `resumeSession` fell back to
+   *    `process.env.WORK_DIR || '/workspace'`, which is wrong as soon as the
+   *    bot manages multiple folders. The bot now passes the correct workDir
+   *    from the thread binding.
+   *
+   * 2. **Use `--resume <uuid>` instead of `--resume` with no argument.** The
+   *    no-arg form opens an interactive picker that can't be driven from a
+   *    headless tmux pane, which manifested as a silent hang (see plan
+   *    §13.1, fix to claudeCliAdapter.ts:455). If Claude can't find the UUID
+   *    (history pruned, different machine), it just starts a new session;
+   *    we surface that to the user (T8 in plan §16.3).
+   */
+  async resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
+    this.stopSession(key);
 
     if (!checkIsInstalled('claude')) {
-      this.emit('output', userId, 'Installing Claude Code...');
+      this.emit('output', key, 'Installing Claude Code...');
       await installTool('claude');
     }
 
-    const sessionName = `claude-${userId}`;
-    console.log(`[Claude] Resuming session in ${workDir}`);
+    const sessionName = buildTmuxSessionName(key);
+    console.log(`[Claude] Resuming session ${sessionId} in ${workDir} for ${keyToString(key)}`);
 
     tmux('kill-session', '-t', sessionName);
 
     const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
-    const startClaudeCmd = `tmux send-keys -t ${sessionName} "cd ${workDir} && ${claudePath} --dangerously-skip-permissions --resume" Enter`;
+    // Pass the UUID explicitly. If it's unknown to claude, it'll just print a
+    // notice and start fresh — better than hanging on a picker.
+    const claudeCmd =
+      `cd ${shellSingleQuote(workDir)} && ` +
+      `${claudePath} --dangerously-skip-permissions --resume ${sessionId}`;
+    const startClaudeCmd = `tmux send-keys -t ${sessionName} ${JSON.stringify(claudeCmd)} Enter`;
 
     try {
       execSync(createCmd, { encoding: 'utf-8', timeout: 5000 });
       execSync(startClaudeCmd, { encoding: 'utf-8', timeout: 5000 });
     } catch (e) {
       console.error(`[Claude] Failed to resume session:`, e);
-      this.emit('error', userId, new Error('Failed to resume Claude session'));
+      this.emit('error', key, new Error('Failed to resume Claude session'));
       return;
     }
 
     const claudeSession: ClaudeSession = {
-      userId,
+      key,
       workDir,
       sessionName,
+      claudeSessionId: sessionId,
       pollTimer: null,
       lastContent: '',
       isActive: true,
@@ -475,22 +588,119 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       lastStatusText: '',
     };
 
-    this.sessions.set(userId, claudeSession);
-    claudeSession.pollTimer = setInterval(() => this.pollOutput(userId), pollInterval);
-    this.emit('started', userId);
+    this.sessions.set(keyToString(key), claudeSession);
+    claudeSession.pollTimer = setInterval(() => this.pollOutput(key), pollInterval);
+    this.emit('started', key);
   }
 
-  private pollOutput(userId: number): void {
-    const session = this.sessions.get(userId);
+  /**
+   * @description Pick up tmux sessions that outlived the bot process.
+   *
+   * Called by `bot.ts` on startup, BEFORE `bot.launch()`. Scans
+   * `tmux list-sessions` for names matching our `claude-<chatId>-<threadId>`
+   * convention. For each match, returns the parsed key + tmux session name —
+   * the bot then decides which ones to re-adopt (must have a live binding in
+   * state.json) and which are orphans to garbage-collect (plan §10.2 / §13.19, E1).
+   *
+   * This method does NOT itself adopt sessions: it has no knowledge of state.json
+   * or which sessions are still bound. The actual re-attach is done by the bot
+   * calling {@link adoptExistingTmuxSession} for each key it wants to keep.
+   *
+   * Returns an empty array if tmux isn't installed or no matching sessions exist.
+   */
+  async listExistingTmuxSessions(): Promise<Array<{ key: ThreadKey; sessionName: string }>> {
+    const raw = tmux('list-sessions', '-F', '#{session_name}');
+    if (!raw) return [];
+    const names = raw.split('\n').map(s => s.trim()).filter(Boolean);
+    const result: Array<{ key: ThreadKey; sessionName: string }> = [];
+    for (const name of names) {
+      const key = parseTmuxSessionName(name);
+      if (key) result.push({ key, sessionName: name });
+    }
+    return result;
+  }
+
+  /**
+   * @description Adopt a tmux session that survived a bot restart.
+   *
+   * The bot calls this after `listExistingTmuxSessions()` for each
+   * `(key, sessionName)` pair it wants to keep alive. Restores the in-memory
+   * `ClaudeSession` and resumes polling so output flows back to Telegram.
+   *
+   * `workDir` and `claudeSessionId` come from state.json (the bot keeps a
+   * binding `(key → subdir, claudeSessionId)`). If we ever lose them, the
+   * caller should kill the tmux session as an orphan instead.
+   *
+   * Returns `true` on success, `false` if the tmux session disappeared between
+   * the `list` call and now (race with manual `tmux kill-session`).
+   */
+  adoptExistingTmuxSession(
+    key: ThreadKey,
+    sessionName: string,
+    workDir: string,
+    claudeSessionId: string,
+  ): boolean {
+    const sessions = tmux('list-sessions', '-F', '#{session_name}');
+    if (!sessions.includes(sessionName)) {
+      console.log(`[Claude] adopt: tmux session ${sessionName} no longer exists`);
+      return false;
+    }
+
+    const k = keyToString(key);
+    // If we already have a tracked session for this key, leave it alone.
+    if (this.sessions.has(k)) {
+      console.log(`[Claude] adopt: already tracking ${k}, skipping`);
+      return true;
+    }
+
+    console.log(`[Claude] adopt: re-attaching to ${sessionName} in ${workDir}`);
+    const session: ClaudeSession = {
+      key,
+      workDir,
+      sessionName,
+      claudeSessionId,
+      pollTimer: null,
+      lastContent: '',
+      isActive: true,
+      handledAutoEnter: true,  // don't try to auto-Enter on a session that's already past startup
+      handledAutoAccept: true, // same — bypass-permissions was accepted on the original launch
+      lastStatusText: '',
+    };
+    this.sessions.set(k, session);
+    session.pollTimer = setInterval(() => this.pollOutput(key), pollInterval);
+    this.emit('started', key);
+    return true;
+  }
+
+  /**
+   * @description Kill a tmux session by name without touching adapter state.
+   *
+   * The bot uses this on startup to garbage-collect orphan tmux sessions
+   * (`claude-<chatId>-<threadId>` names with no corresponding binding in
+   * state.json). See plan §10.2 / §13.19.
+   */
+  killOrphanTmuxSession(sessionName: string): void {
+    console.log(`[Claude] kill orphan tmux session: ${sessionName}`);
+    tmux('kill-session', '-t', sessionName);
+  }
+
+  // Exposed for tests (see §11 Этап 7, R10): keeps the tmux-name parsing
+  // logic unit-testable without instantiating the adapter (which would try to
+  // auto-install claude on construction).
+  static parseTmuxSessionName = parseTmuxSessionName;
+  static buildTmuxSessionName = buildTmuxSessionName;
+
+  private pollOutput(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-e', '-S', '-200');
 
     if (!raw) {
-      if (!this.checkIsActive(userId)) {
+      if (!this.checkIsActive(key)) {
         console.log(`[Claude] Session died, cleaning up`);
-        this.stopSession(userId);
-        this.emit('closed', userId);
+        this.stopSession(key);
+        this.emit('closed', key);
       }
       return;
     }
@@ -513,11 +723,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
             const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
             if (normalized !== session.lastStatusText) {
               session.lastStatusText = normalized;
-              this.emit('status', userId, cleanedOutput);
+              this.emit('status', key, cleanedOutput);
             }
           } else {
             session.lastStatusText = '';
-            this.emit('output', userId, cleanedOutput);
+            this.emit('output', key, cleanedOutput);
           }
         } else {
           console.log(`[Claude] Output filtered out completely`);

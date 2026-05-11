@@ -1,0 +1,180 @@
+/**
+ * @description Lightweight i18n for the multi-thread bot.
+ *
+ * The previous bot mixed Russian and English user-facing strings ad-hoc.
+ * The new bot has a single source of truth: a dictionary keyed by short
+ * stable codes, with language picked via `BOT_LANG` (`ru` | `en`, default
+ * `ru`). Plan §20.9.
+ *
+ * Design choices:
+ *
+ * 1. **Codes, not English-as-key.** `'thread.bound'` instead of
+ *    `'📁 Bound to {subdir}'` so renames don't ripple through `t()` calls
+ *    and so translators see semantic intent.
+ * 2. **No external library.** A handful of strings and one fallback rule
+ *    don't justify pulling in i18next. Easy to swap later.
+ * 3. **`{placeholder}` substitution.** Single regex pass, escapes are
+ *    handled by callers (we don't try to be markdown-aware).
+ * 4. **English is the fallback** so missing translations degrade gracefully
+ *    rather than echoing the code back to the user.
+ *
+ * Error templates (plan §20.7) are co-located here under the `error.*`
+ * namespace and consumed via {@link errorMessage}, which is sugar over
+ * `t()` plus button hints.
+ */
+
+type Lang = 'ru' | 'en';
+
+/**
+ * @description Dictionary of user-facing strings.
+ *
+ * Two-level structure: top key = lang, nested key = message code. We keep
+ * the type permissive (`Record<string, string>`) so new codes can land
+ * without touching a giant type — drift is caught by a runtime fallback
+ * to English, not by TypeScript.
+ */
+const dict: Record<Lang, Record<string, string>> = {
+  ru: {
+    // ── access ──
+    'access.denied': 'Доступ запрещён.',
+    'access.group_only': 'Я работаю только в настроенной forum-супергруппе.',
+
+    // ── bindings / threads ──
+    'thread.no_binding':
+      '📁 Этот тред не привязан к папке. Используй /bind <subdir> или выбери из списка.',
+    'thread.bound': '📁 Привязано к `{subdir}`.\nЗапусти /claude или /opencode.',
+    'thread.unbound': '📁 Привязка снята.',
+    'thread.where_unbound': 'Тред не привязан к папке.',
+    'thread.where_bound': '📁 Папка: `{subdir}`\n🤖 Агент: {agent}\n🟢 Статус: {status}',
+    'thread.general_no_agent':
+      'General не привязан к папке — перейди в тематический тред для разговора с агентом.',
+
+    // ── agent lifecycle ──
+    'agent.ready': '{label} готов в `{subdir}`{argsSuffix}\nОтправь сообщение:',
+    'agent.no_session': 'Агент не запущен. /agent — выбрать, /claude или /opencode — старт.',
+    'agent.session_ended': '{label}: сессия завершена',
+    'agent.stopped': '{label} остановлен',
+    'agent.already_active': '{label} уже работает в этом треде. Отправь сообщение или /stop.',
+    'agent.starting': 'Запускаю {label} в `{subdir}`…',
+    'agent.start_failed': 'Не удалось запустить {label}: {error}',
+    'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
+
+    // ── /clear ──
+    'clear.summary':
+      '🗑 Удалено {deleted} сообщений из {total}. ' +
+      'Telegram не отдаёт ничего старше 48 ч — остальные останутся в истории.',
+    'clear.no_messages': 'Нет сообщений для удаления в этом треде.',
+
+    // ── edited message UX hint ──
+    'edited.hint':
+      '✏️ Редактирование сообщений я не вижу как новый ввод — отправь правку отдельным сообщением.',
+
+    // ── voice ──
+    'voice.no_api_key':
+      'Для голоса нужен GROQ_API_KEY (бесплатно) или OPENAI_API_KEY.',
+    'voice.failed': 'Не удалось распознать голосовое.',
+    'voice.transcribed': '🎤 {text}',
+
+    // ── error codes ──
+    'error.workdir.gone':
+      '📁 Папка `{subdir}` исчезла с диска. Сделай /unbind или /bind <newdir>.',
+    'error.tg.thread.deleted':
+      '⚠️ Тред удалён в Telegram, binding очищен.',
+    'error.tg.thread.closed':
+      '🔒 Тред {key} закрыт — переоткрой его в клиенте Telegram, или удали полностью.',
+    'error.tg.perm.delete':
+      '🔐 Не могу удалить сообщения. Выдай право `can_delete_messages` админу бота.',
+    'error.tg.perm.manage_topics':
+      '🔐 Не хватает прав `can_manage_topics`. Сделай меня админом группы.',
+    'error.state.corrupted':
+      '⚠️ state.json был повреждён, привязки пересозданы. Повтори /bind где нужно.',
+    'error.start_in_general':
+      'Запускать агента в General нельзя — это служебный топик. Открой тематический тред.',
+  },
+  en: {
+    'access.denied': 'Access denied.',
+    'access.group_only': 'I only work in the configured forum supergroup.',
+
+    'thread.no_binding':
+      '📁 This thread is not bound to a folder. Use /bind <subdir> or pick from the list.',
+    'thread.bound': '📁 Bound to `{subdir}`.\nRun /claude or /opencode.',
+    'thread.unbound': '📁 Binding cleared.',
+    'thread.where_unbound': 'Thread is not bound to a folder.',
+    'thread.where_bound': '📁 Folder: `{subdir}`\n🤖 Agent: {agent}\n🟢 Status: {status}',
+    'thread.general_no_agent':
+      'General is not bound to a folder — switch to a topical thread to talk to an agent.',
+
+    'agent.ready': '{label} ready in `{subdir}`{argsSuffix}\nSend a message:',
+    'agent.no_session': 'No agent running. /agent to pick, /claude or /opencode to start.',
+    'agent.session_ended': '{label}: session ended',
+    'agent.stopped': '{label} stopped',
+    'agent.already_active': '{label} is already running here. Send a message or /stop.',
+    'agent.starting': 'Starting {label} in `{subdir}`…',
+    'agent.start_failed': 'Failed to start {label}: {error}',
+    'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
+
+    'clear.summary':
+      '🗑 Deleted {deleted} of {total} messages. ' +
+      'Telegram refuses to delete anything older than 48 h — the rest stays in history.',
+    'clear.no_messages': 'No messages to delete in this thread.',
+
+    'edited.hint':
+      '✏️ I don\'t treat edited messages as new input — send the correction as a separate message.',
+
+    'voice.no_api_key':
+      'Voice requires GROQ_API_KEY (free) or OPENAI_API_KEY.',
+    'voice.failed': 'Failed to transcribe voice message.',
+    'voice.transcribed': '🎤 {text}',
+
+    'error.workdir.gone':
+      '📁 Folder `{subdir}` is gone from disk. Run /unbind or /bind <newdir>.',
+    'error.tg.thread.deleted':
+      '⚠️ Thread was deleted in Telegram; binding cleared.',
+    'error.tg.thread.closed':
+      '🔒 Thread {key} is closed — reopen it in your Telegram client, or delete it entirely.',
+    'error.tg.perm.delete':
+      '🔐 Can\'t delete messages. Grant the bot `can_delete_messages`.',
+    'error.tg.perm.manage_topics':
+      '🔐 Missing `can_manage_topics`. Make me a group admin.',
+    'error.state.corrupted':
+      '⚠️ state.json was corrupted; bindings reset. Re-run /bind where needed.',
+    'error.start_in_general':
+      'Can\'t start an agent in General — that\'s a service topic. Open a topical thread.',
+  },
+};
+
+/** Active language, picked once at boot from `BOT_LANG`. */
+const lang: Lang = (process.env.BOT_LANG === 'en' ? 'en' : 'ru');
+
+/**
+ * @description Format a localised message.
+ *
+ * `opts` values are substituted into `{name}` placeholders. Unknown codes
+ * fall back to English; if the code is missing in English too, the code
+ * itself is returned (loud failure mode — easier to spot in tests / logs
+ * than a silently empty string).
+ */
+export function t(code: string, opts?: Record<string, string | number>): string {
+  const primary = dict[lang][code];
+  const fallback = dict.en[code];
+  let template = primary ?? fallback ?? code;
+  if (opts) {
+    for (const [k, v] of Object.entries(opts)) {
+      template = template.replace(new RegExp(`\\{${k}\\}`, 'g'), v.toString());
+    }
+  }
+  return template;
+}
+
+/**
+ * @description Sugar for {@link t} that prefixes the code with `error.`
+ * — purely cosmetic, makes call sites easier to read and grep for.
+ */
+export function errorMessage(code: string, opts?: Record<string, string | number>): string {
+  return t(`error.${code}`, opts);
+}
+
+/** Exposed for tests + `/doctor` output ("language: ru"). */
+export function getActiveLang(): Lang {
+  return lang;
+}

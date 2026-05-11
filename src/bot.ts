@@ -1,311 +1,481 @@
-import { Telegraf, type Context, Markup } from 'telegraf';
+import { Telegraf, Markup, type Context, type NarrowedContext } from 'telegraf';
 import { message } from 'telegraf/filters';
-import {
-  getUserAdapter,
-  getUserAdapterName,
-  setUserAdapter,
-  getAvailableAdapters,
-  getDefaultAdapterName,
-  registerAdapterEventHandlers,
-} from './adapters/createAdapter';
-import { withRateLimitRetry, checkIsRateLimited } from './rateLimiter';
-import { stopOpenCodeServer, checkIsOpenCodeServerRunning, ensureOpenCodeServer } from './installManager';
-import type { OpenCodePendingQuestion, OpenCodeQuestion } from './adapters/openCodeAdapter';
+import type { Update, Message } from 'telegraf/typings/core/types/typegram';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import * as http from 'http';
 
-const botToken = process.env.TELEGRAM_BOT_TOKEN;
-const allowedUsersEnv = process.env.ALLOWED_USERS;
-const defaultWorkDir = process.env.WORK_DIR || '/workspace';
-const openaiApiKey = process.env.OPENAI_API_KEY;
-const groqApiKey = process.env.GROQ_API_KEY;
+import {
+  getAdapter,
+  getThreadAdapter,
+  getThreadAdapterName,
+  setThreadAdapter,
+  getAvailableAdapters,
+  getDefaultAdapterName,
+  registerAdapterEventHandlers,
+} from './adapters/createAdapter';
+import type { ThreadKey } from './types';
+import { keyToString } from './types';
+import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
+import type { OpenCodePendingQuestion } from './adapters/openCodeAdapter';
+import {
+  enqueueSend,
+  checkIsRateLimited,
+} from './rateLimiter';
+import {
+  stopOpenCodeServer,
+  ensureOpenCodeServer,
+} from './installManager';
+import { getStateStore, type StateStore } from './state';
+import { t } from './i18n';
 
-if (!botToken) {
-  console.error('TELEGRAM_BOT_TOKEN is required');
-  process.exit(1);
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ENV parsing & fatal validation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Parse + validate boot environment. Throws (and ends the
+ * process via `index.ts`) on any required mis-configuration so the bot
+ * never silently runs in a half-broken state.
+ *
+ * Plan §10.7 lists the obligatory variables; §13.4 / §13.12 spell out
+ * the breaking renames (`WORK_DIR` → `WORK_ROOT`, new `ALLOWED_GROUP_ID`).
+ */
+function parseEnv() {
+  const errors: string[] = [];
+
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) errors.push('TELEGRAM_BOT_TOKEN is required');
+
+  const allowedUsersEnv = process.env.ALLOWED_USERS ?? '';
+  const allowedUsers = allowedUsersEnv
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter(n => Number.isFinite(n));
+  if (allowedUsers.length === 0) {
+    // P3 fix from plan §16.3: empty list after filter would silently ban
+    // everyone, which looks like a working bot that just never answers.
+    errors.push('ALLOWED_USERS must contain at least one numeric user id');
+  }
+
+  const allowedGroupIdRaw = process.env.ALLOWED_GROUP_ID;
+  const allowedGroupId = allowedGroupIdRaw ? Number(allowedGroupIdRaw) : NaN;
+  if (!Number.isFinite(allowedGroupId)) {
+    errors.push(
+      'ALLOWED_GROUP_ID is required — set it to the negative chat id of your forum supergroup',
+    );
+  }
+
+  // WORK_DIR deprecation (plan §13.12, D20).
+  if (process.env.WORK_DIR && !process.env.WORK_ROOT) {
+    errors.push(
+      'WORK_DIR is deprecated in 2.0; set WORK_ROOT to the parent folder ' +
+        'containing your projects (e.g., WORK_ROOT=/home/user/src). ' +
+        'Each forum thread will bind to a subdirectory under WORK_ROOT.',
+    );
+  }
+
+  const workRoot = process.env.WORK_ROOT;
+  if (!workRoot) {
+    errors.push('WORK_ROOT is required (parent dir of your project subfolders)');
+  } else {
+    try {
+      if (!fs.statSync(workRoot).isDirectory()) {
+        errors.push(`WORK_ROOT="${workRoot}" is not a directory`);
+      }
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? 'unknown';
+      errors.push(`WORK_ROOT="${workRoot}" is not accessible (${code})`);
+    }
+  }
+
+  if (errors.length > 0) {
+    for (const err of errors) console.error(`[startup] ${err}`);
+    process.exit(1);
+  }
+
+  return {
+    botToken: botToken!,
+    allowedUsers,
+    allowedGroupId,
+    workRoot: workRoot!,
+    defaultAgent: process.env.DEFAULT_AGENT || 'claude',
+    openaiApiKey: process.env.OPENAI_API_KEY,
+    groqApiKey: process.env.GROQ_API_KEY,
+  };
 }
 
-if (!allowedUsersEnv) {
-  console.error('ALLOWED_USERS is required for security');
-  process.exit(1);
-}
+const ENV = parseEnv();
+const bot = new Telegraf(ENV.botToken);
 
-const allowedUsers = allowedUsersEnv.split(',').filter(Boolean).map(Number);
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Constants
+// ═══════════════════════════════════════════════════════════════════════════════
 
-if (allowedUsers.length === 0) {
-  console.error('ALLOWED_USERS must contain at least one user ID');
-  process.exit(1);
-}
+/**
+ * @description `message_thread_id` of the General forum topic. The Bot API
+ * uses 1 for General; some clients omit `message_thread_id` entirely for
+ * General messages. We normalise both forms to 1 in `getThreadKey()` so
+ * routing is consistent (plan §4.3 point 3).
+ */
+const GENERAL_THREAD_ID = 1;
 
-const maxMessageLength = 4000;
-const messageIdsFile = path.join(process.env.HOME || '/tmp', '.telegram-bot-messages.json');
+/** Telegram caps a message at 4096 chars; we leave headroom for markdown noise. */
+const MAX_MESSAGE_LEN = 4000;
 
-const bot = new Telegraf(botToken);
+/** Debounce window for output batching. Telegram tolerates ~1 msg/sec/chat. */
+const OUTPUT_DEBOUNCE_MS = 1000;
 
-interface UserMessageState {
+// ═══════════════════════════════════════════════════════════════════════════════
+//  State store — singleton populated in startBot(), referenced by handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let state!: StateStore;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Per-thread in-memory state
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description UI state per `ThreadKey` — tracks the editable message id,
+ * status indicator, and loader message used for the typing UX. Lives in
+ * memory only (re-derived on bot restart from the next outgoing message).
+ *
+ * Persistent state — bindings, agent choice, message-id history — lives
+ * in `state.json` via {@link StateStore}, not here.
+ */
+interface ThreadMessageState {
+  /** Most recent assistant-message id we can edit in place. */
   lastMessageId: number | null;
+  /** True when next output should send a new message instead of editing. */
   needsNewMessage: boolean;
-  messageIds: number[];
+  /** Loader (⏳) message id — deleted when the first real output arrives. */
   loaderMessageId: number | null;
-  /** ID of the current transient status message (tool calls, thinking) — edited in place, deleted on text output */
+  /** Transient status/spinner message id — replaced by permanent text. */
   statusMessageId: number | null;
 }
 
-interface StoredMessageIds {
-  [userId: string]: number[];
-}
-
-/**
- * Output queue state per user.
- * Prevents race conditions when multiple outputs arrive faster than Telegram API can handle.
- * Uses debounce to batch rapid updates into single message edits.
- */
 interface OutputQueueState {
-  /** Pending output text waiting to be sent */
   pendingOutput: string | null;
-  /** Whether queue is currently being processed */
   isProcessing: boolean;
-  /** Debounce timer for batching rapid updates */
   debounceTimer: NodeJS.Timeout | null;
 }
 
-const userMessageStates = new Map<number, UserMessageState>();
-const outputQueues = new Map<number, OutputQueueState>();
-
-/**
- * Per-user pending question state.
- * When a question is shown to the user, we store it here so callback handlers
- * can look up the question data and send the answer back to the adapter.
- */
 interface PendingQuestionState {
-  /** The question data from the adapter */
   data: OpenCodePendingQuestion;
-  /** Message ID of the question message in Telegram (for cleanup) */
   messageId: number | null;
 }
-const pendingQuestions = new Map<number, PendingQuestionState>();
 
-/** Debounce delay in ms — increased to avoid Telegram 429 rate limits */
-const outputDebounceMs = 1000;
+const threadMessageStates = new Map<string, ThreadMessageState>();
+const outputQueues = new Map<string, OutputQueueState>();
+const pendingQuestions = new Map<string, PendingQuestionState>();
+const threadModelLists = new Map<string, string[]>();
+const awaitingModelSelection = new Set<string>();
 
-function loadMessageIds(): void {
-  try {
-    if (fs.existsSync(messageIdsFile)) {
-      const data = JSON.parse(fs.readFileSync(messageIdsFile, 'utf-8')) as StoredMessageIds;
-      for (const [userIdStr, messageIds] of Object.entries(data)) {
-        const userId = Number(userIdStr);
-        const state = getUserMessageState(userId);
-        state.messageIds = messageIds;
-      }
-      console.log(`[Bot] Loaded message IDs from ${messageIdsFile}`);
-    }
-  } catch (err) {
-    console.error('[Bot] Failed to load message IDs:', err);
+function getThreadMessageState(key: ThreadKey): ThreadMessageState {
+  const k = keyToString(key);
+  let s = threadMessageStates.get(k);
+  if (!s) {
+    s = { lastMessageId: null, needsNewMessage: true, loaderMessageId: null, statusMessageId: null };
+    threadMessageStates.set(k, s);
   }
+  return s;
 }
 
-function saveMessageIds(): void {
-  try {
-    const data: StoredMessageIds = {};
-    for (const [userId, state] of userMessageStates.entries()) {
-      if (state.messageIds.length > 0) {
-        data[userId.toString()] = state.messageIds;
-      }
-    }
-    fs.writeFileSync(messageIdsFile, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('[Bot] Failed to save message IDs:', err);
+function getOutputQueueState(key: ThreadKey): OutputQueueState {
+  const k = keyToString(key);
+  let s = outputQueues.get(k);
+  if (!s) {
+    s = { pendingOutput: null, isProcessing: false, debounceTimer: null };
+    outputQueues.set(k, s);
   }
+  return s;
 }
 
-function getUserMessageState(userId: number): UserMessageState {
-  let state = userMessageStates.get(userId);
-  if (!state) {
-    state = { lastMessageId: null, needsNewMessage: true, messageIds: [], loaderMessageId: null, statusMessageId: null };
-    userMessageStates.set(userId, state);
-  }
-  return state;
+function markNeedsNewMessage(key: ThreadKey): void {
+  getThreadMessageState(key).needsNewMessage = true;
 }
 
-function setLoaderMessage(userId: number, messageId: number): void {
-  const state = getUserMessageState(userId);
-  state.loaderMessageId = messageId;
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Threading helpers — gating, key extraction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Resolve a `ThreadKey` from a Telegram context, or `null` if
+ * the message must be ignored.
+ *
+ * Plan §8 gating rules:
+ *   1. Chat must be a forum supergroup (`type === 'supergroup'` AND `is_forum: true`).
+ *   2. Chat id must match `ALLOWED_GROUP_ID`.
+ *   3. If a `message_thread_id` is present, `is_topic_message` must be true
+ *      — guards against plain reply-threads in non-forum supergroups, which
+ *      also carry `message_thread_id` but are NOT topics (plan §4.3 point 2).
+ *   4. `message_thread_id` absent → General topic, normalised to 1.
+ */
+function getThreadKey(ctx: Context): ThreadKey | null {
+  const chat = ctx.chat;
+  if (!chat || chat.type !== 'supergroup') return null;
+  // The forum flag isn't on the union type for all chat shapes, but a
+  // forum supergroup has it set.
+  if (!('is_forum' in chat) || !chat.is_forum) return null;
+  if (chat.id !== ENV.allowedGroupId) return null;
+
+  // The message may come from either a fresh update or a callback query's
+  // origin message — both carry `message_thread_id` on the same shape.
+  const msg = (ctx.message ?? ctx.callbackQuery?.message) as Message | undefined;
+
+  // Default: General topic (id 1) if the message has no explicit thread id.
+  const rawThreadId = msg && 'message_thread_id' in msg ? msg.message_thread_id : undefined;
+  const isTopicMessage = msg && 'is_topic_message' in msg ? msg.is_topic_message : undefined;
+
+  // Plain reply-threads (non-forum supergroups) also carry message_thread_id.
+  // Reject them: they're not topics, just reply nests.
+  if (rawThreadId && !isTopicMessage) return null;
+
+  const threadId = rawThreadId ?? GENERAL_THREAD_ID;
+  return { chatId: chat.id, threadId };
 }
 
-async function deleteLoaderMessage(userId: number): Promise<void> {
-  const state = getUserMessageState(userId);
-  if (state.loaderMessageId) {
-    try {
-      await withRateLimitRetry(userId, () =>
-        bot.telegram.deleteMessage(userId, state.loaderMessageId!)
-      );
-    } catch {
-      // Message might already be deleted
-    }
-    state.loaderMessageId = null;
-  }
-}
-
-function getOutputQueueState(userId: number): OutputQueueState {
-  let state = outputQueues.get(userId);
-  if (!state) {
-    state = { pendingOutput: null, isProcessing: false, debounceTimer: null };
-    outputQueues.set(userId, state);
-  }
-  return state;
-}
-
-function markNeedsNewMessage(userId: number): void {
-  const state = getUserMessageState(userId);
-  state.needsNewMessage = true;
-}
-
-function trackMessageId(userId: number, messageId: number): void {
-  const state = getUserMessageState(userId);
-  state.messageIds.push(messageId);
-  if (state.messageIds.length > 500) {
-    state.messageIds = state.messageIds.slice(-500);
-  }
-  saveMessageIds();
-}
-
-function checkIsAllowed(userId: number): boolean {
-  return allowedUsers.includes(userId);
-}
-
-function checkIsPrivateChat(ctx: Context): boolean {
-  return ctx.chat?.type === 'private';
+/** Is this thread the General forum topic? */
+function checkIsGeneral(key: ThreadKey): boolean {
+  return key.threadId === GENERAL_THREAD_ID;
 }
 
 /**
- * Split a long message into multiple chunks that fit within Telegram's 4096 char limit.
- * Tries to split on newline boundaries for cleaner output.
+ * @description Combined access check. Returns the `ThreadKey` if the
+ * context is from an authorised user in the configured forum supergroup,
+ * else `null`. Logs (but does not reply to) chats / users we don't accept
+ * so foreign chats / spam stay silent (plan §13.13, D21).
  */
-function splitMessage(text: string, maxLen: number = maxMessageLength): string[] {
-  if (text.length <= maxLen) return [text];
+function authoriseContext(ctx: Context): ThreadKey | null {
+  const userId = ctx.from?.id;
+  if (!userId || !ENV.allowedUsers.includes(userId)) {
+    if (ctx.chat) {
+      console.warn(
+        `[security] ignored update from chat ${ctx.chat.id} user ${userId ?? '?'} (not in ALLOWED_USERS)`,
+      );
+    }
+    return null;
+  }
+  const key = getThreadKey(ctx);
+  if (!key) {
+    if (ctx.chat) {
+      console.warn(
+        `[security] ignored update from chat ${ctx.chat.id} (not the forum supergroup we listen to)`,
+      );
+    }
+    return null;
+  }
+  return key;
+}
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Send helpers — replyToThread + auto-track + error routing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Classify Telegram API errors so we can surgically clean up
+ * stale bindings without confusing closures with deletions (plan §13.10, E5).
+ */
+interface TelegramApiErrorLike {
+  response?: { error_code?: number; description?: string };
+  description?: string;
+}
+
+function checkIsApiError(e: unknown): e is TelegramApiErrorLike {
+  return typeof e === 'object' && e !== null && (
+    'response' in e || 'description' in e
+  );
+}
+
+function getErrorDescription(e: TelegramApiErrorLike): string {
+  return (e.response?.description ?? e.description ?? '').toString();
+}
+
+function getErrorCode(e: TelegramApiErrorLike): number | undefined {
+  return e.response?.error_code;
+}
+
+/**
+ * @description Central handler for failed sends.
+ *
+ * Differentiates between:
+ *   - **thread-deleted** (400 "message thread not found") → wipe binding +
+ *     in-memory state, kill any matching tmux session. Plan §13.10.
+ *   - **topic-closed** (400 "TOPIC_CLOSED" / "topic is closed") → preserve
+ *     binding (closures are reversible), mark `closed: true`, notify in
+ *     General.
+ *   - **perm-denied** (400 about permissions) → log + leave a hint.
+ *   - **everything else** → log; no state mutation.
+ */
+async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
+  if (!checkIsApiError(err)) {
+    console.error(`[send] ${keyToString(key)} unknown error:`, err);
+    return;
+  }
+  const code = getErrorCode(err);
+  const desc = getErrorDescription(err);
+
+  if (code === 400 && /thread not found/i.test(desc)) {
+    console.log(`[gc] thread ${keyToString(key)} not found — removing binding`);
+    await state.removeBinding(key);
+    clearInMemoryThreadState(key);
+    return;
+  }
+  if (code === 400 && /TOPIC_CLOSED|topic is closed/i.test(desc)) {
+    console.log(`[skip] thread ${keyToString(key)} is closed — binding preserved`);
+    await state.setBindingClosed(key, true);
+    // Notify in General so user is not silent. Use low-level send (no
+    // recursion through replyToThread, which would re-enter this handler).
+    const generalKey: ThreadKey = { chatId: key.chatId, threadId: GENERAL_THREAD_ID };
+    enqueueSend(key.chatId, () =>
+      bot.telegram.sendMessage(
+        key.chatId,
+        t('error.tg.thread.closed', { key: keyToString(key) }),
+        { message_thread_id: generalKey.threadId },
+      ),
+    ).catch(e2 => console.error('[send] failed to notify General about TOPIC_CLOSED:', e2));
+    return;
+  }
+  console.error(
+    `[send] ${keyToString(key)} ${code ?? '?'} ${desc || '(no description)'}`,
+  );
+}
+
+/**
+ * @description Drop all in-memory traces of a thread.
+ *
+ * Used after a `forum_topic_deleted` event or a 400-thread-not-found
+ * cleanup. Does NOT touch state.json — caller already did or will.
+ */
+function clearInMemoryThreadState(key: ThreadKey): void {
+  const k = keyToString(key);
+  threadMessageStates.delete(k);
+  outputQueues.delete(k);
+  pendingQuestions.delete(k);
+  threadModelLists.delete(k);
+  awaitingModelSelection.delete(k);
+}
+
+/**
+ * @description Send a message into a specific thread, going through the
+ * per-chat rate-limit queue and auto-tracking the message id in state.json.
+ *
+ * This is the **only** function bot code should use to send new messages.
+ * Direct `bot.telegram.sendMessage(...)` calls bypass tracking and the
+ * `/clear` command will then leave orphan messages behind (plan §13.11, D19).
+ *
+ * Returns the message id on success, `null` on failure (the error has
+ * already been logged / handled — caller doesn't need to wrap in try/catch).
+ */
+/**
+ * `extra` is intentionally typed as a loose object so Telegraf `Markup<>`
+ * values (which expose `reply_markup` but don't satisfy a string index
+ * signature) and plain `{ parse_mode: 'Markdown' }` records both work.
+ */
+type SendExtra = Record<string, unknown> | object;
+
+async function replyToThread(
+  key: ThreadKey,
+  text: string,
+  extra: SendExtra = {},
+): Promise<number | null> {
+  try {
+    const sent = await enqueueSend(key.chatId, () =>
+      bot.telegram.sendMessage(key.chatId, text, {
+        message_thread_id: key.threadId,
+        ...(extra as Record<string, unknown>),
+      } as Parameters<typeof bot.telegram.sendMessage>[2]),
+    );
+    const messageId = (sent as { message_id: number }).message_id;
+    await state.pushMessageId(key, messageId);
+    return messageId;
+  } catch (e) {
+    await handleSendError(key, e);
+    return null;
+  }
+}
+
+/**
+ * @description Edit an existing assistant message in the thread.
+ *
+ * Returns `true` on success, `false` if the edit failed for any reason —
+ * caller decides whether to fall back to a new `replyToThread`. We don't
+ * track edits as new ids (the original was already tracked).
+ */
+async function editThreadMessage(
+  key: ThreadKey,
+  messageId: number,
+  text: string,
+  extra: SendExtra = {},
+): Promise<boolean> {
+  try {
+    await enqueueSend(key.chatId, () =>
+      bot.telegram.editMessageText(
+        key.chatId, messageId, undefined, text, extra as Parameters<typeof bot.telegram.editMessageText>[4],
+      ),
+    );
+    return true;
+  } catch (e) {
+    const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+    if (/message is not modified/i.test(desc)) return true; // benign
+    if (
+      /thread not found|TOPIC_CLOSED|topic is closed/i.test(desc)
+    ) {
+      await handleSendError(key, e);
+    } else {
+      console.error(`[edit] ${keyToString(key)}#${messageId}:`, desc || e);
+    }
+    return false;
+  }
+}
+
+async function deleteThreadMessage(key: ThreadKey, messageId: number): Promise<void> {
+  try {
+    await enqueueSend(key.chatId, () => bot.telegram.deleteMessage(key.chatId, messageId));
+  } catch {
+    /* messages older than 48h or already deleted — silently ignore */
+  }
+}
+
+/**
+ * @description `sendChatAction('typing')` in a thread. Best-effort; we
+ * don't fail the caller if the API rejects it (e.g. action briefly not
+ * supported for forum threads on older clients).
+ */
+async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
+  try {
+    await enqueueSend(key.chatId, () =>
+      bot.telegram.sendChatAction(key.chatId, 'typing', { message_thread_id: key.threadId }),
+    );
+  } catch (e) {
+    console.log(`[typing] ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Output rendering — split, escape, queued edits
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function splitMessage(text: string, maxLen: number = MAX_MESSAGE_LEN): string[] {
+  if (text.length <= maxLen) return [text];
   const parts: string[] = [];
   let remaining = text;
-
   while (remaining.length > 0) {
     if (remaining.length <= maxLen) {
       parts.push(remaining);
       break;
     }
-
-    // Try to cut at last newline within the limit
     let cutAt = maxLen;
     const lastNewline = remaining.lastIndexOf('\n', maxLen);
-    if (lastNewline > maxLen * 0.5) {
-      cutAt = lastNewline;
-    }
-
+    if (lastNewline > maxLen * 0.5) cutAt = lastNewline;
     parts.push(remaining.slice(0, cutAt));
-    remaining = remaining.slice(cutAt).replace(/^\n/, ''); // skip leading newline in next chunk
+    remaining = remaining.slice(cutAt).replace(/^\n/, '');
   }
-
   return parts;
-}
-
-async function downloadFile(url: string, destPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    const client = url.startsWith('https') ? https : http;
-
-    client.get(url, (response) => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        const redirectUrl = response.headers.location;
-        if (redirectUrl) {
-          file.close();
-          fs.unlinkSync(destPath);
-          downloadFile(redirectUrl, destPath).then(resolve).catch(reject);
-          return;
-        }
-      }
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        resolve();
-      });
-    }).on('error', (err) => {
-      fs.unlink(destPath, () => {});
-      reject(err);
-    });
-  });
-}
-
-async function transcribeAudio(filePath: string, retryCount = 0): Promise<string | null> {
-  const apiKey = groqApiKey || openaiApiKey;
-  const isGroq = !!groqApiKey;
-
-  if (!apiKey) {
-    console.log('[Bot] No GROQ_API_KEY or OPENAI_API_KEY, cannot transcribe voice');
-    return null;
-  }
-
-  const FormData = (await import('form-data')).default;
-  const form = new FormData();
-  form.append('file', fs.createReadStream(filePath));
-  form.append('model', isGroq ? 'whisper-large-v3' : 'whisper-1');
-
-  const hostname = isGroq ? 'api.groq.com' : 'api.openai.com';
-  const apiPath = isGroq ? '/openai/v1/audio/transcriptions' : '/v1/audio/transcriptions';
-
-  console.log(`[Bot] Transcribing with ${isGroq ? 'Groq' : 'OpenAI'}...`);
-
-  return new Promise((resolve) => {
-    const req = https.request({
-      hostname,
-      path: apiPath,
-      method: 'POST',
-      headers: {
-        ...form.getHeaders(),
-        'Authorization': `Bearer ${apiKey}`,
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', async () => {
-        if (res.statusCode === 429) {
-          const retryAfter = parseInt(res.headers['retry-after'] as string) || 5;
-          console.log(`[Bot] Rate limited, retry after ${retryAfter}s (attempt ${retryCount + 1}/3)`);
-
-          if (retryCount < 2) {
-            await new Promise(r => setTimeout(r, retryAfter * 1000));
-            const result = await transcribeAudio(filePath, retryCount + 1);
-            resolve(result);
-            return;
-          } else {
-            console.error('[Bot] Rate limit exceeded, max retries reached');
-            resolve(null);
-            return;
-          }
-        }
-
-        try {
-          const json = JSON.parse(data);
-          if (json.text) {
-            resolve(json.text);
-          } else {
-            console.error('[Bot] Whisper error:', json);
-            resolve(null);
-          }
-        } catch (e) {
-          console.error('[Bot] Whisper parse error:', e);
-          resolve(null);
-        }
-      });
-    });
-
-    req.on('error', (e) => {
-      console.error('[Bot] Whisper request error:', e);
-      resolve(null);
-    });
-
-    form.pipe(req);
-  });
 }
 
 function escapeMarkdownChars(text: string): string {
@@ -317,6 +487,12 @@ function escapeMarkdownChars(text: string): string {
     .replace(/`/g, '\\`');
 }
 
+/**
+ * @description Best-effort escape that preserves existing `*bold*` runs
+ * while escaping incidental Markdown chars elsewhere. Same heuristic as
+ * the legacy bot — Telegram's classic Markdown is loose enough that this
+ * holds for the agent output we render.
+ */
 function escapeMarkdown(text: string): string {
   const boldRegex = /\*([^*\n]+)\*/g;
   const boldMatches: Array<{ start: number; end: number; content: string }> = [];
@@ -326,13 +502,12 @@ function escapeMarkdown(text: string): string {
     boldMatches.push({
       start: match.index,
       end: match.index + match[0].length,
-      content: match[1]
+      content: match[1],
     });
   }
 
   let result = '';
   let lastIndex = 0;
-
   for (const m of boldMatches) {
     const before = text.slice(lastIndex, m.start);
     result += escapeMarkdownChars(before);
@@ -340,689 +515,258 @@ function escapeMarkdown(text: string): string {
     result += `*${escapedContent}*`;
     lastIndex = m.end;
   }
-
-  const remaining = text.slice(lastIndex);
-  result += escapeMarkdownChars(remaining);
-
+  result += escapeMarkdownChars(text.slice(lastIndex));
   return result;
 }
 
-interface ParsedOutput {
-  text: string;
-  options: Array<{ num: string; label: string }>;
-}
-
-function parseOutput(output: string): ParsedOutput {
-  const options: Array<{ num: string; label: string }> = [];
-
-  const optionRegex = /^\s*(\d+)[.)]\s*(.+)$/gm;
-  let match;
-  while ((match = optionRegex.exec(output)) !== null) {
-    const label = match[2].trim().slice(0, 30);
-    if (label.length > 0) {
-      options.push({ num: match[1], label });
-    }
-  }
-
-  return { text: output, options };
-}
-
 /**
- * Queue output for sending with debounce.
- * Multiple rapid outputs will be batched into single message updates.
- * Skips sending if user is currently rate-limited by Telegram.
+ * @description Queue an output text for a thread with debounce.
+ *
+ * Rapid stream of `output` events from the adapter coalesces into a single
+ * Telegram message edit. During a 429 cooldown the delay stretches so we
+ * don't keep hammering the API.
  */
-function queueOutput(userId: number, output: string): void {
-  const queueState = getOutputQueueState(userId);
-
-  queueState.pendingOutput = output;
-
-  if (queueState.debounceTimer) {
-    clearTimeout(queueState.debounceTimer);
-  }
-
-  // If rate-limited, use longer delay
-  const delayMs = checkIsRateLimited(userId)
-    ? Math.max(outputDebounceMs, 5000)
-    : outputDebounceMs;
-
-  queueState.debounceTimer = setTimeout(() => {
-    queueState.debounceTimer = null;
-    processOutputQueue(userId);
+function queueOutput(key: ThreadKey, output: string): void {
+  const q = getOutputQueueState(key);
+  q.pendingOutput = output;
+  if (q.debounceTimer) clearTimeout(q.debounceTimer);
+  const delayMs = checkIsRateLimited(key.chatId)
+    ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
+    : OUTPUT_DEBOUNCE_MS;
+  q.debounceTimer = setTimeout(() => {
+    q.debounceTimer = null;
+    processOutputQueue(key);
   }, delayMs);
 }
 
-/**
- * Process the output queue for a user.
- * Ensures sequential processing — only one send operation at a time.
- */
-async function processOutputQueue(userId: number): Promise<void> {
-  const queueState = getOutputQueueState(userId);
-
-  if (queueState.isProcessing) return;
-  if (!queueState.pendingOutput) return;
-
-  queueState.isProcessing = true;
-
+async function processOutputQueue(key: ThreadKey): Promise<void> {
+  const q = getOutputQueueState(key);
+  if (q.isProcessing || !q.pendingOutput) return;
+  q.isProcessing = true;
   try {
-    const output = queueState.pendingOutput;
-    queueState.pendingOutput = null;
-
-    await sendOutputImmediate(userId, output);
+    const out = q.pendingOutput;
+    q.pendingOutput = null;
+    await sendOutputImmediate(key, out);
   } finally {
-    queueState.isProcessing = false;
-
-    if (queueState.pendingOutput) {
-      const delayMs = checkIsRateLimited(userId)
-        ? Math.max(outputDebounceMs, 5000)
-        : outputDebounceMs;
-      setTimeout(() => processOutputQueue(userId), delayMs);
+    q.isProcessing = false;
+    if (q.pendingOutput) {
+      const delayMs = checkIsRateLimited(key.chatId)
+        ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
+        : OUTPUT_DEBOUNCE_MS;
+      setTimeout(() => processOutputQueue(key), delayMs);
     }
   }
 }
 
 /**
- * Send a single chunk of text to the user, with Markdown fallback to plain text.
- * Returns the sent message ID.
+ * @description Render `output` as the agent's permanent message in a
+ * thread. Uses edit-in-place for the first chunk if we have a recent
+ * editable message, otherwise sends new. Subsequent chunks always send new.
+ *
+ * On Markdown rejection by Telegram we fall back to plain text (`parse_mode`
+ * unset) — the message lands either way.
  */
-async function sendChunk(userId: number, text: string, parseMode: 'Markdown' | undefined): Promise<number | null> {
-  try {
-    const sent = await withRateLimitRetry(userId, () =>
-      bot.telegram.sendMessage(userId, text, parseMode ? { parse_mode: parseMode } : {})
-    );
-    return (sent as { message_id: number }).message_id;
-  } catch {
-    if (parseMode) {
-      // Markdown failed, retry as plain text
-      try {
-        const sent = await withRateLimitRetry(userId, () =>
-          bot.telegram.sendMessage(userId, text)
-        );
-        return (sent as { message_id: number }).message_id;
-      } catch (plainErr) {
-        console.error('[sendChunk] Plain text also failed:', plainErr);
-        return null;
-      }
-    }
-    return null;
-  }
-}
-
-/**
- * Immediately send output to user (internal function).
- * Splits long messages into multiple Telegram messages.
- * First chunk may edit the existing message; subsequent chunks are always new messages.
- */
-async function sendOutputImmediate(userId: number, output: string): Promise<void> {
-  await deleteLoaderMessage(userId);
-  await deleteStatusMessage(userId);
+async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void> {
+  await deleteLoaderMessage(key);
+  await deleteStatusMessage(key);
 
   const chunks = splitMessage(output);
-  const msgState = getUserMessageState(userId);
-  const parseMode = 'Markdown' as const;
+  const msgState = getThreadMessageState(key);
 
-  const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;
-
-  // --- First chunk: try editing existing message if possible ---
-  const firstChunk = chunks[0];
-  const firstEscaped = escapeMarkdown(firstChunk);
-
-  if (shouldSendNew) {
-    const msgId = await sendChunk(userId, firstEscaped, parseMode);
-    if (msgId) {
-      msgState.lastMessageId = msgId;
-      msgState.needsNewMessage = false;
-      trackMessageId(userId, msgId);
-    }
-  } else {
-    const messageId = msgState.lastMessageId as number;
-    try {
-      await withRateLimitRetry(userId, () =>
-        bot.telegram.editMessageText(userId, messageId, undefined, firstEscaped, { parse_mode: parseMode })
-      );
-    } catch (editErr: unknown) {
-      const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
-      if (!errMessage.includes('message is not modified')) {
-        // Edit failed — send as new message
-        const msgId = await sendChunk(userId, firstEscaped, parseMode);
-        if (msgId) {
-          msgState.lastMessageId = msgId;
-          msgState.needsNewMessage = false;
-          trackMessageId(userId, msgId);
-        }
+  const sendOrEditFirst = async (text: string): Promise<number | null> => {
+    const escaped = escapeMarkdown(text);
+    const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;
+    if (shouldSendNew) {
+      const id = await replyChunkWithFallback(key, escaped, text);
+      if (id) {
+        msgState.lastMessageId = id;
+        msgState.needsNewMessage = false;
       }
+      return id;
     }
-  }
+    // Try edit; on failure send new.
+    const editedOk = await editThreadMessage(key, msgState.lastMessageId!, escaped, {
+      parse_mode: 'Markdown',
+    });
+    if (editedOk) return msgState.lastMessageId;
+    const id = await replyChunkWithFallback(key, escaped, text);
+    if (id) {
+      msgState.lastMessageId = id;
+      msgState.needsNewMessage = false;
+    }
+    return id;
+  };
 
-  // --- Remaining chunks: always send as new messages ---
+  await sendOrEditFirst(chunks[0]);
+
   for (let i = 1; i < chunks.length; i++) {
     const escaped = escapeMarkdown(chunks[i]);
-    const msgId = await sendChunk(userId, escaped, parseMode);
-    if (msgId) {
-      msgState.lastMessageId = msgId;
+    const id = await replyChunkWithFallback(key, escaped, chunks[i]);
+    if (id) {
+      msgState.lastMessageId = id;
       msgState.needsNewMessage = false;
-      trackMessageId(userId, msgId);
     }
   }
 }
 
-// ═══════════════════════════════════════════
-//  Helper for sending replies with rate limit
-// ═══════════════════════════════════════════
-
-async function safeSendMessage(userId: number, text: string, extra?: object): Promise<number | null> {
-  try {
-    const msg = await withRateLimitRetry(userId, () =>
-      bot.telegram.sendMessage(userId, text, extra)
-    );
-    return msg.message_id;
-  } catch (err) {
-    console.error('[Bot] safeSendMessage failed:', err);
-    return null;
-  }
+/**
+ * @description Send a chunk with Markdown first; if Markdown is rejected,
+ * fall back to plain text so the message reaches the user either way.
+ */
+async function replyChunkWithFallback(
+  key: ThreadKey,
+  escapedMarkdown: string,
+  plainFallback: string,
+): Promise<number | null> {
+  const id = await replyToThread(key, escapedMarkdown, { parse_mode: 'Markdown' });
+  if (id) return id;
+  return replyToThread(key, plainFallback);
 }
 
-// ═══════════════════════════════════════════
-//  Commands
-// ═══════════════════════════════════════════
+async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
+  const s = getThreadMessageState(key);
+  if (s.loaderMessageId === null) return;
+  const id = s.loaderMessageId;
+  s.loaderMessageId = null;
+  await deleteThreadMessage(key, id);
+}
 
-bot.command('start', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) {
-    await ctx.reply('This bot works only in private messages.');
-    return;
-  }
+async function deleteStatusMessage(key: ThreadKey): Promise<void> {
+  const s = getThreadMessageState(key);
+  if (s.statusMessageId === null) return;
+  const id = s.statusMessageId;
+  s.statusMessageId = null;
+  await deleteThreadMessage(key, id);
+}
 
-  if (!checkIsAllowed(ctx.from!.id)) {
-    await ctx.reply('Access denied.');
-    return;
-  }
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Voice download + transcribe
+// ═══════════════════════════════════════════════════════════════════════════════
 
-  const adapters = getAvailableAdapters();
-  const adapterList = adapters.map(a => `• ${a.label} (/${a.name})`).join('\n');
-
-  await ctx.reply(
-    'AI Agent Bot\n\n' +
-    `Work dir: ${defaultWorkDir}\n\n` +
-    `Available agents:\n${adapterList}\n\n` +
-    '/agent - Choose agent\n' +
-    '/sessions - Previous sessions\n' +
-    '/stop - Stop current agent\n' +
-    '/status - Show status'
-  );
-});
-
-bot.command('status', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  const isActive = adapter.checkIsActive(userId);
-  const adapterName = getUserAdapterName(userId);
-
-  const status =
-    `Status:\n\n` +
-    `Agent: ${adapter.label} (${adapterName})\n` +
-    `Work dir: ${defaultWorkDir}\n` +
-    `Session: ${isActive ? 'running' : 'stopped'}`;
-
-  await ctx.reply(status);
-});
-
-bot.command('claude', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  setUserAdapter(userId, 'claude');
-  const adapter = getUserAdapter(userId);
-
-  if (adapter.checkIsActive(userId)) {
-    await ctx.reply('Claude session active. Send a message or /stop');
-    return;
-  }
-
-  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  const msg = await startAgentSession(userId, args || undefined);
-  await ctx.reply(msg);
-});
-
-bot.command('opencode', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  setUserAdapter(userId, 'opencode');
-  const adapter = getUserAdapter(userId);
-
-  if (adapter.checkIsActive(userId)) {
-    await ctx.reply('OpenCode session active. Send a message or /stop');
-    return;
-  }
-
-  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  const msg = await startAgentSession(userId, args || undefined);
-  await ctx.reply(msg);
-});
-
-bot.command('oc', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  setUserAdapter(userId, 'opencode');
-  const adapter = getUserAdapter(userId);
-
-  if (adapter.checkIsActive(userId)) {
-    await ctx.reply('OpenCode session active. Send a message or /stop');
-    return;
-  }
-
-  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  const msg = await startAgentSession(userId, args || undefined);
-  await ctx.reply(msg);
-});
-
-/** Store model list for number-based selection */
-const userModelLists = new Map<number, string[]>();
-/** Track if user is awaiting model selection (after /model without args) */
-const awaitingModelSelection = new Set<number>();
-
-bot.command('model', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-
-  // If number provided, select from previous list
-  if (/^\d+$/.test(args)) {
-    const num = parseInt(args, 10);
-    const modelList = userModelLists.get(userId);
-    if (!modelList || num < 1 || num > modelList.length) {
-      await ctx.reply('Invalid number. Use /model to see the list.');
-      return;
-    }
-    const selectedModel = modelList[num - 1];
-    if (!adapter.checkIsActive(userId)) {
-      await ctx.reply('No active session. Start an agent first.');
-      return;
-    }
-    if (adapter.setModel) {
-      const error = await adapter.setModel(userId, selectedModel);
-      if (error) {
-        await ctx.reply(`Error: ${error}`);
-      } else {
-        await ctx.reply(`Model set to: ${selectedModel}`);
+async function downloadFile(url: string, destPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    const client = url.startsWith('https') ? https : http;
+    client.get(url, (response) => {
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        const redirectUrl = response.headers.location;
+        if (redirectUrl) {
+          file.close();
+          fs.unlinkSync(destPath);
+          downloadFile(redirectUrl, destPath).then(resolve).catch(reject);
+          return;
+        }
       }
-    }
-    return;
-  }
-
-  // If model name provided, set it directly
-  if (args) {
-    if (!adapter.checkIsActive(userId)) {
-      await ctx.reply('No active session. Start an agent first.');
-      return;
-    }
-    if (adapter.setModel) {
-      const error = await adapter.setModel(userId, args);
-      if (error) {
-        await ctx.reply(`Error: ${error}`);
-      } else {
-        const currentModel = adapter.getCurrentModel?.(userId) || args;
-        await ctx.reply(`Model set to: ${currentModel}`);
-      }
-    } else {
-      await ctx.reply(`Model switching not supported for ${adapter.label}`);
-    }
-    return;
-  }
-
-  // No args — show numbered list of models
-  const currentModel = adapter.getCurrentModel?.(userId) || 'default';
-  
-  // Get available models from adapter
-  let models: string[] = [];
-  if (adapter.getAvailableModels) {
-    try {
-      models = await adapter.getAvailableModels();
-    } catch (e) {
-      console.error('[Bot] Failed to get models:', e);
-    }
-  }
-
-  if (models.length === 0) {
-    await ctx.reply(
-      `Current: ${currentModel}\n\nNo models available. Use /model <provider/model> to set manually.`
-    );
-    return;
-  }
-
-  // Store list for number selection
-  userModelLists.set(userId, models);
-
-  // Build numbered list grouped by provider
-  const byProvider = groupModelsByProvider(models);
-  let listText = `Current: ${currentModel}\n\n`;
-  let num = 1;
-  
-  for (const [provider, providerModels] of byProvider) {
-    listText += `📦 ${provider}:\n`;
-    for (const model of providerModels) {
-      const modelName = model.slice(provider.length + 1);
-      listText += `  ${num}. ${modelName}\n`;
-      num++;
-    }
-    listText += '\n';
-  }
-  
-  listText += `Reply with number to select`;
-
-  // Mark that we're waiting for model selection
-  awaitingModelSelection.add(userId);
-  
-  await ctx.reply(listText);
-});
-
-bot.action(/^model_(.+)$/, async (ctx) => {
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const modelId = ctx.match[1];
-  const adapter = getUserAdapter(userId);
-
-  if (!adapter.checkIsActive(userId)) {
-    await ctx.answerCbQuery('No active session');
-    return;
-  }
-
-  if (adapter.setModel) {
-    const error = await adapter.setModel(userId, modelId);
-    if (error) {
-      await ctx.answerCbQuery(`Error: ${error.slice(0, 50)}`);
-      return;
-    }
-    const currentModel = adapter.getCurrentModel?.(userId) || modelId;
-    await ctx.answerCbQuery(`Model: ${currentModel.split('/').pop() || currentModel}`);
-    await safeSendMessage(userId, `Model switched to: ${currentModel}`);
-  } else {
-    await ctx.answerCbQuery(`Not supported for ${adapter.label}`);
-  }
-});
-
-bot.command('agent', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const available = getAvailableAdapters();
-  const currentName = getUserAdapterName(ctx.from!.id);
-
-  const buttons = available.map(a => {
-    const isCurrent = a.name === currentName;
-    const label = isCurrent ? `${a.label} ✓` : a.label;
-    return Markup.button.callback(label, `agent_${a.name}`);
-  });
-
-  await ctx.reply('Choose agent:', Markup.inlineKeyboard(buttons, { columns: 2 }));
-});
-
-bot.action(/^agent_(.+)$/, async (ctx) => {
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapterName = ctx.match[1];
-
-  try {
-    setUserAdapter(userId, adapterName);
-    const adapter = getUserAdapter(userId);
-    await ctx.answerCbQuery(`Switched to ${adapter.label}`);
-    await safeSendMessage(userId, `Agent: ${adapter.label}\nSend a message or /${adapterName} to start`);
-  } catch {
-    await ctx.answerCbQuery('Unknown agent');
-  }
-});
-
-bot.command('sessions', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-
-  try {
-    const sessions = await adapter.getSessions(userId);
-
-    if (sessions.length === 0) {
-      await ctx.reply('No previous sessions');
-      return;
-    }
-
-    const buttons = sessions.slice(0, 10).map(s => {
-      const timeAgo = formatTimeAgo(s.updatedAt);
-      const title = (s.title || s.id).slice(0, 40);
-      return Markup.button.callback(`${title} (${timeAgo})`, `resume_${s.id.slice(0, 60)}`);
+      response.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', (err) => {
+      fs.unlink(destPath, () => {});
+      reject(err);
     });
+  });
+}
 
-    await ctx.reply(
-      `Previous sessions (${adapter.label}):`,
-      Markup.inlineKeyboard(buttons, { columns: 1 })
-    );
-  } catch (err) {
-    console.error('[Bot] getSessions error:', err);
-    await ctx.reply('Failed to load sessions');
-  }
-});
+async function transcribeAudio(filePath: string, retryCount = 0): Promise<string | null> {
+  const apiKey = ENV.groqApiKey || ENV.openaiApiKey;
+  const isGroq = !!ENV.groqApiKey;
+  if (!apiKey) return null;
 
-bot.action(/^resume_(.+)$/, async (ctx) => {
-  if (!checkIsAllowed(ctx.from!.id)) return;
+  const FormData = (await import('form-data')).default;
+  const form = new FormData();
+  form.append('file', fs.createReadStream(filePath));
+  form.append('model', isGroq ? 'whisper-large-v3' : 'whisper-1');
 
-  const userId = ctx.from!.id;
-  const sessionId = ctx.match[1];
-  const adapter = getUserAdapter(userId);
+  const hostname = isGroq ? 'api.groq.com' : 'api.openai.com';
+  const apiPath = isGroq ? '/openai/v1/audio/transcriptions' : '/v1/audio/transcriptions';
 
-  markNeedsNewMessage(userId);
-  await ctx.answerCbQuery('Resuming session...');
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname, path: apiPath, method: 'POST',
+      headers: { ...form.getHeaders(), 'Authorization': `Bearer ${apiKey}` },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', async () => {
+        if (res.statusCode === 429) {
+          const retryAfter = parseInt(res.headers['retry-after'] as string) || 5;
+          if (retryCount < 2) {
+            await new Promise(r => setTimeout(r, retryAfter * 1000));
+            resolve(await transcribeAudio(filePath, retryCount + 1));
+            return;
+          }
+          resolve(null);
+          return;
+        }
+        try {
+          const json = JSON.parse(data);
+          resolve(json.text ?? null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    form.pipe(req);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Adapter lifecycle helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Resolve the working directory for an adapter session in
+ * this thread.
+ *
+ * Этап 3 fallback: if the thread has a binding, use it; otherwise use
+ * `WORK_ROOT` itself so a fresh install can smoke-test agents before any
+ * `/bind` lands. Этап 4 adds `/bind` proper and may make the «no binding»
+ * case error out depending on UX choices.
+ */
+function getWorkDir(key: ThreadKey): string {
+  const binding = state.getBinding(key);
+  if (binding) return path.join(ENV.workRoot, binding.subdir);
+  return ENV.workRoot;
+}
+
+async function startAgentSession(key: ThreadKey, args?: string): Promise<string> {
+  markNeedsNewMessage(key);
+  const adapter = getThreadAdapter(key);
+  const workDir = getWorkDir(key);
+
+  // U1 from plan §10.2 / §16.3: typing indicator while the agent boots so
+  // the user doesn't think the bot is asleep.
+  sendThreadTypingIndicator(key).catch(() => {});
+
   try {
-    await adapter.resumeSession(userId, sessionId);
-    await safeSendMessage(userId, `Session resumed. Send your message:`);
+    await adapter.startSession(key, workDir, args);
+
+    // If this adapter exposes a session id (Claude does, OpenCode handles
+    // it server-side via resumeSession), persist it now so a bot restart
+    // can re-attach without losing history (plan §13.1, D14).
+    if (adapter instanceof ClaudeCliAdapter) {
+      const uuid = adapter.getClaudeSessionId(key);
+      if (uuid) await state.setClaudeSessionId(key, uuid);
+    }
+    await state.setAgent(key, { name: adapter.name });
+
+    const subdir = state.getBinding(key)?.subdir ?? path.basename(ENV.workRoot);
+    return t('agent.ready', {
+      label: adapter.label,
+      subdir,
+      argsSuffix: args ? ` (${args})` : '',
+    });
   } catch (e) {
-    const errorMsg = e instanceof Error ? e.message : String(e);
-    await safeSendMessage(userId, `Failed to resume: ${errorMsg}`);
+    return t('agent.start_failed', {
+      label: adapter.label,
+      error: e instanceof Error ? e.message : String(e),
+    });
   }
-});
+}
 
-bot.command('stop', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-
-  if (!adapter.checkIsActive(userId)) {
-    await ctx.reply('No agent running');
-    return;
-  }
-
-  adapter.stopSession(userId);
-  await ctx.reply(`${adapter.label} stopped`);
-});
-
-bot.command('c', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  markNeedsNewMessage(userId);
-  adapter.sendSignal(userId, 'SIGINT');
-  await ctx.reply('Ctrl+C sent');
-});
-
-bot.command('y', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  if (adapter.checkIsActive(userId)) {
-    markNeedsNewMessage(userId);
-    adapter.sendInput(userId, 'y');
-  }
-});
-
-bot.command('n', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  if (adapter.checkIsActive(userId)) {
-    markNeedsNewMessage(userId);
-    adapter.sendInput(userId, 'n');
-  }
-});
-
-bot.command('enter', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  if (adapter.sendEnter) {
-    markNeedsNewMessage(userId);
-    adapter.sendEnter(userId);
-  } else {
-    await ctx.reply(`Not supported for ${adapter.label}`);
-  }
-});
-
-bot.command('up', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  if (adapter.sendArrow) {
-    adapter.sendArrow(userId, 'Up');
-  } else {
-    await ctx.reply(`Not supported for ${adapter.label}`);
-  }
-});
-
-bot.command('down', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  if (adapter.sendArrow) {
-    adapter.sendArrow(userId, 'Down');
-  } else {
-    await ctx.reply(`Not supported for ${adapter.label}`);
-  }
-});
-
-bot.command('tab', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-  if (adapter.sendTab) {
-    adapter.sendTab(userId);
-  } else {
-    await ctx.reply(`Not supported for ${adapter.label}`);
-  }
-});
-
-bot.command('output', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const adapter = getUserAdapter(userId);
-
-  if (!adapter.getFullOutput) {
-    await ctx.reply(`Not supported for ${adapter.label}`);
-    return;
-  }
-
-  const output = adapter.getFullOutput(userId, 500);
-
-  if (!output) {
-    await ctx.reply('Agent not running or no output');
-    return;
-  }
-
-  const chunks: string[] = [];
-  let current = '';
-  for (const line of output.split('\n')) {
-    if (current.length + line.length + 1 > 4000) {
-      chunks.push(current);
-      current = line;
-    } else {
-      current += (current ? '\n' : '') + line;
-    }
-  }
-  if (current) chunks.push(current);
-
-  for (const chunk of chunks.slice(0, 5)) {
-    const msgId = await safeSendMessage(userId, chunk || '(empty)');
-    if (msgId) trackMessageId(userId, msgId);
-  }
-});
-
-bot.command('clear', async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const state = getUserMessageState(userId);
-  const currentMsgId = ctx.message.message_id;
-
-  const allMsgIds = [...state.messageIds, currentMsgId];
-
-  if (allMsgIds.length === 0) {
-    await ctx.reply('No tracked messages to delete');
-    return;
-  }
-
-  let totalDeleted = 0;
-  const batchSize = 100;
-
-  for (let i = 0; i < allMsgIds.length; i += batchSize) {
-    const batch = allMsgIds.slice(i, i + batchSize);
-    try {
-      await withRateLimitRetry(userId, () =>
-        bot.telegram.callApi('deleteMessages', {
-          chat_id: userId,
-          message_ids: batch,
-        })
-      );
-      totalDeleted += batch.length;
-    } catch {
-      // Some messages might be too old (>48h) or already deleted
-    }
-  }
-
-  state.messageIds = [];
-  state.lastMessageId = null;
-  state.needsNewMessage = true;
-  saveMessageIds();
-
-  console.log(`[Bot] Cleared ${totalDeleted}/${allMsgIds.length} messages for user ${userId}`);
-});
-
-// ═══════════════════════════════════════════
-//  Start phrases (natural language triggers)
-// ═══════════════════════════════════════════
-
-const botCommands = new Set([
-  'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
-  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
-]);
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Natural-language start phrases (`claude ...`, `opencode ...`)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const startClaudePhrases = [
   'клод', 'клауд', 'клоуд', 'claude', 'cloud',
@@ -1046,472 +790,18 @@ interface StartAgentMatch {
 
 function checkIsStartAgentPhrase(text: string): StartAgentMatch {
   const normalized = text.toLowerCase().trim().replace(/[.,!?;:]+$/, '');
-
-  // Check Claude phrases
-  if (startClaudePhrases.includes(normalized)) {
-    return { isMatch: true, adapterName: 'claude' };
-  }
-
-  // Check "claude <args>" pattern
-  const claudeWithArgsMatch = normalized.match(/^(claude|клод|клауд|клоуд)\s+(.+)$/);
-  if (claudeWithArgsMatch) {
-    return { isMatch: true, adapterName: 'claude', args: claudeWithArgsMatch[2] };
-  }
-
-  // Check OpenCode phrases
-  if (startOpencodePhrases.includes(normalized)) {
-    return { isMatch: true, adapterName: 'opencode' };
-  }
-
-  // Check "opencode <args>" pattern
-  const opencodeWithArgsMatch = normalized.match(/^(opencode|опенкод|open code|опен код)\s+(.+)$/);
-  if (opencodeWithArgsMatch) {
-    return { isMatch: true, adapterName: 'opencode', args: opencodeWithArgsMatch[2] };
-  }
-
+  if (startClaudePhrases.includes(normalized)) return { isMatch: true, adapterName: 'claude' };
+  const claudeArgs = normalized.match(/^(claude|клод|клауд|клоуд)\s+(.+)$/);
+  if (claudeArgs) return { isMatch: true, adapterName: 'claude', args: claudeArgs[2] };
+  if (startOpencodePhrases.includes(normalized)) return { isMatch: true, adapterName: 'opencode' };
+  const ocArgs = normalized.match(/^(opencode|опенкод|open code|опен код)\s+(.+)$/);
+  if (ocArgs) return { isMatch: true, adapterName: 'opencode', args: ocArgs[2] };
   return { isMatch: false };
 }
 
-async function startAgentSession(userId: number, args?: string): Promise<string> {
-  markNeedsNewMessage(userId);
-  const adapter = getUserAdapter(userId);
-  try {
-    await adapter.startSession(userId, defaultWorkDir, args);
-    return `${adapter.label} ready in ${defaultWorkDir}${args ? ` (${args})` : ''}\nSend your message:`;
-  } catch (e) {
-    const errorMsg = e instanceof Error ? e.message : String(e);
-    return `Failed to start ${adapter.label}: ${errorMsg}`;
-  }
-}
-
-// ═══════════════════════════════════════════
-//  Message handlers
-// ═══════════════════════════════════════════
-
-bot.on(message('text'), async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const text = ctx.message.text.trim();
-
-  if (text.startsWith('/')) {
-    const cmd = text.slice(1).split(' ')[0].split('@')[0].toLowerCase();
-    if (botCommands.has(cmd)) {
-      return;
-    }
-    // Otherwise pass to agent (e.g., /resume, /help, /compact, etc.)
-  }
-
-  trackMessageId(userId, ctx.message.message_id);
-
-  const adapter = getUserAdapter(userId);
-
-  // Check if this is a model selection number (after /model command)
-  if (/^\d+$/.test(text) && awaitingModelSelection.has(userId)) {
-    const num = parseInt(text, 10);
-    const modelList = userModelLists.get(userId);
-    awaitingModelSelection.delete(userId); // Clear awaiting state
-    
-    if (modelList && num >= 1 && num <= modelList.length) {
-      const selectedModel = modelList[num - 1];
-      if (adapter.setModel) {
-        const error = await adapter.setModel(userId, selectedModel);
-        if (error) {
-          await ctx.reply(`Error: ${error}`);
-        } else {
-          await ctx.reply(`Model set to: ${selectedModel}`);
-        }
-        return;
-      }
-    } else {
-      await ctx.reply(`Invalid number. Use /model to see the list.`);
-      return;
-    }
-  }
-
-  // Check for start phrases when no agent is running
-  if (!adapter.checkIsActive(userId)) {
-    const startMatch = checkIsStartAgentPhrase(text);
-    if (startMatch.isMatch && startMatch.adapterName) {
-      setUserAdapter(userId, startMatch.adapterName);
-      const msg = await startAgentSession(userId, startMatch.args);
-      await ctx.reply(msg);
-      return;
-    }
-  }
-
-  // If there's a pending question, treat text as a custom answer
-  const pending = pendingQuestions.get(userId);
-  if (pending && adapter.checkIsActive(userId) && adapter.answerQuestion) {
-    // Use the typed text as answer for the first question
-    const answers: string[][] = pending.data.questions.map(() => [text]);
-    pendingQuestions.delete(userId);
-
-    // Update question message to show the custom answer
-    if (pending.messageId) {
-      const q = pending.data.questions[0];
-      const header = q?.header || q?.question || 'Question';
-      try {
-        await withRateLimitRetry(userId, () =>
-          bot.telegram.editMessageText(
-            userId, pending.messageId!, undefined,
-            `✅ ${header}: ${text}`,
-          )
-        );
-      } catch { /* ignore */ }
-    }
-
-    adapter.answerQuestion(userId, answers);
-    markNeedsNewMessage(userId);
-    return;
-  }
-
-  if (adapter.checkIsActive(userId)) {
-    markNeedsNewMessage(userId);
-    const processingMsg = await ctx.reply('⏳');
-    trackMessageId(userId, processingMsg.message_id);
-    setLoaderMessage(userId, processingMsg.message_id);
-    adapter.sendInput(userId, text);
-    return;
-  }
-
-  await ctx.reply(`No agent running. /agent to choose, /claude or /opencode to start`);
-});
-
-bot.on(message('voice'), async (ctx) => {
-  if (!checkIsPrivateChat(ctx)) return;
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  trackMessageId(userId, ctx.message.message_id);
-
-  if (!groqApiKey && !openaiApiKey) {
-    await ctx.reply('Voice messages require GROQ_API_KEY (free) or OPENAI_API_KEY');
-    return;
-  }
-
-  try {
-    const fileId = ctx.message.voice.file_id;
-    const file = await ctx.telegram.getFile(fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${botToken}/${file.file_path}`;
-
-    const tempDir = '/tmp';
-    const tempFile = path.join(tempDir, `voice_${userId}_${Date.now()}.ogg`);
-    await downloadFile(fileUrl, tempFile);
-
-    const transcript = await transcribeAudio(tempFile);
-
-    fs.unlink(tempFile, () => {});
-
-    if (!transcript) {
-      await ctx.reply('Failed to transcribe voice message');
-      return;
-    }
-
-    console.log(`[Bot] Voice transcribed: "${transcript}"`);
-
-    const sentMsg = await ctx.reply(`🎤 ${transcript}`, { reply_parameters: { message_id: ctx.message.message_id } });
-    trackMessageId(userId, sentMsg.message_id);
-
-    const adapter = getUserAdapter(userId);
-
-    // Check for start phrases when no agent is running
-    if (!adapter.checkIsActive(userId)) {
-      const startMatch = checkIsStartAgentPhrase(transcript);
-      if (startMatch.isMatch && startMatch.adapterName) {
-        setUserAdapter(userId, startMatch.adapterName);
-        const msg = await startAgentSession(userId, startMatch.args);
-        await ctx.reply(msg);
-        return;
-      }
-    }
-
-    if (!adapter.checkIsActive(userId)) {
-      await ctx.reply('No agent running. /agent to choose, /claude or /opencode to start');
-      return;
-    }
-
-    markNeedsNewMessage(userId);
-    const processingMsg = await ctx.reply('⏳');
-    trackMessageId(userId, processingMsg.message_id);
-    setLoaderMessage(userId, processingMsg.message_id);
-    adapter.sendInput(userId, transcript);
-  } catch (err) {
-    console.error('[Bot] Voice handling error:', err);
-    await ctx.reply('Error processing voice message');
-  }
-});
-
-bot.action(/^opt_(\d+)$/, async (ctx) => {
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const optNum = ctx.match[1];
-  const adapter = getUserAdapter(userId);
-
-  if (adapter.checkIsActive(userId)) {
-    markNeedsNewMessage(userId);
-    adapter.sendInput(userId, optNum);
-    await ctx.answerCbQuery(`Sent: ${optNum}`);
-  } else {
-    await ctx.answerCbQuery('Agent not running');
-  }
-});
-
-/**
- * Handle question answer callback: qa_{questionIndex}_{optionIndex}
- * questionIndex is the index within the questions array (usually 0).
- * optionIndex is the index of the selected option.
- */
-bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
-  if (!checkIsAllowed(ctx.from!.id)) return;
-
-  const userId = ctx.from!.id;
-  const qIdx = parseInt(ctx.match[1], 10);
-  const optIdx = parseInt(ctx.match[2], 10);
-
-  const pending = pendingQuestions.get(userId);
-  if (!pending) {
-    await ctx.answerCbQuery('No pending question');
-    return;
-  }
-
-  const question = pending.data.questions[qIdx];
-  if (!question || !question.options[optIdx]) {
-    await ctx.answerCbQuery('Invalid option');
-    return;
-  }
-
-  const selectedLabel = question.options[optIdx].label;
-  const adapter = getUserAdapter(userId);
-
-  // Build answers array: one answer per question, default empty for unselected
-  const answers: string[][] = pending.data.questions.map((_, i) => {
-    if (i === qIdx) return [selectedLabel];
-    return [''];
-  });
-
-  // Clean up: remove pending state and edit the question message to show selection
-  pendingQuestions.delete(userId);
-
-  try {
-    if (pending.messageId) {
-      await withRateLimitRetry(userId, () =>
-        bot.telegram.editMessageText(
-          userId, pending.messageId!, undefined,
-          `✅ ${question.header || question.question}: ${selectedLabel}`,
-        )
-      );
-    }
-  } catch {
-    // Ignore edit errors
-  }
-
-  if (adapter.answerQuestion) {
-    adapter.answerQuestion(userId, answers);
-    markNeedsNewMessage(userId);
-  }
-
-  await ctx.answerCbQuery(selectedLabel);
-});
-
-// ═══════════════════════════════════════════
-//  Adapter event handlers
-// ═══════════════════════════════════════════
-
-/**
- * Delete the transient status message for a user (if any).
- * Called before sending a permanent text output so the chat stays clean.
- */
-async function deleteStatusMessage(userId: number): Promise<void> {
-  const state = getUserMessageState(userId);
-  if (state.statusMessageId) {
-    const msgId = state.statusMessageId;
-    state.statusMessageId = null;
-    try {
-      await withRateLimitRetry(userId, () =>
-        bot.telegram.deleteMessage(userId, msgId)
-      );
-    } catch {
-      // Message might already be deleted or too old
-    }
-  }
-}
-
-function handleAgentOutput(userId: number, output: string): void {
-  console.log(`[Bot] output (${output.length}): ${output.slice(0, 100)}...`);
-  if (!output.trim()) return;
-
-  const msgState = getUserMessageState(userId);
-  const hadStatusMessage = msgState.statusMessageId !== null;
-
-  // Delete transient status message before sending permanent text
-  deleteStatusMessage(userId).then(() => {
-    // For delta-based adapters (Claude CLI): after a status/thinking break,
-    // force next output as a new message to avoid overwriting previous substantial content
-    if (hadStatusMessage) {
-      const adapter = getUserAdapter(userId);
-      if (adapter.outputsDeltas) {
-        msgState.needsNewMessage = true;
-      }
-    }
-    queueOutput(userId, output);
-  });
-}
-
-/**
- * Handle transient status updates (tool calls, thinking, etc.).
- * If a status message already exists — edit it in place.
- * If not — send a new one and track its ID.
- * Long status texts are split into multiple messages.
- */
-function handleAgentStatus(userId: number, status: string): void {
-  if (!status.trim()) return;
-  console.log(`[Bot] status: ${status.slice(0, 100)}`);
-
-  const msgState = getUserMessageState(userId);
-
-  // Also delete the loader message if it's still showing
-  deleteLoaderMessage(userId).catch(() => {});
-
-  const chunks = splitMessage(status);
-  const parseMode = 'Markdown' as const;
-
-  (async () => {
-    try {
-      // --- First chunk: edit existing status or send new ---
-      const firstEscaped = escapeMarkdown(chunks[0]);
-
-      if (msgState.statusMessageId) {
-        try {
-          await withRateLimitRetry(userId, () =>
-            bot.telegram.editMessageText(
-              userId, msgState.statusMessageId!, undefined,
-              firstEscaped, { parse_mode: parseMode },
-            )
-          );
-        } catch (editErr: unknown) {
-          const errMessage = editErr instanceof Error ? editErr.message : String(editErr);
-          if (!errMessage.includes('message is not modified')) {
-            // Edit failed — send as new message instead
-            msgState.statusMessageId = null;
-            const msgId = await sendChunk(userId, firstEscaped, parseMode);
-            if (msgId) {
-              msgState.statusMessageId = msgId;
-              trackMessageId(userId, msgId);
-            }
-          }
-        }
-      } else {
-        const msgId = await sendChunk(userId, firstEscaped, parseMode);
-        if (msgId) {
-          msgState.statusMessageId = msgId;
-          trackMessageId(userId, msgId);
-        }
-      }
-
-      // --- Remaining chunks: send as new messages, update statusMessageId to last ---
-      for (let i = 1; i < chunks.length; i++) {
-        const escaped = escapeMarkdown(chunks[i]);
-        const msgId = await sendChunk(userId, escaped, parseMode);
-        if (msgId) {
-          msgState.statusMessageId = msgId;
-          trackMessageId(userId, msgId);
-        }
-      }
-    } catch (err) {
-      console.error('[handleAgentStatus] Failed:', err);
-    }
-  })();
-}
-
-/**
- * Handle interactive question from agent.
- * Shows question with inline buttons in Telegram.
- * Also supports custom text answers — user can type a reply.
- */
-function handleAgentQuestion(userId: number, questionData: OpenCodePendingQuestion): void {
-  console.log(`[Bot] question (${questionData.requestId}): ${questionData.questions.length} questions`);
-
-  // Delete status/loader messages to make room for the question
-  deleteStatusMessage(userId).catch(() => {});
-  deleteLoaderMessage(userId).catch(() => {});
-
-  (async () => {
-    try {
-      for (let qIdx = 0; qIdx < questionData.questions.length; qIdx++) {
-        const q = questionData.questions[qIdx];
-        const header = q.header || q.question || 'Question';
-
-        // Build message text
-        const lines: string[] = [`❓ *${escapeMarkdown(header)}*`];
-        if (q.question && q.question !== header) {
-          lines.push(escapeMarkdown(q.question));
-        }
-
-        // Build inline keyboard with options
-        const buttons = q.options.map((opt, optIdx) => {
-          const label = opt.label.length > 40 ? opt.label.slice(0, 37) + '...' : opt.label;
-          return [Markup.button.callback(label, `qa_${qIdx}_${optIdx}`)];
-        });
-
-        const keyboard = buttons.length > 0
-          ? Markup.inlineKeyboard(buttons)
-          : undefined;
-
-        const msgOpts: Record<string, unknown> = { parse_mode: 'Markdown' as const };
-        if (keyboard) Object.assign(msgOpts, keyboard);
-
-        let sent;
-        try {
-          sent = await withRateLimitRetry(userId, () =>
-            bot.telegram.sendMessage(userId, lines.join('\n'), msgOpts as Parameters<typeof bot.telegram.sendMessage>[2])
-          );
-        } catch {
-          // Markdown failed, try plain text
-          const plainLines = [`❓ ${header}`];
-          if (q.question && q.question !== header) plainLines.push(q.question);
-          const plainOpts: Record<string, unknown> = {};
-          if (keyboard) Object.assign(plainOpts, keyboard);
-          sent = await withRateLimitRetry(userId, () =>
-            bot.telegram.sendMessage(userId, plainLines.join('\n'), plainOpts as Parameters<typeof bot.telegram.sendMessage>[2])
-          );
-        }
-
-        const sentMsg = sent as { message_id: number };
-        trackMessageId(userId, sentMsg.message_id);
-
-        // Store pending question so callbacks and text handler can find it
-        pendingQuestions.set(userId, {
-          data: questionData,
-          messageId: sentMsg.message_id,
-        });
-      }
-    } catch (err) {
-      console.error('[handleAgentQuestion] Failed to send question:', err);
-    }
-  })();
-}
-
-function handleAgentClosed(userId: number): void {
-  // Clean up status message and pending questions on session close
-  deleteStatusMessage(userId).catch(() => {});
-  pendingQuestions.delete(userId);
-  const adapter = getUserAdapter(userId);
-  safeSendMessage(userId, `${adapter.label} session ended`);
-}
-
-function handleAgentError(userId: number, error: Error): void {
-  console.error(`[Bot] Agent error for user ${userId}:`, error.message);
-  deleteStatusMessage(userId).catch(() => {});
-  pendingQuestions.delete(userId);
-  safeSendMessage(userId, `Error: ${error.message}`);
-}
-
-// ═══════════════════════════════════════════
-//  Model selection utilities
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Model selection helper — used by /model and the numeric-reply flow
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function groupModelsByProvider(models: string[]): Map<string, string[]> {
   const byProvider = new Map<string, string[]>();
@@ -1519,18 +809,12 @@ function groupModelsByProvider(models: string[]): Map<string, string[]> {
     const slashIdx = model.indexOf('/');
     if (slashIdx > 0) {
       const provider = model.slice(0, slashIdx);
-      if (!byProvider.has(provider)) {
-        byProvider.set(provider, []);
-      }
+      if (!byProvider.has(provider)) byProvider.set(provider, []);
       byProvider.get(provider)!.push(model);
     }
   }
   return byProvider;
 }
-
-// ═══════════════════════════════════════════
-//  Utilities
-// ═══════════════════════════════════════════
 
 function formatTimeAgo(date: Date): string {
   const diffMs = Date.now() - date.getTime();
@@ -1539,25 +823,896 @@ function formatTimeAgo(date: Date): string {
   if (diffMin < 60) return `${diffMin}m ago`;
   const diffHours = Math.floor(diffMin / 60);
   if (diffHours < 24) return `${diffHours}h ago`;
-  const diffDays = Math.floor(diffHours / 24);
-  return `${diffDays}d ago`;
+  return `${Math.floor(diffHours / 24)}d ago`;
 }
 
-// ═══════════════════════════════════════════
-//  Bot startup
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Commands
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Wrap a command handler with the gating check.
+ *
+ * Each handler gets a guaranteed-non-null `key` if it runs at all. Foreign
+ * chats / unauthorized users are silently ignored (logged inside `authoriseContext`).
+ */
+function command(
+  name: string | string[],
+  handler: (ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>, key: ThreadKey) => Promise<void> | void,
+): void {
+  bot.command(name, async (ctx) => {
+    const key = authoriseContext(ctx);
+    if (!key) return;
+    await handler(ctx, key);
+  });
+}
+
+command('start', async (_ctx, key) => {
+  const adapters = getAvailableAdapters();
+  const list = adapters.map(a => `• ${a.label} (/${a.name})`).join('\n');
+  await replyToThread(
+    key,
+    'AI Agent Bot (multi-thread)\n\n' +
+      `WORK_ROOT: ${ENV.workRoot}\n\n` +
+      `Available agents:\n${list}\n\n` +
+      '/claude /opencode — start an agent in this thread\n' +
+      '/sessions — previous sessions\n' +
+      '/stop — stop current agent\n' +
+      '/status — show status',
+  );
+});
+
+command('status', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  const isActive = adapter.checkIsActive(key);
+  const adapterName = getThreadAdapterName(key);
+  const binding = state.getBinding(key);
+  const subdir = binding?.subdir ?? '(no binding — WORK_ROOT)';
+  await replyToThread(
+    key,
+    'Status:\n\n' +
+      `Agent: ${adapter.label} (${adapterName})\n` +
+      `Folder: ${subdir}\n` +
+      `Session: ${isActive ? 'running' : 'stopped'}`,
+  );
+});
+
+async function handleStartCommand(
+  ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>,
+  key: ThreadKey,
+  adapterName: 'claude' | 'opencode',
+): Promise<void> {
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('error.start_in_general'));
+    return;
+  }
+  setThreadAdapter(key, adapterName);
+  const adapter = getThreadAdapter(key);
+  if (adapter.checkIsActive(key)) {
+    await replyToThread(key, t('agent.already_active', { label: adapter.label }));
+    return;
+  }
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const msg = await startAgentSession(key, args || undefined);
+  await replyToThread(key, msg);
+}
+
+command('claude', (ctx, key) => handleStartCommand(ctx, key, 'claude'));
+command(['opencode', 'oc'], (ctx, key) => handleStartCommand(ctx, key, 'opencode'));
+
+command('model', async (ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const kStr = keyToString(key);
+
+  // numeric selection from a previous /model list
+  if (/^\d+$/.test(args)) {
+    const num = parseInt(args, 10);
+    const modelList = threadModelLists.get(kStr);
+    if (!modelList || num < 1 || num > modelList.length) {
+      await replyToThread(key, 'Invalid number. Run /model to see the list.');
+      return;
+    }
+    if (!adapter.checkIsActive(key)) {
+      await replyToThread(key, 'No active session. Start an agent first.');
+      return;
+    }
+    const selected = modelList[num - 1];
+    if (adapter.setModel) {
+      const err = await adapter.setModel(key, selected);
+      await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
+    }
+    return;
+  }
+
+  // direct «/model provider/name»
+  if (args) {
+    if (!adapter.checkIsActive(key)) {
+      await replyToThread(key, 'No active session. Start an agent first.');
+      return;
+    }
+    if (adapter.setModel) {
+      const err = await adapter.setModel(key, args);
+      if (err) {
+        await replyToThread(key, `Error: ${err}`);
+      } else {
+        const current = adapter.getCurrentModel?.(key) || args;
+        await replyToThread(key, `Model set to: ${current}`);
+      }
+    } else {
+      await replyToThread(key, `Model switching not supported for ${adapter.label}`);
+    }
+    return;
+  }
+
+  // list flow
+  const current = adapter.getCurrentModel?.(key) || 'default';
+  let models: string[] = [];
+  if (adapter.getAvailableModels) {
+    try { models = await adapter.getAvailableModels(); } catch (e) {
+      console.error('[Bot] getAvailableModels:', e);
+    }
+  }
+  if (models.length === 0) {
+    await replyToThread(
+      key,
+      `Current: ${current}\n\nNo models available. Use /model <provider/model> to set manually.`,
+    );
+    return;
+  }
+  threadModelLists.set(kStr, models);
+  const byProvider = groupModelsByProvider(models);
+  let listText = `Current: ${current}\n\n`;
+  let num = 1;
+  for (const [provider, providerModels] of byProvider) {
+    listText += `📦 ${provider}:\n`;
+    for (const m of providerModels) {
+      listText += `  ${num}. ${m.slice(provider.length + 1)}\n`;
+      num++;
+    }
+    listText += '\n';
+  }
+  listText += 'Reply with number to select';
+  awaitingModelSelection.add(kStr);
+  await replyToThread(key, listText);
+});
+
+command('agent', async (_ctx, key) => {
+  const available = getAvailableAdapters();
+  const currentName = getThreadAdapterName(key);
+  const buttons = available.map(a => {
+    const label = a.name === currentName ? `${a.label} ✓` : a.label;
+    return Markup.button.callback(label, `agent_${a.name}`);
+  });
+  await replyToThread(key, 'Choose agent:', Markup.inlineKeyboard(buttons, { columns: 2 }));
+});
+
+command('sessions', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  try {
+    const sessions = await adapter.getSessions(key);
+    if (sessions.length === 0) {
+      await replyToThread(key, 'No previous sessions');
+      return;
+    }
+    const buttons = sessions.slice(0, 10).map(s => {
+      const timeAgo = formatTimeAgo(s.updatedAt);
+      const title = (s.title || s.id).slice(0, 40);
+      return Markup.button.callback(`${title} (${timeAgo})`, `resume_${s.id.slice(0, 60)}`);
+    });
+    await replyToThread(
+      key,
+      `Previous sessions (${adapter.label}):`,
+      Markup.inlineKeyboard(buttons, { columns: 1 }),
+    );
+  } catch (e) {
+    console.error('[Bot] getSessions:', e);
+    await replyToThread(key, 'Failed to load sessions');
+  }
+});
+
+command('stop', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (!adapter.checkIsActive(key)) {
+    await replyToThread(key, 'No agent running');
+    return;
+  }
+  adapter.stopSession(key);
+  await replyToThread(key, t('agent.stopped', { label: adapter.label }));
+});
+
+// ── tmux-style controls (Claude CLI) ──
+
+command('c', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  markNeedsNewMessage(key);
+  adapter.sendSignal(key, 'SIGINT');
+  await replyToThread(key, 'Ctrl+C sent');
+});
+
+command('y', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.checkIsActive(key)) {
+    markNeedsNewMessage(key);
+    adapter.sendInput(key, 'y');
+  }
+});
+
+command('n', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.checkIsActive(key)) {
+    markNeedsNewMessage(key);
+    adapter.sendInput(key, 'n');
+  }
+});
+
+command('enter', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.sendEnter) {
+    markNeedsNewMessage(key);
+    adapter.sendEnter(key);
+  } else {
+    await replyToThread(key, `Not supported for ${adapter.label}`);
+  }
+});
+
+command('up', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.sendArrow) adapter.sendArrow(key, 'Up');
+  else await replyToThread(key, `Not supported for ${adapter.label}`);
+});
+
+command('down', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.sendArrow) adapter.sendArrow(key, 'Down');
+  else await replyToThread(key, `Not supported for ${adapter.label}`);
+});
+
+command('tab', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.sendTab) adapter.sendTab(key);
+  else await replyToThread(key, `Not supported for ${adapter.label}`);
+});
+
+command('output', async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (!adapter.getFullOutput) {
+    await replyToThread(key, `Not supported for ${adapter.label}`);
+    return;
+  }
+  const output = adapter.getFullOutput(key, 500);
+  if (!output) {
+    await replyToThread(key, 'Agent not running or no output');
+    return;
+  }
+  const chunks: string[] = [];
+  let current = '';
+  for (const line of output.split('\n')) {
+    if (current.length + line.length + 1 > 4000) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current += (current ? '\n' : '') + line;
+    }
+  }
+  if (current) chunks.push(current);
+  for (const chunk of chunks.slice(0, 5)) {
+    await replyToThread(key, chunk || '(empty)');
+  }
+});
+
+/**
+ * @description `/clear` — delete the bot's messages in this thread.
+ *
+ * Plan §11 Этап 3 / §13.20 (T6):
+ *   - Read ids from state.json (not in-memory `messageIds`).
+ *   - Chunk by 100 (Bot API limit on deleteMessages).
+ *   - Surface 48h truncation in the reply so the user understands why
+ *     not all messages disappear (U2).
+ *   - Requires `can_delete_messages` admin right; we degrade gracefully
+ *     if Telegram says we can't.
+ */
+command('clear', async (ctx, key) => {
+  const trackedIds = state.getMessageIds(key);
+  const currentMsgId = ctx.message.message_id;
+  const all = [...trackedIds, currentMsgId];
+  if (all.length === 0) {
+    await replyToThread(key, t('clear.no_messages'));
+    return;
+  }
+
+  let deleted = 0;
+  const batchSize = 100;
+  for (let i = 0; i < all.length; i += batchSize) {
+    const batch = all.slice(i, i + batchSize);
+    try {
+      await enqueueSend(key.chatId, () =>
+        bot.telegram.callApi('deleteMessages', {
+          chat_id: key.chatId,
+          message_ids: batch,
+        }),
+      );
+      deleted += batch.length;
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : String(e);
+      if (/not enough rights|can't delete/i.test(desc)) {
+        await replyToThread(key, t('error.tg.perm.delete'));
+        return;
+      }
+      // `deleteMessages` is all-or-nothing per batch: a single un-deletable
+      // id (>48h, already gone) sinks every fresh id alongside it. Fall back
+      // to per-id deletes so we recover what we can. (Review HIGH #1.)
+      for (const id of batch) {
+        try {
+          await enqueueSend(key.chatId, () => bot.telegram.deleteMessage(key.chatId, id));
+          deleted += 1;
+        } catch {
+          // Expired / already deleted — drop silently.
+        }
+      }
+    }
+  }
+
+  await state.clearMessageIds(key);
+  const ms = getThreadMessageState(key);
+  ms.lastMessageId = null;
+  ms.needsNewMessage = true;
+
+  console.log(`[clear] ${keyToString(key)}: deleted ${deleted}/${all.length}`);
+  await replyToThread(key, t('clear.summary', { deleted, total: all.length }));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Bot commands list (text vs slash) — known slash commands the bot handles
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const botCommands = new Set([
+  'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
+  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
+]);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Text message handler — main conversational entrypoint
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bot.on(message('text'), async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) return;
+
+  const text = ctx.message.text.trim();
+  const kStr = keyToString(key);
+
+  // Slash commands we don't own → forward to the agent (e.g. `/compact`, `/help`).
+  if (text.startsWith('/')) {
+    const cmd = text.slice(1).split(' ')[0].split('@')[0].toLowerCase();
+    if (botCommands.has(cmd)) return;
+  }
+
+  // Always track inbound message ids so /clear can delete user messages too.
+  await state.pushMessageId(key, ctx.message.message_id);
+
+  const adapter = getThreadAdapter(key);
+
+  // Numeric model selection after `/model`.
+  if (/^\d+$/.test(text) && awaitingModelSelection.has(kStr)) {
+    const num = parseInt(text, 10);
+    const list = threadModelLists.get(kStr);
+    awaitingModelSelection.delete(kStr);
+    if (list && num >= 1 && num <= list.length) {
+      const selected = list[num - 1];
+      if (adapter.setModel) {
+        const err = await adapter.setModel(key, selected);
+        await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
+        return;
+      }
+    } else {
+      await replyToThread(key, 'Invalid number. Run /model to see the list.');
+      return;
+    }
+  }
+
+  // Natural-language start.
+  if (!adapter.checkIsActive(key)) {
+    const startMatch = checkIsStartAgentPhrase(text);
+    if (startMatch.isMatch && startMatch.adapterName) {
+      if (checkIsGeneral(key)) {
+        await replyToThread(key, t('error.start_in_general'));
+        return;
+      }
+      setThreadAdapter(key, startMatch.adapterName);
+      const msg = await startAgentSession(key, startMatch.args);
+      await replyToThread(key, msg);
+      return;
+    }
+  }
+
+  // Pending interactive question (OpenCode) → custom text answer.
+  const pending = pendingQuestions.get(kStr);
+  if (pending && adapter.checkIsActive(key) && adapter.answerQuestion) {
+    const answers: string[][] = pending.data.questions.map(() => [text]);
+    pendingQuestions.delete(kStr);
+    if (pending.messageId) {
+      const q = pending.data.questions[0];
+      const header = q?.header || q?.question || 'Question';
+      await editThreadMessage(key, pending.messageId, `✅ ${header}: ${text}`);
+    }
+    adapter.answerQuestion(key, answers);
+    markNeedsNewMessage(key);
+    return;
+  }
+
+  // Forward text to a running agent.
+  if (adapter.checkIsActive(key)) {
+    markNeedsNewMessage(key);
+    const loaderId = await replyToThread(key, '⏳');
+    if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
+    adapter.sendInput(key, text);
+    return;
+  }
+
+  // Idle thread — guide the user.
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('thread.general_no_agent'));
+  } else {
+    await replyToThread(key, t('agent.no_session'));
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Voice message handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bot.on(message('voice'), async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) return;
+
+  await state.pushMessageId(key, ctx.message.message_id);
+
+  if (!ENV.groqApiKey && !ENV.openaiApiKey) {
+    await replyToThread(key, t('voice.no_api_key'));
+    return;
+  }
+
+  try {
+    const fileId = ctx.message.voice.file_id;
+    const file = await ctx.telegram.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${ENV.botToken}/${file.file_path}`;
+
+    const tempDir = '/tmp';
+    const tempFile = path.join(tempDir, `voice_${key.chatId}_${key.threadId}_${Date.now()}.ogg`);
+    await downloadFile(fileUrl, tempFile);
+    const transcript = await transcribeAudio(tempFile);
+    fs.unlink(tempFile, () => {});
+
+    if (!transcript) {
+      await replyToThread(key, t('voice.failed'));
+      return;
+    }
+    console.log(`[Bot] voice transcribed: "${transcript}"`);
+    await replyToThread(key, t('voice.transcribed', { text: transcript }));
+
+    const adapter = getThreadAdapter(key);
+    if (!adapter.checkIsActive(key)) {
+      const startMatch = checkIsStartAgentPhrase(transcript);
+      if (startMatch.isMatch && startMatch.adapterName) {
+        if (checkIsGeneral(key)) {
+          await replyToThread(key, t('error.start_in_general'));
+          return;
+        }
+        setThreadAdapter(key, startMatch.adapterName);
+        const msg = await startAgentSession(key, startMatch.args);
+        await replyToThread(key, msg);
+        return;
+      }
+    }
+    if (!adapter.checkIsActive(key)) {
+      if (checkIsGeneral(key)) {
+        await replyToThread(key, t('thread.general_no_agent'));
+      } else {
+        await replyToThread(key, t('agent.no_session'));
+      }
+      return;
+    }
+
+    markNeedsNewMessage(key);
+    const loaderId = await replyToThread(key, '⏳');
+    if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
+    adapter.sendInput(key, transcript);
+  } catch (err) {
+    console.error('[Bot] Voice handling error:', err);
+    await replyToThread(key, 'Error processing voice message');
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Edited message — explicit UX hint instead of silent ignore
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bot.on('edited_message', async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) return;
+  // Reply once per edit so the user isn't left wondering. The bot does NOT
+  // treat the edit as a re-prompt to the agent (plan §16.3, E6).
+  await replyToThread(key, t('edited.hint'));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Forum service events — closed / reopened (deleted handled by send errors)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// These service events are generated by *any* group admin (close/reopen
+// requires `can_manage_topics`), who may not be in ALLOWED_USERS. We gate
+// only on group identity here so the binding's `closed` flag stays in
+// sync with reality regardless of who flipped it. (Review HIGH #2.)
+bot.on(message('forum_topic_closed'), async (ctx) => {
+  const key = getThreadKey(ctx);
+  if (!key) return;
+  await state.setBindingClosed(key, true);
+});
+
+bot.on(message('forum_topic_reopened'), async (ctx) => {
+  const key = getThreadKey(ctx);
+  if (!key) return;
+  await state.setBindingClosed(key, false);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Callback queries — model, agent switch, resume, opt buttons, qa answers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bot.action(/^model_(.+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  const modelId = ctx.match[1];
+  const adapter = getThreadAdapter(key);
+  if (!adapter.checkIsActive(key)) {
+    await ctx.answerCbQuery('No active session');
+    return;
+  }
+  if (adapter.setModel) {
+    const err = await adapter.setModel(key, modelId);
+    if (err) { await ctx.answerCbQuery(`Error: ${err.slice(0, 50)}`); return; }
+    const current = adapter.getCurrentModel?.(key) || modelId;
+    await ctx.answerCbQuery(`Model: ${current.split('/').pop() || current}`);
+    await replyToThread(key, `Model switched to: ${current}`);
+  } else {
+    await ctx.answerCbQuery(`Not supported for ${adapter.label}`);
+  }
+});
+
+bot.action(/^agent_(.+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  const adapterName = ctx.match[1];
+  try {
+    setThreadAdapter(key, adapterName);
+    const adapter = getThreadAdapter(key);
+    await ctx.answerCbQuery(`Switched to ${adapter.label}`);
+    await replyToThread(
+      key,
+      `Agent: ${adapter.label}\nSend a message or /${adapterName} to start`,
+    );
+  } catch {
+    await ctx.answerCbQuery('Unknown agent');
+  }
+});
+
+bot.action(/^resume_(.+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  const sessionId = ctx.match[1];
+  const adapter = getThreadAdapter(key);
+  markNeedsNewMessage(key);
+  await ctx.answerCbQuery('Resuming session...');
+  try {
+    await adapter.resumeSession(key, getWorkDir(key), sessionId);
+    await replyToThread(key, 'Session resumed. Send your message:');
+  } catch (e) {
+    await replyToThread(
+      key,
+      `Failed to resume: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+});
+
+bot.action(/^opt_(\d+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  const optNum = ctx.match[1];
+  const adapter = getThreadAdapter(key);
+  if (adapter.checkIsActive(key)) {
+    markNeedsNewMessage(key);
+    adapter.sendInput(key, optNum);
+    await ctx.answerCbQuery(`Sent: ${optNum}`);
+  } else {
+    await ctx.answerCbQuery('Agent not running');
+  }
+});
+
+bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  const qIdx = parseInt(ctx.match[1], 10);
+  const optIdx = parseInt(ctx.match[2], 10);
+  const kStr = keyToString(key);
+  const pending = pendingQuestions.get(kStr);
+  if (!pending) { await ctx.answerCbQuery('No pending question'); return; }
+  const question = pending.data.questions[qIdx];
+  if (!question || !question.options[optIdx]) {
+    await ctx.answerCbQuery('Invalid option');
+    return;
+  }
+  const selectedLabel = question.options[optIdx].label;
+  const adapter = getThreadAdapter(key);
+  const answers: string[][] = pending.data.questions.map((_, i) =>
+    i === qIdx ? [selectedLabel] : [''],
+  );
+  pendingQuestions.delete(kStr);
+  if (pending.messageId) {
+    await editThreadMessage(
+      key,
+      pending.messageId,
+      `✅ ${question.header || question.question}: ${selectedLabel}`,
+    );
+  }
+  if (adapter.answerQuestion) {
+    adapter.answerQuestion(key, answers);
+    markNeedsNewMessage(key);
+  }
+  await ctx.answerCbQuery(selectedLabel);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Adapter event handlers (output / status / question / closed / error)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function handleAgentOutput(key: ThreadKey, output: string): void {
+  console.log(`[Bot] output ${keyToString(key)} (${output.length}): ${output.slice(0, 100)}...`);
+  if (!output.trim()) return;
+
+  const msgState = getThreadMessageState(key);
+  const hadStatusMessage = msgState.statusMessageId !== null;
+
+  deleteStatusMessage(key).then(() => {
+    if (hadStatusMessage) {
+      const adapter = getThreadAdapter(key);
+      if (adapter.outputsDeltas) msgState.needsNewMessage = true;
+    }
+    queueOutput(key, output);
+  });
+}
+
+function handleAgentStatus(key: ThreadKey, status: string): void {
+  if (!status.trim()) return;
+  console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
+
+  const msgState = getThreadMessageState(key);
+  deleteLoaderMessage(key).catch(() => {});
+
+  const chunks = splitMessage(status);
+
+  (async () => {
+    try {
+      const firstEscaped = escapeMarkdown(chunks[0]);
+      if (msgState.statusMessageId) {
+        const ok = await editThreadMessage(key, msgState.statusMessageId, firstEscaped, {
+          parse_mode: 'Markdown',
+        });
+        if (!ok) {
+          msgState.statusMessageId = null;
+          const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
+          if (id) msgState.statusMessageId = id;
+        }
+      } else {
+        const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
+        if (id) msgState.statusMessageId = id;
+      }
+      for (let i = 1; i < chunks.length; i++) {
+        const escaped = escapeMarkdown(chunks[i]);
+        const id = await replyChunkWithFallback(key, escaped, chunks[i]);
+        if (id) msgState.statusMessageId = id;
+      }
+    } catch (err) {
+      console.error('[handleAgentStatus] Failed:', err);
+    }
+  })();
+}
+
+function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuestion): void {
+  console.log(`[Bot] question ${keyToString(key)} (${questionData.requestId}): ${questionData.questions.length}`);
+  deleteStatusMessage(key).catch(() => {});
+  deleteLoaderMessage(key).catch(() => {});
+
+  (async () => {
+    try {
+      for (let qIdx = 0; qIdx < questionData.questions.length; qIdx++) {
+        const q = questionData.questions[qIdx];
+        const header = q.header || q.question || 'Question';
+        const lines: string[] = [`❓ *${escapeMarkdown(header)}*`];
+        if (q.question && q.question !== header) lines.push(escapeMarkdown(q.question));
+
+        const buttons = q.options.map((opt, optIdx) => {
+          const label = opt.label.length > 40 ? opt.label.slice(0, 37) + '...' : opt.label;
+          return [Markup.button.callback(label, `qa_${qIdx}_${optIdx}`)];
+        });
+        const keyboard = buttons.length > 0 ? Markup.inlineKeyboard(buttons) : undefined;
+
+        const extra: Record<string, unknown> = { parse_mode: 'Markdown' };
+        if (keyboard) Object.assign(extra, keyboard);
+
+        let messageId = await replyToThread(key, lines.join('\n'), extra);
+        if (!messageId) {
+          // Markdown rejected — retry plain.
+          const plainLines = [`❓ ${header}`];
+          if (q.question && q.question !== header) plainLines.push(q.question);
+          const plainExtra: Record<string, unknown> = {};
+          if (keyboard) Object.assign(plainExtra, keyboard);
+          messageId = await replyToThread(key, plainLines.join('\n'), plainExtra);
+        }
+
+        if (messageId !== null) {
+          pendingQuestions.set(keyToString(key), {
+            data: questionData,
+            messageId,
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[handleAgentQuestion] Failed:', err);
+    }
+  })();
+}
+
+function handleAgentClosed(key: ThreadKey): void {
+  deleteStatusMessage(key).catch(() => {});
+  pendingQuestions.delete(keyToString(key));
+  const adapter = getThreadAdapter(key);
+  replyToThread(key, t('agent.session_ended', { label: adapter.label })).catch(() => {});
+}
+
+function handleAgentError(key: ThreadKey, error: Error): void {
+  console.error(`[Bot] adapter error ${keyToString(key)}:`, error.message);
+  deleteStatusMessage(key).catch(() => {});
+  pendingQuestions.delete(keyToString(key));
+  replyToThread(key, `Error: ${error.message}`).catch(() => {});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Startup orchestration — state init, re-attach, setMyCommands, launch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const COMMANDS_MENU = [
+  { command: 'claude', description: '▶️ Start Claude Code' },
+  { command: 'opencode', description: '▶️ Start OpenCode' },
+  { command: 'model', description: '🧠 Switch model' },
+  { command: 'agent', description: '🔄 Choose agent' },
+  { command: 'sessions', description: '📋 Previous sessions' },
+  { command: 'stop', description: '⏹ Stop agent' },
+  { command: 'status', description: '📊 Show status' },
+  { command: 'output', description: '📜 Last 500 lines' },
+  { command: 'enter', description: '↵ Press Enter' },
+  { command: 'up', description: '⬆️ Arrow Up' },
+  { command: 'down', description: '⬇️ Arrow Down' },
+  { command: 'tab', description: '⇥ Tab' },
+  { command: 'y', description: '✅ Send "y"' },
+  { command: 'n', description: '❌ Send "n"' },
+  { command: 'c', description: '🛑 Ctrl+C' },
+  { command: 'clear', description: '🗑 Clear messages' },
+];
+
+/**
+ * @description Re-adopt tmux sessions and OpenCode SSE streams that
+ * outlived the bot process.
+ *
+ * Plan §10.2 / §13.19 (E1). Runs **before** `bot.launch()` so the first
+ * user message in any thread already finds a live adapter session, not
+ * a stale "agent not running" reply.
+ */
+async function reattachExistingSessions(): Promise<void> {
+  // 0. Rehydrate per-thread adapter choice from state.agents into the
+  //    in-memory `threadAdapterNames` map. Without this, every thread
+  //    reverts to DEFAULT_AGENT after a restart, so `getThreadAdapter(key)`
+  //    would return the wrong adapter even though the *actual* tmux /
+  //    opencode session was correctly adopted below. (Review CRITICAL #3.)
+  let rehydrated = 0;
+  for (const { key } of state.listBindings()) {
+    const agent = state.getAgent(key);
+    if (!agent?.name) continue;
+    try {
+      setThreadAdapter(key, agent.name);
+      rehydrated += 1;
+    } catch (e) {
+      // Unknown adapter in state (renamed / removed). Log and move on.
+      console.warn(
+        `[reattach] cannot rehydrate ${keyToString(key)} (agent=${agent.name}):`,
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
+  console.log(`[reattach] rehydrated adapter choice for ${rehydrated} threads`);
+
+  // 1. Claude — tmux sessions. Always resolve the claude adapter directly,
+  //    not via `getThreadAdapter(generalKey)`: General may be unbound or
+  //    bound to opencode, which would silently skip the entire claude scan
+  //    (review CRITICAL #1).
+  const claudeAdapter = getAdapter('claude');
+  if (claudeAdapter instanceof ClaudeCliAdapter) {
+    try {
+      const found = await claudeAdapter.listExistingTmuxSessions();
+      let adopted = 0;
+      let killed = 0;
+      for (const { key, sessionName } of found) {
+        const binding = state.getBinding(key);
+        const agent = state.getAgent(key);
+        if (!binding || !agent || agent.name !== 'claude' || !agent.claudeSessionId) {
+          claudeAdapter.killOrphanTmuxSession(sessionName);
+          killed += 1;
+          continue;
+        }
+        const workDir = path.join(ENV.workRoot, binding.subdir);
+        if (claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
+          adopted += 1;
+          replyToThread(key, t('agent.reattached')).catch(() => {});
+        }
+      }
+      console.log(`[reattach] tmux: adopted ${adopted}, killed ${killed} orphans`);
+    } catch (e) {
+      console.error('[reattach] tmux scan failed:', e);
+    }
+  }
+
+  // 2. OpenCode — server-side sessions; resumeSession reconnects SSE.
+  //    Resolve the opencode adapter directly: state.agents[key].name === 'opencode'
+  //    is the source of truth here, not the (possibly stale) default-fallback
+  //    from `getThreadAdapter(key)` (review CRITICAL #2).
+  const opencodeAdapter = getAdapter('opencode');
+  let reopened = 0;
+  for (const { key, data: binding } of state.listBindings()) {
+    const agent = state.getAgent(key);
+    if (!agent || agent.name !== 'opencode' || !agent.opencodeSessionId) continue;
+    if (opencodeAdapter.checkIsActive(key)) continue;
+    try {
+      const workDir = path.join(ENV.workRoot, binding.subdir);
+      await opencodeAdapter.resumeSession(key, workDir, agent.opencodeSessionId);
+      reopened += 1;
+      replyToThread(key, t('agent.reattached')).catch(() => {});
+    } catch (e) {
+      console.warn(`[reattach] opencode ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+  console.log(`[reattach] opencode: reopened ${reopened} sessions`);
+}
 
 export async function startBot(): Promise<void> {
   console.log('');
   console.log('=================================');
-  console.log('  AI Agent Telegram Bot starting...');
+  console.log('  Telegram Code Bot (multi-thread) starting...');
   console.log('=================================');
-  console.log(`Allowed users: ${allowedUsers.join(', ')}`);
-  console.log(`Work dir: ${defaultWorkDir}`);
-  console.log(`Default agent: ${getDefaultAdapterName()}`);
+  console.log(`Allowed users:    ${ENV.allowedUsers.join(', ')}`);
+  console.log(`Allowed group:    ${ENV.allowedGroupId}`);
+  console.log(`Work root:        ${ENV.workRoot}`);
+  console.log(`Default agent:    ${getDefaultAdapterName()}`);
   console.log(`Available agents: ${getAvailableAdapters().map(a => a.name).join(', ')}`);
 
-  // Wire adapter events to bot handlers
+  // 1. State store.
+  state = await getStateStore();
+  console.log(`Data dir:         ${path.dirname(state.stateFilePath)}`);
+  if (state.wasCorruptedOnLoad()) {
+    console.warn(
+      `[startup] previous state.json was corrupted; archived to ${state.getCorruptedArchivePath()}`,
+    );
+    // Best-effort notice into General once the bot is up.
+    setImmediate(() => {
+      const generalKey: ThreadKey = { chatId: ENV.allowedGroupId, threadId: GENERAL_THREAD_ID };
+      replyToThread(generalKey, t('error.state.corrupted')).catch(() => {});
+    });
+  }
+  const legacyBackup = state.getLegacyMigrationPath();
+  if (legacyBackup) {
+    console.log(`[startup] legacy message-ids file archived to ${legacyBackup}`);
+  }
+
+  // 2. Wire adapter events.
   registerAdapterEventHandlers({
     onOutput: handleAgentOutput,
     onStatus: handleAgentStatus,
@@ -1566,75 +1721,61 @@ export async function startBot(): Promise<void> {
     onError: handleAgentError,
   });
 
-  loadMessageIds();
-
-  const shutdown = async (signal: string) => {
-    console.log(`\n${signal} received, shutting down...`);
-    for (const userId of allowedUsers) {
-      const adapter = getUserAdapter(userId);
-      if (adapter.checkIsActive(userId)) {
-        adapter.stopSession(userId);
-      }
+  // 3. Pre-start OpenCode server if available so first request is fast.
+  if (getAvailableAdapters().some(a => a.name === 'opencode')) {
+    try {
+      console.log('[boot] pre-starting OpenCode server...');
+      await ensureOpenCodeServer();
+    } catch (e) {
+      console.log('[boot] OpenCode pre-start failed:', e instanceof Error ? e.message : e);
     }
-    stopOpenCodeServer();
-    bot.stop(signal);
-    process.exit(0);
-  };
+  }
 
-  process.once('SIGINT', () => shutdown('SIGINT'));
-  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  // 4. Re-attach sessions that survived the restart.
+  await reattachExistingSessions();
 
+  // 5. Connect to Telegram and register commands menu.
   console.log('Testing Telegram API connection...');
   try {
     const botInfo = await bot.telegram.getMe();
     console.log(`Bot info: @${botInfo.username} (${botInfo.id})`);
-
-    await bot.telegram.setMyCommands([
-      { command: 'claude', description: '▶️ Start Claude Code' },
-      { command: 'opencode', description: '▶️ Start OpenCode' },
-      { command: 'model', description: '🧠 Switch model' },
-      { command: 'agent', description: '🔄 Choose agent' },
-      { command: 'sessions', description: '📋 Previous sessions' },
-      { command: 'stop', description: '⏹️ Stop agent' },
-      { command: 'status', description: '📊 Show status' },
-      { command: 'output', description: '📜 Last 500 lines' },
-      { command: 'enter', description: '↵ Press Enter' },
-      { command: 'up', description: '⬆️ Arrow Up' },
-      { command: 'down', description: '⬇️ Arrow Down' },
-      { command: 'tab', description: '⇥ Tab' },
-      { command: 'y', description: '✅ Send "y"' },
-      { command: 'n', description: '❌ Send "n"' },
-      { command: 'c', description: '🛑 Ctrl+C' },
-      { command: 'clear', description: '🗑️ Clear messages' },
-    ]);
+    await bot.telegram.setMyCommands(COMMANDS_MENU);
     console.log('Bot commands menu set');
   } catch (err) {
     console.error('Failed to connect to Telegram API:', err);
     throw err;
   }
 
-  // Pre-start OpenCode server if opencode adapter is available
-  if (getAvailableAdapters().some(a => a.name === 'opencode')) {
-    try {
-      console.log('[Boot] Pre-starting OpenCode server...');
-      await ensureOpenCodeServer();
-      
-      // Diagnostic: fetch config to see what model OpenCode resolved
-      const openCodeUrl = (process.env.OPENCODE_URL || 'http://localhost:4096').replace(/\/$/, '');
-      const configResp = await fetch(`${openCodeUrl}/config`, { signal: AbortSignal.timeout(5000) });
-      if (configResp.ok) {
-        const config = await configResp.json() as Record<string, unknown>;
-        const dm = config.defaultModel as { providerID?: string; modelID?: string } | undefined;
-        console.log(`[Boot] OpenCode config.model: ${config.model || '(not set)'}`);
-        console.log(`[Boot] OpenCode defaultModel: ${dm?.providerID && dm?.modelID ? `${dm.providerID}/${dm.modelID}` : '(not resolved)'}`);
-      } else {
-        console.log(`[Boot] OpenCode /config returned ${configResp.status}`);
-      }
-    } catch (e) {
-      console.log(`[Boot] OpenCode pre-start failed:`, e instanceof Error ? e.message : e);
-    }
-  }
+  // 6. Global catch — Telegraf swallows handler errors otherwise.
+  bot.catch((err, ctx) => {
+    console.error('[bot.catch] unhandled error:', err, 'update:', ctx.updateType);
+  });
 
+  // 7. Shutdown — stop active sessions, flush state, kill OpenCode server.
+  const shutdown = async (signal: string) => {
+    console.log(`\n${signal} received, shutting down...`);
+    try {
+      // Stop every active session by walking state bindings.
+      for (const { key } of state.listBindings()) {
+        const adapter = getThreadAdapter(key);
+        if (adapter.checkIsActive(key)) {
+          try { adapter.stopSession(key); } catch (e) {
+            console.warn(`[shutdown] stop ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
+          }
+        }
+      }
+      await state.flush();
+    } catch (e) {
+      console.error('[shutdown] error during cleanup:', e);
+    }
+    stopOpenCodeServer();
+    bot.stop(signal);
+    process.exit(0);
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+  // 8. Launch.
   console.log('Launching Telegraf bot (long polling)...');
   try {
     bot.launch({ dropPendingUpdates: true });
@@ -1647,5 +1788,3 @@ export async function startBot(): Promise<void> {
     throw err;
   }
 }
-
-export { bot };

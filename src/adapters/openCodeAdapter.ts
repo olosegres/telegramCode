@@ -3,22 +3,29 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession } from '../types';
+import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
+import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 
 const execAsync = promisify(exec);
 
 /**
- * Persist per-user model selection so it survives bot restarts.
- * Stored in DATA_DIR (or HOME) as a simple JSON map: { "userId": "provider/model" }
+ * Persist per-thread model selection so it survives bot restarts.
+ * Stored in `DATA_DIR` (or `HOME`) as a JSON map keyed by serialised
+ * `ThreadKey`: `{ "<chatId>:<threadId>": "provider/model" }` (plan §10.3, D22).
+ *
+ * Older versions of the bot used `{ "<userId>": "provider/model" }`. Those
+ * entries are silently ignored after the 2.0 upgrade — users can re-select
+ * their model via `/model`; we deliberately don't try to migrate (one of two
+ * adapters, easy to recover, not worth the migration complexity).
  */
 const modelStateFile = path.join(process.env.DATA_DIR || process.env.HOME || '/tmp', '.opencode-model-prefs.json');
 
-function loadSavedModel(userId: number): { providerID: string; modelID: string } | null {
+function loadSavedModel(key: ThreadKey): { providerID: string; modelID: string } | null {
   try {
     if (!fs.existsSync(modelStateFile)) return null;
     const data = JSON.parse(fs.readFileSync(modelStateFile, 'utf-8'));
-    const saved = data[String(userId)] as string | undefined;
+    const saved = data[keyToString(key)] as string | undefined;
     if (!saved) return null;
     const idx = saved.indexOf('/');
     if (idx <= 0) return null;
@@ -28,13 +35,13 @@ function loadSavedModel(userId: number): { providerID: string; modelID: string }
   }
 }
 
-function saveModelPref(userId: number, label: string): void {
+function saveModelPref(key: ThreadKey, label: string): void {
   try {
     let data: Record<string, string> = {};
     if (fs.existsSync(modelStateFile)) {
       data = JSON.parse(fs.readFileSync(modelStateFile, 'utf-8'));
     }
-    data[String(userId)] = label;
+    data[keyToString(key)] = label;
     fs.writeFileSync(modelStateFile, JSON.stringify(data, null, 2));
   } catch (e) {
     console.log(`[OpenCode] Failed to save model pref:`, e instanceof Error ? e.message : e);
@@ -47,7 +54,7 @@ interface OpenCodeModelOverride {
 }
 
 interface OpenCodeSession {
-  userId: number;
+  key: ThreadKey;
   sessionId: string;
   workDir: string;
   isActive: boolean;
@@ -245,7 +252,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'opencode';
   readonly label = 'OpenCode';
 
-  private sessions: Map<number, OpenCodeSession> = new Map();
+  /**
+   * Map of serialised `ThreadKey` (`"<chatId>:<threadId>"`) → live session.
+   * Keyed by string rather than `ThreadKey` object so map lookups work — JS
+   * `Map` compares object identity, not structural equality.
+   */
+  private sessions: Map<string, OpenCodeSession> = new Map();
   private baseUrl: string;
   private authHeader: string | null;
 
@@ -280,10 +292,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const reason = code === 137 ? 'out of memory (OOM killed)' :
       signal ? `signal ${signal}` : `exit code ${code}`;
 
-    // Notify all active session users about the crash
-    for (const [userId, session] of this.sessions) {
+    // Notify all active session threads about the crash
+    for (const session of this.sessions.values()) {
       if (session.isActive) {
-        this.emit('output', userId, `OpenCode server crashed (${reason}). Restarting...`);
+        this.emit('output', session.key, `OpenCode server crashed (${reason}). Restarting...`);
       }
     }
 
@@ -313,23 +325,25 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       await ensureOpenCodeServer();
       console.log(`[OpenCode] Server restarted successfully`);
 
-      // Notify all active session users about recovery
-      for (const [userId, session] of this.sessions) {
+      // Notify all active session threads about recovery
+      for (const session of this.sessions.values()) {
         if (session.isActive) {
-          this.emit('output', userId, `OpenCode server restarted. Session may need to be restarted (/stop then /opencode).`);
+          this.emit('output', session.key, `OpenCode server restarted. Session may need to be restarted (/stop then /opencode).`);
         }
       }
       return true;
     } catch (e) {
       console.error(`[OpenCode] Server restart failed:`, e);
-      // Notify users about the failure
-      for (const [userId, session] of this.sessions) {
+      // Notify threads about the failure and tear them down
+      // Take a snapshot first so we can safely mutate `this.sessions` inside the loop.
+      const snapshot = Array.from(this.sessions.entries());
+      for (const [k, session] of snapshot) {
         if (session.isActive) {
-          this.emit('output', userId, `Failed to restart OpenCode server: ${e instanceof Error ? e.message : String(e)}`);
+          this.emit('output', session.key, `Failed to restart OpenCode server: ${e instanceof Error ? e.message : String(e)}`);
           // Mark session as inactive — no point keeping it alive
           session.isActive = false;
-          this.sessions.delete(userId);
-          this.emit('stopped', userId);
+          this.sessions.delete(k);
+          this.emit('stopped', session.key);
         }
       }
       return false;
@@ -389,28 +403,34 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return undefined as T;
   }
 
-  async startSession(userId: number, workDir: string, args?: string): Promise<void> {
-    this.stopSession(userId);
+  async startSession(key: ThreadKey, workDir: string, args?: string, _sessionId?: string): Promise<void> {
+    // OpenCode's session id is server-assigned via POST /session, so an
+    // externally-supplied sessionId is not honoured here. The bot keeps the
+    // mapping `ThreadKey → opencodeSessionId` in state.json (plan §13.19) so
+    // resumes after a restart go through `resumeSession()`, not startSession.
+    this.stopSession(key);
+
+    const k = keyToString(key);
 
     if (!checkIsInstalled('opencode')) {
-      this.emit('output', userId, 'Installing OpenCode...');
+      this.emit('output', key, 'Installing OpenCode...');
       await installTool('opencode');
     }
 
     if (!await checkIsOpenCodeServerRunning()) {
-      this.emit('output', userId, 'Starting OpenCode server...');
+      this.emit('output', key, 'Starting OpenCode server...');
       await ensureOpenCodeServer();
     }
 
-    console.log(`[OpenCode] Starting session for user ${userId} in ${workDir}`);
+    console.log(`[OpenCode] Starting session for ${k} in ${workDir}`);
 
     try {
       const apiSession = await this.apiRequest<OpenCodeApiSession>('POST', '/session', {
-        title: args || `Telegram session ${userId}`,
+        title: args || `Telegram session ${k}`,
       });
 
       const session: OpenCodeSession = {
-        userId,
+        key,
         sessionId: apiSession.id,
         workDir,
         isActive: true,
@@ -425,29 +445,30 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         pendingQuestion: null,
       };
 
-      this.sessions.set(userId, session);
-      this.connectSse(userId);
+      this.sessions.set(k, session);
+      this.connectSse(key);
 
       // Fetch default model info from OpenCode server and show to user
-      await this.fetchModelInfo(userId);
+      await this.fetchModelInfo(key);
 
       // If args provided, send as first message
       if (args) {
-        this.sendPromptAsync(userId, args);
+        this.sendPromptAsync(key, args);
       }
 
-      this.emit('started', userId);
+      this.emit('started', key);
     } catch (e) {
       console.error(`[OpenCode] Failed to start session:`, e);
       throw e;
     }
   }
 
-  stopSession(userId: number): void {
-    const session = this.sessions.get(userId);
+  stopSession(key: ThreadKey): void {
+    const k = keyToString(key);
+    const session = this.sessions.get(k);
     if (!session) return;
 
-    console.log(`[OpenCode] Stopping session for user ${userId}`);
+    console.log(`[OpenCode] Stopping session for ${k}`);
 
     session.isActive = false;
 
@@ -455,32 +476,32 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.outputTimer);
     }
 
-    this.disconnectSse(userId);
+    this.disconnectSse(key);
 
     // Abort any running generation
     this.apiRequest('POST', `/session/${session.sessionId}/abort`).catch(() => {});
 
-    this.sessions.delete(userId);
-    this.emit('stopped', userId);
+    this.sessions.delete(k);
+    this.emit('stopped', key);
   }
 
-  checkIsActive(userId: number): boolean {
-    const session = this.sessions.get(userId);
+  checkIsActive(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
     return session?.isActive ?? false;
   }
 
-  sendInput(userId: number, input: string): void {
-    this.sendPromptAsync(userId, input);
+  sendInput(key: ThreadKey, input: string): void {
+    this.sendPromptAsync(key, input);
   }
 
   /**
    * @description Send message via async endpoint (returns 204, response streams via SSE).
    * Fire-and-forget — errors are logged but don't block.
    */
-  private sendPromptAsync(userId: number, input: string): void {
-    const session = this.sessions.get(userId);
+  private sendPromptAsync(key: ThreadKey, input: string): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) {
-      console.log(`[OpenCode] sendInput: no active session for user ${userId}`);
+      console.log(`[OpenCode] sendInput: no active session for ${keyToString(key)}`);
       return;
     }
 
@@ -502,13 +523,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body).catch((e) => {
       console.error(`[OpenCode] Failed to send message:`, e);
-      this.emit('error', userId, e instanceof Error ? e : new Error(String(e)));
+      this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
     });
   }
 
-  sendSignal(userId: number, signal: string): void {
+  sendSignal(key: ThreadKey, signal: string): void {
     if (signal === 'SIGINT') {
-      const session = this.sessions.get(userId);
+      const session = this.sessions.get(keyToString(key));
       if (!session?.isActive) return;
 
       console.log(`[OpenCode] Aborting session (SIGINT)`);
@@ -523,13 +544,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * Accepts either "provider/modelId" format or partial name to search.
    * @returns Error message if model not found, null on success
    */
-  async setModel(userId: number, modelId: string): Promise<string | null> {
-    const session = this.sessions.get(userId);
+  async setModel(key: ThreadKey, modelId: string): Promise<string | null> {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return 'No active session';
 
     const models = await fetchAvailableModels();
     const resolved = await resolveModelId(modelId, models);
-    
+
     if (!resolved) {
       return `Model "${modelId}" not found. Use /model to see available models.`;
     }
@@ -538,7 +559,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.isModelInfoShown = false;
     const label = `${resolved.providerID}/${resolved.modelID}`;
     session.currentModelLabel = label;
-    saveModelPref(userId, label);
+    saveModelPref(key, label);
     console.log(`[OpenCode] Model set to: ${label}`);
     return null;
   }
@@ -550,13 +571,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return fetchAvailableModels();
   }
 
-  getCurrentModel(userId: number): string | null {
-    const session = this.sessions.get(userId);
+  getCurrentModel(key: ThreadKey): string | null {
+    const session = this.sessions.get(keyToString(key));
     if (!session) return null;
     return session.currentModelLabel;
   }
 
-  async getSessions(): Promise<AgentSession[]> {
+  async getSessions(_key: ThreadKey): Promise<AgentSession[]> {
     try {
       const apiSessions = await this.apiRequest<OpenCodeApiSession[]>('GET', '/session');
 
@@ -574,29 +595,36 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
-  async resumeSession(userId: number, sessionId: string): Promise<void> {
-    this.stopSession(userId);
+  async resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
+    // `workDir` is now an explicit argument from the bot, sourced from the
+    // thread's binding in state.json. The old code defaulted to
+    // `process.env.WORK_DIR || '/workspace'`, which silently mis-routed
+    // resumes to the wrong folder as soon as the bot started managing
+    // multiple bindings (plan §10.3, fix to old openCodeAdapter.ts:599).
+    this.stopSession(key);
+
+    const k = keyToString(key);
 
     if (!checkIsInstalled('opencode')) {
-      this.emit('output', userId, 'Installing OpenCode...');
+      this.emit('output', key, 'Installing OpenCode...');
       await installTool('opencode');
     }
 
     if (!await checkIsOpenCodeServerRunning()) {
-      this.emit('output', userId, 'Starting OpenCode server...');
+      this.emit('output', key, 'Starting OpenCode server...');
       await ensureOpenCodeServer();
     }
 
-    console.log(`[OpenCode] Resuming session ${sessionId} for user ${userId}`);
+    console.log(`[OpenCode] Resuming session ${sessionId} for ${k} in ${workDir}`);
 
     try {
       // Verify session exists
       const apiSession = await this.apiRequest<OpenCodeApiSession>('GET', `/session/${sessionId}`);
 
       const session: OpenCodeSession = {
-        userId,
+        key,
         sessionId: apiSession.id,
-        workDir: process.env.WORK_DIR || '/workspace',
+        workDir,
         isActive: true,
         currentResponseText: '',
         outputTimer: null,
@@ -609,9 +637,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         pendingQuestion: null,
       };
 
-      this.sessions.set(userId, session);
-      this.connectSse(userId);
-      this.emit('started', userId);
+      this.sessions.set(k, session);
+      this.connectSse(key);
+      this.emit('started', key);
     } catch (e) {
       console.error(`[OpenCode] Failed to resume session:`, e);
       throw e;
@@ -623,43 +651,43 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * OpenCode SSE uses only `data:` lines (no `event:` field).
    * Each data line contains JSON: { type: "event.name", properties: {...} }
    */
-  private connectSse(userId: number): void {
-    const session = this.sessions.get(userId);
+  private connectSse(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session) return;
 
     const sseUrl = `${this.baseUrl}/event`;
     console.log(`[OpenCode] Connecting SSE: ${sseUrl}`);
 
-    this.pollSse(userId, sseUrl).catch((e) => {
+    this.pollSse(key, sseUrl).catch((e) => {
       console.error(`[OpenCode] SSE connection error:`, e);
     });
   }
 
-  private disconnectSse(userId: number): void {
-    const session = this.sessions.get(userId);
+  private disconnectSse(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session) return;
     session.isActive = false;
   }
 
   /**
    * @description Resolve model for the session. Priority:
-   * 1. User's saved preference (from previous /model selection)
+   * 1. Thread's saved preference (from previous /model selection)
    * 2. OpenCode server's defaultModel (config.model -> model.json recent -> first provider)
    * 3. "not set"
    */
-  private async fetchModelInfo(userId: number): Promise<void> {
-    const session = this.sessions.get(userId);
+  private async fetchModelInfo(key: ThreadKey): Promise<void> {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive || session.isModelInfoShown) return;
 
-    // 1. Check user's saved model preference
-    const saved = loadSavedModel(userId);
+    // 1. Check this thread's saved model preference
+    const saved = loadSavedModel(key);
     if (saved) {
       const label = `${saved.providerID}/${saved.modelID}`;
       session.currentModelLabel = label;
       session.modelOverride = saved;
       session.isModelInfoShown = true;
       console.log(`[OpenCode] Restored saved model: ${label}`);
-      this.emit('output', userId, `Model: ${label}`);
+      this.emit('output', key, `Model: ${label}`);
       return;
     }
 
@@ -669,9 +697,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         model?: string;
         defaultModel?: { providerID: string; modelID: string };
       }>('GET', '/config');
-      
+
       console.log(`[OpenCode] GET /config: model=${config?.model || 'unset'}, defaultModel=${config?.defaultModel ? `${config.defaultModel.providerID}/${config.defaultModel.modelID}` : 'unset'}`);
-      
+
       if (config?.defaultModel?.providerID && config?.defaultModel?.modelID) {
         const label = `${config.defaultModel.providerID}/${config.defaultModel.modelID}`;
         session.currentModelLabel = label;
@@ -681,10 +709,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         };
         session.isModelInfoShown = true;
         console.log(`[OpenCode] Default model: ${label}`);
-        this.emit('output', userId, `Model: ${label}`);
+        this.emit('output', key, `Model: ${label}`);
         return;
       }
-      
+
       if (config?.model) {
         const slashIdx = config.model.indexOf('/');
         if (slashIdx > 0) {
@@ -696,17 +724,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         session.currentModelLabel = config.model;
         session.isModelInfoShown = true;
         console.log(`[OpenCode] Default model (config): ${config.model}`);
-        this.emit('output', userId, `Model: ${config.model}`);
+        this.emit('output', key, `Model: ${config.model}`);
         return;
       }
     } catch (e) {
       console.log(`[OpenCode] fetchModelInfo failed:`, e instanceof Error ? e.message : e);
     }
-    
+
     // 3. No model resolved
     console.log(`[OpenCode] No default model resolved`);
     session.currentModelLabel = 'not set';
-    this.emit('output', userId, `Model: not set (use /model to select)`);
+    this.emit('output', key, `Model: not set (use /model to select)`);
   }
 
   /**
@@ -716,8 +744,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * On connection failure: checks if server is alive, attempts restart if dead,
    * retries with exponential backoff up to maxSseReconnectAttempts.
    */
-  private async pollSse(userId: number, sseUrl: string, reconnectAttempt = 0): Promise<void> {
-    const session = this.sessions.get(userId);
+  private async pollSse(key: ThreadKey, sseUrl: string, reconnectAttempt = 0): Promise<void> {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const headers: Record<string, string> = {
@@ -732,7 +760,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
       if (!response.ok || !response.body) {
         console.error(`[OpenCode] SSE connection failed: ${response.status}`);
-        await this.handleSseReconnect(userId, sseUrl, reconnectAttempt, `HTTP ${response.status}`);
+        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, `HTTP ${response.status}`);
         return;
       }
 
@@ -756,7 +784,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           if (!line.startsWith('data: ')) continue;
 
           const dataStr = line.slice(6);
-          this.handleSseData(userId, dataStr);
+          this.handleSseData(key, dataStr);
         }
       }
 
@@ -765,13 +793,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // If session is still active but stream ended (server-side close), try to reconnect
       if (session.isActive) {
         console.log(`[OpenCode] SSE stream ended while session active, reconnecting...`);
-        await this.handleSseReconnect(userId, sseUrl, 0, 'stream ended');
+        await this.handleSseReconnect(key, sseUrl, 0, 'stream ended');
       }
     } catch (e) {
       if (session.isActive) {
         const errorMessage = e instanceof Error ? e.message : String(e);
         console.error(`[OpenCode] SSE error:`, errorMessage);
-        await this.handleSseReconnect(userId, sseUrl, reconnectAttempt, errorMessage);
+        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, errorMessage);
       }
     }
   }
@@ -779,18 +807,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /**
    * @description Handle SSE reconnection with server health check, auto-restart, and exponential backoff.
    * If the server is dead, attempts to restart it before reconnecting SSE.
-   * Gives up after maxSseReconnectAttempts and notifies the user.
+   * Gives up after maxSseReconnectAttempts and notifies the thread.
    */
-  private async handleSseReconnect(userId: number, sseUrl: string, attempt: number, reason: string): Promise<void> {
-    const session = this.sessions.get(userId);
+  private async handleSseReconnect(key: ThreadKey, sseUrl: string, attempt: number, reason: string): Promise<void> {
+    const k = keyToString(key);
+    const session = this.sessions.get(k);
     if (!session?.isActive) return;
 
     if (attempt >= maxSseReconnectAttempts) {
       console.error(`[OpenCode] SSE reconnect failed after ${attempt} attempts, giving up`);
-      this.emit('output', userId, `Lost connection to OpenCode server after ${attempt} attempts. Use /stop and start a new session.`);
+      this.emit('output', key, `Lost connection to OpenCode server after ${attempt} attempts. Use /stop and start a new session.`);
       session.isActive = false;
-      this.sessions.delete(userId);
-      this.emit('stopped', userId);
+      this.sessions.delete(k);
+      this.emit('stopped', key);
       return;
     }
 
@@ -801,7 +830,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[OpenCode] Server is not responding, attempting restart before SSE reconnect...`);
       const restarted = await this.restartServer();
       if (!restarted) {
-        // restartServer already notified users and cleaned up sessions
+        // restartServer already notified threads and cleaned up sessions
         return;
       }
       // Server restarted — reset attempt counter, give it a fresh chance
@@ -815,15 +844,21 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     await new Promise(resolve => setTimeout(resolve, delay));
 
     if (session.isActive) {
-      this.pollSse(userId, sseUrl, attempt + 1).catch(() => {});
+      this.pollSse(key, sseUrl, attempt + 1).catch(() => {});
     }
   }
 
   /**
    * @description Parse a single SSE data line. The JSON envelope is { type, properties }.
+   *
+   * The OpenCode server multiplexes events for ALL sessions on one `/event` stream,
+   * so we filter by `sessionID` to dispatch only the ones belonging to this `key`.
+   * Note: every `ThreadKey` opens its own SSE connection to the server, so this
+   * filter is double-defence — even if the server ever changes its routing,
+   * we never deliver a cross-thread event by accident.
    */
-  private handleSseData(userId: number, dataStr: string): void {
-    const session = this.sessions.get(userId);
+  private handleSseData(key: ThreadKey, dataStr: string): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     let event: OpenCodeSseEvent;
@@ -843,27 +878,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     switch (eventType) {
       case 'message.part.updated':
       case 'message.part.delta':
-        this.handlePartUpdate(userId, event.properties);
+        this.handlePartUpdate(key, event.properties);
         break;
 
       case 'message.updated':
-        this.handleMessageUpdate(userId, event.properties);
+        this.handleMessageUpdate(key, event.properties);
         break;
 
       case 'session.idle':
-        this.handleSessionIdle(userId, event.properties);
+        this.handleSessionIdle(key, event.properties);
         break;
 
       case 'session.error':
-        this.handleSessionError(userId, event.properties);
+        this.handleSessionError(key, event.properties);
         break;
 
       case 'permission.asked':
-        this.handlePermissionAsked(userId, event.properties);
+        this.handlePermissionAsked(key, event.properties);
         break;
 
       case 'question.asked':
-        this.handleQuestionAsked(userId, event.properties);
+        this.handleQuestionAsked(key, event.properties);
         break;
 
       case 'server.connected':
@@ -901,8 +936,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * Text parts are accumulated and emitted as 'output' (permanent messages).
    * Tool, reasoning, step-* parts are emitted as 'status' (transient messages).
    */
-  private handlePartUpdate(userId: number, properties: Record<string, unknown>): void {
-    const session = this.sessions.get(userId);
+  private handlePartUpdate(key: ThreadKey, properties: Record<string, unknown>): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const part = properties.part as OpenCodePart | undefined;
@@ -920,13 +955,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     switch (partType) {
       case 'text':
-        this.handleTextDelta(userId, session, delta, field);
+        this.handleTextDelta(key, session, delta, field);
         break;
       case 'tool':
-        this.handleToolPart(userId, session, part);
+        this.handleToolPart(key, session, part);
         break;
       case 'reasoning':
-        this.handleReasoningPart(userId, session, part, delta, field);
+        this.handleReasoningPart(key, session, part, delta, field);
         break;
       case 'step-start':
       case 'step-finish':
@@ -945,7 +980,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Handle text delta — accumulate and emit as 'output'.
    */
   private handleTextDelta(
-    userId: number,
+    key: ThreadKey,
     session: OpenCodeSession,
     delta: string | undefined,
     field: string | undefined,
@@ -966,7 +1001,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.outputTimer = setTimeout(() => {
       session.outputTimer = null;
       if (session.currentResponseText.trim()) {
-        this.emit('output', userId, session.currentResponseText);
+        this.emit('output', key, session.currentResponseText);
       }
     }, sseOutputBatchMs);
   }
@@ -975,7 +1010,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Handle tool part — format and emit as 'status'.
    */
   private handleToolPart(
-    userId: number,
+    key: ThreadKey,
     session: OpenCodeSession,
     part: OpenCodePart | undefined,
   ): void {
@@ -1004,18 +1039,18 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         break;
     }
 
-    this.emitStatus(userId, session, statusText);
+    this.emitStatus(key, session, statusText);
   }
 
   /**
    * @description Handle reasoning (thinking) part — format and emit as 'status'.
    */
   private handleReasoningPart(
-    userId: number,
+    key: ThreadKey,
     session: OpenCodeSession,
     part: OpenCodePart | undefined,
     delta: string | undefined,
-    field: string | undefined,
+    _field: string | undefined,
   ): void {
     // For deltas on reasoning parts, show a thinking indicator
     const text = delta || part?.text || '';
@@ -1025,7 +1060,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const preview = text.split('\n')[0].slice(0, 300);
     const statusText = preview ? `💭 ${preview}${text.length > 300 ? '...' : ''}` : '💭 Thinking...';
 
-    this.emitStatus(userId, session, statusText);
+    this.emitStatus(key, session, statusText);
   }
 
   /** Debounce delay (ms) for status updates to avoid Telegram rate limits */
@@ -1036,7 +1071,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * Rapid status updates (e.g. multiple tool state changes) are batched —
    * only the latest status text is emitted after a quiet period.
    */
-  private emitStatus(userId: number, session: OpenCodeSession, text: string): void {
+  private emitStatus(key: ThreadKey, session: OpenCodeSession, text: string): void {
     session.pendingStatus = text;
 
     if (session.statusDebounceTimer) {
@@ -1046,7 +1081,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.statusDebounceTimer = setTimeout(() => {
       session.statusDebounceTimer = null;
       if (session.pendingStatus) {
-        this.emit('status', userId, session.pendingStatus);
+        this.emit('status', key, session.pendingStatus);
         session.pendingStatus = null;
       }
     }, OpenCodeAdapter.statusDebounceMs);
@@ -1056,8 +1091,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Handle message completion.
    * Event properties: { info: OpenCodeMessageInfo }
    */
-  private handleMessageUpdate(userId: number, properties: Record<string, unknown>): void {
-    const session = this.sessions.get(userId);
+  private handleMessageUpdate(key: ThreadKey, properties: Record<string, unknown>): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const info = properties.info as OpenCodeMessageInfo | undefined;
@@ -1073,20 +1108,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       if (!session.isModelInfoShown) {
         session.isModelInfoShown = true;
         console.log(`[OpenCode] Using model: ${modelLabel}`);
-        this.emit('output', userId, `Model: ${modelLabel}`);
+        this.emit('output', key, `Model: ${modelLabel}`);
       }
     }
 
     // When assistant message completes (has finish reason), flush output
     if (info.finish && info.role === 'assistant') {
-      this.flushOutput(userId);
+      this.flushOutput(key);
     }
 
     // Surface errors to the user
     if (info.error) {
       const errorMsg = this.extractErrorMessage(info.error);
       console.error(`[OpenCode] Message error:`, errorMsg);
-      this.emit('output', userId, `Error: ${errorMsg}`);
+      this.emit('output', key, `Error: ${errorMsg}`);
     }
   }
 
@@ -1094,26 +1129,29 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Handle session becoming idle (AI done processing).
    * Flush any remaining accumulated output.
    */
-  private handleSessionIdle(userId: number, properties: Record<string, unknown>): void {
-    const session = this.sessions.get(userId);
+  private handleSessionIdle(key: ThreadKey, properties: Record<string, unknown>): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const sessionId = properties.sessionID as string | undefined;
     if (sessionId && sessionId !== session.sessionId) return;
 
     console.log(`[OpenCode] Session idle`);
-    this.flushOutput(userId);
+    this.flushOutput(key);
   }
 
-  private handleSessionError(userId: number, properties: Record<string, unknown>): void {
+  private handleSessionError(key: ThreadKey, properties: Record<string, unknown>): void {
     const errorMsg = this.extractErrorMessage(properties.error);
     console.error(`[OpenCode] Session error:`, errorMsg);
-    this.emit('output', userId, `OpenCode error: ${errorMsg}`);
+    this.emit('output', key, `OpenCode error: ${errorMsg}`);
   }
 
-  private handlePermissionAsked(userId: number, properties: Record<string, unknown>): void {
+  private handlePermissionAsked(_key: ThreadKey, properties: Record<string, unknown>): void {
     console.log(`[OpenCode] Permission requested:`, JSON.stringify(properties));
-    // Auto-approve all permissions (headless mode)
+    // Auto-approve all permissions (headless mode). Symmetry with the
+    // claude adapter, which always passes `--dangerously-skip-permissions`
+    // (plan D44, §10.2). Per-thread opt-out (S1) was deliberately rejected
+    // — if it ever comes back, this is where it'd hook in.
     const requestId = (properties.requestID || properties.id) as string | undefined;
     if (requestId) {
       this.apiRequest('POST', `/permission/${requestId}/reply`, {
@@ -1131,8 +1169,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    *
    * Event properties: { id, sessionID, questions: QuestionInfo[], tool? }
    */
-  private handleQuestionAsked(userId: number, properties: Record<string, unknown>): void {
-    const session = this.sessions.get(userId);
+  private handleQuestionAsked(key: ThreadKey, properties: Record<string, unknown>): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const requestId = (properties.requestID || properties.id) as string | undefined;
@@ -1154,15 +1192,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.pendingQuestion = { requestId, questions };
 
     // Emit question event for the bot to display to user
-    this.emit('question', userId, { requestId, questions });
+    this.emit('question', key, { requestId, questions });
   }
 
   /**
    * @description Reply to a pending question with user-selected answers.
    * Called by the bot when the user clicks an inline button or types a custom answer.
    */
-  answerQuestion(userId: number, answers: string[][]): void {
-    const session = this.sessions.get(userId);
+  answerQuestion(key: ThreadKey, answers: string[][]): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session?.isActive || !session.pendingQuestion) return;
 
     const { requestId } = session.pendingQuestion;
@@ -1172,7 +1210,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       answers,
     }).catch((e) => {
       console.error(`[OpenCode] Failed to reply to question:`, e);
-      this.emit('output', userId, `Failed to send answer: ${e instanceof Error ? e.message : e}`);
+      this.emit('output', key, `Failed to send answer: ${e instanceof Error ? e.message : e}`);
     });
   }
 
@@ -1198,8 +1236,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return JSON.stringify(error);
   }
 
-  private flushOutput(userId: number): void {
-    const session = this.sessions.get(userId);
+  private flushOutput(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
     if (!session) return;
 
     if (session.outputTimer) {
@@ -1213,12 +1251,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       session.statusDebounceTimer = null;
     }
     if (session.pendingStatus) {
-      this.emit('status', userId, session.pendingStatus);
+      this.emit('status', key, session.pendingStatus);
       session.pendingStatus = null;
     }
 
     if (session.currentResponseText.trim()) {
-      this.emit('output', userId, session.currentResponseText);
+      this.emit('output', key, session.currentResponseText);
     }
 
     session.currentResponseText = '';

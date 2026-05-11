@@ -2,6 +2,7 @@ import { Telegraf, Markup, type Context, type NarrowedContext } from 'telegraf';
 import { message } from 'telegraf/filters';
 import type { Update, Message } from 'telegraf/typings/core/types/typegram';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as https from 'https';
 import * as http from 'http';
@@ -1047,32 +1048,39 @@ command('status', async (_ctx, key) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @description Persist a `key → subdir` binding and notify the user.
+ * @description Persist a `key → subdir` binding and report the outcome.
  *
  * Shared between the `/bind <subdir>` command and the `bind_<subdir>`
  * inline-callback so both paths apply identical validation, collision
  * checks (plan §11 Этап 4 — warn when other threads already use the same
  * folder, decision D7) and acknowledgement formatting.
  *
- * Returns `null` on success or a localised error message on failure;
- * callers decide whether to send via `replyToThread` (commands) or
- * `editThreadMessage` (callback edits).
+ * Returns `{ ok: true, subdir }` on success, plus a localised
+ * acknowledgement string. Callers send the message themselves so they
+ * can stack additional content (rich welcome, etc.) underneath.
  */
-async function applyBinding(key: ThreadKey, rawSubdir: string): Promise<string> {
+type ApplyBindingResult =
+  | { ok: true;  message: string; subdir: string }
+  | { ok: false; message: string };
+
+async function applyBinding(key: ThreadKey, rawSubdir: string): Promise<ApplyBindingResult> {
   let subdir: string;
   try {
     subdir = validateSubdir(ENV.workRoot, rawSubdir);
   } catch (e) {
+    let msg: string;
     if (e instanceof BindError) {
       switch (e.code) {
-        case 'BIND_INVALID_CHARS': return t('bind.invalid_chars');
-        case 'BIND_NOT_FOUND':     return t('bind.not_found', { subdir: rawSubdir, workRoot: ENV.workRoot });
-        case 'BIND_OUTSIDE_ROOT':  return t('bind.outside_root');
-        case 'BIND_NOT_DIRECTORY': return t('bind.not_directory', { subdir: rawSubdir });
-        default:                   return `❌ ${e.message}`;
+        case 'BIND_INVALID_CHARS': msg = t('bind.invalid_chars'); break;
+        case 'BIND_NOT_FOUND':     msg = t('bind.not_found', { subdir: rawSubdir, workRoot: ENV.workRoot }); break;
+        case 'BIND_OUTSIDE_ROOT':  msg = t('bind.outside_root'); break;
+        case 'BIND_NOT_DIRECTORY': msg = t('bind.not_directory', { subdir: rawSubdir }); break;
+        default:                   msg = `❌ ${e.message}`;
       }
+    } else {
+      msg = `❌ ${e instanceof Error ? e.message : String(e)}`;
     }
-    return `❌ ${e instanceof Error ? e.message : String(e)}`;
+    return { ok: false, message: msg };
   }
 
   // Collision warning: one folder may host several threads (D7), but the
@@ -1081,11 +1089,13 @@ async function applyBinding(key: ThreadKey, rawSubdir: string): Promise<string> 
   const peers = state.listKeysForSubdir(subdir).filter(k => keyToString(k) !== keyToString(key));
   await state.setBinding(key, subdir);
 
-  if (peers.length > 0) {
-    const peerList = peers.map(k => `\`${keyToString(k)}\``).join(', ');
-    return t('thread.bind_collision', { subdir, threads: peerList });
-  }
-  return t('thread.bound', { subdir });
+  const message = peers.length > 0
+    ? t('thread.bind_collision', {
+        subdir,
+        threads: peers.map(k => `\`${keyToString(k)}\``).join(', '),
+      })
+    : t('thread.bound', { subdir });
+  return { ok: true, message, subdir };
 }
 
 command('bind', async (ctx, key) => {
@@ -1107,8 +1117,9 @@ command('bind', async (ctx, key) => {
     await replyToThread(key, t('bind.usage'), buildBindKeyboard(subdirs));
     return;
   }
-  const reply = await applyBinding(key, arg);
-  await replyToThread(key, reply);
+  const result = await applyBinding(key, arg);
+  await replyToThread(key, result.message);
+  if (result.ok) await sendBindingWelcome(key, result.subdir);
 });
 
 command('unbind', async (_ctx, key) => {
@@ -1322,6 +1333,7 @@ command('new', async (ctx, key) => {
     // Welcome inside the new thread mirrors `forum_topic_created` so the
     // user doesn't get a different experience based on creation path.
     await replyToThread(newKey, t('thread.welcome_bound', { subdir }));
+    await sendBindingWelcome(newKey, subdir);
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
     if (parts.length >= 2) {
@@ -1428,6 +1440,344 @@ command('help', async (_ctx, key) => {
   await replyToThread(
     key,
     t('help.thread_bound', { subdir: binding.subdir }),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Rich binding welcome (plan §20.5) — folder stats + start-agent keyboard
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface BindingStats {
+  claudeMdSize: string | null;
+  mcpServerCount: number | null;
+  gitBranch: string | null;
+  gitClean: boolean | null;   // null = no git repo
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * @description Collect a short factual summary of a bound project folder for
+ * the welcome message — what onboarding context Claude would actually pick
+ * up (CLAUDE.md), what MCP servers are configured at the project level, and
+ * what git state the folder is in. Every probe is best-effort: a missing
+ * file or non-git folder just means the corresponding row is dropped from
+ * the welcome.
+ */
+async function getBindingStats(workDir: string): Promise<BindingStats> {
+  const out: BindingStats = {
+    claudeMdSize: null,
+    mcpServerCount: null,
+    gitBranch: null,
+    gitClean: null,
+  };
+
+  try {
+    const stat = fs.statSync(path.join(workDir, 'CLAUDE.md'));
+    if (stat.isFile()) out.claudeMdSize = formatBytes(stat.size);
+  } catch { /* no CLAUDE.md */ }
+
+  try {
+    const raw = fs.readFileSync(path.join(workDir, '.mcp.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.mcpServers === 'object' && parsed.mcpServers) {
+      out.mcpServerCount = Object.keys(parsed.mcpServers).length;
+    }
+  } catch { /* no .mcp.json or invalid */ }
+
+  // `git` is only inspected if `.git` is present — avoids spawning the
+  // binary on every /bind, and dodges sub-second `git status` runs for big
+  // monorepos.
+  try {
+    fs.accessSync(path.join(workDir, '.git'));
+  } catch { return out; }
+
+  try {
+    const { stdout } = await execFileAsync('git', ['symbolic-ref', '--short', 'HEAD'], {
+      cwd: workDir, timeout: 1500,
+    });
+    out.gitBranch = stdout.trim() || 'HEAD';
+  } catch { out.gitBranch = 'HEAD'; }
+
+  try {
+    const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
+      cwd: workDir, timeout: 1500,
+    });
+    out.gitClean = stdout.trim().length === 0;
+  } catch { /* keep null = unknown */ }
+
+  return out;
+}
+
+/**
+ * @description Inline keyboard offering one-tap entry into the freshly bound
+ * thread. The buttons reuse existing callback handlers (`agent_*` and
+ * `resume_*`) so the routes stay single-sourced; resume is included as a
+ * shortcut to the picker view.
+ */
+function buildStartAgentKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('▶️ Claude', 'agent_claude'),
+      Markup.button.callback('▶️ OpenCode', 'agent_opencode'),
+    ],
+    [Markup.button.callback('📋 Resume…', 'open_sessions')],
+  ]);
+}
+
+/**
+ * @description Compose and send the rich post-bind welcome described in
+ * plan §20.5: header with the bound subdir, three optional fact rows
+ * (CLAUDE.md / .mcp.json / git), and an inline keyboard to start an agent.
+ * Falls back gracefully when stats can't be probed.
+ */
+async function sendBindingWelcome(key: ThreadKey, subdir: string): Promise<void> {
+  const workDir = path.join(ENV.workRoot, subdir);
+  let stats: BindingStats;
+  try {
+    stats = await getBindingStats(workDir);
+  } catch {
+    stats = { claudeMdSize: null, mcpServerCount: null, gitBranch: null, gitClean: null };
+  }
+
+  const lines: string[] = [t('binding.welcome.header', { subdir })];
+  if (stats.claudeMdSize) lines.push(t('binding.welcome.claude_md', { size: stats.claudeMdSize }));
+  if (stats.mcpServerCount !== null) {
+    lines.push(t('binding.welcome.mcp_json', { count: stats.mcpServerCount }));
+  }
+  if (stats.gitBranch) {
+    const detail = stats.gitClean === null
+      ? ''
+      : stats.gitClean ? t('binding.welcome.git_clean') : t('binding.welcome.git_dirty');
+    lines.push(t('binding.welcome.git', { branch: stats.gitBranch, detail }));
+  } else if (fs.existsSync(path.join(workDir, '.git')) === false) {
+    lines.push(t('binding.welcome.git_none'));
+  }
+  lines.push('');
+  lines.push(t('binding.welcome.start_prompt'));
+
+  await replyToThread(key, lines.join('\n'), {
+    parse_mode: 'Markdown',
+    ...buildStartAgentKeyboard(),
+  });
+}
+
+// `open_sessions` callback wires the [📋 Resume…] button to the `/sessions`
+// flow — same handler the slash command calls into, so the picker source
+// stays single-sourced.
+bot.action('open_sessions', async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  await ctx.answerCbQuery();
+  // Cheapest UX without duplicating the /sessions picker: ask the user to
+  // type /sessions, which opens the same flow. Refactoring the slash
+  // handler into a reusable helper is Stage 7 polish.
+  await replyToThread(key, t('sessions.run_hint'));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  /doctor — self-diagnostics (plan §20.1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface DoctorLine {
+  status: 'ok' | 'warn' | 'fail';
+  label: string;
+  hint?: string;
+}
+
+function formatDoctorLine(line: DoctorLine): string {
+  if (line.status === 'ok')  return t('doctor.ok',   { label: line.label });
+  if (line.status === 'warn') return t('doctor.warn', { label: line.label, hint: line.hint ?? '' });
+  return                       t('doctor.fail', { label: line.label, hint: line.hint ?? '' });
+}
+
+async function checkCliPresent(cmd: string): Promise<boolean> {
+  try {
+    await execFileAsync(cmd, ['--version'], { timeout: 1500 });
+    return true;
+  } catch { return false; }
+}
+
+async function runDoctor(): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+
+  // 1. Bot admin permissions in the configured group.
+  try {
+    const botId = bot.botInfo?.id ?? (await bot.telegram.getMe()).id;
+    const member = await bot.telegram.getChatMember(ENV.allowedGroupId, botId);
+    if (member.status === 'administrator') {
+      lines.push({ status: 'ok', label: t('doctor.bot_admin') });
+      lines.push({
+        status: member.can_manage_topics ? 'ok' : 'fail',
+        label: t('doctor.can_manage_topics'),
+        hint: t('error.tg.perm.manage_topics'),
+      });
+      lines.push({
+        status: member.can_delete_messages ? 'ok' : 'fail',
+        label: t('doctor.can_delete_messages'),
+        hint: t('error.tg.perm.delete'),
+      });
+      lines.push({
+        status: member.can_pin_messages ? 'ok' : 'warn',
+        label: t('doctor.can_pin_messages'),
+        hint: t('doctor.pin_hint'),
+      });
+    } else {
+      lines.push({
+        status: 'fail',
+        label: t('doctor.bot_admin'),
+        hint: `current status: ${member.status}`,
+      });
+    }
+  } catch (e) {
+    lines.push({
+      status: 'warn',
+      label: t('doctor.bot_admin'),
+      hint: t('doctor.no_admin_info'),
+    });
+  }
+
+  // 2. Privacy mode (heuristic — Bot API doesn't expose the flag directly,
+  //    but `getMe().can_read_all_group_messages === false` indicates it's on).
+  try {
+    const me = await bot.telegram.getMe();
+    lines.push({
+      status: me.can_read_all_group_messages ? 'ok' : 'fail',
+      label: t('doctor.privacy_off'),
+      hint: t('doctor.privacy_hint'),
+    });
+  } catch { /* skip silently — covered by admin check above */ }
+
+  // 3. WORK_ROOT.
+  const subdirCount = listAvailableSubdirs(ENV.workRoot, 9999).length;
+  lines.push({
+    status: 'ok',
+    label: t('doctor.workroot_subdirs', { workRoot: ENV.workRoot, count: subdirCount }),
+  });
+
+  // 4. DATA_DIR.
+  lines.push({
+    status: 'ok',
+    label: t('doctor.datadir_path', { dataDir: path.dirname(state.stateFilePath) }),
+  });
+
+  // 5. CLI presence — informational, auto-install kicks in on first /claude
+  //    or /opencode anyway.
+  const [hasClaude, hasOpencode] = await Promise.all([
+    checkCliPresent('claude'),
+    checkCliPresent('opencode'),
+  ]);
+  lines.push({
+    status: hasClaude ? 'ok' : 'warn',
+    label: t('doctor.claude_installed'),
+    hint: t('doctor.cli_missing'),
+  });
+  lines.push({
+    status: hasOpencode ? 'ok' : 'warn',
+    label: t('doctor.opencode_installed'),
+    hint: t('doctor.cli_missing'),
+  });
+
+  // 6. State validity (and archive notice).
+  const bindings = state.listBindings();
+  const activeCount = bindings.filter(({ key: k }) => {
+    try { return getThreadAdapter(k).checkIsActive(k); } catch { return false; }
+  }).length;
+  lines.push({
+    status: 'ok',
+    label: t('doctor.state_valid', { bindings: bindings.length, active: activeCount }),
+  });
+  if (state.wasCorruptedOnLoad()) {
+    lines.push({
+      status: 'warn',
+      label: t('doctor.state_archived', { path: state.getCorruptedArchivePath() ?? '?' }),
+    });
+  }
+
+  return lines;
+}
+
+command('doctor', async (_ctx, key) => {
+  // Single big edit-in-place would be nicer, but doctor is rarely run and
+  // gathering the report in series keeps it dead simple.
+  const lines = await runDoctor();
+  const body = lines.map(formatDoctorLine).join('\n');
+  await replyToThread(
+    key,
+    `${t('doctor.header')}\n\n${body}`,
+    { parse_mode: 'Markdown' },
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  /mcp — read-only listing of MCP servers across all four levels (§19.3)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface McpEntry {
+  name: string;
+  source: string;
+}
+
+function loadMcpFile(filePath: string): string[] {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.mcpServers === 'object' && parsed.mcpServers) {
+      return Object.keys(parsed.mcpServers);
+    }
+    // Claude CLI also accepts a `mcpServers` key inside `~/.claude/settings.json`
+    // alongside other settings; same shape.
+  } catch { /* missing / unreadable / invalid JSON — skip */ }
+  return [];
+}
+
+function collectMcpEntries(workDir: string | null, key: ThreadKey | null): McpEntry[] {
+  const entries: McpEntry[] = [];
+  const dataDir = path.dirname(state.stateFilePath);
+
+  // user-level
+  const userPath = path.join(os.homedir(), '.claude', 'settings.json');
+  for (const name of loadMcpFile(userPath)) {
+    entries.push({ name, source: t('mcp.source_user') });
+  }
+  // group-level
+  for (const name of loadMcpFile(path.join(dataDir, 'mcp.json'))) {
+    entries.push({ name, source: t('mcp.source_group') });
+  }
+  // project-level
+  if (workDir) {
+    for (const name of loadMcpFile(path.join(workDir, '.mcp.json'))) {
+      entries.push({ name, source: t('mcp.source_project', { workDir }) });
+    }
+  }
+  // thread-level
+  if (key) {
+    const threadFile = path.join(dataDir, 'threads', `${keyToString(key)}.json`);
+    for (const name of loadMcpFile(threadFile)) {
+      entries.push({ name, source: t('mcp.source_thread') });
+    }
+  }
+  return entries;
+}
+
+command('mcp', async (_ctx, key) => {
+  const binding = state.getBinding(key);
+  const workDir = binding ? path.join(ENV.workRoot, binding.subdir) : null;
+  // General can still benefit from user+group entries even without a workDir.
+  const entries = collectMcpEntries(workDir, checkIsGeneral(key) ? null : key);
+  if (entries.length === 0) {
+    await replyToThread(key, t('mcp.empty'));
+    return;
+  }
+  const body = entries.map(e => t('mcp.row', { name: e.name, source: e.source })).join('\n');
+  await replyToThread(
+    key,
+    `${t('mcp.header')}\n${body}`,
     { parse_mode: 'Markdown' },
   );
 });
@@ -1733,6 +2083,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'whoami', 'version', 'help',
+  'doctor', 'mcp',
 ]);
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1933,6 +2284,43 @@ bot.on('edited_message', async (ctx) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  my_chat_member — auto-welcome when the bot is added to the group (§20.2)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Detect when *this* bot is added to the configured group and
+ * post a setup checklist into General. Without this, a fresh deployment is
+ * silent: the user adds the bot, sees nothing, and has to dig through the
+ * README to find out what permissions / privacy flags they need to flip.
+ *
+ * Filters:
+ *   - chat must be the allowlisted group (we don't react in foreign chats),
+ *   - the member that changed must be us (other admins being promoted etc.
+ *     are not interesting),
+ *   - new status must be `member` or `administrator` — `kicked`/`left`
+ *     events would only generate noise.
+ */
+bot.on('my_chat_member', async (ctx) => {
+  const chat = ctx.chat;
+  if (!chat || chat.id !== ENV.allowedGroupId) return;
+  const upd = ctx.update.my_chat_member;
+  const newMember = upd.new_chat_member;
+  const botId = bot.botInfo?.id;
+  if (!botId || newMember.user.id !== botId) return;
+  if (newMember.status !== 'member' && newMember.status !== 'administrator') return;
+
+  // We don't know which message_thread_id General actually has on this
+  // group (it can be 1, or undefined for non-forum chats). For a forum
+  // supergroup it's always the constant `GENERAL_THREAD_ID = 1`.
+  const generalKey: ThreadKey = { chatId: chat.id, threadId: GENERAL_THREAD_ID };
+  await replyToThread(
+    generalKey,
+    t('onboarding.welcome', { workRoot: ENV.workRoot }),
+    { parse_mode: 'Markdown' },
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Forum service events — created / deleted / closed / reopened
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1972,6 +2360,7 @@ bot.on(message('forum_topic_created'), async (ctx) => {
       const subdir = validateSubdir(ENV.workRoot, match);
       await state.setBinding(key, subdir);
       await replyToThread(key, t('thread.welcome_bound', { subdir }));
+      await sendBindingWelcome(key, subdir);
       return;
     } catch (e) {
       console.warn(`[forum_topic_created] auto-bind failed for "${match}":`, e);
@@ -2028,8 +2417,9 @@ bot.action(/^bind_(.+)$/, async (ctx) => {
   }
   const subdir = ctx.match[1];
   await ctx.answerCbQuery(`Binding to ${subdir}…`);
-  const reply = await applyBinding(key, subdir);
-  await replyToThread(key, reply);
+  const result = await applyBinding(key, subdir);
+  await replyToThread(key, result.message);
+  if (result.ok) await sendBindingWelcome(key, result.subdir);
 });
 
 bot.action(/^model_(.+)$/, async (ctx) => {
@@ -2269,12 +2659,14 @@ function handleAgentError(key: ThreadKey, error: Error): void {
 
 const COMMANDS_MENU = [
   { command: 'help', description: '❓ Context-aware help' },
+  { command: 'doctor', description: '🔍 Self-diagnostics' },
   { command: 'bind', description: '📁 Bind thread to a subfolder' },
   { command: 'unbind', description: '🚫 Remove binding' },
   { command: 'where', description: '📍 Show current binding' },
   { command: 'ls', description: '📂 List WORK_ROOT subfolders' },
   { command: 'list', description: '🧵 List all bound threads' },
   { command: 'new', description: '🆕 Create a new thread (General)' },
+  { command: 'mcp', description: '🔌 List active MCP servers' },
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
   { command: 'model', description: '🧠 Switch model' },

@@ -111,6 +111,66 @@ const dict: Record<Lang, Record<string, string>> = {
       '/c /y /n /enter /up /down /tab — TUI-команды (Claude)\n' +
       '/where /unbind — управление binding',
 
+    // ── /doctor self-diagnostics ──
+    'doctor.header': '🔍 *Telegram Code Doctor*',
+    'doctor.ok': '✅ {label}',
+    'doctor.warn': '⚠️ {label} — {hint}',
+    'doctor.fail': '❌ {label} — {hint}',
+    'doctor.bot_admin': 'Бот — админ группы',
+    'doctor.can_manage_topics': 'Право `can_manage_topics`',
+    'doctor.can_delete_messages': 'Право `can_delete_messages`',
+    'doctor.can_pin_messages': 'Право `can_pin_messages`',
+    'doctor.privacy_off': 'Privacy mode выключен',
+    'doctor.privacy_hint':
+      '@BotFather → /setprivacy → Disable, потом удали и добавь бота заново',
+    'doctor.workroot_subdirs':
+      'WORK_ROOT: `{workRoot}` ({count} подпапок)',
+    'doctor.datadir_path': 'DATA_DIR: `{dataDir}`',
+    'doctor.claude_installed': 'claude CLI установлен',
+    'doctor.opencode_installed': 'opencode CLI установлен',
+    'doctor.state_valid':
+      'state.json валиден ({bindings} bindings, {active} активных)',
+    'doctor.state_archived':
+      'Прошлый state.json был повреждён, архив: {path}',
+    'doctor.cli_missing':
+      'не найдено в PATH (auto-install сработает при /claude или /opencode)',
+    'doctor.no_admin_info':
+      'не могу прочитать права бота — getChatMember failed',
+
+    // ── auto-welcome when bot is added to group ──
+    'onboarding.welcome':
+      '👋 *Telegram Code Bot 2.0*\n\n' +
+      'Готовность к работе:\n' +
+      '1️⃣ Сделай меня админом группы с правами:\n' +
+      '   • Manage Topics, Delete Messages, Pin Messages\n' +
+      '2️⃣ @BotFather → /setprivacy → Disable, потом удали и добавь бота заново\n' +
+      '3️⃣ Запусти /doctor — увижу проблемы сразу\n' +
+      '4️⃣ В каждом тематическом треде сделай /bind <subdir> и запусти агента\n\n' +
+      'WORK_ROOT: `{workRoot}`',
+
+    // ── rich welcome после /bind (§20.5) ──
+    'binding.welcome.header': '📁 Привязано к `{subdir}`',
+    'binding.welcome.claude_md': '• CLAUDE.md: {size}',
+    'binding.welcome.mcp_json': '• `.mcp.json`: {count} серверов',
+    'binding.welcome.git': '• git: ветка `{branch}`{detail}',
+    'binding.welcome.git_clean': ', чисто',
+    'binding.welcome.git_dirty': ', изменения не закоммичены',
+    'binding.welcome.git_none': '• git: не инициализирован',
+    'binding.welcome.start_prompt': 'Начни диалог:',
+
+    // ── /mcp read-only ──
+    'mcp.header': '🔌 *MCP-серверы для этого треда:*',
+    'mcp.row': '• `{name}` — {source}',
+    'mcp.empty': '🔌 MCP-серверы не настроены.',
+    'mcp.source_user': 'user (~/.claude/settings.json)',
+    'mcp.source_group': 'group (DATA_DIR/mcp.json)',
+    'mcp.source_project': 'project (`{workDir}/.mcp.json`)',
+    'mcp.source_thread': 'thread (DATA_DIR/threads/...)',
+
+    // ── extra hints ──
+    'sessions.run_hint': 'Запусти /sessions, чтобы увидеть сессии для resume.',
+    'doctor.pin_hint': 'Pinned-статус треда (Этап 7) будет недоступен',
+
     // ── /whoami /version /status (global) ──
     'whoami.report':
       '👤 user: `{userId}`\n💬 chat: `{chatId}`\n🧵 thread: `{threadId}`\n' +
@@ -243,6 +303,66 @@ const dict: Record<Lang, Record<string, string>> = {
       '/clear — delete thread messages\n' +
       '/c /y /n /enter /up /down /tab — TUI keys (Claude)\n' +
       '/where /unbind — manage binding',
+
+    // ── /doctor self-diagnostics ──
+    'doctor.header': '🔍 *Telegram Code Doctor*',
+    'doctor.ok': '✅ {label}',
+    'doctor.warn': '⚠️ {label} — {hint}',
+    'doctor.fail': '❌ {label} — {hint}',
+    'doctor.bot_admin': 'Bot is a group admin',
+    'doctor.can_manage_topics': '`can_manage_topics` granted',
+    'doctor.can_delete_messages': '`can_delete_messages` granted',
+    'doctor.can_pin_messages': '`can_pin_messages` granted',
+    'doctor.privacy_off': 'Privacy mode disabled',
+    'doctor.privacy_hint':
+      '@BotFather → /setprivacy → Disable, then remove and re-add the bot',
+    'doctor.workroot_subdirs':
+      'WORK_ROOT: `{workRoot}` ({count} subfolders)',
+    'doctor.datadir_path': 'DATA_DIR: `{dataDir}`',
+    'doctor.claude_installed': 'claude CLI installed',
+    'doctor.opencode_installed': 'opencode CLI installed',
+    'doctor.state_valid':
+      'state.json valid ({bindings} bindings, {active} active)',
+    'doctor.state_archived':
+      'previous state.json was corrupted, archive: {path}',
+    'doctor.cli_missing':
+      'not found in PATH (auto-install will run on /claude or /opencode)',
+    'doctor.no_admin_info':
+      'cannot read bot rights — getChatMember failed',
+
+    // ── auto-welcome when bot is added to group ──
+    'onboarding.welcome':
+      '👋 *Telegram Code Bot 2.0*\n\n' +
+      'Ready-to-work checklist:\n' +
+      '1️⃣ Make me a group admin with rights:\n' +
+      '   • Manage Topics, Delete Messages, Pin Messages\n' +
+      '2️⃣ @BotFather → /setprivacy → Disable, then remove and re-add me\n' +
+      '3️⃣ Run /doctor to see what is still missing\n' +
+      '4️⃣ In each topical thread run /bind <subdir> and start an agent\n\n' +
+      'WORK_ROOT: `{workRoot}`',
+
+    // ── rich welcome after /bind (§20.5) ──
+    'binding.welcome.header': '📁 Bound to `{subdir}`',
+    'binding.welcome.claude_md': '• CLAUDE.md: {size}',
+    'binding.welcome.mcp_json': '• `.mcp.json`: {count} servers',
+    'binding.welcome.git': '• git: branch `{branch}`{detail}',
+    'binding.welcome.git_clean': ', clean',
+    'binding.welcome.git_dirty': ', uncommitted changes',
+    'binding.welcome.git_none': '• git: not initialised',
+    'binding.welcome.start_prompt': 'Start a conversation:',
+
+    // ── /mcp read-only ──
+    'mcp.header': '🔌 *MCP servers for this thread:*',
+    'mcp.row': '• `{name}` — {source}',
+    'mcp.empty': '🔌 No MCP servers configured.',
+    'mcp.source_user': 'user (~/.claude/settings.json)',
+    'mcp.source_group': 'group (DATA_DIR/mcp.json)',
+    'mcp.source_project': 'project (`{workDir}/.mcp.json`)',
+    'mcp.source_thread': 'thread (DATA_DIR/threads/...)',
+
+    // ── extra hints ──
+    'sessions.run_hint': 'Run /sessions to see resumable agent sessions.',
+    'doctor.pin_hint': 'Pinned thread status (Stage 7) will be unavailable',
 
     // ── /whoami /version /status (global) ──
     'whoami.report':

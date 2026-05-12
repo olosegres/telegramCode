@@ -44,6 +44,15 @@ export interface BindingData {
    * is reversible, deletion isn't.
    */
   closed?: boolean;
+  /**
+   * Telegram message id of the per-thread pinned status banner, if any.
+   * Set on first `/bind`, edited on every agent state change, unpinned +
+   * cleared on `/unbind`. Plan §11 Этап 7 / §20.5 / D52 area. Persisting
+   * the id lets a bot restart re-find the pinned message instead of
+   * pinning a fresh banner above it (which Telegram allows, producing a
+   * stack of stale pins).
+   */
+  pinnedStatusMessageId?: number;
 }
 
 export interface AgentData {
@@ -431,6 +440,34 @@ export class StateStore {
       const existing = this.state.bindings[k];
       if (!existing) return;
       this.state.bindings[k] = { ...existing, closed };
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Persist the pinned status banner's message id for a thread,
+   * or clear it (pass `null`). Skipped if the binding doesn't exist — we
+   * don't ever want a pinned-message row dangling without a parent binding.
+   *
+   * Caller is expected to actually pin / unpin in Telegram around this
+   * call; this method only updates the on-disk pointer. Plan §20.5.
+   */
+  async setBindingPinnedStatusMessageId(
+    key: ThreadKey,
+    messageId: number | null,
+  ): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.bindings[k];
+      if (!existing) return;
+      if (messageId === null) {
+        if (existing.pinnedStatusMessageId === undefined) return;
+        const { pinnedStatusMessageId: _drop, ...rest } = existing;
+        this.state.bindings[k] = rest;
+      } else {
+        if (existing.pinnedStatusMessageId === messageId) return;
+        this.state.bindings[k] = { ...existing, pinnedStatusMessageId: messageId };
+      }
       this.scheduleSave();
     });
   }

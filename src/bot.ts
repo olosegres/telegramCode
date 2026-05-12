@@ -42,6 +42,7 @@ import {
   getErrorCode,
   getErrorDescription,
 } from './sendErrorClassifier';
+import { formatPinnedStatus } from './pinnedStatus';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -347,6 +348,197 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   pendingQuestions.delete(k);
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
+  pinnedStatusTextCache.delete(k);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Pinned per-thread status banner (plan §11 Этап 7 / §20.5)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Threads currently inside a `/unbind` critical section.
+ *
+ * `/unbind` deletes the pinned banner and stops the agent in one logical
+ * step; the adapter's synchronous `stopped` event would otherwise race the
+ * teardown and re-pin a stale "idle" banner inside the dying thread. Guard
+ * is keyed by serialised `ThreadKey` and held only while the handler runs.
+ */
+const unbindingKeys = new Set<string>();
+
+/**
+ * @description In-memory dedup for the pinned-banner edit pipeline.
+ *
+ * Telegram answers `400 message is not modified` when we try to edit a
+ * pinned message with identical text; the call is harmless but burns a
+ * token-bucket slot. Remembering the last sent text per thread skips the
+ * round-trip entirely when nothing actually changed (rapid succession of
+ * `started → status → output` events on a busy agent).
+ *
+ * Not persisted: bot restart re-pins via `updatePinnedStatus` anyway and
+ * the cache rebuilds on the first event.
+ */
+const pinnedStatusTextCache = new Map<string, string>();
+
+/**
+ * @description Whether this thread's binding is eligible for a pinned
+ * banner. General has no per-thread state to mirror; closed topics get
+ * the banner left as-is (Telegram refuses edits in closed topics).
+ */
+function shouldHavePinnedStatus(key: ThreadKey): boolean {
+  if (checkIsGeneral(key)) return false;
+  return state.getBinding(key) !== null;
+}
+
+/**
+ * @description Compute the current pinned status text for `key` from live
+ * adapter + state. Returns `null` if the thread shouldn't have a banner
+ * (no binding, or in the General topic).
+ */
+function computePinnedStatusText(key: ThreadKey): string | null {
+  const binding = state.getBinding(key);
+  if (!binding) return null;
+
+  let agentLabel: string | null = null;
+  let model: string | null = null;
+  let isActive = false;
+
+  const agent = state.getAgent(key);
+  if (agent?.name) {
+    try {
+      const adapter = getAdapter(agent.name);
+      agentLabel = adapter.label;
+      isActive = adapter.checkIsActive(key);
+      model = adapter.getCurrentModel?.(key) ?? agent.model ?? null;
+    } catch {
+      // Unknown adapter name from a stale binding — fall back to raw name
+      // so the banner is still informative.
+      agentLabel = agent.name;
+      model = agent.model ?? null;
+    }
+  }
+
+  return formatPinnedStatus({ binding, agentLabel, model, isActive });
+}
+
+/**
+ * @description Send-or-edit the pinned status banner for a thread.
+ *
+ * Idempotent — safe to call from every adapter lifecycle event. Failures
+ * (missing `can_pin_messages`, closed topic, network) are logged but do
+ * not surface to the user: the banner is convenience UI, not blocking UX.
+ *
+ * NB: pinned messages must NOT be auto-tracked into `state.messages[key]`,
+ * otherwise `/clear` would delete the banner. We call `bot.telegram.*`
+ * directly through `enqueueSend` to skip `replyToThread`'s tracking step.
+ */
+async function updatePinnedStatus(key: ThreadKey): Promise<void> {
+  const k = keyToString(key);
+  if (unbindingKeys.has(k)) return;
+  if (!shouldHavePinnedStatus(key)) return;
+
+  const text = computePinnedStatusText(key);
+  if (text === null) return;
+
+  // Skip if nothing changed since the last send/edit.
+  if (pinnedStatusTextCache.get(k) === text) return;
+
+  const binding = state.getBinding(key);
+  if (!binding) return;
+  const existingId = binding.pinnedStatusMessageId;
+
+  if (existingId !== undefined) {
+    try {
+      await enqueueSend(key.chatId, () =>
+        bot.telegram.editMessageText(key.chatId, existingId, undefined, text),
+      );
+      pinnedStatusTextCache.set(k, text);
+      return;
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+      if (/message is not modified/i.test(desc)) {
+        pinnedStatusTextCache.set(k, text);
+        return;
+      }
+      if (!/message to edit not found|MESSAGE_ID_INVALID|message can't be edited/i.test(desc)) {
+        // Other errors — log and bail without churning state. The next
+        // call will retry; we don't want to spam new banners on every
+        // transient API hiccup.
+        console.warn(`[pinned] edit ${k} failed: ${desc || (e instanceof Error ? e.message : e)}`);
+        return;
+      }
+      // Pinned message was deleted out from under us — fall through to
+      // send a fresh one.
+      await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
+    }
+  }
+
+  let messageId: number;
+  try {
+    const sent = await enqueueSend(key.chatId, () =>
+      bot.telegram.sendMessage(key.chatId, text, {
+        message_thread_id: key.threadId,
+        disable_notification: true,
+      }),
+    );
+    messageId = (sent as { message_id: number }).message_id;
+  } catch (e) {
+    await handleSendError(key, e);
+    return;
+  }
+
+  try {
+    await enqueueSend(key.chatId, () =>
+      bot.telegram.pinChatMessage(key.chatId, messageId, {
+        disable_notification: true,
+      }),
+    );
+  } catch (e) {
+    // Most common reason: bot is not admin or lacks `can_pin_messages`.
+    // We still keep the message id so subsequent edits keep refreshing it
+    // (so the user at least sees a fresh status line in the topic body
+    // even without a pin).
+    const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
+    console.warn(`[pinned] pin ${k} failed: ${desc}`);
+  }
+
+  await state.setBindingPinnedStatusMessageId(key, messageId).catch(err =>
+    console.warn(`[pinned] persist id for ${k} failed:`, err),
+  );
+  pinnedStatusTextCache.set(k, text);
+}
+
+/**
+ * @description Unpin and delete the banner for a thread; clear the cached
+ * id. Called from `/unbind` before `state.removeBinding` wipes the row.
+ *
+ * Both Telegram calls swallow errors — if the banner is already gone or
+ * the bot lost pin permissions mid-flight, the user-facing /unbind ack
+ * shouldn't fail because of it.
+ */
+async function clearPinnedStatus(key: ThreadKey): Promise<void> {
+  const k = keyToString(key);
+  pinnedStatusTextCache.delete(k);
+
+  const binding = state.getBinding(key);
+  const existingId = binding?.pinnedStatusMessageId;
+  if (existingId === undefined) return;
+
+  try {
+    await enqueueSend(key.chatId, () =>
+      bot.telegram.unpinChatMessage(key.chatId, existingId),
+    );
+  } catch (e) {
+    const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
+    console.warn(`[pinned] unpin ${k} failed: ${desc}`);
+  }
+  try {
+    await enqueueSend(key.chatId, () =>
+      bot.telegram.deleteMessage(key.chatId, existingId),
+    );
+  } catch {
+    // Older than 48h or already deleted — silently ignored.
+  }
+  await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
 }
 
 /**
@@ -1037,17 +1229,30 @@ command('unbind', async (_ctx, key) => {
     await replyToThread(key, t('thread.unbind_unbound'));
     return;
   }
-  // Stop any running session before discarding the binding so we don't leave
-  // an orphan tmux/SSE stream pointing at a directory we no longer track.
-  const adapter = getThreadAdapter(key);
-  if (adapter.checkIsActive(key)) {
-    try { adapter.stopSession(key); } catch (e) {
-      console.warn(`[unbind] stopSession failed for ${keyToString(key)}:`, e);
+  // Mark this thread as in-flight unbinding so the adapter's synchronous
+  // `stopped` event doesn't race us and re-pin a stale "idle" banner over
+  // the message we're about to delete.
+  const kStr = keyToString(key);
+  unbindingKeys.add(kStr);
+  try {
+    // Order matters: drop the pin FIRST (while binding.pinnedStatusMessageId
+    // is still readable), then stop the session, then wipe the binding.
+    await clearPinnedStatus(key);
+
+    // Stop any running session before discarding the binding so we don't leave
+    // an orphan tmux/SSE stream pointing at a directory we no longer track.
+    const adapter = getThreadAdapter(key);
+    if (adapter.checkIsActive(key)) {
+      try { adapter.stopSession(key); } catch (e) {
+        console.warn(`[unbind] stopSession failed for ${kStr}:`, e);
+      }
     }
+    await state.removeBinding(key);
+    clearInMemoryThreadState(key);
+    await replyToThread(key, t('thread.unbound'));
+  } finally {
+    unbindingKeys.delete(kStr);
   }
-  await state.removeBinding(key);
-  clearInMemoryThreadState(key);
-  await replyToThread(key, t('thread.unbound'));
 });
 
 command('where', async (_ctx, key) => {
@@ -1442,6 +1647,14 @@ function buildStartAgentKeyboard() {
  * Falls back gracefully when stats can't be probed.
  */
 async function sendBindingWelcome(key: ThreadKey, subdir: string): Promise<void> {
+  // Pin the status banner first so the user sees it land near the top of
+  // the thread before the slower stats probe finishes. Fire-and-forget —
+  // a failed pin (missing permissions, closed topic) just logs a warning
+  // and never blocks the welcome flow.
+  updatePinnedStatus(key).catch(err =>
+    console.warn(`[pinned] initial pin for ${keyToString(key)} failed:`, err),
+  );
+
   const workDir = path.join(ENV.workRoot, subdir);
   let stats: BindingStats;
   try {
@@ -1739,6 +1952,7 @@ command('model', async (ctx, key) => {
     if (adapter.setModel) {
       const err = await adapter.setModel(key, selected);
       await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
+      if (!err) await updatePinnedStatus(key).catch(() => {});
     }
     return;
   }
@@ -1756,6 +1970,7 @@ command('model', async (ctx, key) => {
       } else {
         const current = adapter.getCurrentModel?.(key) || args;
         await replyToThread(key, `Model set to: ${current}`);
+        await updatePinnedStatus(key).catch(() => {});
       }
     } else {
       await replyToThread(key, `Model switching not supported for ${adapter.label}`);
@@ -2064,6 +2279,7 @@ bot.on(message('text'), async (ctx) => {
       if (adapter.setModel) {
         const err = await adapter.setModel(key, selected);
         await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
+        if (!err) await updatePinnedStatus(key).catch(() => {});
         return;
       }
     } else {
@@ -2326,12 +2542,17 @@ bot.on(message('forum_topic_closed'), async (ctx) => {
   const key = getThreadKey(ctx);
   if (!key) return;
   await state.setBindingClosed(key, true);
+  // Refresh the banner so the `🔒 closed` marker appears immediately. Edits
+  // INTO a closed topic are still allowed by Telegram even when sends aren't,
+  // so we can update the existing pinned message without re-pinning.
+  await updatePinnedStatus(key).catch(() => {});
 });
 
 bot.on(message('forum_topic_reopened'), async (ctx) => {
   const key = getThreadKey(ctx);
   if (!key) return;
   await state.setBindingClosed(key, false);
+  await updatePinnedStatus(key).catch(() => {});
 });
 
 // `forum_topic_deleted` is intentionally NOT handled here: Telegram doesn't
@@ -2383,6 +2604,8 @@ bot.action(/^model_(.+)$/, async (ctx) => {
     const current = adapter.getCurrentModel?.(key) || modelId;
     await ctx.answerCbQuery(`Model: ${current.split('/').pop() || current}`);
     await replyToThread(key, `Model switched to: ${current}`);
+    // Reflect the new model in the pinned banner.
+    await updatePinnedStatus(key).catch(() => {});
   } else {
     await ctx.answerCbQuery(`Not supported for ${adapter.label}`);
   }
@@ -2400,6 +2623,11 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
       key,
       `Agent: ${adapter.label}\nSend a message or /${adapterName} to start`,
     );
+    // Persist the choice so the banner survives restart and reflect it now.
+    if (state.getBinding(key)) {
+      await state.setAgent(key, { name: adapterName }).catch(() => {});
+      await updatePinnedStatus(key).catch(() => {});
+    }
   } catch {
     await ctx.answerCbQuery('Unknown agent');
   }
@@ -2590,6 +2818,9 @@ function handleAgentClosed(key: ThreadKey): void {
   pendingQuestions.delete(keyToString(key));
   const adapter = getThreadAdapter(key);
   replyToThread(key, t('agent.session_ended', { label: adapter.label })).catch(() => {});
+  // Banner now reads `idle`; closed sessions may also persist with the
+  // wrong model/agent label otherwise.
+  updatePinnedStatus(key).catch(() => {});
 }
 
 function handleAgentError(key: ThreadKey, error: Error): void {
@@ -2597,6 +2828,24 @@ function handleAgentError(key: ThreadKey, error: Error): void {
   deleteStatusMessage(key).catch(() => {});
   pendingQuestions.delete(keyToString(key));
   replyToThread(key, `Error: ${error.message}`).catch(() => {});
+}
+
+/**
+ * @description `started` from the adapter — flip the pinned banner to
+ * `running` and refresh its model row. Fired by both `claudeCliAdapter`
+ * and `openCodeAdapter` (`emit('started', key)`).
+ */
+function handleAgentStarted(key: ThreadKey): void {
+  updatePinnedStatus(key).catch(() => {});
+}
+
+/**
+ * @description `stopped` from the adapter — flip the banner back to `idle`.
+ * Skipped via the in-flight unbind guard inside `updatePinnedStatus` so the
+ * stop-then-unbind sequence doesn't re-pin a stale banner.
+ */
+function handleAgentStopped(key: ThreadKey): void {
+  updatePinnedStatus(key).catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2752,6 +3001,8 @@ export async function startBot(): Promise<void> {
     onStatus: handleAgentStatus,
     onQuestion: handleAgentQuestion,
     onClosed: handleAgentClosed,
+    onStarted: handleAgentStarted,
+    onStopped: handleAgentStopped,
     onError: handleAgentError,
   });
 
@@ -2767,6 +3018,18 @@ export async function startBot(): Promise<void> {
 
   // 4. Re-attach sessions that survived the restart.
   await reattachExistingSessions();
+
+  // 4a. Refresh pinned banners for every binding. Threads that have a
+  //     stored `pinnedStatusMessageId` get their banner edited in place;
+  //     threads that don't (older state.json from before this feature, or
+  //     bindings created while `can_pin_messages` was missing) get one
+  //     freshly pinned. Failures are best-effort — `updatePinnedStatus`
+  //     logs them itself.
+  setImmediate(() => {
+    Promise.all(
+      state.listBindings().map(({ key }) => updatePinnedStatus(key).catch(() => {})),
+    ).catch(() => {});
+  });
 
   // 5. Connect to Telegram and register commands menu.
   console.log('Testing Telegram API connection...');

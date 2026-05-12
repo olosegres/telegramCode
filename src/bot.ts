@@ -587,18 +587,48 @@ async function replyToThread(
   text: string,
   extra: SendExtra = {},
 ): Promise<number | null> {
-  try {
-    const sent = await enqueueSend(key.chatId, () =>
+  const sendOnce = (sendExtra: Record<string, unknown>) =>
+    enqueueSend(key.chatId, () =>
       bot.telegram.sendMessage(
         key.chatId,
         text,
-        buildSendExtra(key, extra) as Parameters<typeof bot.telegram.sendMessage>[2],
+        sendExtra as Parameters<typeof bot.telegram.sendMessage>[2],
       ),
     );
+
+  try {
+    const sent = await sendOnce(buildSendExtra(key, extra));
     const messageId = (sent as { message_id: number }).message_id;
     await state.pushMessageId(key, messageId);
     return messageId;
   } catch (e) {
+    // Markdown parse failure fallback. Several `t(...)` templates interpolate
+    // user-controlled content (subdir names, branch names, error strings)
+    // into Markdown body — a backtick or stray `*` inside the content
+    // breaks Telegram's parser and the whole message gets dropped with a
+    // 400. The right reflex is to retry WITHOUT `parse_mode` so the user
+    // sees raw text instead of silence (review of the live "wrote 3 times,
+    // bot silent" repro). Logged for follow-up so we still find and escape
+    // the culprit at source.
+    const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+    const hasParseMode =
+      typeof (extra as Record<string, unknown>).parse_mode === 'string';
+    if (hasParseMode && /can't parse entities/i.test(desc)) {
+      console.warn(
+        `[send] ${keyToString(key)} markdown parse failed (${desc}); retrying as plain text`,
+      );
+      const plainExtra = { ...(extra as Record<string, unknown>) };
+      delete plainExtra.parse_mode;
+      try {
+        const sent = await sendOnce(buildSendExtra(key, plainExtra));
+        const messageId = (sent as { message_id: number }).message_id;
+        await state.pushMessageId(key, messageId);
+        return messageId;
+      } catch (e2) {
+        await handleSendError(key, e2);
+        return null;
+      }
+    }
     await handleSendError(key, e);
     return null;
   }
@@ -617,12 +647,16 @@ async function editThreadMessage(
   text: string,
   extra: SendExtra = {},
 ): Promise<boolean> {
-  try {
-    await enqueueSend(key.chatId, () =>
+  const editOnce = (editExtra: Record<string, unknown>) =>
+    enqueueSend(key.chatId, () =>
       bot.telegram.editMessageText(
-        key.chatId, messageId, undefined, text, extra as Parameters<typeof bot.telegram.editMessageText>[4],
+        key.chatId, messageId, undefined, text,
+        editExtra as Parameters<typeof bot.telegram.editMessageText>[4],
       ),
     );
+
+  try {
+    await editOnce(extra as Record<string, unknown>);
     return true;
   } catch (e) {
     const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
@@ -631,9 +665,30 @@ async function editThreadMessage(
       /thread not found|TOPIC_CLOSED|topic is closed/i.test(desc)
     ) {
       await handleSendError(key, e);
-    } else {
-      console.error(`[edit] ${keyToString(key)}#${messageId}:`, desc || e);
+      return false;
     }
+    // Symmetric markdown-parse-fail fallback to `replyToThread`. See the
+    // long comment there — same rationale: prefer a plain-text edit over
+    // a silent drop.
+    const hasParseMode =
+      typeof (extra as Record<string, unknown>).parse_mode === 'string';
+    if (hasParseMode && /can't parse entities/i.test(desc)) {
+      console.warn(
+        `[edit] ${keyToString(key)}#${messageId} markdown parse failed (${desc}); retrying as plain text`,
+      );
+      const plainExtra = { ...(extra as Record<string, unknown>) };
+      delete plainExtra.parse_mode;
+      try {
+        await editOnce(plainExtra);
+        return true;
+      } catch (e2) {
+        const desc2 = checkIsApiError(e2) ? getErrorDescription(e2) : '';
+        if (/message is not modified/i.test(desc2)) return true;
+        console.error(`[edit] ${keyToString(key)}#${messageId} retry failed:`, desc2 || e2);
+        return false;
+      }
+    }
+    console.error(`[edit] ${keyToString(key)}#${messageId}:`, desc || e);
     return false;
   }
 }

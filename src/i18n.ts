@@ -47,7 +47,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'thread.unbind_unbound': 'Тред и так не был привязан.',
     'thread.where_unbound': 'Тред не привязан к папке.',
     'thread.where_root':
-      '📁 WORK_ROOT: `{workRoot}`\n📊 Привязок: {bindings}\n🟢 Активных сессий: {active}',
+      '📁 `WORK_ROOT`: `{workRoot}`\n📊 Привязок: {bindings}\n🟢 Активных сессий: {active}',
     'thread.where_bound': '📁 Папка: `{subdir}`\n🤖 Агент: {agent}\n🟢 Статус: {status}',
     'thread.general_no_agent':
       'General не привязан к папке — перейди в тематический тред для разговора с агентом.',
@@ -65,13 +65,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.in_general':
       '/bind работает только в тематических тредах, не в General.',
     'bind.invalid_chars': '❌ В имени папки запрещены управляющие символы.',
-    'bind.not_found': '❌ Папка `{subdir}` не найдена в WORK_ROOT (`{workRoot}`).',
-    'bind.outside_root': '❌ Путь выходит за пределы WORK_ROOT.',
+    'bind.not_found': '❌ Папка `{subdir}` не найдена в `WORK_ROOT` (`{workRoot}`).',
+    'bind.outside_root': '❌ Путь выходит за пределы `WORK_ROOT`.',
     'bind.not_directory': '❌ `{subdir}` существует, но это не папка.',
 
     // ── /ls /list /new (General-scoped) ──
     'ls.header': '📁 Подпапки `{workRoot}`:',
-    'ls.empty': '📁 В WORK_ROOT нет подходящих подпапок.',
+    'ls.empty': '📁 В `WORK_ROOT` нет подходящих подпапок.',
     'list.header': '🧵 Привязки тредов ({count}):',
     'list.empty': '🧵 Привязок ещё нет. Создай тред и напиши /bind.',
     'list.row': '• {threadId}: `{subdir}` · {agent} · {status}',
@@ -90,7 +90,7 @@ const dict: Record<Lang, Record<string, string>> = {
     // ── /help context-aware ──
     'help.general':
       '*Команды в General:*\n' +
-      '/ls — подпапки WORK_ROOT\n' +
+      '/ls — подпапки `WORK_ROOT`\n' +
       '/list — список тредов\n' +
       '/new <name> [subdir] — создать тред\n' +
       '/where — общая сводка\n' +
@@ -102,7 +102,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '*Тред не привязан к папке.*\n' +
       '/bind <subdir> — привязать (или выбери в списке)\n' +
       '/where — показать состояние\n' +
-      '/ls — подпапки WORK_ROOT (в General)',
+      '/ls — подпапки `WORK_ROOT` (в General)',
     'help.thread_bound':
       '*Тред привязан к `{subdir}`.*\n' +
       '/claude /opencode — старт агента\n' +
@@ -124,9 +124,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'doctor.privacy_off': 'Privacy mode выключен',
     'doctor.privacy_hint':
       '@BotFather → /setprivacy → Disable, потом удали и добавь бота заново',
+    // NB: `WORK_ROOT` / `DATA_DIR` are wrapped in backticks below NOT for
+    // typographical reasons but because raw `_` outside code spans is
+    // parsed by Telegram Markdown as italic — and a stray opener in a
+    // multi-line body silently corrupts the rest of the message. Same
+    // pattern applies to any user-visible ALL_CAPS env var name.
     'doctor.workroot_subdirs':
-      'WORK_ROOT: `{workRoot}` ({count} подпапок)',
-    'doctor.datadir_path': 'DATA_DIR: `{dataDir}`',
+      '`WORK_ROOT`: `{workRoot}` ({count} подпапок)',
+    'doctor.datadir_path': '`DATA_DIR`: `{dataDir}`',
     'doctor.claude_installed': 'claude CLI установлен',
     'doctor.opencode_installed': 'opencode CLI установлен',
     'doctor.state_valid':
@@ -147,7 +152,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '2️⃣ @BotFather → /setprivacy → Disable, потом удали и добавь бота заново\n' +
       '3️⃣ Запусти /doctor — увижу проблемы сразу\n' +
       '4️⃣ В каждом тематическом треде сделай /bind <subdir> и запусти агента\n\n' +
-      'WORK_ROOT: `{workRoot}`',
+      '`WORK_ROOT`: `{workRoot}`',
 
     // ── rich welcome после /bind (§20.5) ──
     'binding.welcome.header': '📁 Привязано к `{subdir}`',
@@ -164,9 +169,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'mcp.row': '• `{name}` — {source}',
     'mcp.empty': '🔌 MCP-серверы не настроены.',
     'mcp.source_user': 'user (~/.claude/settings.json)',
-    'mcp.source_group': 'group (DATA_DIR/mcp.json)',
+    'mcp.source_group': 'group (`DATA_DIR`/mcp.json)',
     'mcp.source_project': 'project (`{workDir}/.mcp.json`)',
-    'mcp.source_thread': 'thread (DATA_DIR/threads/...)',
+    'mcp.source_thread': 'thread (`DATA_DIR`/threads/...)',
 
     // ── extra hints ──
     'sessions.run_hint': 'Запусти /sessions, чтобы увидеть сессии для resume.',
@@ -215,7 +220,7 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── voice ──
     'voice.no_api_key':
-      'Для голоса нужен GROQ_API_KEY (бесплатно) или OPENAI_API_KEY.',
+      'Для голоса нужен `GROQ_API_KEY` (бесплатно) или `OPENAI_API_KEY`.',
     'voice.failed': 'Не удалось распознать голосовое.',
     'voice.transcribed': '🎤 {text}',
 
@@ -246,7 +251,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'thread.unbind_unbound': 'Thread had no binding to clear.',
     'thread.where_unbound': 'Thread is not bound to a folder.',
     'thread.where_root':
-      '📁 WORK_ROOT: `{workRoot}`\n📊 Bindings: {bindings}\n🟢 Active sessions: {active}',
+      '📁 `WORK_ROOT`: `{workRoot}`\n📊 Bindings: {bindings}\n🟢 Active sessions: {active}',
     'thread.where_bound': '📁 Folder: `{subdir}`\n🤖 Agent: {agent}\n🟢 Status: {status}',
     'thread.general_no_agent':
       'General is not bound to a folder — switch to a topical thread to talk to an agent.',
@@ -264,13 +269,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.in_general':
       '/bind only works in topical threads, not in General.',
     'bind.invalid_chars': '❌ Folder name must not contain control characters.',
-    'bind.not_found': '❌ Folder `{subdir}` not found under WORK_ROOT (`{workRoot}`).',
-    'bind.outside_root': '❌ Path escapes WORK_ROOT.',
+    'bind.not_found': '❌ Folder `{subdir}` not found under `WORK_ROOT` (`{workRoot}`).',
+    'bind.outside_root': '❌ Path escapes `WORK_ROOT`.',
     'bind.not_directory': '❌ `{subdir}` exists but is not a directory.',
 
     // ── /ls /list /new (General-scoped) ──
     'ls.header': '📁 Subfolders of `{workRoot}`:',
-    'ls.empty': '📁 No bindable subfolders under WORK_ROOT.',
+    'ls.empty': '📁 No bindable subfolders under `WORK_ROOT`.',
     'list.header': '🧵 Thread bindings ({count}):',
     'list.empty': '🧵 No bindings yet. Create a thread and run /bind.',
     'list.row': '• {threadId}: `{subdir}` · {agent} · {status}',
@@ -289,7 +294,7 @@ const dict: Record<Lang, Record<string, string>> = {
     // ── /help context-aware ──
     'help.general':
       '*Commands in General:*\n' +
-      '/ls — list WORK_ROOT subfolders\n' +
+      '/ls — list `WORK_ROOT` subfolders\n' +
       '/list — list threads\n' +
       '/new <name> [subdir] — create a thread\n' +
       '/where — global summary\n' +
@@ -301,7 +306,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '*Thread is not bound to a folder.*\n' +
       '/bind <subdir> — bind (or pick from the list)\n' +
       '/where — show state\n' +
-      '/ls — WORK_ROOT subfolders (in General)',
+      '/ls — `WORK_ROOT` subfolders (in General)',
     'help.thread_bound':
       '*Thread bound to `{subdir}`.*\n' +
       '/claude /opencode — start an agent\n' +
@@ -324,8 +329,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'doctor.privacy_hint':
       '@BotFather → /setprivacy → Disable, then remove and re-add the bot',
     'doctor.workroot_subdirs':
-      'WORK_ROOT: `{workRoot}` ({count} subfolders)',
-    'doctor.datadir_path': 'DATA_DIR: `{dataDir}`',
+      '`WORK_ROOT`: `{workRoot}` ({count} subfolders)',
+    'doctor.datadir_path': '`DATA_DIR`: `{dataDir}`',
     'doctor.claude_installed': 'claude CLI installed',
     'doctor.opencode_installed': 'opencode CLI installed',
     'doctor.state_valid':
@@ -346,7 +351,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '2️⃣ @BotFather → /setprivacy → Disable, then remove and re-add me\n' +
       '3️⃣ Run /doctor to see what is still missing\n' +
       '4️⃣ In each topical thread run /bind <subdir> and start an agent\n\n' +
-      'WORK_ROOT: `{workRoot}`',
+      '`WORK_ROOT`: `{workRoot}`',
 
     // ── rich welcome after /bind (§20.5) ──
     'binding.welcome.header': '📁 Bound to `{subdir}`',
@@ -363,9 +368,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'mcp.row': '• `{name}` — {source}',
     'mcp.empty': '🔌 No MCP servers configured.',
     'mcp.source_user': 'user (~/.claude/settings.json)',
-    'mcp.source_group': 'group (DATA_DIR/mcp.json)',
+    'mcp.source_group': 'group (`DATA_DIR`/mcp.json)',
     'mcp.source_project': 'project (`{workDir}/.mcp.json`)',
-    'mcp.source_thread': 'thread (DATA_DIR/threads/...)',
+    'mcp.source_thread': 'thread (`DATA_DIR`/threads/...)',
 
     // ── extra hints ──
     'sessions.run_hint': 'Run /sessions to see resumable agent sessions.',
@@ -409,7 +414,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '✏️ I don\'t treat edited messages as new input — send the correction as a separate message.',
 
     'voice.no_api_key':
-      'Voice requires GROQ_API_KEY (free) or OPENAI_API_KEY.',
+      'Voice requires `GROQ_API_KEY` (free) or `OPENAI_API_KEY`.',
     'voice.failed': 'Failed to transcribe voice message.',
     'voice.transcribed': '🎤 {text}',
 

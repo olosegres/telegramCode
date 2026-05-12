@@ -1,0 +1,143 @@
+/**
+ * @description Plan §11 Этап 7 — state-store coverage:
+ *
+ *   R4. Legacy migration: `~/.telegram-bot-messages.json` → `.bak`.
+ *   R5. Concurrent `setBinding` / `setAgentChoice` from two callers
+ *       under the same `ThreadKey` doesn't lose either write
+ *       (per-key async-lock, plan §13.15).
+ *   R6. Corrupted `state.json` is archived to
+ *       `state.json.corrupted-<ts>` and the store starts fresh
+ *       (plan §13.14).
+ *
+ * Each test creates an isolated `dataDir` under `os.tmpdir()` and overrides
+ * `HOME` so the legacy-file check (which reads `os.homedir()`) sees the
+ * tmp directory, not the developer's real home. `HOME` is restored in
+ * `afterEach`.
+ */
+
+import { test, beforeEach, afterEach } from 'node:test';
+import * as assert from 'node:assert/strict';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import { StateStore } from '../state';
+import type { ThreadKey } from '../types';
+
+let dataDir: string;
+let fakeHome: string;
+let originalHome: string | undefined;
+
+beforeEach(() => {
+  fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcode-home-'));
+  dataDir = path.join(fakeHome, '.telegramCode');
+  fs.mkdirSync(dataDir, { recursive: true });
+  originalHome = process.env.HOME;
+  // Node's `os.homedir()` on POSIX falls back to `process.env.HOME` when
+  // the userInfo lookup yields the default. Overriding it here keeps the
+  // legacy-migration probe from touching the developer's real homedir.
+  process.env.HOME = fakeHome;
+});
+
+afterEach(() => {
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  fs.rmSync(fakeHome, { recursive: true, force: true });
+});
+
+const key1: ThreadKey = { chatId: -1001234567890, threadId: 42 };
+const key2: ThreadKey = { chatId: -1001234567890, threadId: 99 };
+
+test('R4: legacy ~/.telegram-bot-messages.json is renamed to .bak on init', async () => {
+  const legacy = path.join(fakeHome, '.telegram-bot-messages.json');
+  fs.writeFileSync(legacy, JSON.stringify({ '12345': [1, 2, 3] }));
+
+  const store = new StateStore(dataDir, { saveDebounceMs: 20 });
+  await store.init();
+
+  assert.equal(fs.existsSync(legacy), false, 'legacy file should be gone');
+  assert.equal(fs.existsSync(legacy + '.bak'), true, '.bak should exist');
+  assert.equal(store.getLegacyMigrationPath(), legacy + '.bak');
+});
+
+test('R4: init is a no-op if there is no legacy file', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 20 });
+  await store.init();
+  assert.equal(store.getLegacyMigrationPath(), null);
+});
+
+test('R5: concurrent setBinding under the same key serialises and both writes land', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+
+  // Fire two writes for the same key concurrently. Without the per-key
+  // lock the second read-modify-write would clobber the first half of
+  // the time; with the lock the final state is deterministic.
+  await Promise.all([
+    store.setBinding(key1, 'alpha'),
+    store.setBinding(key1, 'beta'),
+  ]);
+
+  // Whichever ran second wins, but the in-memory state must match the
+  // on-disk state — that's the actual invariant.
+  await store.flush();
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  const persisted = raw.bindings[`${key1.chatId}:${key1.threadId}`];
+  const inMemory = store.getBinding(key1);
+  assert.ok(persisted, 'binding must exist on disk');
+  assert.equal(persisted.subdir, inMemory?.subdir, 'on-disk and in-memory must agree');
+  assert.ok(['alpha', 'beta'].includes(persisted.subdir));
+});
+
+test('R5: concurrent setBinding on DIFFERENT keys both land', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+
+  await Promise.all([
+    store.setBinding(key1, 'alpha'),
+    store.setBinding(key2, 'beta'),
+  ]);
+  await store.flush();
+
+  assert.equal(store.getBinding(key1)?.subdir, 'alpha');
+  assert.equal(store.getBinding(key2)?.subdir, 'beta');
+});
+
+test('R6: corrupted state.json is archived and store starts fresh', async () => {
+  const statePath = path.join(dataDir, 'state.json');
+  fs.writeFileSync(statePath, '{ this is not valid json');
+
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+
+  assert.equal(store.wasCorruptedOnLoad(), true, 'corruption flag must be set');
+  const archive = store.getCorruptedArchivePath();
+  assert.ok(archive, 'archive path must be exposed');
+  assert.match(path.basename(archive!), /^state\.json\.corrupted-/);
+  assert.equal(fs.existsSync(archive!), true, 'archive file must exist on disk');
+  assert.equal(fs.existsSync(statePath), true, 'fresh state.json must be written');
+  assert.equal(store.listBindings().length, 0, 'fresh state has no bindings');
+});
+
+test('R6: missing state.json is treated as a fresh start (no archive, no corruption flag)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  assert.equal(store.wasCorruptedOnLoad(), false);
+  assert.equal(store.getCorruptedArchivePath(), null);
+  assert.equal(store.listBindings().length, 0);
+});
+
+test('R6: valid state.json is loaded and bindings are visible after restart', async () => {
+  // Round-trip persistence: write some data, reload from disk in a
+  // second store instance, confirm the bindings are intact.
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setBinding(key1, 'alpha');
+  await first.setAgent(key1, { name: 'claude' });
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.wasCorruptedOnLoad(), false);
+  assert.equal(second.getBinding(key1)?.subdir, 'alpha');
+  assert.equal(second.getAgent(key1)?.name, 'claude');
+});

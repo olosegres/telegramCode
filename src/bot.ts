@@ -34,6 +34,7 @@ import {
 } from './installManager';
 import { getStateStore, type StateStore } from './state';
 import { t } from './i18n';
+import { validateSubdir, BindError } from './validation';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -738,88 +739,9 @@ function getWorkDir(key: ThreadKey): string {
 //  Subdir validation + discovery (plan §13.7 / T1)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * @description Resolve a user-supplied `subdir` against `WORK_ROOT` and
- * confirm it actually lives inside it.
- *
- * Defends against:
- *  - `../etc/passwd` style traversal (resolve + strict equality / prefix
- *    with trailing separator — naive `startsWith` would let `/work_root_evil`
- *    match `/work_root`),
- *  - Symlinks pointing outside the root (`realpathSync` resolves them),
- *  - NUL bytes and control characters (some filesystems happily store them
- *    but they trip shell-out and tmux command building downstream),
- *  - Unicode NFD vs NFC drift (`café` typed in macOS Terminal is NFD; the
- *    on-disk name is usually NFC).
- *
- * Throws an `Error` whose `.code` lets callers map to a localised reply:
- *   - `BIND_INVALID_CHARS`, `BIND_NOT_FOUND`, `BIND_NOT_DIRECTORY`,
- *     `BIND_OUTSIDE_ROOT`.
- */
-class BindError extends Error {
-  constructor(public readonly code: string, message: string) {
-    super(message);
-    this.name = 'BindError';
-  }
-}
-
-function validateSubdir(workRoot: string, rawSubdir: string): string {
-  if (/[\x00-\x1f]/.test(rawSubdir)) {
-    throw new BindError('BIND_INVALID_CHARS', 'subdir contains control characters');
-  }
-
-  // Normalise to NFC — input from macOS Terminal often arrives NFD, but the
-  // on-disk entry was created NFC, so naive string compare misses it.
-  const normalised = rawSubdir.normalize('NFC').trim();
-  if (!normalised) {
-    throw new BindError('BIND_INVALID_CHARS', 'subdir is empty');
-  }
-
-  let realRoot: string;
-  try {
-    realRoot = fs.realpathSync(workRoot);
-  } catch (e) {
-    // The boot-time check already verified workRoot exists; treat this as a
-    // transient (e.g. user removed it) and translate to a not-found error so
-    // the caller reports a localised message rather than a stack trace.
-    throw new BindError('BIND_NOT_FOUND', `WORK_ROOT vanished: ${(e as Error).message}`);
-  }
-
-  const candidate = path.resolve(realRoot, normalised);
-  let realCandidate: string;
-  try {
-    realCandidate = fs.realpathSync(candidate);
-  } catch {
-    throw new BindError('BIND_NOT_FOUND', `subdir not found: ${normalised}`);
-  }
-
-  // Strict containment: exact equality OR proper prefix with the platform
-  // separator appended. Without the separator, `/work_root_evil` would
-  // satisfy `startsWith('/work_root')` — classic traversal trap.
-  if (
-    realCandidate !== realRoot &&
-    !realCandidate.startsWith(realRoot + path.sep)
-  ) {
-    throw new BindError('BIND_OUTSIDE_ROOT', `subdir resolves outside WORK_ROOT: ${realCandidate}`);
-  }
-
-  // Reject /bind . — binding to WORK_ROOT itself is exactly the unbound
-  // state we just spent the whole stage stopping users from sliding into.
-  // It also has no meaningful project context (no CLAUDE.md / .git scope).
-  if (realCandidate === realRoot) {
-    throw new BindError('BIND_OUTSIDE_ROOT', 'cannot bind to WORK_ROOT itself; pick a subfolder');
-  }
-
-  const stat = fs.statSync(realCandidate);
-  if (!stat.isDirectory()) {
-    throw new BindError('BIND_NOT_DIRECTORY', `${normalised} is not a directory`);
-  }
-
-  // Store the *relative* form so the on-disk record survives `WORK_ROOT`
-  // path changes (e.g. mount point rename). `getWorkDir` re-joins this with
-  // the current `ENV.workRoot` at runtime.
-  return path.relative(realRoot, realCandidate);
-}
+// `validateSubdir` + `BindError` live in `src/validation.ts` so the
+// security-critical bits can be unit-tested without booting Telegraf
+// (plan §11 Этап 7, R3). The import at the top of this file pulls them in.
 
 /**
  * @description List immediate subdirectories of `WORK_ROOT` for the `/bind`

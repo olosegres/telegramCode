@@ -1,0 +1,67 @@
+/**
+ * @description Plan §11 Этап 7 / R1 — `ThreadKey` serialize / deserialize
+ * round-trips losslessly across the full domain we hit in production:
+ *
+ *  - Negative `chatId` (forum supergroups are always `-100…`).
+ *  - General topic (`threadId = 1`).
+ *  - Large topic ids (Telegram allocates monotonically; live groups
+ *    routinely have 4-5 digit threadIds).
+ *  - Zero — historical shim for private chats before §11 Этап 3.
+ *
+ * The serialised form is also the key in `state.json.bindings`, so any
+ * regression here corrupts persisted state. Hence the property-style
+ * round-trip — exhaustive enough to catch sign / off-by-one bugs without
+ * pulling in `fast-check`.
+ */
+
+import { test } from 'node:test';
+import * as assert from 'node:assert/strict';
+import { keyToString, keyFromString, keysEqual, type ThreadKey } from '../types';
+
+test('keyToString → keyFromString round-trips for representative keys', () => {
+  const samples: ThreadKey[] = [
+    { chatId: -1001234567890, threadId: 1 },    // General topic
+    { chatId: -1001234567890, threadId: 42 },   // normal topic
+    { chatId: -1009999999999, threadId: 99999 }, // long-lived group
+    { chatId: 12345, threadId: 0 },              // historical shim
+    { chatId: -1, threadId: 1 },                 // edge small negative
+  ];
+
+  for (const key of samples) {
+    const s = keyToString(key);
+    const decoded = keyFromString(s);
+    assert.equal(decoded.chatId, key.chatId, `chatId mismatch for ${s}`);
+    assert.equal(decoded.threadId, key.threadId, `threadId mismatch for ${s}`);
+    assert.ok(keysEqual(key, decoded), `keysEqual failed for ${s}`);
+  }
+});
+
+test('keyToString format is exactly "<chatId>:<threadId>"', () => {
+  // The state.json schema depends on this exact format — a regression
+  // here would silently invalidate every persisted binding.
+  assert.equal(keyToString({ chatId: -1001234567890, threadId: 42 }), '-1001234567890:42');
+  assert.equal(keyToString({ chatId: 1, threadId: 1 }), '1:1');
+});
+
+test('keyFromString rejects malformed input', () => {
+  // Empty / missing separator / non-numeric / trailing colon — all
+  // realistic state.json corruption modes we'd rather catch loudly than
+  // see silently coerced to NaN.
+  const bad = ['', ':', '42', ':42', '42:', 'a:b', '-1001234567890:abc', 'abc:42'];
+  for (const s of bad) {
+    assert.throws(() => keyFromString(s), /Invalid ThreadKey/, `should reject "${s}"`);
+  }
+});
+
+test('keysEqual is reflexive, symmetric, and structural', () => {
+  const a: ThreadKey = { chatId: -100, threadId: 5 };
+  const b: ThreadKey = { chatId: -100, threadId: 5 };
+  const c: ThreadKey = { chatId: -100, threadId: 6 };
+  const d: ThreadKey = { chatId: -101, threadId: 5 };
+
+  assert.ok(keysEqual(a, a));
+  assert.ok(keysEqual(a, b));
+  assert.ok(keysEqual(b, a));
+  assert.ok(!keysEqual(a, c), 'different threadId must not be equal');
+  assert.ok(!keysEqual(a, d), 'different chatId must not be equal');
+});

@@ -34,7 +34,7 @@ import {
 } from './installManager';
 import { getStateStore, type StateStore } from './state';
 import { t } from './i18n';
-import { validateSubdir, BindError, findAutobindSubdir } from './validation';
+import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { resolveThreadKey, GENERAL_THREAD_ID } from './threadRouting';
 import {
   classifySendError,
@@ -918,6 +918,9 @@ function getWorkDir(key: ThreadKey): string {
 // security-critical bits can be unit-tested without booting Telegraf
 // (plan §11 Этап 7, R3). The import at the top of this file pulls them in.
 
+/** Inline-keyboard page size for `/bind`. 20 fits one phone screen comfortably. */
+const BIND_PAGE_SIZE = 20;
+
 /**
  * @description List immediate subdirectories of `WORK_ROOT` for the `/bind`
  * inline-button picker and the `forum_topic_created` welcome message.
@@ -935,7 +938,7 @@ function getWorkDir(key: ThreadKey): string {
  * topic_created event), and the synchronous block is dwarfed by the Telegram
  * round-trip that follows it.
  */
-function listAvailableSubdirs(workRoot: string, limit = 50): string[] {
+function listAvailableSubdirs(workRoot: string, limit = 200): string[] {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(workRoot, { withFileTypes: true });
@@ -953,20 +956,51 @@ function listAvailableSubdirs(workRoot: string, limit = 50): string[] {
 }
 
 /**
- * @description Build a `subdir`-suggestion keyboard for `/bind` and for the
- * topic-creation welcome message. Two columns keeps the buttons readable on
- * mobile clients. Subdirs whose callback_data exceeds 64 bytes are already
- * filtered out upstream in `listAvailableSubdirs`.
+ * @description Build a `subdir`-suggestion keyboard for `/bind` and friends.
+ *
+ * Lists are paginated at {@link BIND_PAGE_SIZE} entries: a `WORK_ROOT` with
+ * many subfolders (mono-repo workspace, packages dir, etc.) would otherwise
+ * push the inline keyboard past Telegram's per-message height limit and
+ * lose entries below the fold.
+ *
+ * The nav row appears only when there's more than one page. The middle
+ * `pageLabel` button is a no-op (`bind_page_noop` callback) — it exists
+ * solely so the user sees "2/5" without us having to fake a divider with
+ * a separate message.
+ *
+ * Subdirs whose callback_data exceeds 64 bytes are filtered out upstream
+ * in `listAvailableSubdirs`. `page` is clamped to a valid index so a stale
+ * callback (folders disappeared since the keyboard was sent) just lands
+ * on the last available page.
  */
-function buildBindKeyboard(subdirs: string[]) {
+function buildBindKeyboard(
+  subdirs: readonly string[],
+  page: number = 0,
+  pageSize: number = BIND_PAGE_SIZE,
+) {
+  const { slice, currentPage, totalPages } = paginateBindList(subdirs, page, pageSize);
+
   const rows = [];
-  for (let i = 0; i < subdirs.length; i += 2) {
-    const row = [Markup.button.callback(`📁 ${subdirs[i]}`, `bind_${subdirs[i]}`)];
-    if (subdirs[i + 1]) {
-      row.push(Markup.button.callback(`📁 ${subdirs[i + 1]}`, `bind_${subdirs[i + 1]}`));
+  for (let i = 0; i < slice.length; i += 2) {
+    const row = [Markup.button.callback(`📁 ${slice[i]}`, `bind_${slice[i]}`)];
+    if (slice[i + 1]) {
+      row.push(Markup.button.callback(`📁 ${slice[i + 1]}`, `bind_${slice[i + 1]}`));
     }
     rows.push(row);
   }
+
+  if (totalPages > 1) {
+    const nav = [];
+    if (currentPage > 0) {
+      nav.push(Markup.button.callback('⬅️ Prev', `bind_page_${currentPage - 1}`));
+    }
+    nav.push(Markup.button.callback(`${currentPage + 1}/${totalPages}`, 'bind_page_noop'));
+    if (currentPage < totalPages - 1) {
+      nav.push(Markup.button.callback('Next ➡️', `bind_page_${currentPage + 1}`));
+    }
+    rows.push(nav);
+  }
+
   return Markup.inlineKeyboard(rows);
 }
 
@@ -2572,6 +2606,44 @@ bot.on(message('forum_topic_reopened'), async (ctx) => {
  * route through `applyBinding` for validation parity with the slash command
  * (case the disk state changes between keyboard send and callback receive).
  */
+/**
+ * @description Pagination handler for the `/bind` keyboard.
+ *
+ * Edits the *existing* picker message in-place (`editMessageReplyMarkup`)
+ * rather than sending a fresh keyboard — keeps the thread clean and
+ * preserves the surrounding text. A no-op edit (same page tapped twice)
+ * returns Telegram's "message is not modified" 400 which we swallow.
+ *
+ * Note: `bind_page_(\d+)$` is registered BEFORE `bind_(.+)$` so the
+ * page-callback isn't accidentally interpreted as a folder name. Order
+ * matters in Telegraf's action regex dispatch — first match wins.
+ */
+bot.action(/^bind_page_(\d+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (checkIsGeneral(key)) {
+    await ctx.answerCbQuery('/bind only works in topical threads');
+    return;
+  }
+  const page = parseInt(ctx.match[1], 10);
+  const subdirs = listAvailableSubdirs(ENV.workRoot);
+  const keyboard = buildBindKeyboard(subdirs, page);
+  try {
+    await ctx.editMessageReplyMarkup(keyboard.reply_markup);
+  } catch (e) {
+    const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+    if (!/message is not modified/i.test(desc)) {
+      console.warn(`[bind_page] edit failed:`, desc || e);
+    }
+  }
+  await ctx.answerCbQuery();
+});
+
+// Middle "N/M" pill in the nav row — pure UI, no state change.
+bot.action('bind_page_noop', async (ctx) => {
+  await ctx.answerCbQuery();
+});
+
 bot.action(/^bind_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery('Access denied'); return; }

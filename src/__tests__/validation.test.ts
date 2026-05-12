@@ -26,6 +26,7 @@ import {
   BindError,
   findAutobindSubdir,
   normaliseTopicName,
+  paginateBindList,
 } from '../validation';
 
 let workRoot: string = '';
@@ -252,4 +253,71 @@ test('findAutobindSubdir: first match wins on duplicates', () => {
     findAutobindSubdir('My API', ['my-api', 'my_api']),
     'my-api',
   );
+});
+
+// ─── paginateBindList ────────────────────────────────────────────────────────
+
+test('paginateBindList: empty list still yields one page', () => {
+  // The /bind picker must always render *something* (even if it's an empty
+  // body) so the caller doesn't have to special-case an empty list. The
+  // page count never drops below 1.
+  const result = paginateBindList([], 0, 20);
+  assert.deepStrictEqual(result, {
+    slice: [],
+    currentPage: 0,
+    totalPages: 1,
+  });
+});
+
+test('paginateBindList: single page when list fits', () => {
+  const subdirs = ['a', 'b', 'c'];
+  const result = paginateBindList(subdirs, 0, 20);
+  assert.deepStrictEqual(result.slice, ['a', 'b', 'c']);
+  assert.strictEqual(result.totalPages, 1);
+  assert.strictEqual(result.currentPage, 0);
+});
+
+test('paginateBindList: slices into 3 pages of 2', () => {
+  const subdirs = ['a', 'b', 'c', 'd', 'e'];
+  const p0 = paginateBindList(subdirs, 0, 2);
+  const p1 = paginateBindList(subdirs, 1, 2);
+  const p2 = paginateBindList(subdirs, 2, 2);
+  assert.deepStrictEqual(p0.slice, ['a', 'b']);
+  assert.deepStrictEqual(p1.slice, ['c', 'd']);
+  assert.deepStrictEqual(p2.slice, ['e']);
+  assert.strictEqual(p0.totalPages, 3);
+  assert.strictEqual(p1.totalPages, 3);
+  assert.strictEqual(p2.totalPages, 3);
+});
+
+test('paginateBindList: clamps negative page to 0', () => {
+  const subdirs = ['a', 'b', 'c'];
+  const result = paginateBindList(subdirs, -3, 2);
+  assert.strictEqual(result.currentPage, 0);
+  assert.deepStrictEqual(result.slice, ['a', 'b']);
+});
+
+test('paginateBindList: clamps over-range page to last page', () => {
+  // Stale callback after subdirs shrank — should land on the last available
+  // page instead of returning an empty slice.
+  const subdirs = ['a', 'b', 'c', 'd', 'e'];
+  const result = paginateBindList(subdirs, 99, 2);
+  assert.strictEqual(result.totalPages, 3);
+  assert.strictEqual(result.currentPage, 2);
+  assert.deepStrictEqual(result.slice, ['e']);
+});
+
+test('paginateBindList: rejects non-positive pageSize', () => {
+  assert.throws(() => paginateBindList(['a'], 0, 0), /pageSize/);
+  assert.throws(() => paginateBindList(['a'], 0, -1), /pageSize/);
+  // 2.5 is non-integer → reject. The bot only ever passes 20.
+  assert.throws(() => paginateBindList(['a'], 0, 2.5), /pageSize/);
+});
+
+test('paginateBindList: floors fractional page indexes', () => {
+  // Should never happen in practice (callback data is always an integer
+  // string), but parseInt() bugs upstream shouldn't crash the picker.
+  const result = paginateBindList(['a', 'b', 'c', 'd'], 1.7, 2);
+  assert.strictEqual(result.currentPage, 1);
+  assert.deepStrictEqual(result.slice, ['c', 'd']);
 });

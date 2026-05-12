@@ -34,7 +34,7 @@ import {
 } from './installManager';
 import { getStateStore, type StateStore } from './state';
 import { t } from './i18n';
-import { validateSubdir, BindError } from './validation';
+import { validateSubdir, BindError, findAutobindSubdir } from './validation';
 import { resolveThreadKey, GENERAL_THREAD_ID } from './threadRouting';
 import {
   classifySendError,
@@ -2509,14 +2509,11 @@ bot.on(message('forum_topic_created'), async (ctx) => {
   if (existing) return;
 
   const subdirs = listAvailableSubdirs(ENV.workRoot);
-  // NFC-normalised case-insensitive match — Telegram clients tend to send
-  // the topic name verbatim, but case drift is common (`Overview` vs
-  // `overview`). We normalise *both* sides because Linux filesystems happily
-  // preserve NFD names from older macOS/rsync sources, and the topic name
-  // from Telegram is always NFC. We auto-bind only on an exact
-  // (case-insensitive) match to keep the rule predictable.
-  const normalisedName = topicName.normalize('NFC').toLowerCase().trim();
-  const match = subdirs.find(s => s.normalize('NFC').toLowerCase() === normalisedName);
+  // Fuzzy match: NFC + lower + separator-collapsed (see `findAutobindSubdir`
+  // for the precise drift coverage). Anything more aggressive would start
+  // guessing — auto-bind has to stay predictable, mis-matches fall through
+  // to the picker UX.
+  const match = findAutobindSubdir(topicName, subdirs);
   if (match) {
     try {
       const subdir = validateSubdir(ENV.workRoot, match);

@@ -117,3 +117,46 @@ export function validateSubdir(workRoot: string, rawSubdir: string): string {
   // with the current `ENV.workRoot` at runtime.
   return path.relative(realRoot, realCandidate);
 }
+
+/**
+ * @description Normalise a name (topic title or subdir) for fuzzy auto-bind
+ * matching.
+ *
+ * Folds three predictable drifts between Telegram topic titles and on-disk
+ * folder names:
+ *   - case: `Overview` ↔ `overview`
+ *   - separator: `my-api` ↔ `my_api` ↔ `my api` ↔ `my.api`
+ *   - edge whitespace: `  overview  ` ↔ `overview`
+ *
+ * NFC normalisation runs first so macOS-flavoured NFD doesn't slip past
+ * the separator collapse.
+ *
+ * Anything more aggressive (typo tolerance, partial matches) is
+ * intentionally out of scope — auto-bind has to stay predictable; if it
+ * starts guessing the user loses trust in the rule.
+ *
+ * Plan §11 Этап 7 polish (smart auto-bind fuzzy, §20.10).
+ */
+export function normaliseTopicName(s: string): string {
+  return s.normalize('NFC').toLowerCase().trim().replace(/[\s._-]+/g, '-');
+}
+
+/**
+ * @description Find the on-disk subdir whose normalised name matches the
+ * normalised topic title. Returns `null` if no match (auto-bind falls
+ * through to the picker UX).
+ *
+ * Caller is expected to have already filtered `subdirs` to the entries
+ * surfaced in the UI — `listAvailableSubdirs` does that.
+ */
+export function findAutobindSubdir(
+  topicName: string,
+  subdirs: readonly string[],
+): string | null {
+  const normalisedName = normaliseTopicName(topicName);
+  if (!normalisedName) return null;
+  for (const subdir of subdirs) {
+    if (normaliseTopicName(subdir) === normalisedName) return subdir;
+  }
+  return null;
+}

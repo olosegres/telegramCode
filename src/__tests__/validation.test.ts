@@ -21,7 +21,12 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { validateSubdir, BindError } from '../validation';
+import {
+  validateSubdir,
+  BindError,
+  findAutobindSubdir,
+  normaliseTopicName,
+} from '../validation';
 
 let workRoot: string = '';
 let outsideDir: string = '';
@@ -171,4 +176,80 @@ test('rejects sibling whose name starts with the same prefix (no naive startsWit
   } finally {
     fs.rmSync(tmpEvilRoot, { recursive: true, force: true });
   }
+});
+
+// ─── normaliseTopicName + findAutobindSubdir (fuzzy auto-bind) ───────────────
+
+test('normaliseTopicName: lowercases, trims, collapses separators', () => {
+  assert.strictEqual(normaliseTopicName('Overview'), 'overview');
+  assert.strictEqual(normaliseTopicName('  Overview  '), 'overview');
+  assert.strictEqual(normaliseTopicName('my-api'), 'my-api');
+  assert.strictEqual(normaliseTopicName('my_api'), 'my-api');
+  assert.strictEqual(normaliseTopicName('my api'), 'my-api');
+  assert.strictEqual(normaliseTopicName('my.api'), 'my-api');
+  assert.strictEqual(normaliseTopicName('my  api'), 'my-api');
+  assert.strictEqual(normaliseTopicName('my-_-api'), 'my-api');
+});
+
+test('normaliseTopicName: NFC normalisation folds NFD input', () => {
+  // `café` with combining acute accent (NFD) → `café` with single composed
+  // glyph (NFC). On disk the folder will almost always be NFC, but topic
+  // names sometimes arrive NFD from older clients / iOS keyboard variants.
+  const nfd = 'cafe\u0301';
+  const nfc = 'café';
+  assert.notStrictEqual(nfd, nfc); // sanity: they're distinct strings
+  assert.strictEqual(normaliseTopicName(nfd), normaliseTopicName(nfc));
+});
+
+test('normaliseTopicName: empty / whitespace-only returns empty', () => {
+  assert.strictEqual(normaliseTopicName(''), '');
+  assert.strictEqual(normaliseTopicName('   '), '');
+});
+
+test('findAutobindSubdir: exact match', () => {
+  assert.strictEqual(
+    findAutobindSubdir('overview', ['overview', 'projectAlpha']),
+    'overview',
+  );
+});
+
+test('findAutobindSubdir: case-insensitive match', () => {
+  assert.strictEqual(
+    findAutobindSubdir('Overview', ['overview', 'projectAlpha']),
+    'overview',
+  );
+});
+
+test('findAutobindSubdir: separator drift (space → dash)', () => {
+  assert.strictEqual(
+    findAutobindSubdir('my api', ['my-api', 'overview']),
+    'my-api',
+  );
+});
+
+test('findAutobindSubdir: separator drift (underscore → dash)', () => {
+  assert.strictEqual(
+    findAutobindSubdir('My_API', ['my-api', 'overview']),
+    'my-api',
+  );
+});
+
+test('findAutobindSubdir: returns null on no match', () => {
+  assert.strictEqual(findAutobindSubdir('unrelated', ['alpha', 'beta']), null);
+});
+
+test('findAutobindSubdir: returns null on empty topic name', () => {
+  assert.strictEqual(findAutobindSubdir('', ['alpha', 'beta']), null);
+  assert.strictEqual(findAutobindSubdir('   ', ['alpha', 'beta']), null);
+});
+
+test('findAutobindSubdir: first match wins on duplicates', () => {
+  // Two folders normalise to the same form — auto-bind picks the first as
+  // surfaced by `listAvailableSubdirs` (which sorts via localeCompare).
+  // The behaviour is deterministic; documenting it in a test so a refactor
+  // doesn't silently flip the precedence.
+  assert.strictEqual(
+    findAutobindSubdir('My API', ['my-api', 'my_api']),
+    'my-api',
+  );
 });

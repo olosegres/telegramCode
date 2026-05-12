@@ -35,6 +35,7 @@ import {
 import { getStateStore, type StateStore } from './state';
 import { t } from './i18n';
 import { validateSubdir, BindError } from './validation';
+import { resolveThreadKey, GENERAL_THREAD_ID } from './threadRouting';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -122,12 +123,10 @@ const bot = new Telegraf(ENV.botToken);
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @description `message_thread_id` of the General forum topic. The Bot API
- * uses 1 for General; some clients omit `message_thread_id` entirely for
- * General messages. We normalise both forms to 1 in `getThreadKey()` so
- * routing is consistent (plan §4.3 point 3).
+ * @description `GENERAL_THREAD_ID` is imported from `./threadRouting`
+ * (the pure routing module owns it so unit tests can reach it without
+ * booting Telegraf). Plan §4.3 point 3 / R2.
  */
-const GENERAL_THREAD_ID = 1;
 
 /** Telegram caps a message at 4096 chars; we leave headroom for markdown noise. */
 const MAX_MESSAGE_LEN = 4000;
@@ -210,39 +209,37 @@ function markNeedsNewMessage(key: ThreadKey): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @description Resolve a `ThreadKey` from a Telegram context, or `null` if
- * the message must be ignored.
- *
- * Plan §8 gating rules:
- *   1. Chat must be a forum supergroup (`type === 'supergroup'` AND `is_forum: true`).
- *   2. Chat id must match `ALLOWED_GROUP_ID`.
- *   3. If a `message_thread_id` is present, `is_topic_message` must be true
- *      — guards against plain reply-threads in non-forum supergroups, which
- *      also carry `message_thread_id` but are NOT topics (plan §4.3 point 2).
- *   4. `message_thread_id` absent → General topic, normalised to 1.
+ * @description Thin Telegraf adapter over `resolveThreadKey` (pure logic
+ * lives in `./threadRouting`, where it can be unit-tested). The bot only
+ * needs to translate `ctx` shapes into the routing module's plain inputs.
  */
 function getThreadKey(ctx: Context): ThreadKey | null {
   const chat = ctx.chat;
-  if (!chat || chat.type !== 'supergroup') return null;
-  // The forum flag isn't on the union type for all chat shapes, but a
-  // forum supergroup has it set.
-  if (!('is_forum' in chat) || !chat.is_forum) return null;
-  if (chat.id !== ENV.allowedGroupId) return null;
-
-  // The message may come from either a fresh update or a callback query's
-  // origin message — both carry `message_thread_id` on the same shape.
-  const msg = (ctx.message ?? ctx.callbackQuery?.message) as Message | undefined;
-
-  // Default: General topic (id 1) if the message has no explicit thread id.
-  const rawThreadId = msg && 'message_thread_id' in msg ? msg.message_thread_id : undefined;
-  const isTopicMessage = msg && 'is_topic_message' in msg ? msg.is_topic_message : undefined;
-
-  // Plain reply-threads (non-forum supergroups) also carry message_thread_id.
-  // Reject them: they're not topics, just reply nests.
-  if (rawThreadId && !isTopicMessage) return null;
-
-  const threadId = rawThreadId ?? GENERAL_THREAD_ID;
-  return { chatId: chat.id, threadId };
+  // `is_forum` isn't on every chat shape in the Telegraf union; widen
+  // here so the pure routing function can read it as a plain field.
+  const routeChat = chat
+    ? { id: chat.id, type: chat.type, is_forum: 'is_forum' in chat ? chat.is_forum : undefined }
+    : undefined;
+  const msg = ctx.message as Message | undefined;
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  return resolveThreadKey(
+    {
+      chat: routeChat,
+      message: msg
+        ? {
+            message_thread_id: 'message_thread_id' in msg ? msg.message_thread_id : undefined,
+            is_topic_message: 'is_topic_message' in msg ? msg.is_topic_message : undefined,
+          }
+        : undefined,
+      callbackQueryMessage: cbMsg
+        ? {
+            message_thread_id: 'message_thread_id' in cbMsg ? cbMsg.message_thread_id : undefined,
+            is_topic_message: 'is_topic_message' in cbMsg ? cbMsg.is_topic_message : undefined,
+          }
+        : undefined,
+    },
+    ENV.allowedGroupId,
+  );
 }
 
 /** Is this thread the General forum topic? */

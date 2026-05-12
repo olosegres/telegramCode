@@ -313,12 +313,14 @@ async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
     await state.setBindingClosed(key, true);
     // Notify in General so user is not silent. Use low-level send (no
     // recursion through replyToThread, which would re-enter this handler).
-    const generalKey: ThreadKey = { chatId: key.chatId, threadId: GENERAL_THREAD_ID };
+    // Notify General. We use the low-level send (no `replyToThread`) to
+    // avoid re-entering this handler if the notification itself fails;
+    // omit `message_thread_id` so the message lands in General — see the
+    // `buildSendExtra` rationale for why `1` on outbound is now a 400.
     enqueueSend(key.chatId, () =>
       bot.telegram.sendMessage(
         key.chatId,
         t('error.tg.thread.closed', { key: keyToString(key) }),
-        { message_thread_id: generalKey.threadId },
       ),
     ).catch(e2 => console.error('[send] failed to notify General about TOPIC_CLOSED:', e2));
     return;
@@ -559,6 +561,27 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
  */
 type SendExtra = Record<string, unknown> | object;
 
+/**
+ * @description Build the `extra` object for outbound `send*` calls so the
+ * General topic gets NO `message_thread_id` while topical threads get one.
+ *
+ * Telegram historically reserved `message_thread_id == 1` for the General
+ * topic on inbound updates, but on **outbound** sends `1` now returns
+ * `400 Bad Request: message thread not found` in current Bot API versions
+ * (confirmed against this group, 2026-05). The fix is to omit the field
+ * entirely for General — the message lands in General by default.
+ *
+ * Our internal routing still keeps `GENERAL_THREAD_ID = 1` as the marker
+ * for "this update came from / belongs to General" because incoming
+ * updates may still carry `message_thread_id: 1`. Translation happens
+ * only at the API boundary.
+ */
+function buildSendExtra(key: ThreadKey, extra: SendExtra): Record<string, unknown> {
+  const base = extra as Record<string, unknown>;
+  if (checkIsGeneral(key)) return { ...base };
+  return { message_thread_id: key.threadId, ...base };
+}
+
 async function replyToThread(
   key: ThreadKey,
   text: string,
@@ -566,10 +589,11 @@ async function replyToThread(
 ): Promise<number | null> {
   try {
     const sent = await enqueueSend(key.chatId, () =>
-      bot.telegram.sendMessage(key.chatId, text, {
-        message_thread_id: key.threadId,
-        ...(extra as Record<string, unknown>),
-      } as Parameters<typeof bot.telegram.sendMessage>[2]),
+      bot.telegram.sendMessage(
+        key.chatId,
+        text,
+        buildSendExtra(key, extra) as Parameters<typeof bot.telegram.sendMessage>[2],
+      ),
     );
     const messageId = (sent as { message_id: number }).message_id;
     await state.pushMessageId(key, messageId);
@@ -630,7 +654,12 @@ async function deleteThreadMessage(key: ThreadKey, messageId: number): Promise<v
 async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
   try {
     await enqueueSend(key.chatId, () =>
-      bot.telegram.sendChatAction(key.chatId, 'typing', { message_thread_id: key.threadId }),
+      bot.telegram.sendChatAction(
+        key.chatId,
+        'typing',
+        // Omit thread_id for General; see buildSendExtra docs.
+        checkIsGeneral(key) ? undefined : { message_thread_id: key.threadId },
+      ),
     );
   } catch (e) {
     console.log(`[typing] ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);

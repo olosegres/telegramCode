@@ -36,6 +36,12 @@ import { getStateStore, type StateStore } from './state';
 import { t } from './i18n';
 import { validateSubdir, BindError } from './validation';
 import { resolveThreadKey, GENERAL_THREAD_ID } from './threadRouting';
+import {
+  classifySendError,
+  checkIsApiError,
+  getErrorCode,
+  getErrorDescription,
+} from './sendErrorClassifier';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -280,55 +286,28 @@ function authoriseContext(ctx: Context): ThreadKey | null {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @description Classify Telegram API errors so we can surgically clean up
- * stale bindings without confusing closures with deletions (plan §13.10, E5).
- */
-interface TelegramApiErrorLike {
-  response?: { error_code?: number; description?: string };
-  description?: string;
-}
-
-function checkIsApiError(e: unknown): e is TelegramApiErrorLike {
-  return typeof e === 'object' && e !== null && (
-    'response' in e || 'description' in e
-  );
-}
-
-function getErrorDescription(e: TelegramApiErrorLike): string {
-  return (e.response?.description ?? e.description ?? '').toString();
-}
-
-function getErrorCode(e: TelegramApiErrorLike): number | undefined {
-  return e.response?.error_code;
-}
-
-/**
  * @description Central handler for failed sends.
  *
- * Differentiates between:
- *   - **thread-deleted** (400 "message thread not found") → wipe binding +
- *     in-memory state, kill any matching tmux session. Plan §13.10.
- *   - **topic-closed** (400 "TOPIC_CLOSED" / "topic is closed") → preserve
- *     binding (closures are reversible), mark `closed: true`, notify in
- *     General.
- *   - **perm-denied** (400 about permissions) → log + leave a hint.
- *   - **everything else** → log; no state mutation.
+ * Delegates the classification rules to `./sendErrorClassifier` (so the
+ * Telegram-400-text matching is unit-testable, plan §11 Этап 7 / R8),
+ * then performs the imperative side-effects that depend on bot state.
+ *
+ * Categories (plan §13.10, E5):
+ *   - **thread-deleted** → wipe binding + in-memory state.
+ *   - **topic-closed** → preserve binding (closures are reversible),
+ *     mark `closed: true`, notify in General.
+ *   - **other** → log; no state mutation.
  */
 async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
-  if (!checkIsApiError(err)) {
-    console.error(`[send] ${keyToString(key)} unknown error:`, err);
-    return;
-  }
-  const code = getErrorCode(err);
-  const desc = getErrorDescription(err);
+  const kind = classifySendError(err);
 
-  if (code === 400 && /thread not found/i.test(desc)) {
+  if (kind === 'thread-deleted') {
     console.log(`[gc] thread ${keyToString(key)} not found — removing binding`);
     await state.removeBinding(key);
     clearInMemoryThreadState(key);
     return;
   }
-  if (code === 400 && /TOPIC_CLOSED|topic is closed/i.test(desc)) {
+  if (kind === 'topic-closed') {
     console.log(`[skip] thread ${keyToString(key)} is closed — binding preserved`);
     await state.setBindingClosed(key, true);
     // Notify in General so user is not silent. Use low-level send (no
@@ -343,9 +322,16 @@ async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
     ).catch(e2 => console.error('[send] failed to notify General about TOPIC_CLOSED:', e2));
     return;
   }
-  console.error(
-    `[send] ${keyToString(key)} ${code ?? '?'} ${desc || '(no description)'}`,
-  );
+
+  // Fallthrough: keep enough context in the log to recognise repeat
+  // offenders without hauling state.json into the log line.
+  if (checkIsApiError(err)) {
+    console.error(
+      `[send] ${keyToString(key)} ${getErrorCode(err) ?? '?'} ${getErrorDescription(err) || '(no description)'}`,
+    );
+  } else {
+    console.error(`[send] ${keyToString(key)} unknown error:`, err);
+  }
 }
 
 /**

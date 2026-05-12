@@ -95,6 +95,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/new <name> [subdir] — создать тред\n' +
       '/where — общая сводка\n' +
       '/status — статус всех тредов\n' +
+      '/stopall — остановить все агенты\n' +
       '/whoami /version — debug\n\n' +
       'Чтобы начать диалог с агентом — открой тематический тред.',
     'help.thread_unbound':
@@ -197,6 +198,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
 
+    // ── /stop-all ──
+    'stop_all.none_active': 'Нет активных агентов — нечего останавливать.',
+    'stop_all.summary': '🛑 Остановлено {stopped} из {total} активных агентов.',
+    'stop_all.general_only': 'Команда `/stop-all` доступна только в General-топике.',
+
     // ── /clear ──
     'clear.summary':
       '🗑 Удалено {deleted} сообщений из {total}. ' +
@@ -288,6 +294,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/new <name> [subdir] — create a thread\n' +
       '/where — global summary\n' +
       '/status — status of all threads\n' +
+      '/stopall — stop every running agent\n' +
       '/whoami /version — debug\n\n' +
       'To talk to an agent — open a topical thread.',
     'help.thread_unbound':
@@ -388,6 +395,10 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.starting': 'Starting {label} in `{subdir}`…',
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
+
+    'stop_all.none_active': 'No agents running — nothing to stop.',
+    'stop_all.summary': '🛑 Stopped {stopped} of {total} active agents.',
+    'stop_all.general_only': '`/stop-all` is only available in the General topic.',
 
     'clear.summary':
       '🗑 Deleted {deleted} of {total} messages. ' +

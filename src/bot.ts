@@ -1839,6 +1839,47 @@ command('stop', async (_ctx, key) => {
   await replyToThread(key, t('agent.stopped', { label: adapter.label }));
 });
 
+/**
+ * @description `/stop-all` — kill every active agent across every thread.
+ *
+ * General-only because it's a workspace-wide operation that's easy to
+ * fire by mistake; restricting to General + needing an explicit command
+ * matches the «admin-style» surface (see `/doctor`, `/status` global,
+ * `/list`). Plan §20.x / §11 Этап 7.
+ *
+ * We walk persisted bindings (`state.listBindings`) rather than the
+ * adapter's in-memory session map so we catch sessions whose adapter
+ * instance has been replaced after a re-attach. For each, ask the
+ * adapter that thread is configured for and stop only if it's active —
+ * idempotent, so re-running is safe.
+ */
+command(['stop-all', 'stopall'], async (_ctx, key) => {
+  if (!checkIsGeneral(key)) {
+    await replyToThread(key, t('stop_all.general_only'));
+    return;
+  }
+
+  let stopped = 0;
+  let active = 0;
+  for (const { key: bKey } of state.listBindings()) {
+    const adapter = getThreadAdapter(bKey);
+    if (!adapter.checkIsActive(bKey)) continue;
+    active += 1;
+    try {
+      adapter.stopSession(bKey);
+      stopped += 1;
+    } catch (e) {
+      console.error(`[stop-all] failed for ${keyToString(bKey)}:`, e);
+    }
+  }
+
+  if (active === 0) {
+    await replyToThread(key, t('stop_all.none_active'));
+    return;
+  }
+  await replyToThread(key, t('stop_all.summary', { stopped: String(stopped), total: String(active) }));
+});
+
 // ── tmux-style controls (Claude CLI) ──
 
 command('c', async (_ctx, key) => {
@@ -2578,6 +2619,7 @@ const COMMANDS_MENU = [
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions' },
   { command: 'stop', description: '⏹ Stop agent' },
+  { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
   { command: 'whoami', description: '🪪 Show debug ids' },

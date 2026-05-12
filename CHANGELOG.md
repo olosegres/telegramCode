@@ -68,16 +68,25 @@ supergroup with one topic per task; the 1.x "one bot = one private chat
 - Legacy `~/.telegram-bot-messages.json` (renamed to `.bak` on first
   start; no message-id migration into the new schema).
 
-### Deferred (Phase 9)
-- Pinned per-thread status messages (`📁 subdir · branch · agent ·
-  status`) — `can_pin_messages` setup is reserved.
-- Fuzzy auto-bind on `forum_topic_created` (current match is exact +
-  case-insensitive NFC).
-- `/bind` pagination beyond the default 50-folder cap.
+### Deferred (Phase 9+)
 - `/mcp-add`, `/mcp-remove`, `/mcp-restart` UI commands.
 - OpenCode per-thread MCP override.
 - Routines / opencode-scheduler integration (`/schedule`,
-  `/schedule-cloud`).
+  `/schedule-cloud`) — Phase 8.
+- Claude Code hooks integration + `--input-format stream-json`
+  rewrite — Phase 9.
+
+### Stage 7 polish (shipped 2026-05-12)
+- Per-thread pinned status banner (`📁 subdir · agent · model ·
+  state`) — edits in place on every adapter lifecycle event,
+  unpinned on `/unbind`.
+- Fuzzy auto-bind on `forum_topic_created` — separator drift
+  (`my-api` ↔ `my_api` ↔ `my api`) is folded alongside case + NFC.
+- `/bind` keyboard pagination at 20 folders/page with
+  `[⬅️ Prev] [N/M] [Next ➡️]` nav row; `WORK_ROOT` listing cap
+  raised 50 → 200.
+- R9 (tmux re-attach) and R10 (claude `--resume` on bogus UUID)
+  filed as documented skip-tests pending an integration harness.
 
 ### Migration
 1. Stop the 1.x bot.

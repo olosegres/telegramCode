@@ -41,8 +41,8 @@ project for parallel work.
 3. Promote the bot to admin with these rights:
    - `Manage Topics` (required — bind/create threads)
    - `Delete Messages` (for `/clear`)
-   - `Pin Messages` (reserved — the per-thread status pin lands in a later
-     stage; `/doctor` only warns if missing)
+   - `Pin Messages` (per-thread status banner — `/doctor` warns if missing
+     but the bot still operates without it)
 4. **Remove the bot from the group and add it again.** Telegram caches the
    privacy-mode flag on join; without re-adding the bot keeps the old
    private-mode and ignores free-form messages. See

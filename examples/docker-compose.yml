@@ -1,49 +1,103 @@
-# Example: add this service to your project's docker-compose.yml
-# Requires: image "claude-node-git" (run "yarn claude" in telegram-code once to build it)
+# Two-instance docker-compose for telegramCode 2.0 (forum supergroup mode).
+#
+# Pet vs. work: two completely independent bots running on the same host,
+# isolated by:
+#   - separate Telegram bot tokens and groups (TELEGRAM_BOT_TOKEN_* / ALLOWED_GROUP_ID_*)
+#   - separate WORK_ROOT (subtree of host filesystem each instance manages)
+#   - separate DATA_DIR (state.json, mcp.json, tmp/ — see plan §10.7)
+#   - separate OPENCODE_URL ports (plan §13.8 — same port = shared opencode-server = session crosstalk)
+#
+# Edit .env (copy from .env.example) before `docker compose up -d`.
 
 services:
-  telegram-code:
-    image: claude-node-git
-    container_name: telegram-code-bot
-    user: root
+  telegramcode-pet:
+    image: claude-node-git           # built by `yarn claude` once in this repo
+    container_name: telegramcode-pet
     stdin_open: true
     tty: true
     working_dir: /workspace
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
-      # Your project
-      - .:/workspace:rw
-      # telegram-code source (adjust path)
-      - ../telegram-code:/telegram-code:ro
-      - ../telegram-code/.docker-entrypoint.sh:/docker-entrypoint.sh:ro
-      # Persist home (npm installs, CLI configs, session history)
-      - telegram_code_home:/home/agent:rw
-      # Host configs
+      # Your personal/home projects — bot binds threads inside this tree.
+      - ${PET_WORK_ROOT:-/home/${USER}/src}:/workspace:rw
+      # Bot source. Bind-mount lets you edit the bot without rebuilding.
+      - ../:/telegramCode:ro
+      - ../.docker-entrypoint.sh:/docker-entrypoint.sh:ro
+      # Per-instance bot state. MUST differ between instances (plan §10.7).
+      - telegramcode_pet_data:/data
+      # Per-instance home (npm cache, CLI configs, history).
+      - telegramcode_pet_home:/home/agent
+      # Host configs the bot reads from /home/agent at runtime.
       - ~/.gitconfig:/tmp/host-gitconfig:ro
       - ~/.ssh:/tmp/host-ssh:ro
-      # OpenCode config and state from host (persists model selection)
-      - ~/.config/opencode:/home/agent/.config/opencode:rw
-      - ~/.local/state/opencode:/home/agent/.local/state/opencode:rw
-      # Optional: custom opencode binary (built from fork)
-      # Build: cd opencode-fork/packages/opencode && bun run build
-      # - ../opencode-fork/packages/opencode/dist/opencode-linux-x64/bin/opencode:/opt/opencode:ro
+      # OpenCode model preferences + auth (separate from work instance).
+      - ~/.config/opencode-pet:/home/agent/.config/opencode:rw
+      - ~/.local/state/opencode-pet:/home/agent/.local/state/opencode:rw
     environment:
       - HOME=/home/agent
       - TERM=xterm-256color
-      - TARGET_UID=${UID:-501}
-      - TARGET_GID=${GID:-20}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TARGET_UID=${UID:-1000}
+      - TARGET_GID=${GID:-1000}
+      # ── required ──
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_PET}
       - ALLOWED_USERS=${ALLOWED_USERS}
-      - WORK_DIR=/workspace
-      - DEFAULT_AGENT=opencode
-      # API keys for providers
+      - ALLOWED_GROUP_ID=${ALLOWED_GROUP_ID_PET}
+      - WORK_ROOT=/workspace
+      - DATA_DIR=/data
+      # ── optional ──
+      - DEFAULT_AGENT=${DEFAULT_AGENT:-claude}
+      - BOT_LANG=${BOT_LANG:-ru}
+      # OpenCode server port — DIFFERENT from work instance (plan §13.8).
+      - OPENCODE_URL=http://localhost:4096
+      # Provider API keys (used by claude/opencode + voice transcription).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      # Optional: use custom opencode binary
-      # - OPENCODE_BIN=/opt/opencode
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
-    command: ["npx", "tsx", "/telegram-code/src/index.ts"]
+    command: ["npx", "tsx", "/telegramCode/src/index.ts"]
+    restart: unless-stopped
+
+  telegramcode-work:
+    image: claude-node-git
+    container_name: telegramcode-work
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ${WORK_WORK_ROOT:-/home/${USER}/work}:/workspace:rw
+      - ../:/telegramCode:ro
+      - ../.docker-entrypoint.sh:/docker-entrypoint.sh:ro
+      - telegramcode_work_data:/data
+      - telegramcode_work_home:/home/agent
+      - ~/.gitconfig:/tmp/host-gitconfig:ro
+      - ~/.ssh:/tmp/host-ssh:ro
+      - ~/.config/opencode-work:/home/agent/.config/opencode:rw
+      - ~/.local/state/opencode-work:/home/agent/.local/state/opencode:rw
+    environment:
+      - HOME=/home/agent
+      - TERM=xterm-256color
+      - TARGET_UID=${UID:-1000}
+      - TARGET_GID=${GID:-1000}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_WORK}
+      - ALLOWED_USERS=${ALLOWED_USERS}
+      - ALLOWED_GROUP_ID=${ALLOWED_GROUP_ID_WORK}
+      - WORK_ROOT=/workspace
+      - DATA_DIR=/data
+      - DEFAULT_AGENT=${DEFAULT_AGENT:-claude}
+      - BOT_LANG=${BOT_LANG:-ru}
+      # DIFFERENT port from pet — otherwise both instances try to bind 4096
+      # and share an opencode-server (plan §13.8).
+      - OPENCODE_URL=http://localhost:4097
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
+    command: ["npx", "tsx", "/telegramCode/src/index.ts"]
     restart: unless-stopped
 
 volumes:
-  telegram_code_home:
+  telegramcode_pet_data:
+  telegramcode_pet_home:
+  telegramcode_work_data:
+  telegramcode_work_home:

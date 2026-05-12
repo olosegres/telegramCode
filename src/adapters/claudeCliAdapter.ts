@@ -6,6 +6,8 @@ import * as path from 'path';
 import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
+import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
+import { resolveDataDir } from '../state';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -362,11 +364,26 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // --session-id <uuid> assigns the UUID to the NEW session so we can later
     // resume by UUID (plan §13.1). --dangerously-skip-permissions stays hardcoded
     // by D44 (symmetry with opencode auto-approve).
+    //
+    // MCP servers come from up to four sources (user/group/project/thread,
+    // plan §19); user + project are auto-loaded by Claude from cwd, the
+    // other two reach Claude through repeated `--mcp-config` flags that
+    // we build here. The flag values point at tmp files because the bot
+    // expands `${VAR}` env-var placeholders itself before handing the
+    // config off (plan §13.18, T2).
     const claudeArgs = args ? ` ${args}` : '';
+    // The `prepareMcpFlags` array alternates flag literal, path, flag
+    // literal, path, …. Only the path tokens need quoting (DATA_DIR can
+    // contain spaces); quoting the `--mcp-config` literal too is harmless
+    // but obscures the intent.
+    const mcpFlagsArr = prepareMcpFlags({ key, dataDir: resolveDataDir() });
+    const mcpSegment = mcpFlagsArr.length
+      ? ' ' + mcpFlagsArr.map((a, i) => (i % 2 ? shellSingleQuote(a) : a)).join(' ')
+      : '';
     const claudeCmd =
       `cd ${shellSingleQuote(workDir)} && ` +
       `${claudePath} --dangerously-skip-permissions ` +
-      `--session-id ${claudeSessionId}${claudeArgs}`;
+      `--session-id ${claudeSessionId}${mcpSegment}${claudeArgs}`;
     const startClaudeCmd = `tmux send-keys -t ${sessionName} ${JSON.stringify(claudeCmd)} Enter`;
     try {
       execSync(createCmd, { encoding: 'utf-8', timeout: 5000 });
@@ -418,6 +435,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     tmux('kill-session', '-t', session.sessionName);
+    // Remove the tmp MCP files we wrote on startSession — claude inlines
+    // their content into the session at boot, so once tmux is killed they
+    // serve no purpose and would just leak secrets on disk (plan §13.18).
+    cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
     this.sessions.delete(k);
     this.emit('stopped', key);
   }
@@ -560,10 +581,17 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
     // Pass the UUID explicitly. If it's unknown to claude, it'll just print a
-    // notice and start fresh — better than hanging on a picker.
+    // notice and start fresh — better than hanging on a picker. MCP flags
+    // are re-applied here so a resumed session sees the same servers as a
+    // fresh one would (plan §19). Only path tokens are quoted; see
+    // startSession for the rationale.
+    const mcpFlagsArr = prepareMcpFlags({ key, dataDir: resolveDataDir() });
+    const mcpSegment = mcpFlagsArr.length
+      ? ' ' + mcpFlagsArr.map((a, i) => (i % 2 ? shellSingleQuote(a) : a)).join(' ')
+      : '';
     const claudeCmd =
       `cd ${shellSingleQuote(workDir)} && ` +
-      `${claudePath} --dangerously-skip-permissions --resume ${sessionId}`;
+      `${claudePath} --dangerously-skip-permissions --resume ${sessionId}${mcpSegment}`;
     const startClaudeCmd = `tmux send-keys -t ${sessionName} ${JSON.stringify(claudeCmd)} Enter`;
 
     try {

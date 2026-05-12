@@ -1,7 +1,7 @@
 {
   "name": "telegram-code",
-  "version": "1.5.0",
-  "description": "Telegram bot for Claude CLI",
+  "version": "2.0.0",
+  "description": "Telegram forum-supergroup bot for Claude Code / OpenCode — one topic per task, isolated sessions, per-thread MCP",
   "main": "dist/index.js",
   "bin": "./dist/index.js",
   "scripts": {

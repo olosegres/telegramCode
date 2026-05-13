@@ -911,9 +911,26 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     const eventType = event.type;
 
-    // Filter events by session ID (SSE stream contains events for all sessions)
+    // Filter events by session ID (SSE stream contains events for all sessions).
+    // Audit S5 / #6: the previous filter `if (eventSessionId &&
+    // eventSessionId !== session.sessionId) return` LET THROUGH events
+    // whose `eventSessionId` was null. For `permission.asked` and
+    // `question.asked`, whose payloads carry `requestID`/`id` but no
+    // `sessionID`, this meant every active thread's SSE handler processed
+    // the same global event — each POST'ing `reply: 'always'` and each
+    // emitting `question` to its own user. We now require sessionID for
+    // any event that mutates per-session state; events that are
+    // genuinely server-wide (server.connected, server.heartbeat) are
+    // session-less by design and handled separately.
     const eventSessionId = this.getSessionIdFromEvent(event);
-    if (eventSessionId && eventSessionId !== session.sessionId) return;
+    const sessionLessOk = eventType === 'server.connected' || eventType === 'server.heartbeat';
+    if (!sessionLessOk) {
+      if (!eventSessionId) {
+        console.warn(`[OpenCode] dropping ${eventType} without sessionID`);
+        return;
+      }
+      if (eventSessionId !== session.sessionId) return;
+    }
 
     switch (eventType) {
       case 'message.part.updated':

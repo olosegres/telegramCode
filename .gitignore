@@ -1,9 +1,15 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
 data/
 *.log
 .DS_Store
 .idea/
 .claude/
+*.tsbuildinfo
+coverage/
 .yarn/install-state.gz
+.yarn/cache/
+.yarn/unplugged/

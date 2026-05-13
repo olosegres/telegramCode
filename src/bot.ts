@@ -641,7 +641,11 @@ type SendExtra = Record<string, unknown> | object;
 function buildSendExtra(key: ThreadKey, extra: SendExtra): Record<string, unknown> {
   const base = extra as Record<string, unknown>;
   if (checkIsGeneral(key)) return { ...base };
-  return { message_thread_id: key.threadId, ...base };
+  // Audit S20 / #36: spread `base` BEFORE `message_thread_id` so a
+  // caller passing `message_thread_id: undefined` in `extra` can't
+  // accidentally suppress our routing. With this order, our explicit
+  // value wins regardless of what the caller passed.
+  return { ...base, message_thread_id: key.threadId };
 }
 
 async function replyToThread(

@@ -425,11 +425,23 @@ export class StateStore {
     const k = keyToString(key);
     await this.withLock(key, async () => {
       const existing = this.state.bindings[k];
-      this.state.bindings[k] = {
+      // Audit S20 / #44: previous code path used `existing?.closed ? …`,
+      // which falsy-collapsed an explicit `closed: false` and dropped
+      // the field entirely. Now we carry `closed` through verbatim,
+      // letting `false` and `true` round-trip independently.
+      const next: BindingData = {
         subdir,
         createdAt: existing?.createdAt ?? new Date().toISOString(),
-        ...(options.closed !== undefined ? { closed: options.closed } : existing?.closed ? { closed: existing.closed } : {}),
       };
+      if (options.closed !== undefined) {
+        next.closed = options.closed;
+      } else if (existing?.closed !== undefined) {
+        next.closed = existing.closed;
+      }
+      if (existing?.pinnedStatusMessageId !== undefined) {
+        next.pinnedStatusMessageId = existing.pinnedStatusMessageId;
+      }
+      this.state.bindings[k] = next;
       this.scheduleSave();
     });
   }

@@ -1616,39 +1616,40 @@ command('new', async (ctx, key) => {
   const newKey: ThreadKey = { chatId: ENV.allowedGroupId, threadId: topic.message_thread_id };
   const link = makeThreadDeeplink(newKey.chatId, newKey.threadId);
 
-  // Try to auto-bind to the requested subdir. If that fails (folder missing,
-  // path-traversal, etc.) we still keep the thread — user can /bind from
-  // inside it — but the General reply tells them what happened.
-  try {
-    const subdir = validateSubdir(ENV.workRoot, requestedSubdir);
-    await state.setBinding(newKey, subdir);
+  // Audit S11 / #27: route through `applyBinding` so a user who creates
+  // a topic for an already-bound subdir gets the collision warning that
+  // `/bind` would surface. Going around it would silently join two
+  // threads to one workspace without acknowledgement.
+  const result = await applyBinding(newKey, requestedSubdir);
+  if (result.ok) {
     await replyToThread(
       key,
-      t('new.created', { name, threadId: newKey.threadId, subdir, link }),
+      t('new.created', { name, threadId: newKey.threadId, subdir: result.subdir, link }),
       { parse_mode: 'Markdown' },
     );
-    // Welcome inside the new thread mirrors `forum_topic_created` so the
-    // user doesn't get a different experience based on creation path.
-    await replyToThread(newKey, t('thread.welcome_bound', { subdir }));
-    await sendBindingWelcome(newKey, subdir);
-  } catch (e) {
-    const error = e instanceof Error ? e.message : String(e);
-    if (parts.length >= 2) {
-      // User explicitly named a subdir → tell them why bind failed.
-      await replyToThread(key, t('new.bind_failed', { subdir: requestedSubdir, error }));
-    } else {
-      // Implicit subdir (= thread name) didn't match a folder; that's normal
-      // for ad-hoc topic names, just point at /bind.
-      await replyToThread(
-        key,
-        t('new.created_unbound', { name, threadId: newKey.threadId, link }),
-        { parse_mode: 'Markdown' },
-      );
-    }
-    const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
-    await replyToThread(newKey, t('thread.welcome_pick'), extra);
+    // First message in the new thread = the bind ack (which may be a
+    // collision warning). Mirror `forum_topic_created`'s welcome stack.
+    await replyToThread(newKey, result.message);
+    await sendBindingWelcome(newKey, result.subdir);
+    return;
   }
+
+  // Bind failed — keep the thread, point the user at /bind.
+  if (parts.length >= 2) {
+    // User explicitly named a subdir → tell them why bind failed.
+    await replyToThread(key, t('new.bind_failed', { subdir: requestedSubdir, error: result.message }));
+  } else {
+    // Implicit subdir (= thread name) didn't match a folder; that's normal
+    // for ad-hoc topic names, just point at /bind.
+    await replyToThread(
+      key,
+      t('new.created_unbound', { name, threadId: newKey.threadId, link }),
+      { parse_mode: 'Markdown' },
+    );
+  }
+  const subdirs = listAvailableSubdirs(ENV.workRoot);
+  const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+  await replyToThread(newKey, t('thread.welcome_pick'), extra);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2412,8 +2413,20 @@ command('output', async (_ctx, key) => {
     }
   }
   if (current) chunks.push(current);
-  for (const chunk of chunks.slice(0, 5)) {
-    await replyToThread(key, chunk || '(empty)');
+  // Audit S11 / #26: the first chunk used to land via `replyToThread`
+  // without flipping `needsNewMessage`, so it could overwrite a fresh
+  // agent edit by accident. Also surface truncation explicitly so the
+  // user knows N chunks were dropped instead of silently seeing only 5.
+  markNeedsNewMessage(key);
+  const MAX_CHUNKS = 5;
+  const visible = chunks.slice(0, MAX_CHUNKS);
+  const dropped = chunks.length - visible.length;
+  for (let i = 0; i < visible.length; i++) {
+    let chunk = visible[i] || '(empty)';
+    if (i === visible.length - 1 && dropped > 0) {
+      chunk += `\n\n…and ${dropped} more chunk${dropped === 1 ? '' : 's'} omitted`;
+    }
+    await replyToThread(key, chunk);
   }
 });
 
@@ -2429,9 +2442,17 @@ command('output', async (_ctx, key) => {
  *     if Telegram says we can't.
  */
 command('clear', async (ctx, key) => {
-  const trackedIds = state.getMessageIds(key);
+  // Audit S11 / #19: snapshot and clear under the state lock so the
+  // agent's concurrent `pushMessageId` writes between snapshot and
+  // wipe don't get dropped without being deleted. New ids pushed
+  // during the delete loop stay in state and get cleaned by the next
+  // `/clear` invocation.
   const currentMsgId = ctx.message.message_id;
-  const all = [...trackedIds, currentMsgId];
+  const all = await state.withLock(key, async () => {
+    const snap = state.getMessageIds(key);
+    await state.clearMessageIds(key);
+    return [...snap, currentMsgId];
+  });
   if (all.length === 0) {
     await replyToThread(key, t('clear.no_messages'));
     return;
@@ -2469,7 +2490,6 @@ command('clear', async (ctx, key) => {
     }
   }
 
-  await state.clearMessageIds(key);
   const ms = getThreadMessageState(key);
   ms.lastMessageId = null;
   ms.needsNewMessage = true;

@@ -178,6 +178,7 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 | `BOT_LANG` | `ru` | `ru` or `en` |
 | `OPENCODE_URL` | `http://localhost:4096` | OpenCode server URL — must differ per instance on the same host |
 | `OPENCODE_BIN` | (auto) | Custom opencode binary path |
+| `CLAUDE_BIN` | (auto) | Custom Claude binary path for nvm/asdf/systemd PATH differences |
 | `ANTHROPIC_API_KEY` | — | For Claude Code |
 | `GROQ_API_KEY` | — | Voice transcription (free, preferred) |
 | `OPENAI_API_KEY` | — | Voice transcription (fallback) |
@@ -268,6 +269,11 @@ Closed-but-not-deleted topics keep their binding; only `400: message
 thread not found` from a send triggers binding cleanup. Closed topics
 are detected by `TOPIC_CLOSED` errors and surface a friendly message
 asking the user to reopen.
+
+If you run the bot under `systemd`/`systemd-run`, set `KillMode=process`.
+The default `control-group` mode kills tmux and `opencode serve` children,
+which defeats restart/reattach. Process restarts intentionally leave agent
+sessions alive; use `/stop` or `/stop-all` when you want to terminate them.
 
 ## Troubleshooting
 

@@ -98,6 +98,25 @@ interface OpenCodeSseEvent {
   properties: Record<string, unknown>;
 }
 
+/**
+ * OpenCode `/global/event` wraps the real event in `payload`, while `/event`
+ * emits it directly. Normalise both shapes before dispatching.
+ */
+export function normaliseOpenCodeSseEvent(raw: unknown): OpenCodeSseEvent | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const candidate = raw as Record<string, unknown>;
+  const event = typeof candidate.type === 'string'
+    ? candidate
+    : candidate.payload && typeof candidate.payload === 'object'
+      ? candidate.payload as Record<string, unknown>
+      : null;
+  if (!event || typeof event.type !== 'string') return null;
+  const properties = event.properties && typeof event.properties === 'object'
+    ? event.properties as Record<string, unknown>
+    : {};
+  return { type: event.type, properties };
+}
+
 interface OpenCodePart {
   id?: string;
   sessionID?: string;
@@ -281,6 +300,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.error(`[OpenCode] Server crashed unexpectedly: code=${code}, signal=${signal}`);
       this.handleServerCrash(code, signal);
     });
+  }
+
+  private restoreSavedModel(key: ThreadKey, session: OpenCodeSession, emitOutput: boolean): boolean {
+    const saved = loadSavedModel(key);
+    if (!saved) return false;
+
+    const label = `${saved.providerID}/${saved.modelID}`;
+    session.currentModelLabel = label;
+    session.modelOverride = saved;
+    session.isModelInfoShown = true;
+    console.log(`[OpenCode] Restored saved model: ${label}`);
+    if (emitOutput) this.emit('output', key, `Model: ${label}`);
+    return true;
   }
 
   /**
@@ -577,6 +609,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return session.currentModelLabel;
   }
 
+  getOpenCodeSessionId(key: ThreadKey): string | null {
+    return this.sessions.get(keyToString(key))?.sessionId ?? null;
+  }
+
   async getSessions(_key: ThreadKey): Promise<AgentSession[]> {
     try {
       const apiSessions = await this.apiRequest<OpenCodeApiSession[]>('GET', '/session');
@@ -638,6 +674,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       };
 
       this.sessions.set(k, session);
+      this.restoreSavedModel(key, session, false);
       this.connectSse(key);
       this.emit('started', key);
     } catch (e) {
@@ -655,7 +692,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
 
-    const sseUrl = `${this.baseUrl}/event`;
+    // OpenCode 1.14.48 closes `/event` after `server.connected`; the global
+    // stream stays open and is safe because `handleSseData` filters session ids.
+    const sseUrl = `${this.baseUrl}/global/event`;
     console.log(`[OpenCode] Connecting SSE: ${sseUrl}`);
 
     this.pollSse(key, sseUrl).catch((e) => {
@@ -680,16 +719,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive || session.isModelInfoShown) return;
 
     // 1. Check this thread's saved model preference
-    const saved = loadSavedModel(key);
-    if (saved) {
-      const label = `${saved.providerID}/${saved.modelID}`;
-      session.currentModelLabel = label;
-      session.modelOverride = saved;
-      session.isModelInfoShown = true;
-      console.log(`[OpenCode] Restored saved model: ${label}`);
-      this.emit('output', key, `Model: ${label}`);
-      return;
-    }
+    if (this.restoreSavedModel(key, session, true)) return;
 
     // 2. Ask OpenCode server for default model
     try {
@@ -849,7 +879,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Parse a single SSE data line. The JSON envelope is { type, properties }.
+   * @description Parse a single SSE data line. The JSON envelope is either
+   * { type, properties } or `/global/event`'s { payload: { type, properties } }.
    *
    * The OpenCode server multiplexes events for ALL sessions on one `/event` stream,
    * so we filter by `sessionID` to dispatch only the ones belonging to this `key`.
@@ -861,15 +892,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
-    let event: OpenCodeSseEvent;
+    let parsed: unknown;
     try {
-      event = JSON.parse(dataStr);
+      parsed = JSON.parse(dataStr);
     } catch {
       return;
     }
 
+    const event = normaliseOpenCodeSseEvent(parsed);
+    if (!event) return;
+
     const eventType = event.type;
-    if (!eventType) return;
 
     // Filter events by session ID (SSE stream contains events for all sessions)
     const eventSessionId = this.getSessionIdFromEvent(event);

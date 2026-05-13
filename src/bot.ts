@@ -23,7 +23,7 @@ import {
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
 import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
-import type { OpenCodePendingQuestion } from './adapters/openCodeAdapter';
+import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
   enqueueSend,
   checkIsRateLimited,
@@ -123,7 +123,12 @@ function parseEnv() {
 }
 
 const ENV = parseEnv();
-const bot = new Telegraf(ENV.botToken);
+const telegramAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  family: 4,
+});
+const bot = new Telegraf(ENV.botToken, { telegram: { agent: telegramAgent } });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Constants
@@ -787,13 +792,15 @@ function escapeMarkdown(text: string): string {
 /**
  * @description Queue an output text for a thread with debounce.
  *
- * Rapid stream of `output` events from the adapter coalesces into a single
- * Telegram message edit. During a 429 cooldown the delay stretches so we
- * don't keep hammering the API.
+ * Multiple `output` events from the adapter are accumulated (newline-joined),
+ * not overwritten — every emitted chunk reaches Telegram. During a 429
+ * cooldown the delay stretches so we don't keep hammering the API.
  */
 function queueOutput(key: ThreadKey, output: string): void {
   const q = getOutputQueueState(key);
-  q.pendingOutput = output;
+  q.pendingOutput = q.pendingOutput
+    ? `${q.pendingOutput}\n${output}`
+    : output;
   if (q.debounceTimer) clearTimeout(q.debounceTimer);
   const delayMs = checkIsRateLimited(key.chatId)
     ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
@@ -837,10 +844,17 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
 
   const chunks = splitMessage(output);
   const msgState = getThreadMessageState(key);
+  const adapter = getThreadAdapter(key);
+  // Claude's adapter polls tmux and emits deltas (`outputsDeltas = true`).
+  // Editing in place would overwrite a previous delta and silently lose
+  // earlier lines (live ExampleGroup repro: `git status` only showing the tail).
+  // For delta adapters every flush must land as a new message; OpenCode
+  // (which already accumulates server-side) keeps the edit-in-place path.
+  const forceNew = adapter.outputsDeltas === true;
 
   const sendOrEditFirst = async (text: string): Promise<number | null> => {
     const escaped = escapeMarkdown(text);
-    const shouldSendNew = msgState.needsNewMessage || !msgState.lastMessageId;
+    const shouldSendNew = forceNew || msgState.needsNewMessage || !msgState.lastMessageId;
     if (shouldSendNew) {
       const id = await replyChunkWithFallback(key, escaped, text);
       if (id) {
@@ -1100,12 +1114,14 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
   try {
     await adapter.startSession(key, workDir, args);
 
-    // If this adapter exposes a session id (Claude does, OpenCode handles
-    // it server-side via resumeSession), persist it now so a bot restart
-    // can re-attach without losing history (plan §13.1, D14).
+    // Persist backend session ids so a bot restart can re-attach without
+    // losing the live conversation (Claude tmux UUID; OpenCode server UUID).
     if (adapter instanceof ClaudeCliAdapter) {
       const uuid = adapter.getClaudeSessionId(key);
       if (uuid) await state.setClaudeSessionId(key, uuid);
+    } else if (adapter instanceof OpenCodeAdapter) {
+      const sessionId = adapter.getOpenCodeSessionId(key);
+      if (sessionId) await state.setOpenCodeSessionId(key, sessionId);
     }
     await state.setAgent(key, { name: adapter.name });
 
@@ -3159,32 +3175,8 @@ export async function startBot(): Promise<void> {
     onError: handleAgentError,
   });
 
-  // 3. Pre-start OpenCode server if available so first request is fast.
-  if (getAvailableAdapters().some(a => a.name === 'opencode')) {
-    try {
-      console.log('[boot] pre-starting OpenCode server...');
-      await ensureOpenCodeServer();
-    } catch (e) {
-      console.log('[boot] OpenCode pre-start failed:', e instanceof Error ? e.message : e);
-    }
-  }
-
-  // 4. Re-attach sessions that survived the restart.
-  await reattachExistingSessions();
-
-  // 4a. Refresh pinned banners for every binding. Threads that have a
-  //     stored `pinnedStatusMessageId` get their banner edited in place;
-  //     threads that don't (older state.json from before this feature, or
-  //     bindings created while `can_pin_messages` was missing) get one
-  //     freshly pinned. Failures are best-effort — `updatePinnedStatus`
-  //     logs them itself.
-  setImmediate(() => {
-    Promise.all(
-      state.listBindings().map(({ key }) => updatePinnedStatus(key).catch(() => {})),
-    ).catch(() => {});
-  });
-
-  // 5. Connect to Telegram and register commands menu.
+  // 3. Connect to Telegram and register commands menu before starting local
+  // daemons. If getMe fails, we should not leave an orphan opencode server.
   console.log('Testing Telegram API connection...');
   try {
     const botInfo = await bot.telegram.getMe();
@@ -3196,29 +3188,46 @@ export async function startBot(): Promise<void> {
     throw err;
   }
 
+  // 4. Pre-start OpenCode server if available so first request is fast.
+  if (getAvailableAdapters().some(a => a.name === 'opencode')) {
+    try {
+      console.log('[boot] pre-starting OpenCode server...');
+      await ensureOpenCodeServer();
+    } catch (e) {
+      stopOpenCodeServer();
+      console.log('[boot] OpenCode pre-start failed:', e instanceof Error ? e.message : e);
+    }
+  }
+
+  // 5. Re-attach sessions that survived the restart.
+  await reattachExistingSessions();
+
+  // 5a. Refresh pinned banners for every binding. Threads that have a
+  //     stored `pinnedStatusMessageId` get their banner edited in place;
+  //     threads that don't (older state.json from before this feature, or
+  //     bindings created while `can_pin_messages` was missing) get one
+  //     freshly pinned. Failures are best-effort — `updatePinnedStatus`
+  //     logs them itself.
+  setImmediate(() => {
+    Promise.all(
+      state.listBindings().map(({ key }) => updatePinnedStatus(key).catch(() => {})),
+    ).catch(() => {});
+  });
+
   // 6. Global catch — Telegraf swallows handler errors otherwise.
   bot.catch((err, ctx) => {
     console.error('[bot.catch] unhandled error:', err, 'update:', ctx.updateType);
   });
 
-  // 7. Shutdown — stop active sessions, flush state, kill OpenCode server.
+  // 7. Shutdown - preserve active agents for restart/reattach. Use /stop or
+  // /stop-all for an intentional agent stop; process signals only stop the bot.
   const shutdown = async (signal: string) => {
     console.log(`\n${signal} received, shutting down...`);
     try {
-      // Stop every active session by walking state bindings.
-      for (const { key } of state.listBindings()) {
-        const adapter = getThreadAdapter(key);
-        if (adapter.checkIsActive(key)) {
-          try { adapter.stopSession(key); } catch (e) {
-            console.warn(`[shutdown] stop ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
-          }
-        }
-      }
       await state.flush();
     } catch (e) {
       console.error('[shutdown] error during cleanup:', e);
     }
-    stopOpenCodeServer();
     bot.stop(signal);
     process.exit(0);
   };
@@ -3228,13 +3237,14 @@ export async function startBot(): Promise<void> {
   // 8. Launch.
   console.log('Launching Telegraf bot (long polling)...');
   try {
-    bot.launch({ dropPendingUpdates: true });
+    await bot.launch({ dropPendingUpdates: true });
     console.log('');
     console.log('Bot is running! Waiting for messages...');
     console.log('Press Ctrl+C to stop');
     console.log('');
   } catch (err) {
     console.error('Failed to launch bot:', err);
+    stopOpenCodeServer();
     throw err;
   }
 }

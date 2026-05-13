@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
@@ -32,7 +32,23 @@ interface ClaudeSession {
 }
 
 const pollInterval = 300;
-const claudePath = process.env.HOME + '/.npm-global/bin/claude';
+
+/** Locate Claude where this process can actually execute it. */
+function resolveClaudeBinary(): string {
+  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
+  try {
+    const which = execFileSync('which', ['claude'], {
+      encoding: 'utf8',
+      timeout: 1500,
+    }).trim();
+    if (which) return which;
+  } catch {
+    // PATH lookup failed; fall through.
+  }
+  return path.join(process.env.HOME || '/tmp', '.npm-global', 'bin', 'claude');
+}
+
+const claudePath = resolveClaudeBinary();
 const sessionsFile = path.join(process.env.HOME || '/tmp', '.claude-sessions.json');
 
 /**
@@ -71,7 +87,7 @@ function parseTmuxSessionName(name: string): ThreadKey | null {
 
 function tmux(...args: string[]): string {
   try {
-    return execSync(`tmux ${args.join(' ')}`, {
+    return execFileSync('tmux', args, {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim();

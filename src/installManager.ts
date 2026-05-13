@@ -1,4 +1,4 @@
-import { execSync, exec } from 'child_process';
+import { execSync, exec, spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import { sleep } from './utils';
@@ -104,8 +104,7 @@ let openCodeProcess: ChildProcess | null = null;
 
 /** Callback invoked when the OpenCode server process exits unexpectedly (not via stopOpenCodeServer) */
 let onServerExitCallback: ((code: number | null, signal: string | null) => void) | null = null;
-/** Whether the server is being intentionally stopped (to distinguish crash from graceful shutdown) */
-let isIntentionalStop = false;
+const intentionallyStoppedProcesses = new WeakSet<ChildProcess>();
 
 /**
  * @description Register a callback for unexpected server process exits.
@@ -136,32 +135,35 @@ export async function ensureOpenCodeServer(): Promise<void> {
   }
 
   if (openCodeProcess && !openCodeProcess.killed) {
-    // Process exists but not responding, kill and restart
-    openCodeProcess.kill();
-    openCodeProcess = null;
+    // Process exists but is not responding; stop only the process group we own.
+    stopOpenCodeServer();
+    await sleep(500);
   }
 
-  isIntentionalStop = false;
   const port = new URL(process.env.OPENCODE_URL || 'http://localhost:4096').port || '4096';
 
   const opencodeCmd = getToolCommand('opencode');
   console.log(`[OpenCode] Starting server on port ${port}... (${opencodeCmd})`);
 
-  openCodeProcess = exec(`${opencodeCmd} serve --hostname 127.0.0.1 --port ${port}`, {
-    encoding: 'utf-8',
+  const child = spawn(opencodeCmd, ['serve', '--hostname', '127.0.0.1', '--port', port], {
     env: { ...process.env, PATH: `${npmPrefix}/bin:${process.env.PATH}` },
+    detached: process.platform !== 'win32',
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
+  openCodeProcess = child;
 
-  openCodeProcess.stdout?.on('data', (data: string) => {
-    console.log(`[OpenCode Server] ${data.trim()}`);
+  child.stdout?.on('data', (data: Buffer) => {
+    console.log(`[OpenCode Server] ${data.toString().trim()}`);
   });
-  openCodeProcess.stderr?.on('data', (data: string) => {
-    console.error(`[OpenCode Server] ${data.trim()}`);
+  child.stderr?.on('data', (data: Buffer) => {
+    console.error(`[OpenCode Server] ${data.toString().trim()}`);
   });
-  openCodeProcess.on('exit', (code, signal) => {
+  child.on('exit', (code, signal) => {
     console.log(`[OpenCode Server] Process exited with code ${code}, signal ${signal}`);
-    openCodeProcess = null;
-    if (!isIntentionalStop && onServerExitCallback) {
+    if (openCodeProcess === child) {
+      openCodeProcess = null;
+    }
+    if (!intentionallyStoppedProcesses.has(child) && onServerExitCallback) {
       onServerExitCallback(code, signal);
     }
   });
@@ -179,7 +181,7 @@ export async function ensureOpenCodeServer(): Promise<void> {
     } catch {
       // not ready yet
     }
-    if (openCodeProcess?.exitCode !== null && openCodeProcess?.exitCode !== undefined) {
+    if (child.exitCode !== null && child.exitCode !== undefined) {
       throw new Error('OpenCode server failed to start');
     }
   }
@@ -188,12 +190,22 @@ export async function ensureOpenCodeServer(): Promise<void> {
 }
 
 export function stopOpenCodeServer(): void {
-  if (openCodeProcess && !openCodeProcess.killed) {
+  const child = openCodeProcess;
+  if (child && !child.killed) {
     console.log(`[OpenCode] Stopping server...`);
-    isIntentionalStop = true;
-    openCodeProcess.kill();
+    intentionallyStoppedProcesses.add(child);
+    try {
+      if (process.platform !== 'win32' && child.pid) {
+        process.kill(-child.pid, 'SIGTERM');
+      } else {
+        child.kill('SIGTERM');
+      }
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'ESRCH') {
+        console.warn(`[OpenCode] Failed to stop server:`, e instanceof Error ? e.message : e);
+      }
+    }
     openCodeProcess = null;
-    // Reset after a tick to allow the exit event handler to see isIntentionalStop=true
-    setTimeout(() => { isIntentionalStop = false; }, 100);
   }
 }

@@ -1155,6 +1155,32 @@ function buildBindKeyboard(
   return Markup.inlineKeyboard(rows);
 }
 
+/**
+ * @description Switch a thread's adapter and clear the previous adapter's
+ * persisted session id, so a later restart can't re-attach to the wrong
+ * one. Audit S12 / #21: `setAgent({ name })` patched `agents[key].name`
+ * but left `claudeSessionId` / `opencodeSessionId` behind. After a
+ * restart the reattach loop saw both fields, treated the binding as a
+ * claude session (because `claudeSessionId` was non-null), and re-spawned
+ * a tmux pane while the UI insisted the thread used OpenCode.
+ */
+async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<void> {
+  setThreadAdapter(key, newName);
+  const agent = state.getAgent(key);
+  if (!agent) return;
+  // Wipe ids that don't belong to the new adapter. We persist via
+  // setAgent (which merges), so build a fresh record with only the
+  // surviving fields.
+  const next: { name: string; model?: string; claudeSessionId?: string; opencodeSessionId?: string } = { name: newName };
+  if (agent.model !== undefined) next.model = agent.model;
+  if (newName === 'claude' && agent.claudeSessionId) next.claudeSessionId = agent.claudeSessionId;
+  if (newName === 'opencode' && agent.opencodeSessionId) next.opencodeSessionId = agent.opencodeSessionId;
+  // Overwrite by removing the row first; setAgent then writes only the
+  // fields we kept.
+  await state.removeAgent(key);
+  await state.setAgent(key, next);
+}
+
 async function startAgentSession(key: ThreadKey, args?: string): Promise<string> {
   markNeedsNewMessage(key);
   const adapter = getThreadAdapter(key);
@@ -2105,7 +2131,7 @@ async function handleStartCommand(
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
-  setThreadAdapter(key, adapterName);
+  await switchThreadAdapter(key, adapterName);
   const adapter = getThreadAdapter(key);
   if (adapter.checkIsActive(key)) {
     await replyToThread(key, t('agent.already_active', { label: adapter.label }));
@@ -2567,16 +2593,23 @@ bot.on(message('text'), async (ctx) => {
     awaitingModelSelection.delete(kStr);
     if (list && num >= 1 && num <= list.length) {
       const selected = list[num - 1];
+      // Audit S12 / #20: previous code returned only when
+      // `adapter.setModel` was truthy; on adapters that don't implement
+      // it (legacy void return) execution fell through and the same
+      // numeric reply was re-processed as a natural-language start +
+      // forwarded to the agent. Always return after numeric selection
+      // — the user clearly intended a model pick, not a prompt.
       if (adapter.setModel) {
         const err = await adapter.setModel(key, selected);
         await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
         if (!err) await updatePinnedStatus(key).catch(() => {});
-        return;
+      } else {
+        await replyToThread(key, `Model switching is not supported for ${adapter.label}`);
       }
     } else {
       await replyToThread(key, 'Invalid number. Run /model to see the list.');
-      return;
     }
+    return;
   }
 
   // Natural-language start.
@@ -2596,7 +2629,7 @@ bot.on(message('text'), async (ctx) => {
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
-      setThreadAdapter(key, startMatch.adapterName);
+      await switchThreadAdapter(key, startMatch.adapterName);
       const msg = await startAgentSession(key, startMatch.args);
       await replyToThread(key, msg);
       return;
@@ -2692,7 +2725,7 @@ bot.on(message('voice'), async (ctx) => {
           await replyToThread(key, t('thread.no_binding'), extra);
           return;
         }
-        setThreadAdapter(key, startMatch.adapterName);
+        await switchThreadAdapter(key, startMatch.adapterName);
         const msg = await startAgentSession(key, startMatch.args);
         await replyToThread(key, msg);
         return;
@@ -2972,7 +3005,7 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
   if (!key) { await ctx.answerCbQuery('Access denied'); return; }
   const adapterName = ctx.match[1];
   try {
-    setThreadAdapter(key, adapterName);
+    await switchThreadAdapter(key, adapterName);
     const adapter = getThreadAdapter(key);
     await ctx.answerCbQuery(`Switched to ${adapter.label}`);
     await replyToThread(

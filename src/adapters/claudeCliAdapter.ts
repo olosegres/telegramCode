@@ -464,14 +464,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (!checkIsValidUuid(claudeSessionId)) {
       // Caller-supplied UUID — refuse anything that doesn't look like one.
       // See `checkIsValidUuid` for the reasoning (audit S1).
-      console.error(`[Claude] Rejecting non-UUID sessionId: ${claudeSessionId}`);
-      this.emit('error', key, new Error('Invalid sessionId'));
-      return;
+      // Audit S10 / #16: throw instead of emit+return so callers can
+      // distinguish "did not start" from "started, will fail async".
+      throw new Error(`Invalid sessionId: ${claudeSessionId}`);
     }
     if (args && !checkArgsAreSafe(args)) {
-      console.error(`[Claude] Rejecting args with control characters`);
-      this.emit('error', key, new Error('Args contain control characters'));
-      return;
+      throw new Error('Args contain control characters');
     }
     console.log(
       `[Claude] Starting tmux session ${sessionName} in ${workDir} ` +
@@ -527,8 +525,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // leak. Best-effort cleanup before bubbling up the error.
       tmux('kill-session', '-t', sessionName);
       cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
-      this.emit('error', key, new Error('Failed to start Claude session'));
-      return;
+      // Audit S10 / #16: throw so the caller's `await startSession()`
+      // sees the failure and skips registering the binding.
+      throw new Error(`Failed to start Claude session: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     const now = new Date().toISOString();
@@ -666,10 +665,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
   /**
    * @description For Claude CLI, model switching is done via the /model slash command.
-   * Sends "/model <modelId>" as input to the tmux session.
+   * Sends "/model <modelId>" as input to the tmux session. Returns `null`
+   * on success (best-effort: claude doesn't ack the change synchronously).
+   * Audit S10 / #39: unified signature with OpenCode adapter.
    */
-  setModel(key: ThreadKey, modelId: string): void {
+  async setModel(key: ThreadKey, modelId: string): Promise<string | null> {
     this.sendInput(key, `/model ${modelId}`);
+    return null;
   }
 
   getCurrentModel(_key: ThreadKey): string | null {
@@ -731,9 +733,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     if (!checkIsValidUuid(sessionId)) {
-      console.error(`[Claude] resumeSession: invalid UUID ${sessionId}`);
-      this.emit('error', key, new Error('Invalid sessionId'));
-      return;
+      throw new Error(`Invalid sessionId: ${sessionId}`);
     }
     const sessionName = buildTmuxSessionName(key);
     console.log(`[Claude] Resuming session ${sessionId} in ${workDir} for ${keyToString(key)}`);
@@ -768,8 +768,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       console.error(`[Claude] Failed to resume session:`, e);
       tmux('kill-session', '-t', sessionName);
       cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
-      this.emit('error', key, new Error('Failed to resume Claude session'));
-      return;
+      throw new Error(`Failed to resume Claude session: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     const claudeSession: ClaudeSession = {

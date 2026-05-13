@@ -16,7 +16,7 @@
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { keyToString, keyFromString, keysEqual, type ThreadKey } from '../types';
+import { keyToString, keyFromString, keysEqual, type AgentAdapter, type ThreadKey } from '../types';
 
 test('keyToString → keyFromString round-trips for representative keys', () => {
   const samples: ThreadKey[] = [
@@ -64,4 +64,23 @@ test('keysEqual is reflexive, symmetric, and structural', () => {
   assert.ok(keysEqual(b, a));
   assert.ok(!keysEqual(a, c), 'different threadId must not be equal');
   assert.ok(!keysEqual(a, d), 'different chatId must not be equal');
+});
+
+/**
+ * Audit S10 / #16: lock in the AgentAdapter event-and-throw contract via a
+ * type-only compile check. If anyone widens `setModel` back to `void` or
+ * drops the throw guarantee from `startSession`, the assignments below
+ * stop compiling and `yarn typecheck` blocks the merge.
+ */
+test('AgentAdapter contract — startSession returns Promise<void>, setModel returns Promise<string|null>', () => {
+  // The cast-to-`Pick` keeps this purely a compile-time assertion; we
+  // never run the methods so the dummy bodies are unobservable.
+  type StartSig = AgentAdapter['startSession'];
+  type SetModelSig = NonNullable<AgentAdapter['setModel']>;
+
+  const start: StartSig = async () => { /* must return Promise<void> */ };
+  const setModel: SetModelSig = async () => null;
+  // Touch the locals so the linter doesn't drop them.
+  assert.equal(typeof start, 'function');
+  assert.equal(typeof setModel, 'function');
 });

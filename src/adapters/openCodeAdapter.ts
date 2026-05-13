@@ -864,6 +864,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     this.pollSse(key, sseUrl).catch((e) => {
       console.error(`[OpenCode] SSE connection error:`, e);
+      // Audit S10 / #43: surface SSE start failures so the bot can
+      // notify the user — previously they vanished into console logs
+      // and the user saw a silently-dead session.
+      this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
     });
   }
 
@@ -1065,7 +1069,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.emit('output', key, `Lost connection to OpenCode server ${reasonHint}. Use /stop and start a new session.`);
       session.isActive = false;
       this.sessions.delete(k);
+      // Audit S10 / #40: session died on its own (no explicit
+      // `stopSession`). Emit `closed` (not just `stopped`) so the bot
+      // wipes the persisted opencodeSessionId — otherwise the next
+      // bot restart would try to resume a session the server never
+      // had a chance to reopen.
       this.emit('stopped', key);
+      this.emit('closed', key);
       return;
     }
 

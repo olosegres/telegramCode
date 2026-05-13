@@ -70,10 +70,24 @@ export function keysEqual(a: ThreadKey, b: ThreadKey): boolean {
  * - 'output'   (key: ThreadKey, text: string)   — permanent text response
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
- * - 'closed'   (key: ThreadKey)
- * - 'started'  (key: ThreadKey)
- * - 'stopped'  (key: ThreadKey)
- * - 'error'    (key: ThreadKey, error: Error)
+ * - 'started'  (key: ThreadKey)                  — session is up and ready
+ * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)
+ * - 'closed'   (key: ThreadKey)                  — session died on its own (process exit, SSE giveup, server crash)
+ * - 'error'    (key: ThreadKey, error: Error)    — asynchronous failure AFTER successful startSession resolution
+ *
+ * Audit S10 / #16 contract clarifications (enforced by every adapter):
+ *
+ * - `startSession` / `resumeSession` rejects (throws) if the session
+ *   could not be started or recovered. Successful resolution implies
+ *   `checkIsActive(key) === true` and that subsequent events will fire.
+ *
+ * - `emit('error', …)` is for failures that happen AFTER a successful
+ *   start (network blip, SSE drop with no recovery). Synchronous start
+ *   failures must throw, never emit error+return.
+ *
+ * - `emit('closed', …)` is for unsolicited deaths only. If the user
+ *   called `stopSession`, the adapter emits `stopped` instead. Both
+ *   events MUST come with the same teardown (in-memory state freed).
  */
 export interface AgentAdapter extends EventEmitter {
   /** Unique adapter identifier, e.g. 'claude', 'opencode' */
@@ -91,6 +105,10 @@ export interface AgentAdapter extends EventEmitter {
    * and persists it in state.json so resumes survive bot restarts (see plan §13.1, D14).
    * If omitted, the adapter falls back to backend defaults — for Claude this means
    * a CLI-generated UUID that the adapter still exposes via `getClaudeSessionId(key)`.
+   *
+   * **Throws** if the session could not be started (audit S10 / #16). The
+   * returned promise rejecting means no `started` event will fire and no
+   * in-memory state was retained.
    */
   startSession(key: ThreadKey, workDir: string, args?: string, sessionId?: string): Promise<void>;
   stopSession(key: ThreadKey): void;
@@ -116,8 +134,12 @@ export interface AgentAdapter extends EventEmitter {
 
   // — Model selection —
 
-  /** Set model override. Returns error message on failure, null on success */
-  setModel?(key: ThreadKey, modelId: string): string | null | void | Promise<string | null>;
+  /**
+   * Set model override. Returns error message on failure, `null` on
+   * success. Audit S10 / #39: unified to `Promise<string | null>` —
+   * callers used to branch on `void` vs `Promise<string | null>`.
+   */
+  setModel?(key: ThreadKey, modelId: string): Promise<string | null>;
   getCurrentModel?(key: ThreadKey): string | null;
   /** Get available models from backend */
   getAvailableModels?(): Promise<string[]>;

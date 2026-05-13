@@ -49,7 +49,11 @@ function resolveClaudeBinary(): string {
 }
 
 const claudePath = resolveClaudeBinary();
-const sessionsFile = path.join(process.env.HOME || '/tmp', '.claude-sessions.json');
+// Audit S3 / #9: session-history file belongs under DATA_DIR (the same
+// directory that holds `state.json`), so the two-instance setup keeps its
+// promised isolation. Previously this used `$HOME/.claude-sessions.json`,
+// which silently collided when two bots ran as the same Linux user.
+const sessionsFile = path.join(resolveDataDir(), '.claude-sessions.json');
 
 /**
  * @description Tmux session name for a `ThreadKey`.

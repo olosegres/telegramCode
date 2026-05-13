@@ -6,20 +6,27 @@ import * as path from 'path';
 import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
+import { resolveDataDir } from '../state';
 
 const execAsync = promisify(exec);
 
 /**
  * Persist per-thread model selection so it survives bot restarts.
- * Stored in `DATA_DIR` (or `HOME`) as a JSON map keyed by serialised
+ * Stored in `DATA_DIR` (resolved via `resolveDataDir()` for parity with
+ * `state.json` and the Claude adapter) as a JSON map keyed by serialised
  * `ThreadKey`: `{ "<chatId>:<threadId>": "provider/model" }` (plan §10.3, D22).
+ *
+ * Audit S3 / #9: previous fallback chain `DATA_DIR || HOME || /tmp` drifted
+ * from `state.ts:resolveDataDir`, which uses `~/.telegramCode` when
+ * `DATA_DIR` is unset. Two bots on one host sharing a Linux user would have
+ * stored prefs in `$HOME/.opencode-model-prefs.json` and silently collided.
  *
  * Older versions of the bot used `{ "<userId>": "provider/model" }`. Those
  * entries are silently ignored after the 2.0 upgrade — users can re-select
  * their model via `/model`; we deliberately don't try to migrate (one of two
  * adapters, easy to recover, not worth the migration complexity).
  */
-const modelStateFile = path.join(process.env.DATA_DIR || process.env.HOME || '/tmp', '.opencode-model-prefs.json');
+const modelStateFile = path.join(resolveDataDir(), '.opencode-model-prefs.json');
 
 function loadSavedModel(key: ThreadKey): { providerID: string; modelID: string } | null {
   try {

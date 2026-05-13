@@ -193,6 +193,16 @@ const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 
 /**
+ * @description Per-thread snapshot of the last `/sessions` listing. Audit
+ * S4 / #7: Telegram caps `callback_data` at 64 bytes, so encoding a full
+ * OpenCode session id (UUID-like, often > 60 chars) used to require
+ * `.slice(0, 60)` which then resolved to a non-existent id on click. We
+ * keep the full ids on the bot side and use `resume_<index>` as the
+ * callback payload instead.
+ */
+const threadSessionLists = new Map<string, string[]>();
+
+/**
  * @description Forum-topic names that arrived via `forum_topic_created`
  * but couldn't be processed because the creator wasn't in
  * `ALLOWED_USERS` (audit S2 / #5). We can't read a thread's title later
@@ -2178,10 +2188,15 @@ command('sessions', async (_ctx, key) => {
       await replyToThread(key, 'No previous sessions');
       return;
     }
-    const buttons = sessions.slice(0, 10).map(s => {
+    // Audit S4 / #7: stash the full id list per thread so the `resume_<idx>`
+    // callback can recover the full id (Telegram's callback_data cap
+    // would otherwise truncate long OpenCode session ids).
+    const shown = sessions.slice(0, 10);
+    threadSessionLists.set(keyToString(key), shown.map(s => s.id));
+    const buttons = shown.map((s, idx) => {
       const timeAgo = formatTimeAgo(s.updatedAt);
       const title = (s.title || s.id).slice(0, 40);
-      return Markup.button.callback(`${title} (${timeAgo})`, `resume_${s.id.slice(0, 60)}`);
+      return Markup.button.callback(`${title} (${timeAgo})`, `resume_${idx}`);
     });
     await replyToThread(
       key,
@@ -2927,7 +2942,7 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
   }
 });
 
-bot.action(/^resume_(.+)$/, async (ctx) => {
+bot.action(/^resume_(\d+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery('Access denied'); return; }
   // Resume must respect the same binding invariant as every other start
@@ -2944,7 +2959,17 @@ bot.action(/^resume_(.+)$/, async (ctx) => {
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
-  const sessionId = ctx.match[1];
+  // Audit S4 / #7: callback_data is just an index into the list we
+  // showed during the last `/sessions`. Recover the full id from
+  // `threadSessionLists`; if the cache was lost (bot restarted between
+  // showing the list and the user clicking), ask for a refresh.
+  const idx = parseInt(ctx.match[1], 10);
+  const list = threadSessionLists.get(keyToString(key));
+  if (!list || idx < 0 || idx >= list.length) {
+    await ctx.answerCbQuery('Session list expired — run /sessions again');
+    return;
+  }
+  const sessionId = list[idx];
   const adapter = getThreadAdapter(key);
   markNeedsNewMessage(key);
   await ctx.answerCbQuery('Resuming session...');

@@ -8,6 +8,20 @@
 #   - separate OPENCODE_URL ports (plan §13.8 — same port = shared opencode-server = session crosstalk)
 #
 # Edit .env (copy from .env.example) before `docker compose up -d`.
+#
+# Audit S16 hardening:
+#   - cap_drop ALL + no-new-privileges (no kernel surface beyond stdlib);
+#   - bounded mem_limit / pids_limit (keep one runaway thread from
+#     starving the host);
+#   - healthcheck pings claude --version so a stuck container is visible
+#     to `docker ps`.
+#
+# Security note on bind mounts: `~/.ssh` is copied into /home/agent on
+# entrypoint so the agent can git push from inside the container. The
+# agent itself runs `--dangerously-skip-permissions` and so can read
+# every file it has perms on. Run the bot under a dedicated host user
+# with a minimal ssh deploy key, or feed an ssh-agent socket instead,
+# if your `~/.ssh` carries keys you would not hand the LLM.
 
 services:
   telegramcode-pet:
@@ -17,6 +31,17 @@ services:
     tty: true
     working_dir: /workspace
     user: "${UID:-1000}:${GID:-1000}"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 4g
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD-SHELL", "claude --version >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     volumes:
       # Your personal/home projects — bot binds threads inside this tree.
       - ${PET_WORK_ROOT:-/home/${USER}/src}:/workspace:rw
@@ -64,6 +89,17 @@ services:
     tty: true
     working_dir: /workspace
     user: "${UID:-1000}:${GID:-1000}"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 4g
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD-SHELL", "claude --version >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     volumes:
       - ${WORK_WORK_ROOT:-/home/${USER}/work}:/workspace:rw
       - ../:/telegramCode:ro

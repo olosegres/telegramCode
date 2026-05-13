@@ -1,15 +1,32 @@
 services:
-  # Development: run Claude CLI to work on this bot code
+  # Development: run Claude CLI to work on this bot code.
+  #
+  # Audit S16 hardening:
+  #  - drop `user: root` (entrypoint already swaps to agent via runuser);
+  #  - cap_drop ALL + no-new-privileges;
+  #  - bounded mem / pids;
+  #  - healthcheck.
+  #
+  # ssh keys are still bind-mounted ro from the host and copied into
+  # /home/agent at entrypoint time. The agent runs with
+  # `--dangerously-skip-permissions`, so anything it can read it can
+  # exfiltrate. Run a dedicated host user for the bot, or feed an
+  # ssh-agent socket instead, if your host's `~/.ssh` holds keys you'd
+  # rather not expose.
   claude:
     build:
       context: .
       dockerfile: Dockerfile.claude
     image: claude-node-git
     container_name: claude-cli
-    user: root
     stdin_open: true
     tty: true
     working_dir: /workspace
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 4g
+    pids_limit: 512
     volumes:
       - .:/workspace:rw
       - /workspace/node_modules/@biomejs

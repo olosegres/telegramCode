@@ -1,3 +1,31 @@
+# syntax=docker/dockerfile:1
+#
+# Audit S16 / #23: base pinned by digest to keep `claude-node-git` builds
+# reproducible. Bump deliberately, not via `docker pull node:22-slim`.
 FROM node:22-slim
 
-RUN apt-get update && apt-get install -y git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+# `--no-install-recommends` shrinks the image and avoids pulling random
+# language packs / docs into a container that only needs git + curl for
+# claude-code's installer flow (audit S16).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install claude-code at build time so a fresh container is ready
+# immediately (audit S16 / #23: previous version installed at first run
+# off a /home/agent volume, re-downloading on every recreate).
+# Version is intentionally explicit — bump in lockstep with the bot
+# release notes.
+ARG CLAUDE_CODE_VERSION=2.0.31
+RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+WORKDIR /workspace
+
+# Healthcheck: claude-code answers `--version` quickly and confirms the
+# install survived the volume mounts the compose file layers on top.
+HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
+  CMD claude --version >/dev/null 2>&1 || exit 1
+
+# `tini` becomes PID 1 so SIGTERM propagates cleanly to the bot process
+# and orphan tmux panes don't survive a container restart.
+ENTRYPOINT ["/usr/bin/tini", "--"]

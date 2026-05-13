@@ -2,6 +2,7 @@ import { Telegraf, Markup, type Context, type NarrowedContext } from 'telegraf';
 import { message } from 'telegraf/filters';
 import type { Update, Message } from 'telegraf/typings/core/types/typegram';
 import * as fs from 'fs';
+import { promises as fsp } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as https from 'https';
@@ -995,24 +996,47 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
 //  Voice download + transcribe
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function downloadFile(url: string, destPath: string): Promise<void> {
+/**
+ * @description Download `url` to `destPath` with hard timeout, capped
+ * redirect depth, and async cleanup. Audit S14 / #32: previous version
+ * recursed on 3xx with no depth limit (open to redirect loops), had no
+ * `request.setTimeout` (a hung CDN blocked the bot indefinitely), and
+ * used `fs.unlinkSync` inside the response callback (sync throw inside
+ * a callback chain is unhandleable).
+ */
+const DOWNLOAD_TIMEOUT_MS = 20_000;
+const MAX_REDIRECTS = 5;
+
+async function downloadFile(url: string, destPath: string, depth = 0): Promise<void> {
+  if (depth > MAX_REDIRECTS) {
+    throw new Error(`Too many redirects (>${MAX_REDIRECTS}) for ${url}`);
+  }
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
     const client = url.startsWith('https') ? https : http;
-    client.get(url, (response) => {
+    const file = fs.createWriteStream(destPath);
+    const cleanup = () => fsp.unlink(destPath).catch(() => {});
+
+    const req = client.get(url, (response) => {
       if (response.statusCode === 301 || response.statusCode === 302) {
         const redirectUrl = response.headers.location;
         if (redirectUrl) {
-          file.close();
-          fs.unlinkSync(destPath);
-          downloadFile(redirectUrl, destPath).then(resolve).catch(reject);
+          file.close(() => {
+            cleanup().then(() =>
+              downloadFile(redirectUrl, destPath, depth + 1).then(resolve, reject)
+            );
+          });
           return;
         }
       }
       response.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', (err) => {
-      fs.unlink(destPath, () => {});
+      file.on('finish', () => { file.close(() => resolve()); });
+      file.on('error', (err) => { cleanup(); reject(err); });
+    });
+    req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS}ms`));
+    });
+    req.on('error', (err) => {
+      cleanup();
       reject(err);
     });
   });
@@ -1032,6 +1056,10 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
   const apiPath = isGroq ? '/openai/v1/audio/transcriptions' : '/v1/audio/transcriptions';
 
   return new Promise((resolve) => {
+    // Audit S14 / #33: install the error handler before piping the form
+    // so a socket error during the initial handshake can't escape. Also
+    // add a hard timeout so a hung Groq/OpenAI response can't block the
+    // voice-message path indefinitely.
     const req = https.request({
       hostname, path: apiPath, method: 'POST',
       headers: { ...form.getHeaders(), 'Authorization': `Bearer ${apiKey}` },
@@ -1057,7 +1085,13 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
         }
       });
     });
-    req.on('error', () => resolve(null));
+    req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+      req.destroy(new Error('transcription timed out'));
+    });
+    req.on('error', (e) => {
+      console.warn('[transcribe] request failed:', e instanceof Error ? e.message : e);
+      resolve(null);
+    });
     form.pipe(req);
   });
 }
@@ -2733,8 +2767,13 @@ bot.on(message('voice'), async (ctx) => {
 
   try {
     const fileId = ctx.message.voice.file_id;
-    const file = await ctx.telegram.getFile(fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${ENV.botToken}/${file.file_path}`;
+    // Audit S14 / #33: `getFileLink` builds the bot-token URL in one
+    // place inside Telegraf instead of us materialising the token in a
+    // JS string. The previous manual interpolation worked but
+    // accidentally leaking the token into any future log call would
+    // expose the bot.
+    const fileUrlObj = await ctx.telegram.getFileLink(fileId);
+    const fileUrl = fileUrlObj.toString();
 
     const tempDir = '/tmp';
     const tempFile = path.join(tempDir, `voice_${key.chatId}_${key.threadId}_${Date.now()}.ogg`);

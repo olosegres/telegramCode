@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
@@ -73,18 +73,49 @@ function parseTmuxSessionName(name: string): ThreadKey | null {
   // The numeric pair after "claude-" is "<chatId>-<threadId>".
   // chatId may be negative (forum supergroup). We split from the right on the
   // last '-' so the trailing token is always threadId regardless of sign.
+  //
+  // Strict regex on each half (audit S1 / #22): plain `Number(...)` accepts
+  // `1e5`, `0x10`, `1.5`, `" 42 "`. Such values come from a foreign tmux
+  // session whose name happens to share our prefix; treating them as ours
+  // would cause `adoptExistingTmuxSession` to attach to an unrelated session.
   if (!name.startsWith('claude-')) return null;
   const rest = name.slice('claude-'.length);
   const lastDash = rest.lastIndexOf('-');
   if (lastDash <= 0) return null;
   const chatIdStr = rest.slice(0, lastDash);
   const threadIdStr = rest.slice(lastDash + 1);
+  if (!/^-?\d+$/.test(chatIdStr)) return null;
+  if (!/^\d+$/.test(threadIdStr)) return null;
   const chatId = Number(chatIdStr);
   const threadId = Number(threadIdStr);
   if (!Number.isFinite(chatId) || !Number.isFinite(threadId)) return null;
   return { chatId, threadId };
 }
 
+/**
+ * @description Validate a UUID-shaped session id before it ever reaches a
+ * tmux command line. Defence-in-depth (audit S1): even though we now route
+ * every tmux call through argv (no shell interpolation), the UUID is later
+ * concatenated into the `shell-command` we hand to `tmux new-session`,
+ * which tmux execs via `$SHELL -c`. If a non-UUID value ever sneaks in
+ * (corrupted state.json, future user-facing `/resume <id>`), it would land
+ * in that shell. Rejecting up front keeps the surface tight.
+ */
+function checkIsValidUuid(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+}
+
+/**
+ * @description Reject `args` with NUL or other control characters before
+ * passing to claude. These are unsafe in shell-quoted contexts (the
+ * `'\\''` escape doesn't protect against `\x00`), and tmux/terminals
+ * treat them as control sequences. Mirrors `validateSubdir`'s reasoning.
+ */
+function checkArgsAreSafe(args: string): boolean {
+  return !/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(args);
+}
+
+/** Best-effort tmux call: returns stdout on success, empty string on any error. */
 function tmux(...args: string[]): string {
   try {
     return execFileSync('tmux', args, {
@@ -94,6 +125,20 @@ function tmux(...args: string[]): string {
   } catch {
     return '';
   }
+}
+
+/**
+ * @description Strict tmux call: throws if tmux exits non-zero (or times out).
+ * Used on critical paths (`new-session`, `send-keys` of the claude command
+ * line) where silent failure would leave the bot thinking a session
+ * started when it didn't. Callers should wrap and translate to a friendly
+ * error for the user.
+ */
+function tmuxOrThrow(...args: string[]): string {
+  return execFileSync('tmux', args, {
+    encoding: 'utf-8',
+    timeout: 5000,
+  }).trim();
 }
 
 /**
@@ -367,6 +412,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // generation in bot.ts so it can be persisted in state.json (D14), but
     // until §11 Этап 3 wires that up we mint here as a safe default.
     const claudeSessionId = sessionId || randomUUID();
+    if (!checkIsValidUuid(claudeSessionId)) {
+      // Caller-supplied UUID — refuse anything that doesn't look like one.
+      // See `checkIsValidUuid` for the reasoning (audit S1).
+      console.error(`[Claude] Rejecting non-UUID sessionId: ${claudeSessionId}`);
+      this.emit('error', key, new Error('Invalid sessionId'));
+      return;
+    }
+    if (args && !checkArgsAreSafe(args)) {
+      console.error(`[Claude] Rejecting args with control characters`);
+      this.emit('error', key, new Error('Args contain control characters'));
+      return;
+    }
     console.log(
       `[Claude] Starting tmux session ${sessionName} in ${workDir} ` +
       `(sessionId=${claudeSessionId})${args ? ` with args: ${args}` : ''}`,
@@ -375,37 +432,45 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // Make sure no stale session with the same name is lingering.
     tmux('kill-session', '-t', sessionName);
 
-    const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
-    // Build the command we'll send into tmux as a single shell line.
+    // Build the claude command line as an argv list, then assemble the final
+    // shell-command for tmux by single-quoting every element. tmux execs the
+    // trailing `shell-command` argument via `$SHELL -c` (audit S1 / #1, #2):
+    // there is no argv-only path for `new-session`, so the only defence is
+    // to ensure no user-controlled string can break out of single quotes.
+    // `shellSingleQuote` handles embedded single quotes via the standard
+    // `'\\''` close-reopen idiom.
+    //
     // --session-id <uuid> assigns the UUID to the NEW session so we can later
-    // resume by UUID (plan §13.1). --dangerously-skip-permissions stays hardcoded
-    // by D44 (symmetry with opencode auto-approve).
+    // resume by UUID (plan §13.1). --dangerously-skip-permissions stays
+    // hardcoded by D44 (symmetry with opencode auto-approve).
     //
     // MCP servers come from up to four sources (user/group/project/thread,
     // plan §19); user + project are auto-loaded by Claude from cwd, the
-    // other two reach Claude through repeated `--mcp-config` flags that
-    // we build here. The flag values point at tmp files because the bot
-    // expands `${VAR}` env-var placeholders itself before handing the
-    // config off (plan §13.18, T2).
-    const claudeArgs = args ? ` ${args}` : '';
-    // The `prepareMcpFlags` array alternates flag literal, path, flag
-    // literal, path, …. Only the path tokens need quoting (DATA_DIR can
-    // contain spaces); quoting the `--mcp-config` literal too is harmless
-    // but obscures the intent.
+    // other two reach Claude through repeated `--mcp-config` flags. The flag
+    // values point at tmp files because the bot expands `${VAR}` env-var
+    // placeholders itself before handing the config off (plan §13.18, T2).
     const mcpFlagsArr = prepareMcpFlags({ key, dataDir: resolveDataDir() });
-    const mcpSegment = mcpFlagsArr.length
-      ? ' ' + mcpFlagsArr.map((a, i) => (i % 2 ? shellSingleQuote(a) : a)).join(' ')
-      : '';
-    const claudeCmd =
-      `cd ${shellSingleQuote(workDir)} && ` +
-      `${claudePath} --dangerously-skip-permissions ` +
-      `--session-id ${claudeSessionId}${mcpSegment}${claudeArgs}`;
-    const startClaudeCmd = `tmux send-keys -t ${sessionName} ${JSON.stringify(claudeCmd)} Enter`;
+    const claudeArgv: string[] = [
+      claudePath,
+      '--dangerously-skip-permissions',
+      '--session-id', claudeSessionId,
+      ...mcpFlagsArr,
+      ...(args ? [args] : []),
+    ];
+    const claudeShellCmd = claudeArgv.map(shellSingleQuote).join(' ');
     try {
-      execSync(createCmd, { encoding: 'utf-8', timeout: 5000 });
+      // `-c <workDir>` sets the new session's start directory, avoiding a
+      // preceding `cd && …` chain (which would have to be shell-quoted too).
+      tmuxOrThrow(
+        'new-session',
+        '-d',
+        '-s', sessionName,
+        '-x', '300',
+        '-y', '50',
+        '-c', workDir,
+        claudeShellCmd,
+      );
       console.log(`[Claude] tmux session created`);
-      execSync(startClaudeCmd, { encoding: 'utf-8', timeout: 5000 });
-      console.log(`[Claude] claude command sent`);
     } catch (e) {
       console.error(`[Claude] Failed to create tmux session:`, e);
       this.emit('error', key, new Error('Failed to start Claude session'));
@@ -476,18 +541,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     console.log(`[Claude] sendInput: "${input}"`);
 
-    try {
-      execSync(
-        `tmux send-keys -t ${session.sessionName} -l ${JSON.stringify(input)}`,
-        { encoding: 'utf-8', timeout: 5000 }
-      );
-      execSync(
-        `tmux send-keys -t ${session.sessionName} Enter`,
-        { encoding: 'utf-8', timeout: 5000 }
-      );
-    } catch (e) {
-      console.error(`[Claude] sendInput error:`, e);
-    }
+    // Argv-based send-keys: tmux never invokes a shell here, so user-typed
+    // `$(...)` / backticks are delivered to claude's stdin as literal
+    // bytes. The previous implementation used `execSync` with a shell
+    // template; `JSON.stringify(input)` wraps the text in double quotes,
+    // and `/bin/sh` happily expands `$(...)` inside double quotes BEFORE
+    // tmux ever sees the keys — that was the RCE flagged by audit S1 / #1.
+    //
+    // `-l` tells tmux to treat the next argument as literal keys, not as
+    // tmux special-key names (so the user typing the word "Enter" wouldn't
+    // be rewritten to a newline). A separate call adds the actual Enter.
+    tmux('send-keys', '-t', session.sessionName, '-l', input);
+    tmux('send-keys', '-t', session.sessionName, 'Enter');
   }
 
   sendSignal(key: ThreadKey, signal: string): void {
@@ -590,29 +655,40 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       await installTool('claude');
     }
 
+    if (!checkIsValidUuid(sessionId)) {
+      console.error(`[Claude] resumeSession: invalid UUID ${sessionId}`);
+      this.emit('error', key, new Error('Invalid sessionId'));
+      return;
+    }
     const sessionName = buildTmuxSessionName(key);
     console.log(`[Claude] Resuming session ${sessionId} in ${workDir} for ${keyToString(key)}`);
 
     tmux('kill-session', '-t', sessionName);
 
-    const createCmd = `tmux new-session -d -s ${sessionName} -x 300 -y 50`;
     // Pass the UUID explicitly. If it's unknown to claude, it'll just print a
     // notice and start fresh — better than hanging on a picker. MCP flags
     // are re-applied here so a resumed session sees the same servers as a
-    // fresh one would (plan §19). Only path tokens are quoted; see
-    // startSession for the rationale.
+    // fresh one would (plan §19). Argv-style shell-quoting mirrors
+    // `startSession` (audit S1).
     const mcpFlagsArr = prepareMcpFlags({ key, dataDir: resolveDataDir() });
-    const mcpSegment = mcpFlagsArr.length
-      ? ' ' + mcpFlagsArr.map((a, i) => (i % 2 ? shellSingleQuote(a) : a)).join(' ')
-      : '';
-    const claudeCmd =
-      `cd ${shellSingleQuote(workDir)} && ` +
-      `${claudePath} --dangerously-skip-permissions --resume ${sessionId}${mcpSegment}`;
-    const startClaudeCmd = `tmux send-keys -t ${sessionName} ${JSON.stringify(claudeCmd)} Enter`;
+    const claudeArgv: string[] = [
+      claudePath,
+      '--dangerously-skip-permissions',
+      '--resume', sessionId,
+      ...mcpFlagsArr,
+    ];
+    const claudeShellCmd = claudeArgv.map(shellSingleQuote).join(' ');
 
     try {
-      execSync(createCmd, { encoding: 'utf-8', timeout: 5000 });
-      execSync(startClaudeCmd, { encoding: 'utf-8', timeout: 5000 });
+      tmuxOrThrow(
+        'new-session',
+        '-d',
+        '-s', sessionName,
+        '-x', '300',
+        '-y', '50',
+        '-c', workDir,
+        claudeShellCmd,
+      );
     } catch (e) {
       console.error(`[Claude] Failed to resume session:`, e);
       this.emit('error', key, new Error('Failed to resume Claude session'));

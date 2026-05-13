@@ -1976,7 +1976,7 @@ async function sendBindingWelcome(key: ThreadKey, subdir: string): Promise<void>
 // stays single-sourced.
 bot.action('open_sessions', async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   await ctx.answerCbQuery();
   // Cheapest UX without duplicating the /sessions picker: ask the user to
   // type /sessions, which opens the same flow. Refactoring the slash
@@ -3017,9 +3017,9 @@ bot.on(message('forum_topic_reopened'), async (ctx) => {
  */
 bot.action(/^bind_page_(\d+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   if (checkIsGeneral(key)) {
-    await ctx.answerCbQuery('/bind only works in topical threads');
+    await ctx.answerCbQuery(t('cb.bind_only_topical'));
     return;
   }
   const page = parseInt(ctx.match[1], 10);
@@ -3043,13 +3043,13 @@ bot.action('bind_page_noop', async (ctx) => {
 
 bot.action(/^bind_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   if (checkIsGeneral(key)) {
-    await ctx.answerCbQuery('/bind only works in topical threads');
+    await ctx.answerCbQuery(t('cb.bind_only_topical'));
     return;
   }
   const subdir = ctx.match[1];
-  await ctx.answerCbQuery(`Binding to ${subdir}…`);
+  await ctx.answerCbQuery(t('cb.binding_to', { subdir }));
   const result = await applyBinding(key, subdir);
   await replyToThread(key, result.message);
   if (result.ok) await sendBindingWelcome(key, result.subdir);
@@ -3057,34 +3057,34 @@ bot.action(/^bind_(.+)$/, async (ctx) => {
 
 bot.action(/^model_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const modelId = ctx.match[1];
   const adapter = getThreadAdapter(key);
   if (!adapter.checkIsActive(key)) {
-    await ctx.answerCbQuery('No active session');
+    await ctx.answerCbQuery(t('cb.no_active_session'));
     return;
   }
   if (adapter.setModel) {
     const err = await adapter.setModel(key, modelId);
-    if (err) { await ctx.answerCbQuery(`Error: ${err.slice(0, 50)}`); return; }
+    if (err) { await ctx.answerCbQuery(t('cb.model_error', { error: err.slice(0, 50) })); return; }
     const current = adapter.getCurrentModel?.(key) || modelId;
-    await ctx.answerCbQuery(`Model: ${current.split('/').pop() || current}`);
+    await ctx.answerCbQuery(t('cb.model_set', { model: current.split('/').pop() || current }));
     await replyToThread(key, `Model switched to: ${current}`);
     // Reflect the new model in the pinned banner.
     await updatePinnedStatus(key).catch(() => {});
   } else {
-    await ctx.answerCbQuery(`Not supported for ${adapter.label}`);
+    await ctx.answerCbQuery(t('cb.not_supported', { label: adapter.label }));
   }
 });
 
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const adapterName = ctx.match[1];
   try {
     await switchThreadAdapter(key, adapterName);
     const adapter = getThreadAdapter(key);
-    await ctx.answerCbQuery(`Switched to ${adapter.label}`);
+    await ctx.answerCbQuery(t('cb.agent_switched', { label: adapter.label }));
     await replyToThread(
       key,
       `Agent: ${adapter.label}\nSend a message or /${adapterName} to start`,
@@ -3095,22 +3095,22 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
       await updatePinnedStatus(key).catch(() => {});
     }
   } catch {
-    await ctx.answerCbQuery('Unknown agent');
+    await ctx.answerCbQuery(t('cb.unknown_agent'));
   }
 });
 
 bot.action(/^resume_(\d+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   // Resume must respect the same binding invariant as every other start
   // path — otherwise picking an old session here would silently spawn an
   // adapter against WORK_ROOT itself (review HIGH #2).
   if (checkIsGeneral(key)) {
-    await ctx.answerCbQuery('Resume only works in topical threads');
+    await ctx.answerCbQuery(t('cb.resume_only_topical'));
     return;
   }
   if (!state.getBinding(key)) {
-    await ctx.answerCbQuery('Bind a folder first via /bind');
+    await ctx.answerCbQuery(t('cb.bind_folder_first'));
     const subdirs = listAvailableSubdirs(ENV.workRoot);
     const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
     await replyToThread(key, t('thread.no_binding'), extra);
@@ -3123,13 +3123,13 @@ bot.action(/^resume_(\d+)$/, async (ctx) => {
   const idx = parseInt(ctx.match[1], 10);
   const list = threadSessionLists.get(keyToString(key));
   if (!list || idx < 0 || idx >= list.length) {
-    await ctx.answerCbQuery('Session list expired — run /sessions again');
+    await ctx.answerCbQuery(t('cb.sessions_expired'));
     return;
   }
   const sessionId = list[idx];
   const adapter = getThreadAdapter(key);
   markNeedsNewMessage(key);
-  await ctx.answerCbQuery('Resuming session...');
+  await ctx.answerCbQuery(t('cb.resuming'));
   try {
     await adapter.resumeSession(key, getWorkDir(key), sessionId);
     await replyToThread(key, 'Session resumed. Send your message:');
@@ -3143,29 +3143,29 @@ bot.action(/^resume_(\d+)$/, async (ctx) => {
 
 bot.action(/^opt_(\d+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const optNum = ctx.match[1];
   const adapter = getThreadAdapter(key);
   if (adapter.checkIsActive(key)) {
     markNeedsNewMessage(key);
     adapter.sendInput(key, optNum);
-    await ctx.answerCbQuery(`Sent: ${optNum}`);
+    await ctx.answerCbQuery(t('cb.sent_option', { option: optNum }));
   } else {
-    await ctx.answerCbQuery('Agent not running');
+    await ctx.answerCbQuery(t('cb.agent_not_running'));
   }
 });
 
 bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery('Access denied'); return; }
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const qIdx = parseInt(ctx.match[1], 10);
   const optIdx = parseInt(ctx.match[2], 10);
   const kStr = keyToString(key);
   const pending = pendingQuestions.get(kStr);
-  if (!pending) { await ctx.answerCbQuery('No pending question'); return; }
+  if (!pending) { await ctx.answerCbQuery(t('cb.no_pending_question')); return; }
   const question = pending.data.questions[qIdx];
   if (!question || !question.options[optIdx]) {
-    await ctx.answerCbQuery('Invalid option');
+    await ctx.answerCbQuery(t('cb.invalid_option'));
     return;
   }
   const selectedLabel = question.options[optIdx].label;

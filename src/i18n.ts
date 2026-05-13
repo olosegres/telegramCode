@@ -240,6 +240,26 @@ const dict: Record<Lang, Record<string, string>> = {
       '⚠️ state.json был повреждён, привязки пересозданы. Повтори /bind где нужно.',
     'error.start_in_general':
       'Запускать агента в General нельзя — это служебный топик. Открой тематический тред.',
+
+    // Inline-keyboard answer-callback strings (audit S18 / #45).
+    // Telegram caps answerCbQuery at ~200 chars; keep them short.
+    'cb.access_denied': 'Доступ запрещён',
+    'cb.bind_only_topical': '/bind работает только в тематических тредах',
+    'cb.binding_to': 'Привязываю к {subdir}…',
+    'cb.no_active_session': 'Нет активной сессии',
+    'cb.model_error': 'Ошибка: {error}',
+    'cb.model_set': 'Модель: {model}',
+    'cb.not_supported': 'Не поддерживается для {label}',
+    'cb.unknown_agent': 'Неизвестный агент',
+    'cb.agent_switched': 'Переключено на {label}',
+    'cb.resume_only_topical': 'Resume работает только в тематических тредах',
+    'cb.bind_folder_first': 'Сначала привяжи папку через /bind',
+    'cb.sessions_expired': 'Список сессий устарел — запусти /sessions снова',
+    'cb.resuming': 'Возобновляю сессию…',
+    'cb.agent_not_running': 'Агент не запущен',
+    'cb.no_pending_question': 'Нет ожидающего вопроса',
+    'cb.invalid_option': 'Некорректный вариант',
+    'cb.sent_option': 'Отправлено: {option}',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -434,24 +454,67 @@ const dict: Record<Lang, Record<string, string>> = {
       '⚠️ state.json was corrupted; bindings reset. Re-run /bind where needed.',
     'error.start_in_general':
       'Can\'t start an agent in General — that\'s a service topic. Open a topical thread.',
+
+    'cb.access_denied': 'Access denied',
+    'cb.bind_only_topical': '/bind only works in topical threads',
+    'cb.binding_to': 'Binding to {subdir}…',
+    'cb.no_active_session': 'No active session',
+    'cb.model_error': 'Error: {error}',
+    'cb.model_set': 'Model: {model}',
+    'cb.not_supported': 'Not supported for {label}',
+    'cb.unknown_agent': 'Unknown agent',
+    'cb.agent_switched': 'Switched to {label}',
+    'cb.resume_only_topical': 'Resume only works in topical threads',
+    'cb.bind_folder_first': 'Bind a folder first via /bind',
+    'cb.sessions_expired': 'Session list expired — run /sessions again',
+    'cb.resuming': 'Resuming session…',
+    'cb.agent_not_running': 'Agent not running',
+    'cb.no_pending_question': 'No pending question',
+    'cb.invalid_option': 'Invalid option',
+    'cb.sent_option': 'Sent: {option}',
   },
 };
 
-/** Active language, picked once at boot from `BOT_LANG`. */
-const lang: Lang = (process.env.BOT_LANG === 'en' ? 'en' : 'ru');
+/**
+ * @description Active language, picked once at boot from `BOT_LANG`.
+ *
+ * Audit S18 / #46: previous code did a literal `=== 'en'` check, so
+ * `BOT_LANG=EN` / `English` / `En` silently fell back to ru with no
+ * indication anything was off. Now we lowercase + trim and warn loudly
+ * on unknown values.
+ */
+const lang: Lang = ((): Lang => {
+  const raw = (process.env.BOT_LANG ?? '').trim().toLowerCase();
+  if (raw === 'en') return 'en';
+  if (raw === 'ru' || raw === '') return 'ru';
+  console.warn(`[i18n] unknown BOT_LANG="${process.env.BOT_LANG}", falling back to ru`);
+  return 'ru';
+})();
 
 /**
  * @description Format a localised message.
  *
  * `opts` values are substituted into `{name}` placeholders. Unknown codes
- * fall back to English; if the code is missing in English too, the code
- * itself is returned (loud failure mode — easier to spot in tests / logs
- * than a silently empty string).
+ * fall back to English; if the code is missing in English too, the last
+ * segment of the code is returned with a warning (loud failure mode —
+ * easier to spot in tests / logs than a silently empty string).
+ *
+ * Audit S18 / #46: previously returned the raw code, which surfaces in
+ * chat as e.g. `agent.foo.bar` — confusing for users. Last-segment
+ * fallback at least reads naturally while the warning still hits logs.
  */
 export function t(code: string, opts?: Record<string, string | number>): string {
   const primary = dict[lang][code];
   const fallback = dict.en[code];
-  let template = primary ?? fallback ?? code;
+  let template: string;
+  if (primary !== undefined) {
+    template = primary;
+  } else if (fallback !== undefined) {
+    template = fallback;
+  } else {
+    console.warn(`[i18n] missing key "${code}" in both ru and en`);
+    template = code.split('.').pop() ?? code;
+  }
   if (opts) {
     for (const [k, v] of Object.entries(opts)) {
       template = template.replace(new RegExp(`\\{${k}\\}`, 'g'), v.toString());

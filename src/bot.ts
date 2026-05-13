@@ -810,6 +810,11 @@ function escapeMarkdownChars(text: string): string {
     .replace(/`/g, '\\`');
 }
 
+// Audit S13 / #29: hoisted to module scope so `escapeMarkdown` doesn't
+// recompile the regex on every output chunk. `g`-flag regexes are stateful
+// (`lastIndex`), so we explicitly reset before each use.
+const ESCAPE_BOLD_REGEX = /\*([^*\n]+)\*/g;
+
 /**
  * @description Best-effort escape that preserves existing `*bold*` runs
  * while escaping incidental Markdown chars elsewhere. Same heuristic as
@@ -817,11 +822,11 @@ function escapeMarkdownChars(text: string): string {
  * holds for the agent output we render.
  */
 function escapeMarkdown(text: string): string {
-  const boldRegex = /\*([^*\n]+)\*/g;
+  ESCAPE_BOLD_REGEX.lastIndex = 0;
   const boldMatches: Array<{ start: number; end: number; content: string }> = [];
 
   let match;
-  while ((match = boldRegex.exec(text)) !== null) {
+  while ((match = ESCAPE_BOLD_REGEX.exec(text)) !== null) {
     boldMatches.push({
       start: match.index,
       end: match.index + match[0].length,
@@ -849,19 +854,27 @@ function escapeMarkdown(text: string): string {
  * not overwritten — every emitted chunk reaches Telegram. During a 429
  * cooldown the delay stretches so we don't keep hammering the API.
  */
+/**
+ * Audit S13 / #30: extracted from two near-identical ternaries; lengthens
+ * the debounce window during a 429 cooldown so we don't keep hammering
+ * Telegram while it's already throttling us.
+ */
+function getOutputDelay(chatId: number): number {
+  return checkIsRateLimited(chatId)
+    ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
+    : OUTPUT_DEBOUNCE_MS;
+}
+
 function queueOutput(key: ThreadKey, output: string): void {
   const q = getOutputQueueState(key);
   q.pendingOutput = q.pendingOutput
     ? `${q.pendingOutput}\n${output}`
     : output;
   if (q.debounceTimer) clearTimeout(q.debounceTimer);
-  const delayMs = checkIsRateLimited(key.chatId)
-    ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
-    : OUTPUT_DEBOUNCE_MS;
   q.debounceTimer = setTimeout(() => {
     q.debounceTimer = null;
     processOutputQueue(key);
-  }, delayMs);
+  }, getOutputDelay(key.chatId));
 }
 
 async function processOutputQueue(key: ThreadKey): Promise<void> {
@@ -875,10 +888,17 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
   } finally {
     q.isProcessing = false;
     if (q.pendingOutput) {
-      const delayMs = checkIsRateLimited(key.chatId)
-        ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
-        : OUTPUT_DEBOUNCE_MS;
-      setTimeout(() => processOutputQueue(key), delayMs);
+      // Audit S13 / #30: the re-trigger `setTimeout` used to be a bare
+      // call whose handle was never stored. A `queueOutput` call between
+      // here and the timer firing would `clearTimeout(null)` and
+      // schedule a duplicate timer, leaving one orphan callback alive.
+      // Routing through `queueOutput`-equivalent code keeps `q.debounceTimer`
+      // authoritative.
+      if (q.debounceTimer) clearTimeout(q.debounceTimer);
+      q.debounceTimer = setTimeout(() => {
+        q.debounceTimer = null;
+        processOutputQueue(key);
+      }, getOutputDelay(key.chatId));
     }
   }
 }
@@ -1089,21 +1109,39 @@ const BIND_PAGE_SIZE = 20;
  * topic_created event), and the synchronous block is dwarfed by the Telegram
  * round-trip that follows it.
  */
+/**
+ * Audit S13 / #28: `fs.readdirSync` on every no-binding text reply / every
+ * `/bind` keyboard rebuild is a synchronous blocker on the event loop for
+ * any WORK_ROOT with thousands of entries. Cache the result for 30 s —
+ * the only realistic way the list changes is the operator creating a
+ * folder, which `/bind` after that interval picks up naturally.
+ */
+const SUBDIR_CACHE_TTL_MS = 30_000;
+const subdirCache = new Map<string, { value: string[]; ts: number }>();
+
 function listAvailableSubdirs(workRoot: string, limit = 200): string[] {
+  const cacheKey = `${workRoot}|${limit}`;
+  const cached = subdirCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < SUBDIR_CACHE_TTL_MS) {
+    return cached.value;
+  }
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(workRoot, { withFileTypes: true });
   } catch {
+    subdirCache.set(cacheKey, { value: [], ts: Date.now() });
     return [];
   }
   const skip = new Set(['node_modules', '.git', '.cache', '.idea', '.vscode']);
   const callbackPrefix = 'bind_';
-  return entries
+  const result = entries
     .filter(e => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('__') && !skip.has(e.name))
     .map(e => e.name)
     .filter(name => Buffer.byteLength(callbackPrefix + name, 'utf8') <= 64)
     .sort((a, b) => a.localeCompare(b))
     .slice(0, limit);
+  subdirCache.set(cacheKey, { value: result, ts: Date.now() });
+  return result;
 }
 
 /**
@@ -3172,6 +3210,15 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   deleteStatusMessage(key).catch(() => {});
   deleteLoaderMessage(key).catch(() => {});
 
+  // Audit S13 / #31: register the pending question BEFORE the async
+  // network round-trip. A user hammering an inline button right after
+  // the question arrives used to find an empty `pendingQuestions` entry
+  // (the network reply was still in flight) and get a confusing
+  // "no pending question" answerCbQuery. The messageId is patched in
+  // after `replyToThread` resolves.
+  const kStr = keyToString(key);
+  pendingQuestions.set(kStr, { data: questionData, messageId: null });
+
   (async () => {
     try {
       for (let qIdx = 0; qIdx < questionData.questions.length; qIdx++) {
@@ -3200,10 +3247,12 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
         }
 
         if (messageId !== null) {
-          pendingQuestions.set(keyToString(key), {
-            data: questionData,
-            messageId,
-          });
+          // Patch the messageId on the existing entry (it may already
+          // have been deleted by a `qa_*` callback firing in between).
+          const existing = pendingQuestions.get(kStr);
+          if (existing && existing.data === questionData) {
+            existing.messageId = messageId;
+          }
         }
       }
     } catch (err) {
@@ -3444,6 +3493,46 @@ export async function startBot(): Promise<void> {
     ).catch(() => {});
   });
 
+  // 5b. Audit S13 / #18: periodically GC in-memory per-thread maps
+  //     against state.json. Topics deleted via Telegram's UI don't
+  //     produce a reliable service event; without this sweep their
+  //     entries in `threadMessageStates` / `outputQueues` / etc. linger
+  //     until the next failed send.
+  const inMemoryGcInterval = setInterval(() => {
+    try {
+      const live = new Set(state.listBindings().map(({ key }) => keyToString(key)));
+      // General-topic key always counts as live: in-memory state for
+      // /status, /ls etc. is rooted there even without a binding row.
+      live.add(`${ENV.allowedGroupId}:${GENERAL_THREAD_ID}`);
+      let removed = 0;
+      for (const m of [
+        threadMessageStates as Map<string, unknown>,
+        outputQueues as Map<string, unknown>,
+        pendingQuestions as Map<string, unknown>,
+        threadModelLists as Map<string, unknown>,
+        threadSessionLists as Map<string, unknown>,
+      ]) {
+        for (const k of m.keys()) {
+          if (!live.has(k)) { m.delete(k); removed += 1; }
+        }
+      }
+      for (const k of awaitingModelSelection) {
+        if (!live.has(k)) { awaitingModelSelection.delete(k); removed += 1; }
+      }
+      // Per-topic-name cache also benefits from the same sweep — entries
+      // for live keys are valid until TTL; for dead keys, drop now.
+      for (const k of pendingTopicNames.keys()) {
+        if (!live.has(k)) { pendingTopicNames.delete(k); removed += 1; }
+      }
+      if (removed > 0) console.log(`[gc] removed ${removed} orphan in-memory entries`);
+    } catch (e) {
+      console.warn('[gc] sweep failed:', e);
+    }
+  }, 60_000);
+  // Keep the interval handle so shutdown can clear it (so test-time
+  // shutdowns don't leak timers).
+  (globalThis as { __telegramCodeGcInterval?: NodeJS.Timeout }).__telegramCodeGcInterval = inMemoryGcInterval;
+
   // 6. Global catch — Telegraf swallows handler errors otherwise.
   bot.catch((err, ctx) => {
     console.error('[bot.catch] unhandled error:', err, 'update:', ctx.updateType);
@@ -3453,6 +3542,7 @@ export async function startBot(): Promise<void> {
   // /stop-all for an intentional agent stop; process signals only stop the bot.
   const shutdown = async (signal: string) => {
     console.log(`\n${signal} received, shutting down...`);
+    clearInterval(inMemoryGcInterval);
     try {
       await state.flush();
     } catch (e) {

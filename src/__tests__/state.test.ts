@@ -141,3 +141,26 @@ test('R6: valid state.json is loaded and bindings are visible after restart', as
   assert.equal(second.getBinding(key1)?.subdir, 'alpha');
   assert.equal(second.getAgent(key1)?.name, 'claude');
 });
+
+test('Forward-compat: state.json with an unknown future field still loads cleanly', async () => {
+  // Audit S19: pin forward-compat — if we ever add a new top-level
+  // field, an older bot reading the file must NOT treat it as corrupt
+  // (we'd lose every binding to "archived to .corrupted"). The shape
+  // check in `loadStateFile` only requires the known fields; unknown
+  // extras are preserved untouched on the next save.
+  const statePath = path.join(dataDir, 'state.json');
+  const futureShape = {
+    version: 1,
+    bindings: { '-1001:42': { subdir: 'alpha', createdAt: new Date().toISOString() } },
+    agents: {},
+    messages: {},
+    futurePrefs: { newFeatureFlag: true }, // unknown top-level field
+  };
+  fs.writeFileSync(statePath, JSON.stringify(futureShape));
+
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  assert.equal(store.wasCorruptedOnLoad(), false, 'unknown field must not trigger corruption');
+  assert.equal(store.listBindings().length, 1, 'binding must survive');
+  assert.equal(store.getBinding({ chatId: -1001, threadId: 42 })?.subdir, 'alpha');
+});

@@ -23,6 +23,9 @@ import {
 } from './adapters/createAdapter';
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
+// Pure parser lives in `./agentTrigger` so it can be unit-tested without
+// booting Telegraf (audit S19 / #25).
+import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
 import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
@@ -1294,36 +1297,7 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
 //  Natural-language start phrases (`claude ...`, `opencode ...`)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const startClaudePhrases = [
-  'клод', 'клауд', 'клоуд', 'claude', 'cloud',
-  'запусти клод', 'запусти клода',
-  'запусти клауд', 'запусти клауда',
-  'запусти клоуд', 'запусти клоуда',
-  'запусти claude', 'запусти cloud',
-];
-
-const startOpencodePhrases = [
-  'opencode', 'опенкод', 'open code', 'опен код',
-  'запусти opencode', 'запусти опенкод',
-  'запусти open code', 'запусти опен код',
-];
-
-interface StartAgentMatch {
-  isMatch: boolean;
-  adapterName?: string;
-  args?: string;
-}
-
-function checkIsStartAgentPhrase(text: string): StartAgentMatch {
-  const normalized = text.toLowerCase().trim().replace(/[.,!?;:]+$/, '');
-  if (startClaudePhrases.includes(normalized)) return { isMatch: true, adapterName: 'claude' };
-  const claudeArgs = normalized.match(/^(claude|клод|клауд|клоуд)\s+(.+)$/);
-  if (claudeArgs) return { isMatch: true, adapterName: 'claude', args: claudeArgs[2] };
-  if (startOpencodePhrases.includes(normalized)) return { isMatch: true, adapterName: 'opencode' };
-  const ocArgs = normalized.match(/^(opencode|опенкод|open code|опен код)\s+(.+)$/);
-  if (ocArgs) return { isMatch: true, adapterName: 'opencode', args: ocArgs[2] };
-  return { isMatch: false };
-}
+// (Parser imported up-top — see `parseAgentTrigger` import.)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Model selection helper — used by /model and the numeric-reply flow

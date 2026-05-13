@@ -366,14 +366,29 @@ interface StoredSession {
 }
 
 function loadStoredSessions(): StoredSession[] {
+  // Audit S15 / #42: previously every read error was swallowed; a
+  // corrupt JSON file (single edit gone wrong) would silently look like
+  // "no sessions" forever. Log so the operator notices; archive the
+  // bad file so subsequent writes start clean.
   try {
+    if (!fs.existsSync(sessionsFile)) return [];
+    const raw = fs.readFileSync(sessionsFile, 'utf-8');
+    return JSON.parse(raw) as StoredSession[];
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    console.error(`[Claude] loadStoredSessions failed (${code ?? 'parse'}):`, e instanceof Error ? e.message : e);
     if (fs.existsSync(sessionsFile)) {
-      return JSON.parse(fs.readFileSync(sessionsFile, 'utf-8')) as StoredSession[];
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const archive = `${sessionsFile}.corrupted-${ts}`;
+      try {
+        fs.renameSync(sessionsFile, archive);
+        console.warn(`[Claude] archived corrupt sessions file to ${archive}`);
+      } catch (re) {
+        console.warn(`[Claude] failed to archive corrupt sessions file:`, re);
+      }
     }
-  } catch {
-    // ignore
+    return [];
   }
-  return [];
 }
 
 function saveStoredSession(session: StoredSession): void {
@@ -388,8 +403,8 @@ function saveStoredSession(session: StoredSession): void {
   const trimmed = sessions.slice(0, 50);
   try {
     fs.writeFileSync(sessionsFile, JSON.stringify(trimmed, null, 2));
-  } catch {
-    // ignore
+  } catch (e) {
+    console.error(`[Claude] saveStoredSession failed:`, e instanceof Error ? e.message : e);
   }
 }
 

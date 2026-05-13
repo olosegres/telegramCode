@@ -37,7 +37,16 @@ function loadSavedModel(key: ThreadKey): { providerID: string; modelID: string }
     const idx = saved.indexOf('/');
     if (idx <= 0) return null;
     return { providerID: saved.slice(0, idx), modelID: saved.slice(idx + 1) };
-  } catch {
+  } catch (e) {
+    // Audit S15: surface and archive a corrupt prefs file so the next
+    // save can start clean; previous silent return left users wondering
+    // why /model selections didn't stick across restarts.
+    console.error(`[OpenCode] loadSavedModel failed:`, e instanceof Error ? e.message : e);
+    if (fs.existsSync(modelStateFile)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      try { fs.renameSync(modelStateFile, `${modelStateFile}.corrupted-${ts}`); }
+      catch (re) { console.warn(`[OpenCode] archive of corrupt prefs failed:`, re); }
+    }
     return null;
   }
 }
@@ -51,7 +60,7 @@ function saveModelPref(key: ThreadKey, label: string): void {
     data[keyToString(key)] = label;
     fs.writeFileSync(modelStateFile, JSON.stringify(data, null, 2));
   } catch (e) {
-    console.log(`[OpenCode] Failed to save model pref:`, e instanceof Error ? e.message : e);
+    console.error(`[OpenCode] Failed to save model pref:`, e instanceof Error ? e.message : e);
   }
 }
 
@@ -668,8 +677,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     this.disconnectSse(key);
 
-    // Abort any running generation
-    this.apiRequest('POST', `/session/${session.sessionId}/abort`).catch(() => {});
+    // Abort any running generation. Audit S15: log failures instead
+    // of swallowing — a 4xx here usually means the server already
+    // dropped the session, which is worth surfacing.
+    this.apiRequest('POST', `/session/${session.sessionId}/abort`)
+      .catch(e => console.warn(`[OpenCode] abort on stopSession failed:`, e instanceof Error ? e.message : e));
 
     this.sessions.delete(k);
     this.emit('stopped', key);
@@ -1493,11 +1505,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const { requestId } = session.pendingQuestion;
     session.pendingQuestion = null;
 
+    // Audit S15 / #41: surface failures via `error` so the bot's
+    // handleAgentError shows them in the thread, not just in console.
     this.apiRequest('POST', `/question/${requestId}/reply`, {
       answers,
     }).catch((e) => {
       console.error(`[OpenCode] Failed to reply to question:`, e);
-      this.emit('output', key, `Failed to send answer: ${e instanceof Error ? e.message : e}`);
+      this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
     });
   }
 

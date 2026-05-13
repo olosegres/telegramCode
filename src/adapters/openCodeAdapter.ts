@@ -83,6 +83,13 @@ interface OpenCodeSession {
   pendingStatus: string | null;
   /** Pending question awaiting user's answer */
   pendingQuestion: OpenCodePendingQuestion | null;
+  /**
+   * Abort controller for the live SSE `fetch` + reader. Set by
+   * `pollSse`, cleared on natural exit. `disconnectSse` / `stopSession`
+   * call `.abort()` so the reader unblocks immediately instead of
+   * waiting for the server to deliver the next byte (audit S7 / #12).
+   */
+  sseController: AbortController | null;
 }
 
 interface OpenCodeApiSession {
@@ -182,6 +189,51 @@ const maxSseReconnectAttempts = 5;
 
 /** Base delay (ms) for exponential backoff on SSE reconnect */
 const sseReconnectBaseDelayMs = 2000;
+
+/**
+ * @description Default timeout for non-SSE HTTP requests to OpenCode.
+ * 30 s comfortably covers `prompt_async` (returns 204 immediately) and
+ * `getSessions` / `getModels` (file scans on the server side). The SSE
+ * stream uses its own long-lived connection without this timeout.
+ */
+const apiRequestTimeoutMs = 30_000;
+
+/**
+ * @description Wall-clock cap on SSE reconnect attempts for one session.
+ * Audit S7 / #12: a flapping OpenCode server reset `attempt = 0` after
+ * each successful connect, so the legacy 5-attempts ceiling never
+ * actually bounded retry time. Cap total reconnect lifetime to 10 min
+ * before giving up regardless of per-attempt counter.
+ */
+const sseReconnectTotalBudgetMs = 10 * 60 * 1000;
+
+/**
+ * @description Validate `OPENCODE_URL`. SSRF guard for audit S7 / #34:
+ * an operator-controlled env var was previously trusted verbatim, so a
+ * misconfigured `OPENCODE_URL=http://169.254.169.254/` (or similar
+ * metadata endpoint) would route every adapter call to that host. We
+ * restrict the scheme to http/https and the host to loopback unless
+ * `OPENCODE_ALLOW_REMOTE=1` opts in.
+ */
+function validateOpenCodeUrl(raw: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`OPENCODE_URL is not a valid URL: ${raw}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`OPENCODE_URL must use http(s); got ${parsed.protocol}`);
+  }
+  const host = parsed.hostname;
+  const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  if (!isLoopback && process.env.OPENCODE_ALLOW_REMOTE !== '1') {
+    throw new Error(
+      `OPENCODE_URL points at non-loopback host ${host}; set OPENCODE_ALLOW_REMOTE=1 to allow remote OpenCode servers`,
+    );
+  }
+  return parsed.origin + parsed.pathname.replace(/\/$/, '');
+}
 
 /** Cache for available models from OpenCode CLI */
 let cachedModels: string[] | null = null;
@@ -292,7 +344,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   constructor() {
     super();
-    this.baseUrl = (process.env.OPENCODE_URL || 'http://localhost:4096').replace(/\/$/, '');
+    // Audit S7 / #34: SSRF guard on OPENCODE_URL before any fetch runs.
+    this.baseUrl = validateOpenCodeUrl(process.env.OPENCODE_URL || 'http://localhost:4096');
 
     const password = process.env.OPENCODE_PASSWORD;
     if (password) {
@@ -402,22 +455,45 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return headers;
   }
 
-  private async apiRequest<T>(method: string, urlPath: string, body?: unknown): Promise<T> {
+  private async apiRequest<T>(
+    method: string,
+    urlPath: string,
+    body?: unknown,
+    options?: { signal?: AbortSignal },
+  ): Promise<T> {
     const url = `${this.baseUrl}${urlPath}`;
-    const options: RequestInit = {
+    // Audit S7 / #12: every fetch now carries a timeout. Caller may also
+    // pass an external `AbortSignal` (e.g. tied to session lifetime) —
+    // we don't compose those into one signal because `AbortSignal.any` is
+    // Node-22-only and we want to keep the dependency surface tight; the
+    // 30 s timeout is a safety net regardless.
+    const timeoutSignal = AbortSignal.timeout(apiRequestTimeoutMs);
+    const requestInit: RequestInit = {
       method,
       headers: this.getHeaders(),
+      signal: options?.signal ?? timeoutSignal,
     };
     if (body !== undefined) {
-      options.body = JSON.stringify(body);
+      requestInit.body = JSON.stringify(body);
     }
 
     let response: Response;
     try {
-      response = await fetch(url, options);
+      response = await fetch(url, requestInit);
     } catch (e) {
-      const cause = e instanceof TypeError && (e as NodeJS.ErrnoException).cause
-        ? (e.cause as NodeJS.ErrnoException)
+      // `e instanceof DOMException && e.name === 'TimeoutError'` is the
+      // AbortSignal.timeout path; treat it like a connection failure so
+      // the user gets a friendly hint, not a stack trace.
+      if (e instanceof DOMException && e.name === 'TimeoutError') {
+        throw new Error(`OpenCode request timed out after ${apiRequestTimeoutMs}ms (${method} ${urlPath})`);
+      }
+      // Node's fetch wraps low-level errors in a TypeError with `.cause`
+      // holding the underlying ErrnoException. Only `'cause' in e` is a
+      // reliable check (TypeScript narrows `cause` to `unknown` even on
+      // TypeError in Node's lib types).
+      const causeUnknown = (e as { cause?: unknown }).cause;
+      const cause = causeUnknown && typeof causeUnknown === 'object' && 'code' in causeUnknown
+        ? (causeUnknown as { code?: string })
         : null;
       if (cause?.code === 'ECONNREFUSED') {
         throw new Error(`OpenCode server not available at ${this.baseUrl}. Is "opencode serve" running?`);
@@ -439,6 +515,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (contentType.includes('application/json')) {
       return await response.json() as T;
     }
+    // Audit S7 / #35: undici keeps the socket open until the body is
+    // drained. Even when we discard it, we must read it.
+    await response.text().catch(() => '');
     return undefined as T;
   }
 
@@ -482,6 +561,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         statusDebounceTimer: null,
         pendingStatus: null,
         pendingQuestion: null,
+        sseController: null,
       };
 
       this.sessions.set(k, session);
@@ -678,6 +758,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         statusDebounceTimer: null,
         pendingStatus: null,
         pendingQuestion: null,
+        sseController: null,
       };
 
       this.sessions.set(k, session);
@@ -713,6 +794,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
     session.isActive = false;
+    // Audit S7 / #12: unblock the SSE reader immediately. Without this,
+    // the in-flight `reader.read()` would only return when the server
+    // happened to send the next byte — could be minutes for a silent
+    // session.
+    if (session.sseController) {
+      session.sseController.abort();
+      session.sseController = null;
+    }
   }
 
   /**
@@ -781,7 +870,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * On connection failure: checks if server is alive, attempts restart if dead,
    * retries with exponential backoff up to maxSseReconnectAttempts.
    */
-  private async pollSse(key: ThreadKey, sseUrl: string, reconnectAttempt = 0): Promise<void> {
+  private async pollSse(key: ThreadKey, sseUrl: string, reconnectAttempt = 0, reconnectStartTs = Date.now()): Promise<void> {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
@@ -792,18 +881,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       headers['Authorization'] = this.authHeader;
     }
 
+    // Audit S7 / #12: SSE was previously read with no abort path —
+    // `await reader.read()` blocks until bytes arrive, so a `stopSession`
+    // during a silent server couldn't actually free the connection. The
+    // session-scoped controller is stored so `disconnectSse` / `stopSession`
+    // can abort the in-flight `fetch` and `reader.read` immediately.
+    const controller = new AbortController();
+    session.sseController = controller;
+
+    let sawData = false;
+
     try {
-      const response = await fetch(sseUrl, { headers });
+      const response = await fetch(sseUrl, { headers, signal: controller.signal });
 
       if (!response.ok || !response.body) {
         console.error(`[OpenCode] SSE connection failed: ${response.status}`);
-        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, `HTTP ${response.status}`);
+        await response.body?.cancel().catch(() => {});
+        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, `HTTP ${response.status}`);
         return;
       }
 
       console.log(`[OpenCode] SSE connected successfully`);
-      // Reset reconnect counter on successful connection
-      reconnectAttempt = 0;
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -812,6 +910,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       while (session.isActive) {
         const { done, value } = await reader.read();
         if (done) break;
+
+        // Audit S7 / #12: a flapping server used to reset `reconnectAttempt`
+        // on a *successful TCP connect*, so the 5-attempts ceiling never
+        // bounded anything. Reset only once we observe actual application
+        // data, and keep a wall-clock budget so even data-producing flaps
+        // get capped.
+        if (!sawData) {
+          sawData = true;
+          reconnectAttempt = 0;
+          reconnectStartTs = Date.now();
+        }
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -830,30 +939,48 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // If session is still active but stream ended (server-side close), try to reconnect
       if (session.isActive) {
         console.log(`[OpenCode] SSE stream ended while session active, reconnecting...`);
-        await this.handleSseReconnect(key, sseUrl, 0, 'stream ended');
+        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, 'stream ended');
       }
     } catch (e) {
+      // Aborted fetches are not errors — they're how `stopSession` exits.
+      if (controller.signal.aborted) return;
       if (session.isActive) {
         const errorMessage = e instanceof Error ? e.message : String(e);
         console.error(`[OpenCode] SSE error:`, errorMessage);
-        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, errorMessage);
+        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, errorMessage);
       }
+    } finally {
+      if (session.sseController === controller) session.sseController = null;
     }
   }
 
   /**
    * @description Handle SSE reconnection with server health check, auto-restart, and exponential backoff.
    * If the server is dead, attempts to restart it before reconnecting SSE.
-   * Gives up after maxSseReconnectAttempts and notifies the thread.
+   * Gives up after `maxSseReconnectAttempts` consecutive failures OR
+   * `sseReconnectTotalBudgetMs` of wall-clock retry time — whichever hits
+   * first (audit S7 / #12).
    */
-  private async handleSseReconnect(key: ThreadKey, sseUrl: string, attempt: number, reason: string): Promise<void> {
+  private async handleSseReconnect(
+    key: ThreadKey,
+    sseUrl: string,
+    attempt: number,
+    reconnectStartTs: number,
+    reason: string,
+  ): Promise<void> {
     const k = keyToString(key);
     const session = this.sessions.get(k);
     if (!session?.isActive) return;
 
-    if (attempt >= maxSseReconnectAttempts) {
-      console.error(`[OpenCode] SSE reconnect failed after ${attempt} attempts, giving up`);
-      this.emit('output', key, `Lost connection to OpenCode server after ${attempt} attempts. Use /stop and start a new session.`);
+    const elapsed = Date.now() - reconnectStartTs;
+    const overAttemptCap = attempt >= maxSseReconnectAttempts;
+    const overTimeBudget = elapsed >= sseReconnectTotalBudgetMs;
+    if (overAttemptCap || overTimeBudget) {
+      const reasonHint = overTimeBudget
+        ? `after ${Math.round(elapsed / 1000)}s of retries`
+        : `after ${attempt} attempts`;
+      console.error(`[OpenCode] SSE reconnect giving up ${reasonHint}`);
+      this.emit('output', key, `Lost connection to OpenCode server ${reasonHint}. Use /stop and start a new session.`);
       session.isActive = false;
       this.sessions.delete(k);
       this.emit('stopped', key);
@@ -870,18 +997,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         // restartServer already notified threads and cleaned up sessions
         return;
       }
-      // Server restarted — reset attempt counter, give it a fresh chance
+      // Server restarted — keep the wall-clock budget but allow another
+      // round of per-attempt retries (in case the freshly-started server
+      // refuses the first connect on its boot path).
       attempt = 0;
     }
 
     // Exponential backoff: 2s, 4s, 8s, 16s, 32s
     const delay = sseReconnectBaseDelayMs * Math.pow(2, attempt);
-    console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}/${maxSseReconnectAttempts}, reason: ${reason})`);
+    console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}/${maxSseReconnectAttempts}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
 
     await new Promise(resolve => setTimeout(resolve, delay));
 
     if (session.isActive) {
-      this.pollSse(key, sseUrl, attempt + 1).catch(() => {});
+      this.pollSse(key, sseUrl, attempt + 1, reconnectStartTs).catch(() => {});
     }
   }
 

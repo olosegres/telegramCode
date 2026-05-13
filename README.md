@@ -126,7 +126,8 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/agent` | Pick agent inline |
 | `/model` | Switch model |
 | `/sessions` | List & resume previous sessions in this folder |
-| `/stop` | Kill current agent |
+| `/stop` | Kill current agent (tmux/server, brute) |
+| `/quit`, `/q` | Graceful exit — Claude: double Ctrl+C, OpenCode: `stopSession` |
 | `/status` | This thread's status |
 | `/output` | Last 500 lines of agent output |
 | `/c`, `/y`, `/n` | Ctrl+C / "y" / "n" |

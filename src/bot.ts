@@ -2229,6 +2229,56 @@ command(['stop-all', 'stopall'], async (_ctx, key) => {
   await replyToThread(key, t('stop_all.summary', { stopped: String(stopped), total: String(active) }));
 });
 
+/**
+ * Delay between the two `SIGINT`s that `/quit` sends to Claude CLI.
+ *
+ * Claude CLI debounces back-to-back Ctrl+C: the second press has to
+ * land AFTER the first one has been rendered ("press Ctrl+C again to
+ * exit") but BEFORE the prompt clears. 250ms is comfortably inside
+ * that window on every machine we've tried — tighter values
+ * occasionally collapse both presses into a single keystroke.
+ */
+const CLAUDE_DOUBLE_SIGINT_GAP_MS = 250;
+
+// `/quit` (alias `/q`) — graceful exit of the agent, regardless of
+// adapter shape. Lives alongside `/stop` and `/stop-all` because it's
+// a session-end command, not a tmux-style intra-session control.
+// Two distinct paths because the agents themselves have very
+// different "exit" semantics:
+//
+// • Claude CLI runs in a tmux session. Its canonical exit is two
+//   Ctrl+C in quick succession (the first cancels the current turn,
+//   the second leaves the CLI). We replay that by sending `SIGINT`
+//   through the adapter twice with a small gap — softer than the
+//   `tmux kill-session` that `/stop` performs.
+//
+// • OpenCode is a long-running HTTP server, not a TUI. There is no
+//   "double Ctrl+C" — the only way to actually leave is to abort
+//   the running generation, disconnect the SSE stream and drop the
+//   session, which is exactly what `stopSession` does. We call it
+//   directly so `/quit` behaves like a real exit instead of two
+//   no-op aborts.
+command(['quit', 'q'], async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (!adapter.checkIsActive(key)) {
+    await replyToThread(key, 'No agent running');
+    return;
+  }
+  markNeedsNewMessage(key);
+
+  const adapterName = getThreadAdapterName(key);
+  if (adapterName === 'opencode') {
+    adapter.stopSession(key);
+    await replyToThread(key, t('agent.stopped', { label: adapter.label }));
+    return;
+  }
+
+  adapter.sendSignal(key, 'SIGINT');
+  await new Promise((r) => setTimeout(r, CLAUDE_DOUBLE_SIGINT_GAP_MS));
+  adapter.sendSignal(key, 'SIGINT');
+  await replyToThread(key, t('agent.exit_signal_sent', { label: adapter.label }));
+});
+
 // ── tmux-style controls (Claude CLI) ──
 
 command('c', async (_ctx, key) => {

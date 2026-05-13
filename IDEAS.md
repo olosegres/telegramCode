@@ -349,7 +349,27 @@ next planning session:
 
 ---
 
-## 8. Next action
+## 8. Roadmap / backlog
+
+Small, scoped features captured during regular work. Move into
+`agent/tasks/actual/...` when picked up. Items here are *not yet
+done* — once shipped, the code is the record (drop the bullet or
+move it to `CHANGELOG.md`).
+
+- **Telegraf `setMyCommands` for the bot.** So `/quit`, `/stop`,
+  `/c`, `/y`, `/n`, `/enter`, `/clear`, `/status`, `/bind`, … are
+  autocompleted in the Telegram input. Today the user has to
+  remember them. One call at boot, after `bot.launch`.
+- **Process-level double-`Ctrl+C` in the daemon itself.** First
+  press warns "press Ctrl+C again within 2s to exit", second
+  triggers `shutdown('SIGINT')` (`src/bot.ts:3234`). Today a single
+  `Ctrl+C` exits the daemon — fine in docker, error-prone when
+  running locally and the user just meant to interrupt a foreground
+  log tail.
+
+---
+
+## 9. Next action
 
 Don't start coding. Resolve **Q1–Q5 + the "new vs evolve" repo
 question** with the user, then create

@@ -90,6 +90,12 @@ interface OpenCodeSession {
    * waiting for the server to deliver the next byte (audit S7 / #12).
    */
   sseController: AbortController | null;
+  /**
+   * Handle for the SSE reconnect `setTimeout`. Cleared by `stopSession`
+   * / `disconnectSse` so the callback doesn't re-enter `pollSse` for a
+   * tornDown session (audit S8 / #14).
+   */
+  reconnectTimer: NodeJS.Timeout | null;
 }
 
 interface OpenCodeApiSession {
@@ -339,6 +345,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   private baseUrl: string;
   private authHeader: string | null;
 
+  /**
+   * @description Per-key start/stop serialisation queue (audit S8 / #13).
+   * Two near-simultaneous `startSession(key, …)` calls otherwise both
+   * progress through `POST /session`; the second's `stopSession(key)`
+   * (line 529) clears whatever the first inserted into `this.sessions`,
+   * but the losing thread still has its SSE stream and a server-side
+   * session id with no owner.
+   */
+  private lifecycleChains: Map<string, Promise<unknown>> = new Map();
+
   /** Whether a server restart is already in progress (prevents concurrent restart attempts) */
   private isServerRestarting = false;
 
@@ -417,11 +433,25 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       await ensureOpenCodeServer();
       console.log(`[OpenCode] Server restarted successfully`);
 
-      // Notify all active session threads about recovery
-      for (const session of this.sessions.values()) {
-        if (session.isActive) {
-          this.emit('output', session.key, `OpenCode server restarted. Session may need to be restarted (/stop then /opencode).`);
-        }
+      // Audit S8 / #14: after a restart the new server doesn't know any
+      // previous session ids, so every in-memory session is effectively
+      // orphaned — SSE reconnects would succeed at the TCP layer but
+      // never see traffic for these ids. Tear them down explicitly so
+      // the bot's state store can clean up too (via `emit('closed')`,
+      // wired through createAdapter.ts). Take a snapshot first.
+      const snapshot = Array.from(this.sessions.entries());
+      for (const [k, session] of snapshot) {
+        if (!session.isActive) continue;
+        this.emit('output', session.key, `OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /stop to release).`);
+        this.stopSessionInner(session.key);
+        // `stopSessionInner` already emits `stopped`. Also emit `closed`
+        // so downstream (bot.ts) wipes the persisted session id, not
+        // just the in-memory state — otherwise the next bot restart
+        // would try to resume an id the server doesn't recognise.
+        this.emit('closed', session.key);
+        // Defensive: stopSessionInner deletes from `this.sessions`, but
+        // emit order matters for downstream cleanup races.
+        this.sessions.delete(k);
       }
       return true;
     } catch (e) {
@@ -521,68 +551,97 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return undefined as T;
   }
 
+  /**
+   * @description Serialise start/stop ops per key. Returns the queued
+   * promise so callers still see the original result/throw. Audit S8.
+   */
+  private withLifecycleLock<T>(k: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.lifecycleChains.get(k);
+    const run = async (): Promise<T> => {
+      if (prev) { try { await prev; } catch { /* swallow predecessor failures */ } }
+      return fn();
+    };
+    const current = run();
+    const tracked: Promise<unknown> = current.then(() => undefined, () => undefined);
+    this.lifecycleChains.set(k, tracked);
+    return current.finally(() => {
+      if (this.lifecycleChains.get(k) === tracked) this.lifecycleChains.delete(k);
+    });
+  }
+
   async startSession(key: ThreadKey, workDir: string, args?: string, _sessionId?: string): Promise<void> {
     // OpenCode's session id is server-assigned via POST /session, so an
     // externally-supplied sessionId is not honoured here. The bot keeps the
     // mapping `ThreadKey → opencodeSessionId` in state.json (plan §13.19) so
     // resumes after a restart go through `resumeSession()`, not startSession.
-    this.stopSession(key);
-
     const k = keyToString(key);
+    return this.withLifecycleLock(k, async () => {
+      this.stopSessionInner(key);
 
-    if (!checkIsInstalled('opencode')) {
-      this.emit('output', key, 'Installing OpenCode...');
-      await installTool('opencode');
-    }
-
-    if (!await checkIsOpenCodeServerRunning()) {
-      this.emit('output', key, 'Starting OpenCode server...');
-      await ensureOpenCodeServer();
-    }
-
-    console.log(`[OpenCode] Starting session for ${k} in ${workDir}`);
-
-    try {
-      const apiSession = await this.apiRequest<OpenCodeApiSession>('POST', '/session', {
-        title: args || `Telegram session ${k}`,
-      });
-
-      const session: OpenCodeSession = {
-        key,
-        sessionId: apiSession.id,
-        workDir,
-        isActive: true,
-        currentResponseText: '',
-        outputTimer: null,
-        isModelInfoShown: false,
-        modelOverride: null,
-        currentModelLabel: null,
-        partTypes: new Map(),
-        statusDebounceTimer: null,
-        pendingStatus: null,
-        pendingQuestion: null,
-        sseController: null,
-      };
-
-      this.sessions.set(k, session);
-      this.connectSse(key);
-
-      // Fetch default model info from OpenCode server and show to user
-      await this.fetchModelInfo(key);
-
-      // If args provided, send as first message
-      if (args) {
-        this.sendPromptAsync(key, args);
+      if (!checkIsInstalled('opencode')) {
+        this.emit('output', key, 'Installing OpenCode...');
+        await installTool('opencode');
       }
 
-      this.emit('started', key);
-    } catch (e) {
-      console.error(`[OpenCode] Failed to start session:`, e);
-      throw e;
-    }
+      if (!await checkIsOpenCodeServerRunning()) {
+        this.emit('output', key, 'Starting OpenCode server...');
+        await ensureOpenCodeServer();
+      }
+
+      console.log(`[OpenCode] Starting session for ${k} in ${workDir}`);
+
+      try {
+        const apiSession = await this.apiRequest<OpenCodeApiSession>('POST', '/session', {
+          title: args || `Telegram session ${k}`,
+        });
+
+        const session: OpenCodeSession = {
+          key,
+          sessionId: apiSession.id,
+          workDir,
+          isActive: true,
+          currentResponseText: '',
+          outputTimer: null,
+          isModelInfoShown: false,
+          modelOverride: null,
+          currentModelLabel: null,
+          partTypes: new Map(),
+          statusDebounceTimer: null,
+          pendingStatus: null,
+          pendingQuestion: null,
+          sseController: null,
+          reconnectTimer: null,
+        };
+
+        this.sessions.set(k, session);
+        this.connectSse(key);
+
+        // Fetch default model info from OpenCode server and show to user
+        await this.fetchModelInfo(key);
+
+        // If args provided, send as first message
+        if (args) {
+          this.sendPromptAsync(key, args);
+        }
+
+        this.emit('started', key);
+      } catch (e) {
+        console.error(`[OpenCode] Failed to start session:`, e);
+        throw e;
+      }
+    });
   }
 
   stopSession(key: ThreadKey): void {
+    // Public API contract: stop is fire-and-forget. We still queue it on
+    // the lifecycle chain so an in-flight start finishes first.
+    const k = keyToString(key);
+    void this.withLifecycleLock(k, async () => { this.stopSessionInner(key); });
+  }
+
+  /** Lock-free body of `stopSession`; safe to call from start/resume paths
+   * that already hold the lifecycle lock. */
+  private stopSessionInner(key: ThreadKey): void {
     const k = keyToString(key);
     const session = this.sessions.get(k);
     if (!session) return;
@@ -593,6 +652,18 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     if (session.outputTimer) {
       clearTimeout(session.outputTimer);
+      session.outputTimer = null;
+    }
+    // Audit S8 / #11: previously the status timer kept firing after
+    // `stopSession`, emitting transient `status` events to a thread that
+    // had just announced `stopped`.
+    if (session.statusDebounceTimer) {
+      clearTimeout(session.statusDebounceTimer);
+      session.statusDebounceTimer = null;
+    }
+    if (session.reconnectTimer) {
+      clearTimeout(session.reconnectTimer);
+      session.reconnectTimer = null;
     }
 
     this.disconnectSse(key);
@@ -724,7 +795,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // `process.env.WORK_DIR || '/workspace'`, which silently mis-routed
     // resumes to the wrong folder as soon as the bot started managing
     // multiple bindings (plan §10.3, fix to old openCodeAdapter.ts:599).
-    this.stopSession(key);
+    const k = keyToString(key);
+    return this.withLifecycleLock(k, () => this.resumeSessionInner(key, workDir, sessionId));
+  }
+
+  private async resumeSessionInner(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
+    this.stopSessionInner(key);
 
     const k = keyToString(key);
 
@@ -759,6 +835,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         pendingStatus: null,
         pendingQuestion: null,
         sseController: null,
+        reconnectTimer: null,
       };
 
       this.sessions.set(k, session);
@@ -801,6 +878,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (session.sseController) {
       session.sseController.abort();
       session.sseController = null;
+    }
+    // Audit S8 / #14: also kill any pending reconnect timer.
+    if (session.reconnectTimer) {
+      clearTimeout(session.reconnectTimer);
+      session.reconnectTimer = null;
     }
   }
 
@@ -1007,7 +1089,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const delay = sseReconnectBaseDelayMs * Math.pow(2, attempt);
     console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}/${maxSseReconnectAttempts}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
 
-    await new Promise(resolve => setTimeout(resolve, delay));
+    // Store the timer handle on the session so `stopSession` / `disconnectSse`
+    // can cancel it; otherwise a `setTimeout` fired after the session is
+    // gone re-enters `pollSse` for a dead session and keeps the event
+    // loop alive (audit S8 / #14).
+    await new Promise<void>(resolve => {
+      session.reconnectTimer = setTimeout(() => {
+        session.reconnectTimer = null;
+        resolve();
+      }, delay);
+    });
 
     if (session.isActive) {
       this.pollSse(key, sseUrl, attempt + 1, reconnectStartTs).catch(() => {});

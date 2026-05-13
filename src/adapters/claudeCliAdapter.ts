@@ -29,6 +29,26 @@ interface ClaudeSession {
   handledAutoAccept: boolean;
   /** Normalized text of last emitted status (for deduplication of spinner updates) */
   lastStatusText: string;
+  /**
+   * Handles for the auto-Enter / auto-Accept `setTimeout`s. Audit S9 / #10:
+   * the callbacks used to fire 300–400 ms after detection regardless of
+   * whether the session was still alive; on rapid stop/start the keystroke
+   * would land in a different invocation (e.g. auto-accepting a permission
+   * prompt belonging to a replacement session). Cleared on `stopSession`;
+   * callbacks also re-check `session.isActive` before issuing tmux keys.
+   */
+  autoEnterTimer: NodeJS.Timeout | null;
+  autoAcceptOuterTimer: NodeJS.Timeout | null;
+  autoAcceptInnerTimer: NodeJS.Timeout | null;
+  /**
+   * Re-entrancy guard for `pollOutput`. Audit S9 / #37: a `tmux capture-pane`
+   * under load can take longer than the 300 ms poll interval, and the next
+   * `setInterval` tick would fire before the previous one finished, leading
+   * to duplicate `output` emissions. With self-rescheduling `setTimeout`
+   * and this flag we serialise polls; ticks that overlap with an in-flight
+   * one are skipped silently.
+   */
+  isPolling: boolean;
 }
 
 const pollInterval = 300;
@@ -398,6 +418,31 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    */
   private sessions: Map<string, ClaudeSession> = new Map();
 
+  /**
+   * @description Schedule the next `pollOutput` for a session. Audit S9 /
+   * #37: replaces `setInterval` so a slow `tmux capture-pane` cannot
+   * cause overlapping invocations. The handle is stored back on
+   * `session.pollTimer` so `stopSession` can cancel the next tick.
+   */
+  private schedulePoll(key: ThreadKey, session: ClaudeSession): void {
+    if (!session.isActive) return;
+    session.pollTimer = setTimeout(() => {
+      if (!session.isActive) return;
+      if (session.isPolling) {
+        // Previous poll still in-flight; skip this tick and reschedule.
+        this.schedulePoll(key, session);
+        return;
+      }
+      session.isPolling = true;
+      try {
+        this.pollOutput(key);
+      } finally {
+        session.isPolling = false;
+        this.schedulePoll(key, session);
+      }
+    }, pollInterval);
+  }
+
   async startSession(
     key: ThreadKey,
     workDir: string,
@@ -477,6 +522,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[Claude] tmux session created`);
     } catch (e) {
       console.error(`[Claude] Failed to create tmux session:`, e);
+      // Audit S9 / #14: even when the spawn fails, tmux can leave a
+      // half-built session and we wrote MCP tmp files we don't want to
+      // leak. Best-effort cleanup before bubbling up the error.
+      tmux('kill-session', '-t', sessionName);
+      cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
       this.emit('error', key, new Error('Failed to start Claude session'));
       return;
     }
@@ -500,10 +550,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoEnter: false,
       handledAutoAccept: false,
       lastStatusText: '',
+      autoEnterTimer: null,
+      autoAcceptOuterTimer: null,
+      autoAcceptInnerTimer: null,
+      isPolling: false,
     };
 
     this.sessions.set(keyToString(key), session);
-    session.pollTimer = setInterval(() => this.pollOutput(key), pollInterval);
+    this.schedulePoll(key, session);
     this.emit('started', key);
   }
 
@@ -515,8 +569,25 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     console.log(`[Claude] Stopping session for ${k}`);
 
     session.isActive = false;
+    // pollTimer is now a `setTimeout` handle (not interval), but
+    // clearTimeout safely handles either type.
     if (session.pollTimer) {
-      clearInterval(session.pollTimer);
+      clearTimeout(session.pollTimer);
+      session.pollTimer = null;
+    }
+    // Audit S9 / #10: cancel pending auto-Enter / auto-Accept callbacks
+    // so they don't land in a replacement session.
+    if (session.autoEnterTimer) {
+      clearTimeout(session.autoEnterTimer);
+      session.autoEnterTimer = null;
+    }
+    if (session.autoAcceptOuterTimer) {
+      clearTimeout(session.autoAcceptOuterTimer);
+      session.autoAcceptOuterTimer = null;
+    }
+    if (session.autoAcceptInnerTimer) {
+      clearTimeout(session.autoAcceptInnerTimer);
+      session.autoAcceptInnerTimer = null;
     }
 
     tmux('kill-session', '-t', session.sessionName);
@@ -695,6 +766,8 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       );
     } catch (e) {
       console.error(`[Claude] Failed to resume session:`, e);
+      tmux('kill-session', '-t', sessionName);
+      cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
       this.emit('error', key, new Error('Failed to resume Claude session'));
       return;
     }
@@ -710,10 +783,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoEnter: false,
       handledAutoAccept: false,
       lastStatusText: '',
+      autoEnterTimer: null,
+      autoAcceptOuterTimer: null,
+      autoAcceptInnerTimer: null,
+      isPolling: false,
     };
 
     this.sessions.set(keyToString(key), claudeSession);
-    claudeSession.pollTimer = setInterval(() => this.pollOutput(key), pollInterval);
+    this.schedulePoll(key, claudeSession);
     this.emit('started', key);
   }
 
@@ -770,6 +847,22 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       return false;
     }
 
+    // Audit S9 / #15: confirm the tmux session has a live child process,
+    // not just an empty pane. With `remain-on-exit` semantics or a crashed
+    // claude, a session can exist but produce no output forever; adopting
+    // it would silently swallow further user input.
+    const panesRaw = tmux('list-panes', '-t', sessionName, '-F', '#{pane_pid}');
+    const pids = panesRaw.split('\n').map(s => s.trim()).filter(s => /^\d+$/.test(s));
+    const anyAlive = pids.some(pidStr => {
+      try { process.kill(Number(pidStr), 0); return true; }
+      catch { return false; }
+    });
+    if (!anyAlive) {
+      console.log(`[Claude] adopt: ${sessionName} has no live child process, killing as zombie`);
+      tmux('kill-session', '-t', sessionName);
+      return false;
+    }
+
     const k = keyToString(key);
     // If we already have a tracked session for this key, leave it alone.
     if (this.sessions.has(k)) {
@@ -789,9 +882,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoEnter: true,  // don't try to auto-Enter on a session that's already past startup
       handledAutoAccept: true, // same — bypass-permissions was accepted on the original launch
       lastStatusText: '',
+      autoEnterTimer: null,
+      autoAcceptOuterTimer: null,
+      autoAcceptInnerTimer: null,
+      isPolling: false,
     };
     this.sessions.set(k, session);
-    session.pollTimer = setInterval(() => this.pollOutput(key), pollInterval);
+    this.schedulePoll(key, session);
     this.emit('started', key);
     return true;
   }
@@ -818,7 +915,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
-    const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-e', '-S', '-200');
+    // Audit S9 / #38: a burst of more than 200 lines between two polls
+    // would slide off the top of the capture window before the next poll
+    // saw it, breaking the diff and causing duplicate "new" emissions.
+    // 2000 lines comfortably covers a long Claude tool-call block; we
+    // still diff against `session.lastContent` in memory so the larger
+    // capture doesn't grow the output we send to Telegram.
+    const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-e', '-S', '-2000');
 
     if (!raw) {
       if (!this.checkIsActive(key)) {
@@ -866,7 +969,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       if (!session.handledAutoEnter && this.checkNeedsAutoEnter(content)) {
         session.handledAutoEnter = true;
         console.log(`[Claude] Auto-pressing Enter`);
-        setTimeout(() => {
+        session.autoEnterTimer = setTimeout(() => {
+          session.autoEnterTimer = null;
+          if (!session.isActive) return;
           tmux('send-keys', '-t', session.sessionName, 'Enter');
         }, 300);
       }
@@ -874,9 +979,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       if (!session.handledAutoAccept && this.checkNeedsAutoAccept(content)) {
         session.handledAutoAccept = true;
         console.log(`[Claude] Auto-accepting bypass permissions`);
-        setTimeout(() => {
+        session.autoAcceptOuterTimer = setTimeout(() => {
+          session.autoAcceptOuterTimer = null;
+          if (!session.isActive) return;
           tmux('send-keys', '-t', session.sessionName, 'Down');
-          setTimeout(() => {
+          session.autoAcceptInnerTimer = setTimeout(() => {
+            session.autoAcceptInnerTimer = null;
+            if (!session.isActive) return;
             tmux('send-keys', '-t', session.sessionName, 'Enter');
           }, 100);
         }, 300);

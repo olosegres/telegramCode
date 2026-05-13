@@ -32,7 +32,7 @@ import {
   stopOpenCodeServer,
   ensureOpenCodeServer,
 } from './installManager';
-import { getStateStore, type StateStore } from './state';
+import { getStateStore, KeyLock, type StateStore } from './state';
 import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { resolveThreadKey, GENERAL_THREAD_ID } from './threadRouting';
@@ -413,6 +413,18 @@ const unbindingKeys = new Set<string>();
 const pinnedStatusTextCache = new Map<string, string>();
 
 /**
+ * @description Per-thread lock for the pinned-banner send/edit pipeline.
+ * Audit S6 / #8: `updatePinnedStatus` reads `binding.pinnedStatusMessageId`,
+ * awaits several `enqueueSend` round-trips, then writes the id back.
+ * Two concurrent adapter events (`started` + `status`) could both observe
+ * a missing id, both send + pin, and overwrite each other → duplicate
+ * stacked pins. We deliberately don't reuse `state.withLock` here: the
+ * banner pipeline does multi-second network work, and holding the state
+ * lock that long would stall every other persistence op on the key.
+ */
+const pinnedStatusLock = new KeyLock();
+
+/**
  * @description Whether this thread's binding is eligible for a pinned
  * banner. General has no per-thread state to mirror; closed topics get
  * the banner left as-is (Telegram refuses edits in closed topics).
@@ -469,75 +481,86 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
   if (unbindingKeys.has(k)) return;
   if (!shouldHavePinnedStatus(key)) return;
 
-  const text = computePinnedStatusText(key);
-  if (text === null) return;
+  // Audit S6 / #8: serialise all banner work for a key — without this,
+  // two near-simultaneous adapter events could both observe a missing
+  // `pinnedStatusMessageId` and stack duplicate pins. Errors from one
+  // invocation must not poison followers, so `KeyLock` swallows them
+  // internally (the body's own try/catch already handles user-facing
+  // outcomes).
+  await pinnedStatusLock.withLock(k, async () => {
+    if (unbindingKeys.has(k)) return;
+    if (!shouldHavePinnedStatus(key)) return;
 
-  // Skip if nothing changed since the last send/edit.
-  if (pinnedStatusTextCache.get(k) === text) return;
+    const text = computePinnedStatusText(key);
+    if (text === null) return;
 
-  const binding = state.getBinding(key);
-  if (!binding) return;
-  const existingId = binding.pinnedStatusMessageId;
+    // Skip if nothing changed since the last send/edit.
+    if (pinnedStatusTextCache.get(k) === text) return;
 
-  if (existingId !== undefined) {
-    try {
-      await enqueueSend(key.chatId, () =>
-        bot.telegram.editMessageText(key.chatId, existingId, undefined, text),
-      );
-      pinnedStatusTextCache.set(k, text);
-      return;
-    } catch (e) {
-      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
-      if (/message is not modified/i.test(desc)) {
+    const binding = state.getBinding(key);
+    if (!binding) return;
+    const existingId = binding.pinnedStatusMessageId;
+
+    if (existingId !== undefined) {
+      try {
+        await enqueueSend(key.chatId, () =>
+          bot.telegram.editMessageText(key.chatId, existingId, undefined, text),
+        );
         pinnedStatusTextCache.set(k, text);
         return;
+      } catch (e) {
+        const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+        if (/message is not modified/i.test(desc)) {
+          pinnedStatusTextCache.set(k, text);
+          return;
+        }
+        if (!/message to edit not found|MESSAGE_ID_INVALID|message can't be edited/i.test(desc)) {
+          // Other errors — log and bail without churning state. The next
+          // call will retry; we don't want to spam new banners on every
+          // transient API hiccup.
+          console.warn(`[pinned] edit ${k} failed: ${desc || (e instanceof Error ? e.message : e)}`);
+          return;
+        }
+        // Pinned message was deleted out from under us — fall through to
+        // send a fresh one.
+        await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
       }
-      if (!/message to edit not found|MESSAGE_ID_INVALID|message can't be edited/i.test(desc)) {
-        // Other errors — log and bail without churning state. The next
-        // call will retry; we don't want to spam new banners on every
-        // transient API hiccup.
-        console.warn(`[pinned] edit ${k} failed: ${desc || (e instanceof Error ? e.message : e)}`);
-        return;
-      }
-      // Pinned message was deleted out from under us — fall through to
-      // send a fresh one.
-      await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
     }
-  }
 
-  let messageId: number;
-  try {
-    const sent = await enqueueSend(key.chatId, () =>
-      bot.telegram.sendMessage(key.chatId, text, {
-        message_thread_id: key.threadId,
-        disable_notification: true,
-      }),
+    let messageId: number;
+    try {
+      const sent = await enqueueSend(key.chatId, () =>
+        bot.telegram.sendMessage(key.chatId, text, {
+          message_thread_id: key.threadId,
+          disable_notification: true,
+        }),
+      );
+      messageId = (sent as { message_id: number }).message_id;
+    } catch (e) {
+      await handleSendError(key, e);
+      return;
+    }
+
+    try {
+      await enqueueSend(key.chatId, () =>
+        bot.telegram.pinChatMessage(key.chatId, messageId, {
+          disable_notification: true,
+        }),
+      );
+    } catch (e) {
+      // Most common reason: bot is not admin or lacks `can_pin_messages`.
+      // We still keep the message id so subsequent edits keep refreshing it
+      // (so the user at least sees a fresh status line in the topic body
+      // even without a pin).
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
+      console.warn(`[pinned] pin ${k} failed: ${desc}`);
+    }
+
+    await state.setBindingPinnedStatusMessageId(key, messageId).catch(err =>
+      console.warn(`[pinned] persist id for ${k} failed:`, err),
     );
-    messageId = (sent as { message_id: number }).message_id;
-  } catch (e) {
-    await handleSendError(key, e);
-    return;
-  }
-
-  try {
-    await enqueueSend(key.chatId, () =>
-      bot.telegram.pinChatMessage(key.chatId, messageId, {
-        disable_notification: true,
-      }),
-    );
-  } catch (e) {
-    // Most common reason: bot is not admin or lacks `can_pin_messages`.
-    // We still keep the message id so subsequent edits keep refreshing it
-    // (so the user at least sees a fresh status line in the topic body
-    // even without a pin).
-    const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
-    console.warn(`[pinned] pin ${k} failed: ${desc}`);
-  }
-
-  await state.setBindingPinnedStatusMessageId(key, messageId).catch(err =>
-    console.warn(`[pinned] persist id for ${k} failed:`, err),
-  );
-  pinnedStatusTextCache.set(k, text);
+    pinnedStatusTextCache.set(k, text);
+  });
 }
 
 /**
@@ -550,28 +573,32 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
  */
 async function clearPinnedStatus(key: ThreadKey): Promise<void> {
   const k = keyToString(key);
-  pinnedStatusTextCache.delete(k);
+  // Same lock as `updatePinnedStatus` so an `/unbind` mid-flight doesn't
+  // race a concurrent banner refresh and leak a freshly-pinned message.
+  await pinnedStatusLock.withLock(k, async () => {
+    pinnedStatusTextCache.delete(k);
 
-  const binding = state.getBinding(key);
-  const existingId = binding?.pinnedStatusMessageId;
-  if (existingId === undefined) return;
+    const binding = state.getBinding(key);
+    const existingId = binding?.pinnedStatusMessageId;
+    if (existingId === undefined) return;
 
-  try {
-    await enqueueSend(key.chatId, () =>
-      bot.telegram.unpinChatMessage(key.chatId, existingId),
-    );
-  } catch (e) {
-    const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
-    console.warn(`[pinned] unpin ${k} failed: ${desc}`);
-  }
-  try {
-    await enqueueSend(key.chatId, () =>
-      bot.telegram.deleteMessage(key.chatId, existingId),
-    );
-  } catch {
-    // Older than 48h or already deleted — silently ignored.
-  }
-  await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
+    try {
+      await enqueueSend(key.chatId, () =>
+        bot.telegram.unpinChatMessage(key.chatId, existingId),
+      );
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
+      console.warn(`[pinned] unpin ${k} failed: ${desc}`);
+    }
+    try {
+      await enqueueSend(key.chatId, () =>
+        bot.telegram.deleteMessage(key.chatId, existingId),
+      );
+    } catch {
+      // Older than 48h or already deleted — silently ignored.
+    }
+    await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
+  });
 }
 
 /**

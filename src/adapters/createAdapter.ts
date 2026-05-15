@@ -142,3 +142,78 @@ export function setThreadAdapter(key: ThreadKey, adapterName: string): void {
   }
   threadAdapterNames.set(keyToString(key), adapterName);
 }
+
+/**
+ * @description Names of every adapter the bot knows how to drive. Single
+ * source of truth used by sweep helpers below — these need to enumerate
+ * adapters without instantiating them just to read a label, so the list
+ * is derived directly from `adapterFactories`.
+ */
+export function getKnownAdapterNames(): string[] {
+  return Object.keys(adapterFactories);
+}
+
+/**
+ * @description Minimal interface a sweep helper needs from an adapter.
+ * Extracted so unit tests can pass fakes without instantiating real
+ * Claude/OpenCode adapters (those hit `which claude`, spawn opencode
+ * servers, etc.).
+ */
+export interface AdapterSweepTarget {
+  readonly name: string;
+  readonly label: string;
+  checkIsActive(key: ThreadKey): boolean;
+  stopSession(key: ThreadKey): void;
+}
+
+/**
+ * @description Result of {@link stopAllAdaptersFor}. `stopped` are the
+ * labels whose `stopSession` returned without throwing; `attempted` is
+ * the count of adapters that were `checkIsActive === true` before the
+ * sweep. `attempted > stopped.length` means at least one stop call
+ * threw, which the bot uses to distinguish "fully stopped" from
+ * "stopped some, others failed" in the user-facing reply.
+ */
+export interface StopAllAdaptersResult {
+  stopped: string[];
+  attempted: number;
+}
+
+/**
+ * @description Stop **every** adapter that has a live session for `key`,
+ * regardless of which adapter the in-memory thread map currently points at.
+ *
+ * Why this is its own helper: adapter switching used to leak the previous
+ * adapter's session — e.g. `/claude` then `/opencode` left the claude
+ * tmux session alive while the thread map said opencode. `/stop` and
+ * `/quit` would then silently no-op the surviving session because they
+ * only stopped the adapter the map pointed at. Routing every stop call
+ * through this sweep makes the user's intent ("stop the thing in this
+ * topic") immune to that drift.
+ *
+ * `resolveAdapter` is taken as a parameter so tests can pass fakes; the
+ * production caller passes `getAdapter` from this module. Adapter names
+ * that fail to resolve (renamed/removed) are skipped silently — they
+ * can't have an active session if they don't exist.
+ */
+export function stopAllAdaptersFor(
+  key: ThreadKey,
+  resolveAdapter: (name: string) => AdapterSweepTarget,
+  adapterNames: string[] = getKnownAdapterNames(),
+): StopAllAdaptersResult {
+  const stopped: string[] = [];
+  let attempted = 0;
+  for (const name of adapterNames) {
+    let adapter: AdapterSweepTarget;
+    try { adapter = resolveAdapter(name); } catch { continue; }
+    if (!adapter.checkIsActive(key)) continue;
+    attempted += 1;
+    try {
+      adapter.stopSession(key);
+      stopped.push(adapter.label);
+    } catch (e) {
+      console.error(`[stopAllAdaptersFor] ${name} stopSession failed for ${keyToString(key)}:`, e);
+    }
+  }
+  return { stopped, attempted };
+}

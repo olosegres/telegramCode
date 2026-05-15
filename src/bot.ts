@@ -20,6 +20,8 @@ import {
   getAvailableAdapters,
   getDefaultAdapterName,
   registerAdapterEventHandlers,
+  stopAllAdaptersFor as sweepAdapters,
+  getKnownAdapterNames,
 } from './adapters/createAdapter';
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
@@ -1235,6 +1237,16 @@ function buildBindKeyboard(
 }
 
 /**
+ * @description Bot-level wrapper around the pure sweep helper in
+ * `createAdapter.ts`. Binds the production adapter resolver so callers
+ * don't have to thread it through; tests in `stopAllAdapters.test.ts`
+ * cover the sweep logic directly with fakes.
+ */
+function stopAllAdaptersFor(key: ThreadKey, adapterNames?: string[]) {
+  return sweepAdapters(key, getAdapter, adapterNames);
+}
+
+/**
  * @description Switch a thread's adapter and clear the previous adapter's
  * persisted session id, so a later restart can't re-attach to the wrong
  * one. Audit S12 / #21: `setAgent({ name })` patched `agents[key].name`
@@ -1242,8 +1254,34 @@ function buildBindKeyboard(
  * restart the reattach loop saw both fields, treated the binding as a
  * claude session (because `claudeSessionId` was non-null), and re-spawned
  * a tmux pane while the UI insisted the thread used OpenCode.
+ *
+ * Also stops any live session belonging to the *previous* adapter so two
+ * adapters can't end up polling/streaming the same thread at once — that
+ * desync caused mixed output, silent `/stop`, and the "I keep getting
+ * 'Login successful' on every message" bug reported 2026-05-15.
  */
 async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<void> {
+  const prevName = getThreadAdapterName(key);
+  if (prevName !== newName) {
+    try {
+      const prev = getAdapter(prevName);
+      if (prev.checkIsActive(key)) {
+        // `stopSession` is `void` in the AgentAdapter contract — OpenCode
+        // queues teardown behind its lifecycle lock and returns
+        // immediately. A handful of stragger `output`/`status` events
+        // can still fire between this call and the actual teardown.
+        // They route through the *new* adapter's `outputsDeltas` after
+        // the map switch below, which is bounded and never lands them
+        // in the wrong topic. A fully-awaited stop would need an async
+        // hook on the adapter interface — follow-up if anyone hits a
+        // real artefact from this window.
+        prev.stopSession(key);
+      }
+    } catch (e) {
+      // Unknown previous adapter (renamed/removed): nothing to stop.
+      console.warn(`[switchThreadAdapter] could not stop previous adapter ${prevName}:`, e instanceof Error ? e.message : e);
+    }
+  }
   setThreadAdapter(key, newName);
   const agent = state.getAgent(key);
   if (!agent) return;
@@ -2314,13 +2352,17 @@ command('sessions', async (_ctx, key) => {
 });
 
 command('stop', async (_ctx, key) => {
-  const adapter = getThreadAdapter(key);
-  if (!adapter.checkIsActive(key)) {
+  // Sweep every adapter, not just the one the in-memory map currently
+  // points at — keeps `/stop` working when state and reality have drifted
+  // apart (a previous switch left a live session on the other adapter).
+  const { stopped, attempted } = stopAllAdaptersFor(key);
+  if (attempted === 0) {
     await replyToThread(key, 'No agent running');
     return;
   }
-  adapter.stopSession(key);
-  await replyToThread(key, t('agent.stopped', { label: adapter.label }));
+  for (const label of stopped) {
+    await replyToThread(key, t('agent.stopped', { label }));
+  }
 });
 
 /**
@@ -2343,18 +2385,18 @@ command(['stop-all', 'stopall'], async (_ctx, key) => {
     return;
   }
 
+  // Same sweep semantics as `/stop`: kill any adapter that's actually
+  // active for this key, not only the one the thread map points at —
+  // otherwise a desynced thread (state says opencode but claude tmux is
+  // running) gets counted as inactive and skipped. `attempted` /
+  // `stopped` count *adapter sessions*, not threads, so the user-facing
+  // summary preserves the "M of N" semantic when a stop call fails.
   let stopped = 0;
   let active = 0;
   for (const { key: bKey } of state.listBindings()) {
-    const adapter = getThreadAdapter(bKey);
-    if (!adapter.checkIsActive(bKey)) continue;
-    active += 1;
-    try {
-      adapter.stopSession(bKey);
-      stopped += 1;
-    } catch (e) {
-      console.error(`[stop-all] failed for ${keyToString(bKey)}:`, e);
-    }
+    const result = stopAllAdaptersFor(bKey);
+    active += result.attempted;
+    stopped += result.stopped.length;
   }
 
   if (active === 0) {
@@ -2395,13 +2437,23 @@ const CLAUDE_DOUBLE_SIGINT_GAP_MS = 250;
 //   no-op aborts.
 command(['quit', 'q'], async (_ctx, key) => {
   const adapter = getThreadAdapter(key);
-  if (!adapter.checkIsActive(key)) {
+  const adapterName = getThreadAdapterName(key);
+  const primaryActive = adapter.checkIsActive(key);
+
+  // Defensive: any *other* adapter that's also active for this thread is
+  // a leftover from a previous botched switch. Kill it first so it can't
+  // keep streaming after the user's "quit". Same robustness as `/stop` —
+  // re-using the sweep helper instead of an open-coded loop avoids
+  // drift between the two call sites.
+  const otherAdapters = getKnownAdapterNames().filter(n => n !== adapterName);
+  stopAllAdaptersFor(key, otherAdapters);
+
+  if (!primaryActive) {
     await replyToThread(key, 'No agent running');
     return;
   }
   markNeedsNewMessage(key);
 
-  const adapterName = getThreadAdapterName(key);
   if (adapterName === 'opencode') {
     adapter.stopSession(key);
     await replyToThread(key, t('agent.stopped', { label: adapter.label }));
@@ -3332,7 +3384,8 @@ const COMMANDS_MENU = [
   { command: 'model', description: '🧠 Switch model' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions' },
-  { command: 'stop', description: '⏹ Stop agent' },
+  { command: 'stop', description: '⏹ Stop agent (hard kill)' },
+  { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },
   { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
@@ -3389,10 +3442,48 @@ async function reattachExistingSessions(): Promise<void> {
       const found = await claudeAdapter.listExistingTmuxSessions();
       let adopted = 0;
       let killed = 0;
+      let reconciled = 0;
       for (const { key, sessionName } of found) {
         const binding = state.getBinding(key);
-        const agent = state.getAgent(key);
-        if (!binding || !agent || agent.name !== 'claude' || !agent.claudeSessionId) {
+        if (!binding) {
+          // No binding at all → genuine orphan, no thread owns it.
+          claudeAdapter.killOrphanTmuxSession(sessionName);
+          killed += 1;
+          continue;
+        }
+        let agent = state.getAgent(key);
+        // If state and reality disagree (agent missing, or names another
+        // adapter, or claudeSessionId is gone), try to reconstruct state
+        // from the live tmux argv before declaring the session an orphan.
+        // The running tmux session is the source of truth — `state.json`
+        // can fall out of sync if the bot crashed mid-write (the 500ms
+        // debounce never flushed) or if a previous `switchThreadAdapter`
+        // call left a leftover session of the other adapter alive.
+        const needsReconcile = !agent || agent.name !== 'claude' || !agent.claudeSessionId;
+        if (needsReconcile) {
+          const recovered = claudeAdapter.recoverSessionIdFromTmux(sessionName);
+          if (recovered) {
+            const patched: { name: string; model?: string; claudeSessionId: string } = {
+              name: 'claude',
+              claudeSessionId: recovered,
+            };
+            if (agent?.model !== undefined) patched.model = agent.model;
+            // Drop the row first so a stale opencodeSessionId doesn't
+            // ride along into the new shape (setAgent merges).
+            await state.removeAgent(key);
+            await state.setAgent(key, patched);
+            setThreadAdapter(key, 'claude');
+            agent = state.getAgent(key);
+            reconciled += 1;
+            console.log(`[reattach] reconciled state for ${keyToString(key)} (recovered claudeSessionId=${recovered})`);
+          } else {
+            claudeAdapter.killOrphanTmuxSession(sessionName);
+            killed += 1;
+            continue;
+          }
+        }
+        // After reconcile, agent is always populated with claudeSessionId.
+        if (!agent?.claudeSessionId) {
           claudeAdapter.killOrphanTmuxSession(sessionName);
           killed += 1;
           continue;
@@ -3403,7 +3494,7 @@ async function reattachExistingSessions(): Promise<void> {
           replyToThread(key, t('agent.reattached')).catch(() => {});
         }
       }
-      console.log(`[reattach] tmux: adopted ${adopted}, killed ${killed} orphans`);
+      console.log(`[reattach] tmux: adopted ${adopted}, reconciled ${reconciled}, killed ${killed} orphans`);
     } catch (e) {
       console.error('[reattach] tmux scan failed:', e);
     }

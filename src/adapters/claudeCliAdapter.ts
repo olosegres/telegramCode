@@ -130,6 +130,28 @@ function checkIsValidUuid(s: string): boolean {
 }
 
 /**
+ * @description Pure parser — pulls a `--session-id <uuid>` value out of a
+ * claude command line. Lives outside the adapter class so it can be
+ * unit-tested without booting tmux. Quoting in the input is flexible
+ * because `pane_start_command` can come back as `--session-id 'uuid'`,
+ * `--session-id "uuid"`, `--session-id=uuid`, or just `--session-id uuid`,
+ * depending on how the original shell-command was assembled. Returns the
+ * lowercase UUID, or `null` if no valid UUID is found.
+ */
+export function parseClaudeSessionIdFromCommand(cmd: string): string | null {
+  if (!cmd) return null;
+  // Lookahead refuses to truncate a 37+ char "UUID-like" garbage tail to
+  // the first 36 chars: trailing hex must be followed by end-of-string,
+  // whitespace, or a quote. Production input comes from our own
+  // `pane_start_command`, but the anchor closes a defence-in-depth gap
+  // against future call sites that may pass weirder strings.
+  const match = cmd.match(/--session-id[\s'"=]+([0-9a-fA-F-]{36})(?=$|[\s'"])/);
+  if (!match) return null;
+  const uuid = match[1].toLowerCase();
+  return checkIsValidUuid(uuid) ? uuid : null;
+}
+
+/**
  * @description Reject `args` with NUL or other control characters before
  * passing to claude. These are unsafe in shell-quoted contexts (the
  * `'\\''` escape doesn't protect against `\x00`), and tmux/terminals
@@ -833,6 +855,32 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       if (key) result.push({ key, sessionName: name });
     }
     return result;
+  }
+
+  /**
+   * @description Recover the `--session-id <uuid>` flag from a live tmux
+   * session's start command.
+   *
+   * Used by the bot's reattach loop to reconcile state with reality when
+   * `state.agents[key]` is missing a `claudeSessionId` (or names a
+   * different adapter) but a `claude-<chatId>-<threadId>` tmux session is
+   * still running. Previously such cases were treated as orphans and the
+   * tmux session was killed, throwing away the user's live work.
+   *
+   * Implementation: read `pane_start_command` for the session's first
+   * pane and parse the UUID out via {@link parseClaudeSessionIdFromCommand}.
+   * `pane_start_command` survives across restarts because tmux keeps the
+   * original command line for the pane.
+   *
+   * Returns `null` if no UUID can be recovered (caller falls back to
+   * killing the session as an orphan).
+   */
+  recoverSessionIdFromTmux(sessionName: string): string | null {
+    const sessions = tmux('list-sessions', '-F', '#{session_name}');
+    if (!sessions.includes(sessionName)) return null;
+    const cmd = tmux('display-message', '-p', '-t', sessionName, '#{pane_start_command}');
+    if (!cmd) return null;
+    return parseClaudeSessionIdFromCommand(cmd);
   }
 
   /**

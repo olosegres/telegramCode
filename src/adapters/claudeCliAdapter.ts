@@ -8,6 +8,7 @@ import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
+import { resolveClaudeBinary } from '../utils/resolveBinary';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -52,21 +53,6 @@ interface ClaudeSession {
 }
 
 const pollInterval = 300;
-
-/** Locate Claude where this process can actually execute it. */
-function resolveClaudeBinary(): string {
-  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
-  try {
-    const which = execFileSync('which', ['claude'], {
-      encoding: 'utf8',
-      timeout: 1500,
-    }).trim();
-    if (which) return which;
-  } catch {
-    // PATH lookup failed; fall through.
-  }
-  return path.join(process.env.HOME || '/tmp', '.npm-global', 'bin', 'claude');
-}
 
 const claudePath = resolveClaudeBinary();
 // Audit S3 / #9: session-history file belongs under DATA_DIR (the same

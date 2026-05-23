@@ -69,6 +69,45 @@ just the block you want. The pair is set up so they cannot collide
 (separate tokens, groups, data volumes, opencode ports — see
 [Two instances on one host](#two-instances-on-one-host)).
 
+### 4b. Or run as a global CLI (`telegramCode`)
+
+Skip Docker entirely and install the bot as a Node binary on the host:
+
+```bash
+git clone https://github.com/anomalyco/telegramCode && cd telegramCode
+yarn install && yarn build
+npm install -g .            # registers the `telegramCode` command
+
+mkdir -p ~/.config/telegram-code
+cp .env.example ~/.config/telegram-code/.env
+$EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN, ALLOWED_USERS, ALLOWED_GROUP_ID
+
+cd ~/projects && telegramCode          # WORK_ROOT defaults to $PWD = ~/projects
+```
+
+The wrapper looks for env in two places (in order):
+
+1. `~/.config/telegram-code/.env` — base, set once, used everywhere
+2. `$PWD/.env` — per-project override
+
+`WORK_ROOT` defaults to `$PWD` when unset, so you can `cd` into your
+projects parent and just type `telegramCode`. A single-instance lockfile
+(`$DATA_DIR/instance.lock`) prevents a second bot starting under the same
+user; cross-user instances are naturally isolated by `HOME`-derived
+`DATA_DIR`. Stale locks (after `kill -9`) are reclaimed automatically.
+
+The wrapper also exposes a CLI passthrough so you can continue the same
+sessions from a terminal:
+
+```bash
+cd ~/projects/myapp && telegramCode cli claude [args...]
+```
+
+This is exactly `claude --dangerously-skip-permissions` in `$PWD` — same
+binary, same `~/.claude/projects/` session store the bot uses, so a
+session started in a Telegram thread can be picked up in the terminal
+and vice versa.
+
 ### 5. Use it
 
 1. Open the group in Telegram.
@@ -168,7 +207,7 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 | `TELEGRAM_BOT_TOKEN` | From @BotFather |
 | `ALLOWED_USERS` | Comma-separated Telegram user IDs (numeric) |
 | `ALLOWED_GROUP_ID` | The forum supergroup id (`-100…`). Get from `/whoami` |
-| `WORK_ROOT` | Host parent folder; topics bind to its subdirs |
+| `WORK_ROOT` | Host parent folder; topics bind to its subdirs. Defaults to `$PWD` when launched via the `telegramCode` wrapper |
 
 ### Optional
 
@@ -186,7 +225,9 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 
 > `WORK_DIR` (1.x) is **fatal** in 2.0 — set `WORK_ROOT` to the parent
 > instead. The bot reports a clear error on boot, see
-> [Migration from 1.x](#migration-from-1x).
+> [Migration from 1.x](#migration-from-1x). When started via the
+> `telegramCode` CLI wrapper, an unset `WORK_ROOT` is no longer fatal —
+> it defaults to `$PWD` with a stderr warning.
 
 ## MCP servers — user / group / project / thread
 

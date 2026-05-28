@@ -1037,6 +1037,18 @@ async function downloadFile(url: string, destPath: string, depth = 0): Promise<v
           return;
         }
       }
+      // Anything outside 2xx/3xx is a real failure — without this check
+      // the error body (HTML or JSON) was being piped into the destination
+      // file, producing a broken "audio" file that Whisper later rejects
+      // with a generic 400 and no useful signal to the operator.
+      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+        file.close(() => {
+          cleanup().then(() =>
+            reject(new Error(`Download failed: HTTP ${response.statusCode ?? '???'} ${response.statusMessage ?? ''}`))
+          );
+        });
+        return;
+      }
       response.pipe(file);
       file.on('finish', () => { file.close(() => resolve()); });
       file.on('error', (err) => { cleanup(); reject(err); });
@@ -1051,14 +1063,36 @@ async function downloadFile(url: string, destPath: string, depth = 0): Promise<v
   });
 }
 
-async function transcribeAudio(filePath: string, retryCount = 0): Promise<string | null> {
+type TranscribeResult =
+  | { ok: true; text: string }
+  | { ok: false; error: string };
+
+async function transcribeAudio(filePath: string, retryCount = 0): Promise<TranscribeResult> {
   const apiKey = ENV.groqApiKey || ENV.openaiApiKey;
   const isGroq = !!ENV.groqApiKey;
-  if (!apiKey) return null;
+  if (!apiKey) return { ok: false, error: 'no api key configured' };
+
+  // Detect a 0-byte download up-front: previously this would still be sent
+  // to Whisper, which replies 400 with a generic "file is empty" body that
+  // the old error path swallowed silently. Failing here gives the operator
+  // a concrete cause (download produced no bytes) without the round-trip.
+  let fileSize = 0;
+  try {
+    fileSize = (await fsp.stat(filePath)).size;
+  } catch (e) {
+    return { ok: false, error: `stat failed: ${e instanceof Error ? e.message : e}` };
+  }
+  if (fileSize === 0) return { ok: false, error: 'downloaded audio is empty' };
 
   const FormData = (await import('form-data')).default;
   const form = new FormData();
-  form.append('file', fs.createReadStream(filePath));
+  // Explicit filename + content-type: form-data's auto-detection from the
+  // ReadStream's path usually works, but some intermediaries strip
+  // path-based hints. Setting both makes the multipart upload deterministic.
+  form.append('file', fs.createReadStream(filePath), {
+    filename: path.basename(filePath),
+    contentType: 'audio/ogg',
+  });
   form.append('model', isGroq ? 'whisper-large-v3' : 'whisper-1');
 
   const hostname = isGroq ? 'api.groq.com' : 'api.openai.com';
@@ -1076,21 +1110,42 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', async () => {
-        if (res.statusCode === 429) {
+        const status = res.statusCode ?? 0;
+        if (status === 429) {
           const retryAfter = parseInt(res.headers['retry-after'] as string) || 5;
           if (retryCount < 2) {
             await new Promise(r => setTimeout(r, retryAfter * 1000));
             resolve(await transcribeAudio(filePath, retryCount + 1));
             return;
           }
-          resolve(null);
+          console.warn(`[transcribe] rate-limited after ${retryCount + 1} attempts`);
+          resolve({ ok: false, error: 'rate limited (429), gave up after retries' });
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          const bodyPreview = data.slice(0, 500);
+          console.warn(
+            `[transcribe] ${isGroq ? 'groq' : 'openai'} returned HTTP ${status}; body: ${bodyPreview}`,
+          );
+          let apiMessage = bodyPreview;
+          try {
+            const errJson = JSON.parse(data);
+            apiMessage = errJson?.error?.message ?? errJson?.error ?? bodyPreview;
+          } catch { /* keep raw preview */ }
+          resolve({ ok: false, error: `HTTP ${status}: ${apiMessage}` });
           return;
         }
         try {
           const json = JSON.parse(data);
-          resolve(json.text ?? null);
-        } catch {
-          resolve(null);
+          if (typeof json.text === 'string' && json.text.length > 0) {
+            resolve({ ok: true, text: json.text });
+            return;
+          }
+          console.warn(`[transcribe] 200 OK but no .text in body: ${data.slice(0, 500)}`);
+          resolve({ ok: false, error: 'transcription returned empty text' });
+        } catch (e) {
+          console.warn(`[transcribe] failed to parse response: ${e instanceof Error ? e.message : e}; body: ${data.slice(0, 500)}`);
+          resolve({ ok: false, error: 'malformed response from Whisper API' });
         }
       });
     });
@@ -1098,8 +1153,9 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<string
       req.destroy(new Error('transcription timed out'));
     });
     req.on('error', (e) => {
-      console.warn('[transcribe] request failed:', e instanceof Error ? e.message : e);
-      resolve(null);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[transcribe] request failed:', msg);
+      resolve({ ok: false, error: msg });
     });
     form.pipe(req);
   });
@@ -2807,14 +2863,22 @@ bot.on(message('voice'), async (ctx) => {
 
     const tempDir = '/tmp';
     const tempFile = path.join(tempDir, `voice_${key.chatId}_${key.threadId}_${Date.now()}.ogg`);
-    await downloadFile(fileUrl, tempFile);
-    const transcript = await transcribeAudio(tempFile);
-    fs.unlink(tempFile, () => {});
-
-    if (!transcript) {
-      await replyToThread(key, t('voice.failed'));
+    try {
+      await downloadFile(fileUrl, tempFile);
+    } catch (downloadErr) {
+      const msg = downloadErr instanceof Error ? downloadErr.message : String(downloadErr);
+      console.warn(`[Bot] voice download failed: ${msg}`);
+      await replyToThread(key, `${t('voice.failed')} (${msg})`);
       return;
     }
+    const result = await transcribeAudio(tempFile);
+    fs.unlink(tempFile, () => {});
+
+    if (!result.ok) {
+      await replyToThread(key, `${t('voice.failed')} (${result.error})`);
+      return;
+    }
+    const transcript = result.text;
     console.log(`[Bot] voice transcribed: "${transcript}"`);
     await replyToThread(key, t('voice.transcribed', { text: transcript }));
 

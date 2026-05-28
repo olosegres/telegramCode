@@ -935,6 +935,29 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       autoAcceptInnerTimer: null,
       isPolling: false,
     };
+
+    // Seed `lastContent` with the current pane snapshot **before** the
+    // first poll fires. Without this, the bot's first `pollOutput` after
+    // re-adoption would diff a ~2000-line scrollback (hours of stale
+    // conversation that survived the restart inside tmux) against `''`
+    // — `getNewContent('', x) === x` — and emit every line of it to
+    // Telegram as if it were brand new output. Symptom: user restarts
+    // the bot, types a fresh message in an existing thread, and the
+    // thread gets flooded with answers from previous sessions before
+    // the new answer arrives.
+    //
+    // The capture uses the SAME flags as `pollOutput` (`-e -S -2000`)
+    // so the seed and the next poll's snapshot are produced by the
+    // same code path; otherwise edge differences in ANSI handling or
+    // scrollback depth would re-introduce phantom "new" lines on the
+    // first diff. Best-effort — if `capture-pane` fails the seed stays
+    // empty and we fall back to the pre-fix (noisy) behaviour, which
+    // is still better than refusing to adopt.
+    const initialRaw = tmux('capture-pane', '-t', sessionName, '-p', '-e', '-S', '-2000');
+    if (initialRaw) {
+      session.lastContent = cleanOutput(initialRaw);
+    }
+
     this.sessions.set(k, session);
     this.schedulePoll(key, session);
     this.emit('started', key);

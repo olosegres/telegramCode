@@ -3451,6 +3451,7 @@ const COMMANDS_MENU = [
   { command: 'stop', description: '⏹ Stop agent (hard kill)' },
   { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },
   { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
+  { command: 'compact', description: '🧹 Compact agent context' },
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
   { command: 'whoami', description: '🪪 Show debug ids' },

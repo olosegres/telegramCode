@@ -108,6 +108,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/claude /opencode — старт агента\n' +
       '/agent /model /sessions — выбор/переключение\n' +
       '/stop /status /output — контроль\n' +
+      '/compact — сжать контекст агента\n' +
       '/clear — удалить сообщения треда\n' +
       '/c /y /n /enter /up /down /tab — TUI-команды (Claude)\n' +
       '/where /unbind — управление binding',
@@ -333,6 +334,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/claude /opencode — start an agent\n' +
       '/agent /model /sessions — choose/switch\n' +
       '/stop /status /output — control\n' +
+      '/compact — compact agent context\n' +
       '/clear — delete thread messages\n' +
       '/c /y /n /enter /up /down /tab — TUI keys (Claude)\n' +
       '/where /unbind — manage binding',

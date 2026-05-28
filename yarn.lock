@@ -1168,7 +1168,7 @@ __metadata:
     tsx: "npm:^4.21.0"
     typescript: "npm:^5.7.0"
   bin:
-    telegram-code: ./dist/index.js
+    telegramCode: ./dist/cli.js
   languageName: unknown
   linkType: soft
 

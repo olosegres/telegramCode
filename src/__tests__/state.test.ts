@@ -164,3 +164,23 @@ test('Forward-compat: state.json with an unknown future field still loads cleanl
   assert.equal(store.listBindings().length, 1, 'binding must survive');
   assert.equal(store.getBinding({ chatId: -1001, threadId: 42 })?.subdir, 'alpha');
 });
+
+test('pairedGroupId: defaults to null when never paired', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  assert.equal(store.getPairedGroupId(), null);
+});
+
+test('pairedGroupId: set → get round-trips and survives a reload from disk', async () => {
+  const groupId = -1009876543210;
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setPairedGroupId(groupId);
+  assert.equal(first.getPairedGroupId(), groupId);
+
+  // setPairedGroupId flushes immediately — a second store reads it back
+  // without an explicit flush, proving the id is durable across restart.
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getPairedGroupId(), groupId);
+});

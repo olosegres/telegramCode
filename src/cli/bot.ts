@@ -30,8 +30,9 @@ export async function runBot(): Promise<void> {
   if (loaded.length === 0) {
     process.stderr.write(
       `Warning: no .env file found in $PWD or ~/.config/telegram-code/. ` +
-        `Required env (TELEGRAM_BOT_TOKEN, ALLOWED_USERS, ALLOWED_GROUP_ID) ` +
-        `must come from the shell instead.\n`,
+        `Required env (TELEGRAM_BOT_TOKEN, ALLOWED_USERS) ` +
+        `must come from the shell instead. ALLOWED_GROUP_ID is optional ` +
+        `(auto-pairs on first contact if unset).\n`,
     );
   }
 

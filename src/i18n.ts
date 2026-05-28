@@ -183,6 +183,14 @@ const dict: Record<Lang, Record<string, string>> = {
       '👤 user: `{userId}`\n💬 chat: `{chatId}`\n🧵 thread: `{threadId}`\n' +
       '🔐 allowed: {allowed}\n📁 binding: {binding}',
     'whoami.binding_unbound': '(нет привязки)',
+
+    // ── pairing ──
+    'pair.success': '✅ Группа привязана. id: `{groupId}`. Бот готов к работе в этой супергруппе.',
+    'pair.locked':
+      'ℹ️ id группы задан через `ALLOWED_GROUP_ID` — авто-привязка отключена. ' +
+      'Чтобы сменить группу, измени переменную и перезапусти бота.',
+    'pair.only_forum': '❌ /pair работает только в forum-супергруппе (включи Topics).',
+    'pair.not_paired': 'группа ещё не привязана (режим pairing)',
     'version.report':
       '*telegramCode {bot}*\n' +
       'Node: {node}\n' +
@@ -404,6 +412,14 @@ const dict: Record<Lang, Record<string, string>> = {
       '👤 user: `{userId}`\n💬 chat: `{chatId}`\n🧵 thread: `{threadId}`\n' +
       '🔐 allowed: {allowed}\n📁 binding: {binding}',
     'whoami.binding_unbound': '(no binding)',
+
+    // ── pairing ──
+    'pair.success': '✅ Group paired. id: `{groupId}`. The bot is now serving this supergroup.',
+    'pair.locked':
+      'ℹ️ The group id is set via `ALLOWED_GROUP_ID` — auto-pairing is disabled. ' +
+      'To switch groups, change the variable and restart the bot.',
+    'pair.only_forum': '❌ /pair only works inside a forum supergroup (enable Topics).',
+    'pair.not_paired': 'group not paired yet (pairing mode)',
     'version.report':
       '*telegramCode {bot}*\n' +
       'Node: {node}\n' +

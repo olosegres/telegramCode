@@ -48,11 +48,17 @@ project for parallel work.
    private-mode and ignores free-form messages. See
    [Troubleshooting → Bot doesn't see text](#bot-doesnt-see-text).
 
-### 3. Find your user id and group id
+### 3. Find your user id (group id is automatic)
 
 - Your user id: send `/start` to [@userinfobot](https://t.me/userinfobot).
-- Group id: add the bot, send `/whoami` inside the group — the reply
-  contains the `chatId` (starts with `-100…`).
+- Group id: **you don't need to find it.** Leave `ALLOWED_GROUP_ID`
+  empty. The bot auto-pairs with the first forum supergroup an allowed
+  user contacts it from — it captures the `-100…` id, saves it to
+  `state.json`, and replies a confirmation. Re-point later with `/pair`
+  inside another group.
+  - To pin a specific id by hand instead, set `ALLOWED_GROUP_ID` to the
+    numeric value (a group **name** is not accepted — Telegram addresses
+    chats only by numeric id). A numeric env value disables auto-pairing.
 
 ### 4. Run with Docker
 
@@ -80,7 +86,7 @@ npm install -g .            # registers the `telegramCode` command
 
 mkdir -p ~/.config/telegram-code
 cp .env.example ~/.config/telegram-code/.env
-$EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN, ALLOWED_USERS, ALLOWED_GROUP_ID
+$EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN, ALLOWED_USERS (group auto-pairs)
 
 cd ~/projects && telegramCode          # WORK_ROOT defaults to $PWD = ~/projects
 ```
@@ -188,6 +194,7 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/doctor` | Self-diagnose: admin rights, privacy mode, paths, CLIs |
 | `/version` | Versions: bot, claude, opencode, node, tmux |
 | `/whoami` | Show userId, chatId, threadId, isAllowed, binding |
+| `/pair` | Bind this forum supergroup to the bot (re-point auto-pairing) |
 
 ### Natural language
 
@@ -206,13 +213,13 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | From @BotFather |
 | `ALLOWED_USERS` | Comma-separated Telegram user IDs (numeric) |
-| `ALLOWED_GROUP_ID` | The forum supergroup id (`-100…`). Get from `/whoami` |
 | `WORK_ROOT` | Host parent folder; topics bind to its subdirs. Defaults to `$PWD` when launched via the `telegramCode` wrapper |
 
 ### Optional
 
 | Variable | Default | Description |
 |---|---|---|
+| `ALLOWED_GROUP_ID` | (auto-pair) | Numeric forum supergroup id (`-100…`). Leave empty to auto-pair with the first group an allowed user contacts the bot from (id is saved to `state.json`; re-point with `/pair`). A **name** is not accepted. A numeric value disables auto-pairing |
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
 | `DEFAULT_AGENT` | `claude` | `claude` or `opencode` |
 | `BOT_LANG` | `ru` | `ru` or `en` |
@@ -402,7 +409,8 @@ There is no in-place upgrade; the steps are:
 2. Create a forum supergroup, add the bot, follow [Quick Start §2-3](#2-create-the-forum-supergroup).
 3. Rename `WORK_DIR` → `WORK_ROOT` in your env and point it at the
    parent folder (e.g. `/home/user/src`).
-4. Add `ALLOWED_GROUP_ID` (`/whoami` in the group reveals it).
+4. Leave `ALLOWED_GROUP_ID` empty to auto-pair on first contact (or set
+   the numeric id by hand).
 5. Set `DATA_DIR` if you run two instances on the same host.
 6. The old `~/.telegram-bot-messages.json` is moved to `.bak` on first
    start — no migration of message ids, fresh `state.json`.

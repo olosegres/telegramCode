@@ -78,6 +78,13 @@ export interface StateV1 {
   bindings: Record<string, BindingData>;
   agents: Record<string, AgentData>;
   messages: Record<string, number[]>;
+  /**
+   * Numeric chat id of the forum supergroup discovered via auto-pairing,
+   * persisted so the operator doesn't have to look up the `-100…` id by
+   * hand. Only consulted when `ALLOWED_GROUP_ID` env is unset; a numeric
+   * env value always wins and disables pairing.
+   */
+  pairedGroupId?: number;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -621,6 +628,26 @@ export class StateStore {
       delete this.state.messages[k];
       this.scheduleSave();
     });
+  }
+
+  // ── paired group id (auto-pairing) ──
+
+  /** The auto-paired forum supergroup id, or `null` if never paired. */
+  getPairedGroupId(): number | null {
+    return this.state.pairedGroupId ?? null;
+  }
+
+  /**
+   * @description Persist the auto-paired group id and flush immediately.
+   *
+   * Unlike per-thread mutations this is a rare, one-shot critical write:
+   * if the process dies right after pairing we must not lose the id and
+   * fall back into pairing mode on the next boot. So we `flush()` rather
+   * than debounce.
+   */
+  async setPairedGroupId(groupId: number): Promise<void> {
+    this.state.pairedGroupId = groupId;
+    await this.flush();
   }
 
   // ── persistence ──

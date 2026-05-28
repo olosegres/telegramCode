@@ -30,7 +30,9 @@ function printUsage(): void {
       `\n` +
       `Environment:\n` +
       `  Loaded from ~/.config/telegram-code/.env (base) then $PWD/.env (override).\n` +
-      `  Required for 'bot': TELEGRAM_BOT_TOKEN, ALLOWED_USERS, ALLOWED_GROUP_ID.\n` +
+      `  Required for 'bot': TELEGRAM_BOT_TOKEN, ALLOWED_USERS.\n` +
+      `  ALLOWED_GROUP_ID is optional — leave it empty to auto-pair with your\n` +
+      `  forum supergroup on first contact (or use /pair in the group).\n` +
       `  WORK_ROOT defaults to $PWD if unset.\n`,
   );
 }

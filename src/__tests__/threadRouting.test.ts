@@ -21,9 +21,15 @@
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { resolveThreadKey, checkIsGeneralTopic, GENERAL_THREAD_ID } from '../threadRouting';
+import {
+  resolveThreadKey,
+  resolvePairingCandidate,
+  checkIsGeneralTopic,
+  GENERAL_THREAD_ID,
+} from '../threadRouting';
 
 const ALLOWED = -1001234567890;
+const ALLOWED_USER = 555;
 
 test('R2: GENERAL_THREAD_ID constant is 1 (Telegram contract)', () => {
   // The General topic id is baked into Telegram's protocol; if this
@@ -155,4 +161,96 @@ test('R2: checkIsGeneralTopic returns true only for threadId=1', () => {
   assert.equal(checkIsGeneralTopic({ chatId: ALLOWED, threadId: 1 }), true);
   assert.equal(checkIsGeneralTopic({ chatId: ALLOWED, threadId: 2 }), false);
   assert.equal(checkIsGeneralTopic({ chatId: ALLOWED, threadId: 42 }), false);
+});
+
+// ─── auto-pairing decision ──────────────────────────────────────────────
+
+const forumChat = { id: ALLOWED, type: 'supergroup', is_forum: true };
+
+test('pair: allowed user in a forum supergroup with no id yet → pairs that chat', () => {
+  const id = resolvePairingCandidate({
+    chat: forumChat,
+    userId: ALLOWED_USER,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: false,
+  });
+  assert.equal(id, ALLOWED);
+});
+
+test('pair: env-locked id never pairs (env wins)', () => {
+  const id = resolvePairingCandidate({
+    chat: forumChat,
+    userId: ALLOWED_USER,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: true,
+  });
+  assert.equal(id, null);
+});
+
+test('pair: already-paired (currentGroupId set) does not auto-pair again', () => {
+  const id = resolvePairingCandidate({
+    chat: { id: -1009999999999, type: 'supergroup', is_forum: true },
+    userId: ALLOWED_USER,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: ALLOWED,
+    isEnvLocked: false,
+  });
+  assert.equal(id, null);
+});
+
+test('pair: non-allowed user cannot pair (no hijacking)', () => {
+  const id = resolvePairingCandidate({
+    chat: forumChat,
+    userId: 999,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: false,
+  });
+  assert.equal(id, null);
+});
+
+test('pair: missing userId is rejected', () => {
+  const id = resolvePairingCandidate({
+    chat: forumChat,
+    userId: undefined,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: false,
+  });
+  assert.equal(id, null);
+});
+
+test('pair: non-forum supergroup is rejected', () => {
+  const id = resolvePairingCandidate({
+    chat: { id: ALLOWED, type: 'supergroup', is_forum: false },
+    userId: ALLOWED_USER,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: false,
+  });
+  assert.equal(id, null);
+});
+
+test('pair: private chat is rejected', () => {
+  const id = resolvePairingCandidate({
+    chat: { id: ALLOWED_USER, type: 'private' },
+    userId: ALLOWED_USER,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: false,
+  });
+  assert.equal(id, null);
+});
+
+test('pair: undefined chat is rejected (defensive)', () => {
+  const id = resolvePairingCandidate({
+    chat: undefined,
+    userId: ALLOWED_USER,
+    allowedUsers: [ALLOWED_USER],
+    currentGroupId: null,
+    isEnvLocked: false,
+  });
+  assert.equal(id, null);
 });

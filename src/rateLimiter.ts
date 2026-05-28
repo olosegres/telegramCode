@@ -1,28 +1,46 @@
 import { sleep } from './utils';
+import type { ThreadKey } from './types';
+import { keyToString } from './types';
 
 /**
  * @description Telegram-side rate limiting for the multi-thread bot.
  *
- * Two layers, both keyed by **chat id** (not user id — Telegram's
- * per-chat budget is what matters for forum supergroups where N threads
- * share one `chat.id`, plan §13.16, T5):
+ * Three layers, with different keying because they protect against
+ * different things:
  *
- *   1. **Token-bucket** (`enqueueSend`). Proactive shaping: 1 token per
- *      second, burst of 5. Sends are serialised per chat behind this
- *      bucket so multiple threads in one supergroup don't pile up faster
- *      than Telegram accepts. This prevents most 429s in the first place.
+ *   1. **FIFO queue** (`enqueueSend`). Keyed by **ThreadKey**
+ *      (`chatId+threadId`). Its only job is to preserve ordering between
+ *      *dependent* operations on the same Telegram thread — e.g. an
+ *      `editMessageText` that depends on a preceding `sendMessage`. There
+ *      is no cross-thread ordering dependency: two forum topics in the
+ *      same supergroup can interleave freely. Keying this queue by
+ *      `chatId` alone (the pre-fix behaviour) caused a busy thread to
+ *      block every other thread's sends in the same supergroup, and
+ *      within a single thread it let a burst of `status` edits pile up
+ *      ahead of a real `output` send.
  *
- *   2. **`withRateLimitRetry`.** Reactive: if Telegram still returns 429,
- *      sleep `retry_after + jitter` and retry once. After a retry that
- *      also fails, the chat is marked blocked for the cooldown so the
- *      next send waits before even hitting the API.
+ *   2. **Token-bucket**. Keyed by **chatId**. Proactive shaping: 1 token
+ *      per second, burst of 5. Telegram's documented per-chat ceiling
+ *      applies to the *whole* supergroup, so the bucket has to stay
+ *      chat-wide; if threads each had their own bucket, N parallel
+ *      threads would burst at ~N msgs/sec and get 429'd. Threads
+ *      awaiting the bucket do so on independent async paths
+ *      (`bucket.take()` doesn't block the event loop), so the bucket no
+ *      longer creates head-of-line blocking the way a single FIFO did.
  *
- * The two layers compose: `enqueueSend(chatId, fn)` runs `fn` through the
- * bucket and also wraps it in `withRateLimitRetry`. Callers should always
- * go through `enqueueSend` for outgoing messages; `withRateLimitRetry`
- * stays exported for the legacy `bot.ts` shim (Этап 1 callers — removed
- * by Этап 3) and for any future caller that needs the retry without the
- * proactive bucket (e.g. one-off admin commands).
+ *   3. **`withRateLimitRetry`.** Keyed by **chatId**. Reactive: if
+ *      Telegram still returns 429, sleep `retry_after + jitter` and
+ *      retry once. After a retry that also fails, the chat is marked
+ *      blocked for the cooldown so the next send waits before even
+ *      hitting the API. 429-state is per-chat because that's how
+ *      Telegram returns it.
+ *
+ * The three layers compose: `enqueueSend(key, fn)` chains behind the
+ * previous send for the *same thread*, then runs `fn` through the
+ * chat-level bucket and `withRateLimitRetry`. Callers should always go
+ * through `enqueueSend` for outgoing messages; `withRateLimitRetry` stays
+ * exported for callers that need the retry without the proactive bucket
+ * (e.g. one-off admin / health-check operations during boot).
  */
 
 const BUCKET_CAPACITY = 5;
@@ -75,12 +93,24 @@ function getBucket(chatId: number): TokenBucket {
 }
 
 /**
- * @description Per-chat FIFO of in-flight sends. The bucket already paces
- * sends, but we also chain them so `bot.telegram.sendMessage` returns to
- * callers in the order they were queued. This prevents subtle UI bugs
- * where an "edit" arrives at Telegram before the "create" it depends on.
+ * @description Per-thread FIFO of in-flight sends, keyed by serialised
+ * `ThreadKey` (`"<chatId>:<threadId>"`).
+ *
+ * The bucket already paces sends globally per chat, but we additionally
+ * chain sends within a single Telegram thread so `bot.telegram.sendMessage`
+ * returns to callers in the order they were queued. This preserves
+ * sequencing for operations that *do* depend on order (an `editMessageText`
+ * after the `sendMessage` whose id it edits, a `pinChatMessage` after the
+ * banner-send that produced the id) — but only within one thread, where
+ * those dependencies actually live.
+ *
+ * Keying by chatId alone (pre-fix) coupled unrelated threads in the same
+ * forum supergroup: a slow send in topic A held the queue tail and every
+ * topic B/C/… waited behind it. With per-thread keying the queues are
+ * independent and a 429 sleep / slow editMessageText in one thread no
+ * longer freezes the others.
  */
-const queues = new Map<number, Promise<unknown>>();
+const queues = new Map<string, Promise<unknown>>();
 
 interface RateLimitState {
   /** Timestamp (ms) when rate limit cooldown expires */
@@ -186,28 +216,34 @@ export async function withRateLimitRetry<T>(
 }
 
 /**
- * @description Send a Telegram operation through the per-chat queue and
- * token bucket, with 429 retry on top.
+ * @description Send a Telegram operation through the per-thread queue,
+ * per-chat token bucket, and per-chat 429 retry.
  *
- * - **Serialised per chat**: the next send for the same `chatId` only runs
- *   after this one settles (success or failure).
- * - **Paced**: token bucket waits before passing the call to Telegram.
+ * - **Serialised per thread**: the next send for the same `ThreadKey`
+ *   only runs after this one settles (success or failure). Sends for
+ *   *different* threads in the same chat run concurrently, gated only
+ *   by the chat-wide token bucket.
+ * - **Paced per chat**: token bucket waits before passing the call to
+ *   Telegram. Bucket waits are async (don't block the event loop), so
+ *   threads contending for the bucket interleave fairly as tokens
+ *   become available.
  * - **Retry on 429**: reactive backoff via {@link withRateLimitRetry}.
  *
  * Errors from the operation are returned to the caller (we don't swallow
  * them — only the queue tail is swallowed so a single failure doesn't
- * poison every subsequent send on that chat).
+ * poison every subsequent send on that thread).
  *
  * @example
- *   await enqueueSend(key.chatId, () =>
+ *   await enqueueSend(key, () =>
  *     bot.telegram.sendMessage(key.chatId, text, { message_thread_id: key.threadId }));
  */
-export async function enqueueSend<T>(chatId: number, fn: () => Promise<T>): Promise<T> {
-  const prev = queues.get(chatId);
+export async function enqueueSend<T>(key: ThreadKey, fn: () => Promise<T>): Promise<T> {
+  const queueKey = keyToString(key);
+  const prev = queues.get(queueKey);
 
   const exec = async (): Promise<T> => {
-    await getBucket(chatId).take();
-    return withRateLimitRetry(chatId, fn);
+    await getBucket(key.chatId).take();
+    return withRateLimitRetry(key.chatId, fn);
   };
 
   // Chain: wait for prev (ignore its errors), then run our exec.
@@ -222,13 +258,13 @@ export async function enqueueSend<T>(chatId: number, fn: () => Promise<T>): Prom
     () => undefined,
     () => undefined,
   );
-  queues.set(chatId, tracked);
+  queues.set(queueKey, tracked);
 
   try {
     return await current;
   } finally {
-    if (queues.get(chatId) === tracked) {
-      queues.delete(chatId);
+    if (queues.get(queueKey) === tracked) {
+      queues.delete(queueKey);
     }
   }
 }

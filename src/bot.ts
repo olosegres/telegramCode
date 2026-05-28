@@ -41,7 +41,7 @@ import {
 import { getStateStore, KeyLock, type StateStore } from './state';
 import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
-import { resolveThreadKey, GENERAL_THREAD_ID } from './threadRouting';
+import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
 import {
   classifySendError,
   checkIsApiError,
@@ -49,6 +49,7 @@ import {
   getErrorDescription,
 } from './sendErrorClassifier';
 import { formatPinnedStatus } from './pinnedStatus';
+import { checkIsProgressChunk } from './progressLine';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -81,12 +82,20 @@ function parseEnv() {
     errors.push('ALLOWED_USERS must contain at least one numeric user id');
   }
 
-  const allowedGroupIdRaw = process.env.ALLOWED_GROUP_ID;
-  const allowedGroupId = allowedGroupIdRaw ? Number(allowedGroupIdRaw) : NaN;
-  if (!Number.isFinite(allowedGroupId)) {
-    errors.push(
-      'ALLOWED_GROUP_ID is required — set it to the negative chat id of your forum supergroup',
-    );
+  // ALLOWED_GROUP_ID is optional: leave it empty to auto-pair with the
+  // first forum supergroup an allowed user contacts the bot from (the id
+  // is then persisted to state.json). A non-numeric value is still an
+  // error — Telegram addresses chats by numeric id, not by group name.
+  const allowedGroupIdRaw = (process.env.ALLOWED_GROUP_ID ?? '').trim();
+  let allowedGroupId = NaN;
+  if (allowedGroupIdRaw) {
+    allowedGroupId = Number(allowedGroupIdRaw);
+    if (!Number.isFinite(allowedGroupId)) {
+      errors.push(
+        'ALLOWED_GROUP_ID must be a numeric chat id (e.g. -1001234567890), ' +
+          'or leave it empty to auto-pair with your forum supergroup on first contact',
+      );
+    }
   }
 
   // WORK_DIR deprecation (plan §13.12, D20).
@@ -129,12 +138,40 @@ function parseEnv() {
 }
 
 const ENV = parseEnv();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Effective group id — single source of truth for the forum supergroup
+//
+//  A numeric `ALLOWED_GROUP_ID` env locks the id and disables auto-pairing.
+//  Otherwise the id starts `null` (pairing mode) and is adopted from
+//  `state.json` at boot (see startBot) or set live by the pairing middleware
+//  / `/pair`. Every runtime consumer reads `getAllowedGroupId()` so a
+//  pairing event takes effect without a restart.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const isGroupLockedByEnv = Number.isFinite(ENV.allowedGroupId);
+let effectiveGroupId: number | null = isGroupLockedByEnv ? ENV.allowedGroupId : null;
+
+/** The forum supergroup id currently in effect, or `null` while unpaired. */
+function getAllowedGroupId(): number | null {
+  return effectiveGroupId;
+}
+
 const telegramAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 10000,
   family: 4,
 });
 const bot = new Telegraf(ENV.botToken, { telegram: { agent: telegramAgent } });
+
+// Auto-pairing must run before any command / `on` handler so a freshly
+// discovered group id is already in effect by the time the routing gates
+// fire on the same update. Registered here (right after bot creation) to
+// guarantee it precedes the module-scope handler registrations below.
+bot.use(async (ctx, next) => {
+  await tryAutoPair(ctx);
+  return next();
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Constants
@@ -192,11 +229,42 @@ interface PendingQuestionState {
   messageId: number | null;
 }
 
+/**
+ * @description Per-thread coalescer for `status` (thinking / spinner) events.
+ *
+ * Claude's tmux poller can emit a status update every ~300 ms while the
+ * agent is thinking, and each one used to translate into its own
+ * `editMessageText` call going through the rate-limiter FIFO. A burst of
+ * 10 thinking-text changes would put 10 edit operations into the queue —
+ * and any real `output` arriving in the middle of that burst had to wait
+ * behind them all (this was the "thinking blocks output even within one
+ * thread" symptom).
+ *
+ * The coalescer enforces "at most one status send in flight per thread"
+ * and "latest text always wins":
+ *
+ * - When a status arrives, `pendingText` is overwritten unconditionally.
+ *   Stale intermediate frames are dropped before they ever reach Telegram.
+ * - If no flush is currently running, one is started; otherwise the
+ *   in-flight flush will pick up the new text after it finishes the
+ *   current send.
+ * - When real `output` arrives (`handleAgentOutput`), `pendingText` is
+ *   cleared — there's no point sending a "Thinking…" frame that the
+ *   output is about to replace anyway.
+ */
+interface StatusCoalesceState {
+  /** Latest status text not yet sent. `null` = nothing pending. */
+  pendingText: string | null;
+  /** A `flushStatusCoalescer` loop is currently running. */
+  inFlight: boolean;
+}
+
 const threadMessageStates = new Map<string, ThreadMessageState>();
 const outputQueues = new Map<string, OutputQueueState>();
 const pendingQuestions = new Map<string, PendingQuestionState>();
 const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
+const statusCoalescers = new Map<string, StatusCoalesceState>();
 
 /**
  * @description Per-thread snapshot of the last `/sessions` listing. Audit
@@ -244,6 +312,16 @@ function getOutputQueueState(key: ThreadKey): OutputQueueState {
   return s;
 }
 
+function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
+  const k = keyToString(key);
+  let s = statusCoalescers.get(k);
+  if (!s) {
+    s = { pendingText: null, inFlight: false };
+    statusCoalescers.set(k, s);
+  }
+  return s;
+}
+
 function markNeedsNewMessage(key: ThreadKey): void {
   getThreadMessageState(key).needsNewMessage = true;
 }
@@ -258,17 +336,11 @@ function markNeedsNewMessage(key: ThreadKey): void {
  * needs to translate `ctx` shapes into the routing module's plain inputs.
  */
 function getThreadKey(ctx: Context): ThreadKey | null {
-  const chat = ctx.chat;
-  // `is_forum` isn't on every chat shape in the Telegraf union; widen
-  // here so the pure routing function can read it as a plain field.
-  const routeChat = chat
-    ? { id: chat.id, type: chat.type, is_forum: 'is_forum' in chat ? chat.is_forum : undefined }
-    : undefined;
   const msg = ctx.message as Message | undefined;
   const cbMsg = ctx.callbackQuery?.message as Message | undefined;
   return resolveThreadKey(
     {
-      chat: routeChat,
+      chat: getRouteChat(ctx),
       message: msg
         ? {
             message_thread_id: 'message_thread_id' in msg ? msg.message_thread_id : undefined,
@@ -282,13 +354,63 @@ function getThreadKey(ctx: Context): ThreadKey | null {
           }
         : undefined,
     },
-    ENV.allowedGroupId,
+    getAllowedGroupId() ?? NaN,
   );
 }
 
 /** Is this thread the General forum topic? */
 function checkIsGeneral(key: ThreadKey): boolean {
   return key.threadId === GENERAL_THREAD_ID;
+}
+
+/**
+ * @description Build the minimal `RouteChat` shape from a Telegraf context
+ * (the `is_forum` flag isn't on every chat variant in the union).
+ */
+function getRouteChat(ctx: Context): { id: number; type: string; is_forum?: boolean } | undefined {
+  const chat = ctx.chat;
+  if (!chat) return undefined;
+  return { id: chat.id, type: chat.type, is_forum: 'is_forum' in chat ? chat.is_forum : undefined };
+}
+
+/**
+ * @description Auto-pairing entrypoint, invoked as the first middleware on
+ * every update. No-op unless the bot is in pairing mode (no effective group
+ * id and not locked by env). On the first qualifying update from an allowed
+ * user in a forum supergroup it adopts that chat as the bot's group, persists
+ * the id, and confirms in-chat — so the operator never looks up the `-100…`
+ * id by hand. Re-pointing later is done explicitly via `/pair`.
+ */
+async function tryAutoPair(ctx: Context): Promise<void> {
+  const chat = getRouteChat(ctx);
+
+  // While unpaired, log every incoming update so the operator can see
+  // exactly what reaches the bot. Without this, the three ways pairing
+  // can silently fail — privacy mode (no update at all), a non-forum chat,
+  // or a sender outside ALLOWED_USERS — are indistinguishable from "bot
+  // is broken". Gated to pairing mode so normal operation stays quiet.
+  if (!isGroupLockedByEnv && getAllowedGroupId() === null) {
+    console.log(
+      `[pair] incoming ${ctx.updateType} update: chat=${chat?.id} type=${chat?.type} ` +
+        `is_forum=${chat?.is_forum} from=${ctx.from?.id} (allowed users: ${ENV.allowedUsers.join(',')})`,
+    );
+  }
+
+  const candidate = resolvePairingCandidate({
+    chat,
+    userId: ctx.from?.id,
+    allowedUsers: ENV.allowedUsers,
+    currentGroupId: getAllowedGroupId(),
+    isEnvLocked: isGroupLockedByEnv,
+  });
+  if (candidate === null) return;
+
+  effectiveGroupId = candidate;
+  await state.setPairedGroupId(candidate);
+  console.log(`[pair] auto-paired forum supergroup ${candidate} (persisted to state.json)`);
+
+  const key = getThreadKey(ctx) ?? { chatId: candidate, threadId: GENERAL_THREAD_ID };
+  await replyToThread(key, t('pair.success', { groupId: candidate })).catch(() => {});
 }
 
 /**
@@ -354,7 +476,7 @@ async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
     // avoid re-entering this handler if the notification itself fails;
     // omit `message_thread_id` so the message lands in General — see the
     // `buildSendExtra` rationale for why `1` on outbound is now a 400.
-    enqueueSend(key.chatId, () =>
+    enqueueSend(key, () =>
       bot.telegram.sendMessage(
         key.chatId,
         t('error.tg.thread.closed', { key: keyToString(key) }),
@@ -388,6 +510,12 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
   pinnedStatusTextCache.delete(k);
+  // Drop any pending status frame so it doesn't surface in a freshly-bound
+  // session. The `inFlight` loop, if running, will exit on its next tick
+  // because `pendingText` is now `null`.
+  const sc = statusCoalescers.get(k);
+  if (sc) sc.pendingText = null;
+  statusCoalescers.delete(k);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -509,7 +637,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
 
     if (existingId !== undefined) {
       try {
-        await enqueueSend(key.chatId, () =>
+        await enqueueSend(key, () =>
           bot.telegram.editMessageText(key.chatId, existingId, undefined, text),
         );
         pinnedStatusTextCache.set(k, text);
@@ -535,7 +663,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
 
     let messageId: number;
     try {
-      const sent = await enqueueSend(key.chatId, () =>
+      const sent = await enqueueSend(key, () =>
         bot.telegram.sendMessage(key.chatId, text, {
           message_thread_id: key.threadId,
           disable_notification: true,
@@ -548,7 +676,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
     }
 
     try {
-      await enqueueSend(key.chatId, () =>
+      await enqueueSend(key, () =>
         bot.telegram.pinChatMessage(key.chatId, messageId, {
           disable_notification: true,
         }),
@@ -589,7 +717,7 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
     if (existingId === undefined) return;
 
     try {
-      await enqueueSend(key.chatId, () =>
+      await enqueueSend(key, () =>
         bot.telegram.unpinChatMessage(key.chatId, existingId),
       );
     } catch (e) {
@@ -597,7 +725,7 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
       console.warn(`[pinned] unpin ${k} failed: ${desc}`);
     }
     try {
-      await enqueueSend(key.chatId, () =>
+      await enqueueSend(key, () =>
         bot.telegram.deleteMessage(key.chatId, existingId),
       );
     } catch {
@@ -656,7 +784,7 @@ async function replyToThread(
   extra: SendExtra = {},
 ): Promise<number | null> {
   const sendOnce = (sendExtra: Record<string, unknown>) =>
-    enqueueSend(key.chatId, () =>
+    enqueueSend(key, () =>
       bot.telegram.sendMessage(
         key.chatId,
         text,
@@ -716,7 +844,7 @@ async function editThreadMessage(
   extra: SendExtra = {},
 ): Promise<boolean> {
   const editOnce = (editExtra: Record<string, unknown>) =>
-    enqueueSend(key.chatId, () =>
+    enqueueSend(key, () =>
       bot.telegram.editMessageText(
         key.chatId, messageId, undefined, text,
         editExtra as Parameters<typeof bot.telegram.editMessageText>[4],
@@ -763,7 +891,7 @@ async function editThreadMessage(
 
 async function deleteThreadMessage(key: ThreadKey, messageId: number): Promise<void> {
   try {
-    await enqueueSend(key.chatId, () => bot.telegram.deleteMessage(key.chatId, messageId));
+    await enqueueSend(key, () => bot.telegram.deleteMessage(key.chatId, messageId));
   } catch {
     /* messages older than 48h or already deleted — silently ignore */
   }
@@ -776,7 +904,7 @@ async function deleteThreadMessage(key: ThreadKey, messageId: number): Promise<v
  */
 async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
   try {
-    await enqueueSend(key.chatId, () =>
+    await enqueueSend(key, () =>
       bot.telegram.sendChatAction(
         key.chatId,
         'typing',
@@ -1041,10 +1169,10 @@ async function downloadFile(url: string, destPath: string, depth = 0): Promise<v
       // the error body (HTML or JSON) was being piped into the destination
       // file, producing a broken "audio" file that Whisper later rejects
       // with a generic 400 and no useful signal to the operator.
-      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.statusCode && (response.statusCode < 200 || response.statusCode >= 300)) {
         file.close(() => {
           cleanup().then(() =>
-            reject(new Error(`Download failed: HTTP ${response.statusCode ?? '???'} ${response.statusMessage ?? ''}`))
+            reject(new Error(`Download failed: HTTP ${response.statusCode} ${response.statusMessage ?? ''}`))
           );
         });
         return;
@@ -1776,14 +1904,14 @@ command('new', async (ctx, key) => {
 
   let topic: { message_thread_id: number };
   try {
-    topic = await bot.telegram.createForumTopic(ENV.allowedGroupId, name);
+    topic = await bot.telegram.createForumTopic(key.chatId, name);
   } catch (e) {
     const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
     await replyToThread(key, t('new.failed', { error: desc }));
     return;
   }
 
-  const newKey: ThreadKey = { chatId: ENV.allowedGroupId, threadId: topic.message_thread_id };
+  const newKey: ThreadKey = { chatId: key.chatId, threadId: topic.message_thread_id };
   const link = makeThreadDeeplink(newKey.chatId, newKey.threadId);
 
   // Audit S11 / #27: route through `applyBinding` so a user who creates
@@ -1875,7 +2003,7 @@ command('version', async (_ctx, key) => {
 
 command('whoami', async (ctx, key) => {
   const userId = ctx.from?.id ?? 0;
-  const allowed = ENV.allowedUsers.includes(userId) && ctx.chat?.id === ENV.allowedGroupId;
+  const allowed = ENV.allowedUsers.includes(userId) && ctx.chat?.id === getAllowedGroupId();
   const binding = state.getBinding(key);
   await replyToThread(
     key,
@@ -1888,6 +2016,41 @@ command('whoami', async (ctx, key) => {
     }),
     { parse_mode: 'Markdown' },
   );
+});
+
+/**
+ * @description Re-point the bot to the forum supergroup this command was
+ * sent in. Registered raw (not via the group-gated `command()` wrapper) so
+ * it can switch the bot from one group to another. Refused when the id is
+ * locked by `ALLOWED_GROUP_ID` env. Allowed-user check is kept so a random
+ * group can't hijack the binding.
+ */
+bot.command('pair', async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId || !ENV.allowedUsers.includes(userId)) return;
+
+  const routeChat = getRouteChat(ctx);
+  const fallbackThreadId =
+    ctx.message && 'message_thread_id' in ctx.message ? ctx.message.message_thread_id : undefined;
+  const replyKey: ThreadKey = getThreadKey(ctx) ?? {
+    chatId: ctx.chat?.id ?? routeChat?.id ?? 0,
+    threadId: fallbackThreadId ?? GENERAL_THREAD_ID,
+  };
+
+  if (isGroupLockedByEnv) {
+    await replyToThread(replyKey, t('pair.locked')).catch(() => {});
+    return;
+  }
+  if (!routeChat || routeChat.type !== 'supergroup' || !routeChat.is_forum) {
+    await replyToThread(replyKey, t('pair.only_forum')).catch(() => {});
+    return;
+  }
+
+  effectiveGroupId = routeChat.id;
+  await state.setPairedGroupId(routeChat.id);
+  console.log(`[pair] re-paired to forum supergroup ${routeChat.id} via /pair`);
+  const key = getThreadKey(ctx) ?? { chatId: routeChat.id, threadId: GENERAL_THREAD_ID };
+  await replyToThread(key, t('pair.success', { groupId: routeChat.id }));
 });
 
 command('help', async (_ctx, key) => {
@@ -2083,9 +2246,12 @@ async function runDoctor(): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
 
   // 1. Bot admin permissions in the configured group.
-  try {
+  const groupId = getAllowedGroupId();
+  if (groupId === null) {
+    lines.push({ status: 'warn', label: t('doctor.bot_admin'), hint: t('pair.not_paired') });
+  } else try {
     const botId = bot.botInfo?.id ?? (await bot.telegram.getMe()).id;
-    const member = await bot.telegram.getChatMember(ENV.allowedGroupId, botId);
+    const member = await bot.telegram.getChatMember(groupId, botId);
     if (member.status === 'administrator') {
       lines.push({ status: 'ok', label: t('doctor.bot_admin') });
       lines.push({
@@ -2647,7 +2813,7 @@ command('clear', async (ctx, key) => {
   for (let i = 0; i < all.length; i += batchSize) {
     const batch = all.slice(i, i + batchSize);
     try {
-      await enqueueSend(key.chatId, () =>
+      await enqueueSend(key, () =>
         bot.telegram.callApi('deleteMessages', {
           chat_id: key.chatId,
           message_ids: batch,
@@ -2665,7 +2831,7 @@ command('clear', async (ctx, key) => {
       // to per-id deletes so we recover what we can. (Review HIGH #1.)
       for (const id of batch) {
         try {
-          await enqueueSend(key.chatId, () => bot.telegram.deleteMessage(key.chatId, id));
+          await enqueueSend(key, () => bot.telegram.deleteMessage(key.chatId, id));
           deleted += 1;
         } catch {
           // Expired / already deleted — drop silently.
@@ -2959,7 +3125,7 @@ bot.on('edited_message', async (ctx) => {
  */
 bot.on('my_chat_member', async (ctx) => {
   const chat = ctx.chat;
-  if (!chat || chat.id !== ENV.allowedGroupId) return;
+  if (!chat || chat.id !== getAllowedGroupId()) return;
   const upd = ctx.update.my_chat_member;
   const newMember = upd.new_chat_member;
   const botId = bot.botInfo?.id;
@@ -3290,6 +3456,29 @@ function handleAgentOutput(key: ThreadKey, output: string): void {
   console.log(`[Bot] output ${keyToString(key)} (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
 
+  // Bot-side safety net for Claude-CLI "thinking" bursts that slip past
+  // the adapter classifier (`checkIsStatusOutput`'s ≤200-char / ≤3-line
+  // heuristic). When the diff between two polls happens to contain
+  // 4+ progress ticks or pushes the chunk over 200 chars, the adapter
+  // routes it as substantive `output` and the thread used to receive a
+  // wall of spinner messages. The redirect into `handleAgentStatus`
+  // sends the chunk through the same coalescer that single-line ticks
+  // already use, so a long-thinking session edits ONE rolling message
+  // instead of flooding the topic. Adapter-agnostic — same fix protects
+  // OpenCode and any future adapter without touching their code.
+  // See `progressLine.ts` for the regex and the chunk-purity rule.
+  if (checkIsProgressChunk(output)) {
+    handleAgentStatus(key, output);
+    return;
+  }
+
+  // Real output supersedes any not-yet-sent status frame. Without this,
+  // a thinking-text edit queued ~50 ms before could still hit Telegram
+  // and briefly overwrite the visible status with stale text after the
+  // real output already landed. Clearing `pendingText` here is safe even
+  // mid-flush: the loop re-checks `pendingText` after every send.
+  getStatusCoalesceState(key).pendingText = null;
+
   const msgState = getThreadMessageState(key);
   const hadStatusMessage = msgState.statusMessageId !== null;
 
@@ -3302,44 +3491,96 @@ function handleAgentOutput(key: ThreadKey, output: string): void {
   });
 }
 
+/**
+ * @description Receive a `status` (thinking/spinner) event from the adapter.
+ *
+ * Does not send to Telegram directly — instead it parks the latest text in
+ * the per-thread coalescer and (re)starts the flush loop if one isn't
+ * already running. See {@link StatusCoalesceState} for the rationale: a
+ * burst of status events from a busy agent used to translate 1:1 into
+ * `editMessageText` operations on the rate-limiter FIFO, pushing real
+ * `output` sends behind a wall of stale thinking frames.
+ */
 function handleAgentStatus(key: ThreadKey, status: string): void {
   if (!status.trim()) return;
   console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
 
-  const msgState = getThreadMessageState(key);
   deleteLoaderMessage(key).catch(() => {});
 
-  const chunks = splitMessage(status);
+  const c = getStatusCoalesceState(key);
+  c.pendingText = status;
+  if (!c.inFlight) {
+    void flushStatusCoalescer(key);
+  }
+}
 
-  (async () => {
-    try {
-      const firstEscaped = escapeMarkdown(chunks[0]);
-      if (msgState.statusMessageId) {
-        const ok = await editThreadMessage(key, msgState.statusMessageId, firstEscaped, {
-          parse_mode: 'Markdown',
-        });
-        if (!ok) {
-          msgState.statusMessageId = null;
-          const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
-          if (id) msgState.statusMessageId = id;
-        }
-      } else {
+/**
+ * @description Drain the per-thread status coalescer.
+ *
+ * Loops while `pendingText` keeps being refreshed by new `handleAgentStatus`
+ * calls. Each iteration consumes the *current* `pendingText` and sends it,
+ * so:
+ *
+ *  - intermediate frames that arrive during a send are dropped (the loop
+ *    only sees the latest one on its next iteration);
+ *  - at most one send per thread is in flight at any time, regardless of
+ *    how fast Claude's poller emits new frames;
+ *  - if `handleAgentOutput` clears `pendingText`, the loop exits cleanly
+ *    on the next iteration without queueing a stale edit.
+ */
+async function flushStatusCoalescer(key: ThreadKey): Promise<void> {
+  const c = getStatusCoalesceState(key);
+  if (c.inFlight) return;
+  c.inFlight = true;
+  try {
+    while (c.pendingText !== null) {
+      const text = c.pendingText;
+      c.pendingText = null;
+      await sendStatusFrame(key, text);
+    }
+  } finally {
+    c.inFlight = false;
+  }
+}
+
+/**
+ * @description Edit (or create) the thread's transient status message
+ * with `status`. Lifted out of the old `handleAgentStatus` body so the
+ * coalescer loop can call it once per latest-frame, instead of one
+ * IIFE per incoming event.
+ */
+async function sendStatusFrame(key: ThreadKey, status: string): Promise<void> {
+  const msgState = getThreadMessageState(key);
+  const chunks = splitMessage(status);
+  try {
+    const firstEscaped = escapeMarkdown(chunks[0]);
+    if (msgState.statusMessageId) {
+      const ok = await editThreadMessage(key, msgState.statusMessageId, firstEscaped, {
+        parse_mode: 'Markdown',
+      });
+      if (!ok) {
+        msgState.statusMessageId = null;
         const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
         if (id) msgState.statusMessageId = id;
       }
-      for (let i = 1; i < chunks.length; i++) {
-        const escaped = escapeMarkdown(chunks[i]);
-        const id = await replyChunkWithFallback(key, escaped, chunks[i]);
-        if (id) msgState.statusMessageId = id;
-      }
-    } catch (err) {
-      console.error('[handleAgentStatus] Failed:', err);
+    } else {
+      const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
+      if (id) msgState.statusMessageId = id;
     }
-  })();
+    for (let i = 1; i < chunks.length; i++) {
+      const escaped = escapeMarkdown(chunks[i]);
+      const id = await replyChunkWithFallback(key, escaped, chunks[i]);
+      if (id) msgState.statusMessageId = id;
+    }
+  } catch (err) {
+    console.error('[sendStatusFrame] Failed:', err);
+  }
 }
 
 function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuestion): void {
   console.log(`[Bot] question ${keyToString(key)} (${questionData.requestId}): ${questionData.questions.length}`);
+  // A pending status frame is now stale — the question UI replaces it.
+  getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
   deleteLoaderMessage(key).catch(() => {});
 
@@ -3395,6 +3636,9 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
 }
 
 function handleAgentClosed(key: ThreadKey): void {
+  // Session is gone — drop any not-yet-sent status frame so it doesn't
+  // surface after the "session ended" notice.
+  getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
   pendingQuestions.delete(keyToString(key));
   const adapter = getThreadAdapter(key);
@@ -3406,6 +3650,7 @@ function handleAgentClosed(key: ThreadKey): void {
 
 function handleAgentError(key: ThreadKey, error: Error): void {
   console.error(`[Bot] adapter error ${keyToString(key)}:`, error.message);
+  getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
   pendingQuestions.delete(keyToString(key));
   replyToThread(key, `Error: ${error.message}`).catch(() => {});
@@ -3455,6 +3700,7 @@ const COMMANDS_MENU = [
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
   { command: 'whoami', description: '🪪 Show debug ids' },
+  { command: 'pair', description: '🔗 Bind this group to the bot' },
   { command: 'version', description: 'ℹ️ Versions of bot + CLI tools' },
   { command: 'enter', description: '↵ Press Enter' },
   { command: 'up', description: '⬆️ Arrow Up' },
@@ -3593,7 +3839,6 @@ export async function startBot(): Promise<void> {
   console.log('  Telegram Code Bot (multi-thread) starting...');
   console.log('=================================');
   console.log(`Allowed users:    ${ENV.allowedUsers.join(', ')}`);
-  console.log(`Allowed group:    ${ENV.allowedGroupId}`);
   console.log(`Work root:        ${ENV.workRoot}`);
   console.log(`Default agent:    ${getDefaultAdapterName()}`);
   console.log(`Available agents: ${getAvailableAdapters().map(a => a.name).join(', ')}`);
@@ -3601,15 +3846,30 @@ export async function startBot(): Promise<void> {
   // 1. State store.
   state = await getStateStore();
   console.log(`Data dir:         ${path.dirname(state.stateFilePath)}`);
+
+  // 1a. Adopt a previously auto-paired group id (unless env locks one).
+  if (!isGroupLockedByEnv && effectiveGroupId === null) {
+    effectiveGroupId = state.getPairedGroupId();
+  }
+  console.log(
+    `Allowed group:    ${
+      getAllowedGroupId() ??
+        '(pairing mode — add the bot to your forum supergroup and send a message)'
+    }`,
+  );
   if (state.wasCorruptedOnLoad()) {
     console.warn(
       `[startup] previous state.json was corrupted; archived to ${state.getCorruptedArchivePath()}`,
     );
-    // Best-effort notice into General once the bot is up.
-    setImmediate(() => {
-      const generalKey: ThreadKey = { chatId: ENV.allowedGroupId, threadId: GENERAL_THREAD_ID };
-      replyToThread(generalKey, t('error.state.corrupted')).catch(() => {});
-    });
+    // Best-effort notice into General once the bot is up — only if we
+    // already know the group (skipped while still in pairing mode).
+    const groupId = getAllowedGroupId();
+    if (groupId !== null) {
+      setImmediate(() => {
+        const generalKey: ThreadKey = { chatId: groupId, threadId: GENERAL_THREAD_ID };
+        replyToThread(generalKey, t('error.state.corrupted')).catch(() => {});
+      });
+    }
   }
   const legacyBackup = state.getLegacyMigrationPath();
   if (legacyBackup) {
@@ -3676,7 +3936,8 @@ export async function startBot(): Promise<void> {
       const live = new Set(state.listBindings().map(({ key }) => keyToString(key)));
       // General-topic key always counts as live: in-memory state for
       // /status, /ls etc. is rooted there even without a binding row.
-      live.add(`${ENV.allowedGroupId}:${GENERAL_THREAD_ID}`);
+      const groupId = getAllowedGroupId();
+      if (groupId !== null) live.add(`${groupId}:${GENERAL_THREAD_ID}`);
       let removed = 0;
       for (const m of [
         threadMessageStates as Map<string, unknown>,

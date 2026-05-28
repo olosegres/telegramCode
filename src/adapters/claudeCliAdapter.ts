@@ -181,8 +181,38 @@ function tmuxOrThrow(...args: string[]): string {
  * 1) Bold regex consumed \x1B[ of the following sequence, leaking codes like 38;5;231m
  * 2) Cleanup regex \*\s*\* merged adjacent bold sections, removing newlines between them
  */
-function convertAnsiToMarkdown(text: string): string {
+export function convertAnsiToMarkdown(text: string): string {
   let result = text;
+
+  // Step 0: Strip OSC 8 hyperlink escapes. Plan §2026-05-28
+  // tg-output-readability / S2 (C2).
+  //
+  // The full sequence is one of:
+  //   ESC ] 8 ; <params> ; <url> BEL    <visible text>  ESC ] 8 ; ; BEL
+  //   ESC ] 8 ; <params> ; <url> ESC\   <visible text>  ESC ] 8 ; ; ESC\
+  //
+  // ECMA-48 / xterm spec allows either BEL (0x07) or the C1 string
+  // terminator `ESC \` (0x1B 0x5C, "ST") as the OSC closer. Live
+  // capture from tmux pane shows Claude uses ST, not BEL (see
+  // `od -c` of `tmux capture-pane -e -p` during the live V3
+  // re-verification on 2026-05-28). The two terminators are
+  // interchangeable in the spec; we support both.
+  //
+  // The downstream control-char filter in `cleanOutput` removes the
+  // bare ESC (0x1B) and BEL (0x07) bytes — but the *payload*
+  // (`]8;...;file://...`, then duplicated visible text, then `]8;;`)
+  // is plain ASCII and falls through, producing live artefacts like
+  // `Update(8;id=...;file:///...IDEAS.mdIDEAS.md8;;)` in Telegram.
+  // We strip the whole sequence here, while ESC/BEL are still present
+  // to anchor the regex, and keep only the visible text in $1.
+  //
+  // `\\` inside the character class matches a literal backslash, so
+  // `(?:\x07|\x1B\\\\)` is "BEL  or  ESC followed by `\`".
+  result = result.replace(
+    // eslint-disable-next-line no-control-regex
+    /\x1B\]8;[^;\x07\x1B]*;[^\x07\x1B]*(?:\x07|\x1B\\)([^\x1B\x07]*)\x1B\]8;;(?:\x07|\x1B\\)/g,
+    '$1',
+  );
 
   // Step 1: Mark bold boundaries with control characters
   // Bold on: \x1B[1m → \x01 marker
@@ -214,6 +244,16 @@ function convertAnsiToMarkdown(text: string): string {
 
   // Separate adjacent bold sections: *text1**text2* → *text1* *text2*
   result = result.replace(/\*\*/g, '* *');
+
+  // Drop bold wrappers around a single Claude TUI spinner glyph. Plan
+  // §2026-05-28 tg-output-readability / S5 (N3): claude's TUI toggles
+  // ANSI bold on the spinner cell every redraw, which our bold→`*X*`
+  // conversion above then turns into `*·* Brewing…` / `*✻* Smooshing…`.
+  // The glyph itself carries the spinner semantics — the asterisks add
+  // nothing and make the rolling status message look broken. Narrow
+  // match (listed glyphs only) so a real `*x*` highlight from prose
+  // survives.
+  result = result.replace(/\*([✻✽✶✢·*●○])\*/g, '$1');
 
   return result;
 }
@@ -258,13 +298,22 @@ function joinBrokenUrls(text: string): string {
   return result.join('\n');
 }
 
-function cleanOutput(text: string): string {
+export function cleanOutput(text: string): string {
   let cleaned = convertAnsiToMarkdown(text);
   cleaned = cleaned.replace(/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/g, '');
   cleaned = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   cleaned = joinBrokenUrls(cleaned);
+  // Trim trailing whitespace on every line WITHOUT dropping the line
+  // itself. Plan §2026-05-28 tg-output-readability / S1 (C1):
+  // `tmux capture-pane -e` pads every pane line with trailing spaces to
+  // terminal width, so a "blank" paragraph separator arrives as e.g.
+  // "                                                                    "
+  // (not ""). The previous filter dropped any whitespace-only line,
+  // gluing two paragraphs together in Telegram. Per-line trim preserves
+  // the line, leaves a bare empty string in its place, and lets the
+  // `\n{3,}→\n\n` collapse below normalise sequences of newlines.
+  cleaned = cleaned.replace(/[ \t]+$/gm, '');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-  cleaned = cleaned.split('\n').filter(line => line.trim() || line === '').join('\n');
   return cleaned.trim();
 }
 
@@ -320,7 +369,67 @@ function checkIsStatusOutput(text: string): boolean {
   });
 }
 
-function stripTuiElements(text: string): string {
+/**
+ * @description Active spinner tick, per-line shape used by Claude's TUI
+ * while it is thinking or running a tool. Examples:
+ *   `✽ Doing… (4s · ↓ 14 tokens)`
+ *   `* Brewing… (1m 30s · ↑ 88 tokens · thought for 17s)`
+ *   `· Working… (7s · ↓ 222 tokens)`
+ *
+ * Plan §2026-05-28 tg-output-readability / S4 (N1.b). Why a SECOND
+ * regex on top of `PROGRESS_LINE_RE` (in `progressLine.ts`): the
+ * canonical regex requires `\d+m\s+\d+s` (a full minute count); short
+ * runs under 60s render as just `5s` and slip past it. The relaxed
+ * `\d+(?:m\s+\d+)?s` here accepts both shapes. We deliberately do NOT
+ * loosen `PROGRESS_LINE_RE` because the bot-side coalescer
+ * (`checkIsProgressChunk`) relies on its current strictness as an
+ * anti-false-positive guard.
+ *
+ * The required `\S+…` verb-with-ellipsis disambiguates this from a
+ * tool-call header (`● Bash(ls -la)`), which starts with the same
+ * `●` glyph but has no ellipsis.
+ */
+const SPINNER_TICK_RE =
+  /^\s*[✻✽✶✢·*●○]\s+\S+…\s*\(\d+(?:m\s+\d+)?s(?:\s*·[^()]*)?\)\s*$/;
+
+/**
+ * @description Post-thinking trailer line that Claude's TUI prints
+ * AFTER it has finished thinking (just before resuming the prompt
+ * area). Examples observed in the live ExampleGroup debug session:
+ *   `✻ Cooked for 27s`        (msg 1855, 1863)
+ *   `✻ Cogitated for 20s`     (msg 1873)
+ *   `✻ Crunched for 7s`       (msg 1869)
+ *   `✻ Baked for 10s`         (msg 1837)
+ *   `✻ Churned for 20s`       (msg 1897 — V3 iteration 1, 2026-05-28)
+ *   `✻ Sautéed for 20s`       (msg 1909 — V3 iteration 2, 2026-05-28)
+ *
+ * Plan §2026-05-28 tg-output-readability / S3 (N1.a). The trailer
+ * carries zero novel info — the same time was already streaming in
+ * the active spinner that preceded it — so we drop it.
+ *
+ * Verb match is `\S+`, not an explicit list. The original plan called
+ * for an explicit list of `-ed` forms (Cooked|Cogitated|...) on the
+ * theory that a future Claude verb that IS real prose (e.g.
+ * `✻ Ready for input`) could be silently swallowed. Two live V3
+ * iterations on 2026-05-28 demonstrated the opposite failure mode:
+ * Claude ships new spinner verbs faster than we'd realistically
+ * extend the list (`Churned` and `Sautéed` both slipped through on
+ * first encounter). The triple anchor `<glyph> <verb> for <N>s` is
+ * shape-specific enough that real prose almost cannot satisfy it:
+ *   - line must START with a spinner glyph (`✻✽✶✢·*●○`) — outside
+ *     transient TUI status, Claude never emits these as the first
+ *     non-whitespace char of a prose line;
+ *   - line must END with `for \d+(?:m\s+\d+)?s` — a time literal,
+ *     not a generic noun;
+ *   - line has no other content (anchored `$`).
+ * `\S+` is the minimal relaxation: one non-whitespace token between
+ * the glyph and ` for `. Accepts `Sautéed`, `Churned`, future verbs,
+ * and rejects anything containing whitespace or extra structure.
+ */
+const POST_THINKING_TRAILER_RE =
+  /^[✻✽✶✢·*●○]\s+\S+\s+for\s+\d+(?:m\s+\d+)?s\s*$/;
+
+export function stripTuiElements(text: string): string {
   const lines = text.split('\n');
   const filtered: string[] = [];
 
@@ -332,6 +441,14 @@ function stripTuiElements(text: string): string {
     if (/^❯/.test(line)) continue;
     if (/\(shift\+tab to cycle\)/i.test(line)) continue;
     if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) continue;
+
+    // S3 (N1.a) / S4 (N1.b): per-line strip of mid-chunk spinner ticks
+    // and post-thinking trailers. These shapes used to slip through
+    // `checkIsStatusOutput` (adapter side) and `checkIsProgressChunk`
+    // (bot side) when they appeared mixed with real output in a single
+    // poll diff (msg 1853, 1855, 1863 in the debug session).
+    if (SPINNER_TICK_RE.test(line)) continue;
+    if (POST_THINKING_TRAILER_RE.test(line.trim())) continue;
 
     const trimmedLine = line.trim();
     const isToolCall = /^[●○]?\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i.test(trimmedLine);

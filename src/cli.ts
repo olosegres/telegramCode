@@ -12,6 +12,7 @@ dns.setDefaultResultOrder('ipv4first');
 
 import { runBot } from './cli/bot';
 import { runClaudeCli } from './cli/cliClaude';
+import { runHot } from './cli/hot';
 
 /**
  * @description Print top-level usage to stderr.
@@ -25,6 +26,9 @@ function printUsage(): void {
     `Usage:\n` +
       `  telegramCode                  Start the bot (WORK_ROOT defaults to $PWD)\n` +
       `  telegramCode bot              Same as above\n` +
+      `  telegramCode hot              Hot-reload dev mode: tsc -w + nodemon on dist/\n` +
+      `                                  (rebuilds + restarts the bot on src/ edits;\n` +
+      `                                   in-flight agent sessions are reattached)\n` +
       `  telegramCode cli claude [..]  Run 'claude --dangerously-skip-permissions' in $PWD\n` +
       `  telegramCode --help, -h       Show this help\n` +
       `\n` +
@@ -56,6 +60,11 @@ async function main(): Promise<void> {
 
   if (sub === undefined || sub === 'bot') {
     await runBot();
+    return;
+  }
+
+  if (sub === 'hot') {
+    await runHot();
     return;
   }
 

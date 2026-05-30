@@ -192,14 +192,63 @@ export function tryAcquireLock(): AcquireResult {
 }
 
 /**
+ * @description Same as {@link tryAcquireLock} but waits up to `maxWaitMs`
+ * for a same-token holder to release before giving up.
+ *
+ * Why same-token-only: a different token means a genuinely different bot
+ * instance is running against the same `DATA_DIR` (operator mistake — they
+ * forgot to set distinct `DATA_DIR`s). We MUST refuse fast in that case;
+ * polite waiting would mask the misconfiguration. A matching token, on the
+ * other hand, almost always means "my own predecessor is in the middle of
+ * its graceful-shutdown sequence" — typical during a `nodemon`-driven hot
+ * reload where the old PID has been signalled but is still flushing state.
+ * That window is short (sub-second) and well worth waiting out so the new
+ * process picks the lock back up without spamming the operator with a
+ * "live-holder" abort.
+ *
+ * The sleep function is injected so unit tests can drive the retry loop
+ * deterministically without spending real wall-clock time.
+ */
+export async function tryAcquireLockWithRetry(opts: {
+  maxWaitMs?: number;
+  intervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+} = {}): Promise<AcquireResult> {
+  const maxWaitMs = opts.maxWaitMs ?? 3000;
+  const intervalMs = opts.intervalMs ?? 100;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const ourTokenHash = hashToken(process.env.TELEGRAM_BOT_TOKEN);
+
+  const deadline = Date.now() + maxWaitMs;
+  for (;;) {
+    const r = tryAcquireLock();
+    if (r.ok) return r;
+
+    // Foreign holder: refuse fast, no retry. Wrong DATA_DIR config or two
+    // different bots competing — surfacing the conflict is correct.
+    if (r.reason !== 'live-holder' || r.holder.tokenHash !== ourTokenHash) {
+      return r;
+    }
+
+    // Same-token live holder. Wait for it to release (nodemon hot reload
+    // handoff), then retry. Bounded by `maxWaitMs` so a wedged old process
+    // can't keep us spinning forever.
+    if (Date.now() >= deadline) return r;
+    await sleep(intervalMs);
+  }
+}
+
+/**
  * @description Acquire the single-instance lock for this `DATA_DIR`, or
  * `process.exit(1)` after printing diagnostics.
  *
- * Thin user-facing wrapper around {@link tryAcquireLock}. Kept separate so
- * the testable core stays pure.
+ * Thin user-facing wrapper around {@link tryAcquireLockWithRetry} — the
+ * retry tolerates a brief overlap between an exiting old bot and the
+ * incoming new bot during a `nodemon` hot reload (same token, same
+ * `DATA_DIR`). Foreign holders still fail immediately.
  */
-export function acquireLock(): void {
-  const r = tryAcquireLock();
+export async function acquireLock(): Promise<void> {
+  const r = await tryAcquireLockWithRetry();
   if (r.ok) return;
 
   if (r.reason === 'live-holder') {
@@ -244,25 +293,35 @@ export function releaseLock(): void {
 }
 
 /**
- * @description Register exit / signal handlers that release the lock.
+ * @description Register exit / crash handlers that release the lock.
  *
- * Wired once from `runBot()`. Handles:
- *   - normal exit (release on `process.exit`)
- *   - SIGINT / SIGTERM / SIGHUP (release then exit 0)
- *   - uncaughtException (release then re-throw so Node's default handler runs)
+ * Wired once from `runBot()`. Covers:
+ *   - normal exit (release on `process.exit`) — fires whenever any code
+ *     path calls `process.exit(N)`, including the bot's own ordered
+ *     shutdown (`bot.stop → state.flush → releaseLock → exit(0)`). The
+ *     redundant release here is a belt-and-suspenders for code paths that
+ *     hit `process.exit` without going through the bot shutdown (CLI
+ *     misuse, early env-validation failures).
+ *   - `uncaughtException` (release on crash).
  *
- * SIGKILL is not catchable, hence the stale-lock recovery path in
- * {@link acquireLock}.
+ * **Signal handlers are intentionally NOT installed here.** That used to
+ * be the case, but it caused a race: this module loads first
+ * (`cli/bot.ts:54`), so its `SIGINT`/`SIGTERM` handler always fires before
+ * the bot's own (`bot.ts: shutdown(...)`); a synchronous `process.exit(0)`
+ * inside the lock handler then pre-empts the bot's *async* `state.flush()`
+ * and the last <500ms of state never reaches disk. Letting the bot own
+ * signal handling (and ending with `releaseLock(); process.exit(0)` itself)
+ * makes the sequence deterministic. If a SIGINT/SIGTERM arrives before the
+ * bot installs its handler (very narrow window during boot), Node's
+ * default action terminates the process and we leak the lock file —
+ * harmless, because the next start sees a dead pid and reclaims it via
+ * the stale-lock recovery path in {@link tryAcquireLock}.
+ *
+ * SIGKILL is not catchable, hence the same stale-lock recovery path.
  */
 export function installLockCleanupHandlers(): void {
   const cleanup = (): void => releaseLock();
   process.on('exit', cleanup);
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-    process.on(sig, () => {
-      cleanup();
-      process.exit(0);
-    });
-  }
   process.on('uncaughtException', (err) => {
     cleanup();
     // Print the original error ourselves and exit with the canonical

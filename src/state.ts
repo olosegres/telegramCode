@@ -85,6 +85,21 @@ export interface StateV1 {
    * env value always wins and disables pairing.
    */
   pairedGroupId?: number;
+  /**
+   * Epoch milliseconds of the last successful heartbeat write — the bot
+   * stamps this every ~10s while running. On boot we compare `now -
+   * lastHeartbeatAt` against {@link HOT_RELOAD_THRESHOLD_MS}: small gaps
+   * are a hot reload (quiet reattach, keep buffered updates), large gaps
+   * (or `undefined` for fresh installs / older state files) are a cold
+   * start (allow the per-thread "session reattached" notice, optionally
+   * drop the stale update backlog).
+   *
+   * Optional so old `state.json` files (created before heartbeats existed)
+   * remain valid — `loadStateFile`'s shape check doesn't require it, and
+   * a missing value is interpreted as "treat as cold start", which is the
+   * conservative default we want.
+   */
+  lastHeartbeatAt?: number;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -628,6 +643,39 @@ export class StateStore {
       delete this.state.messages[k];
       this.scheduleSave();
     });
+  }
+
+  // ── heartbeat (hot-reload vs cold-start detection) ──
+
+  /**
+   * @description Stamp `lastHeartbeatAt = now` (ms) and schedule a debounced
+   * save. Called by the bot on a ~10s interval while running so the next
+   * boot can tell a hot reload (gap < threshold) from a real cold start
+   * (gap large, or no stamp at all on a fresh install).
+   *
+   * Cheap by design: a one-field mutation that piggy-backs on the existing
+   * debounced save loop. We don't `flush()` here — losing the last 10s
+   * heartbeat on a hard crash just biases the next boot toward
+   * "cold start", which is the conservative direction.
+   */
+  touchHeartbeat(now: number = Date.now()): void {
+    this.state.lastHeartbeatAt = now;
+    this.scheduleSave();
+  }
+
+  /**
+   * @description Time since the last persisted heartbeat in ms, or `null`
+   * if the state file has no heartbeat stamp (fresh install, or pre-feature
+   * state file). `null` should be treated as "unknown → assume cold start".
+   *
+   * Read at boot to decide hot-vs-cold-start, ideally BEFORE the first
+   * `touchHeartbeat()` call or `state.flush()` (otherwise the value
+   * compares against ourselves and always looks like a hot reload).
+   */
+  getDowntimeMs(now: number = Date.now()): number | null {
+    const last = this.state.lastHeartbeatAt;
+    if (typeof last !== 'number' || !Number.isFinite(last)) return null;
+    return Math.max(0, now - last);
   }
 
   // ── paired group id (auto-pairing) ──

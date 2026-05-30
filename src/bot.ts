@@ -38,6 +38,9 @@ import {
   ensureOpenCodeServer,
 } from './installManager';
 import { getStateStore, KeyLock, type StateStore } from './state';
+import { releaseLock } from './cli/lock';
+import { gracefulShutdown } from './shutdown';
+import { classifyBoot } from './bootClassifier';
 import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
@@ -3847,8 +3850,19 @@ const COMMANDS_MENU = [
  * Plan §10.2 / §13.19 (E1). Runs **before** `bot.launch()` so the first
  * user message in any thread already finds a live adapter session, not
  * a stale "agent not running" reply.
+ *
+ * `opts.quietReattach` controls whether each successfully re-adopted
+ * session triggers a per-topic notice (`t('agent.reattached')`). On a hot
+ * reload (nodemon swap, sub-threshold downtime) the user typically didn't
+ * even notice the bot blinked — spamming every active topic with
+ * "session reattached" is noise. On a real cold start (the operator
+ * actually stopped and restarted the bot) the notice is informative and
+ * stays. The classifier lives in `bootClassifier.ts`; this function only
+ * consumes the flag.
  */
-async function reattachExistingSessions(): Promise<void> {
+async function reattachExistingSessions(
+  opts: { quietReattach: boolean } = { quietReattach: false },
+): Promise<void> {
   // 0. Rehydrate per-thread adapter choice from state.agents into the
   //    in-memory `threadAdapterNames` map. Without this, every thread
   //    reverts to DEFAULT_AGENT after a restart, so `getThreadAdapter(key)`
@@ -3930,10 +3944,12 @@ async function reattachExistingSessions(): Promise<void> {
         const workDir = path.join(ENV.workRoot, binding.subdir);
         if (claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
           adopted += 1;
-          replyToThread(key, t('agent.reattached')).catch(() => {});
+          if (!opts.quietReattach) {
+            replyToThread(key, t('agent.reattached')).catch(() => {});
+          }
         }
       }
-      console.log(`[reattach] tmux: adopted ${adopted}, reconciled ${reconciled}, killed ${killed} orphans`);
+      console.log(`[reattach] tmux: adopted ${adopted}, reconciled ${reconciled}, killed ${killed} orphans (quiet=${opts.quietReattach})`);
     } catch (e) {
       console.error('[reattach] tmux scan failed:', e);
     }
@@ -3953,12 +3969,14 @@ async function reattachExistingSessions(): Promise<void> {
       const workDir = path.join(ENV.workRoot, binding.subdir);
       await opencodeAdapter.resumeSession(key, workDir, agent.opencodeSessionId);
       reopened += 1;
-      replyToThread(key, t('agent.reattached')).catch(() => {});
+      if (!opts.quietReattach) {
+        replyToThread(key, t('agent.reattached')).catch(() => {});
+      }
     } catch (e) {
       console.warn(`[reattach] opencode ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
     }
   }
-  console.log(`[reattach] opencode: reopened ${reopened} sessions`);
+  console.log(`[reattach] opencode: reopened ${reopened} sessions (quiet=${opts.quietReattach})`);
 }
 
 export async function startBot(): Promise<void> {
@@ -3974,6 +3992,18 @@ export async function startBot(): Promise<void> {
   // 1. State store.
   state = await getStateStore();
   console.log(`Data dir:         ${path.dirname(state.stateFilePath)}`);
+
+  // 1.5. Boot classification — hot reload vs cold start. Read the gap to
+  //      the last persisted heartbeat BEFORE we stamp a fresh one
+  //      (otherwise the comparison would always be against ourselves and
+  //      every boot would look like a hot reload). `null` means "no
+  //      heartbeat ever recorded" → conservative cold-start default.
+  const downtimeMs = state.getDowntimeMs();
+  const bootMode = classifyBoot(downtimeMs);
+  console.log(
+    `Boot mode:        ${bootMode.isHotReload ? 'HOT RELOAD' : 'COLD START'} ` +
+      `(downtime=${downtimeMs === null ? 'unknown' : `${downtimeMs}ms`})`,
+  );
 
   // 1a. Adopt a previously auto-paired group id (unless env locks one).
   if (!isGroupLockedByEnv && effectiveGroupId === null) {
@@ -4039,8 +4069,10 @@ export async function startBot(): Promise<void> {
     }
   }
 
-  // 5. Re-attach sessions that survived the restart.
-  await reattachExistingSessions();
+  // 5. Re-attach sessions that survived the restart. Quiet during a hot
+  //    reload so the user isn't spammed with "session reattached" notices
+  //    on every nodemon swap; verbose on a real cold start.
+  await reattachExistingSessions({ quietReattach: bootMode.isHotReload });
 
   // 5a. Refresh pinned banners for every binding. Threads that have a
   //     stored `pinnedStatusMessageId` get their banner edited in place;
@@ -4095,31 +4127,62 @@ export async function startBot(): Promise<void> {
   // shutdowns don't leak timers).
   (globalThis as { __telegramCodeGcInterval?: NodeJS.Timeout }).__telegramCodeGcInterval = inMemoryGcInterval;
 
+  // 5c. Heartbeat. Stamps `state.lastHeartbeatAt = Date.now()` every
+  //     `HEARTBEAT_INTERVAL_MS`; the next boot reads the stamp to
+  //     distinguish a nodemon hot-reload swap (sub-threshold gap) from
+  //     the operator stopping/restarting the bot (large gap, or no stamp
+  //     after a fresh state.json wipe). `touchHeartbeat()` is debounced
+  //     via the existing 500ms save coalescer so this loop is cheap.
+  const HEARTBEAT_INTERVAL_MS = 10_000;
+  const heartbeatInterval = setInterval(() => {
+    try {
+      state.touchHeartbeat();
+    } catch (e) {
+      console.warn('[heartbeat] touchHeartbeat failed:', e);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+  // Stamp once immediately so a very short-lived first boot still leaves
+  // a marker for the next start to read.
+  state.touchHeartbeat();
+
   // 6. Global catch — Telegraf swallows handler errors otherwise.
   bot.catch((err, ctx) => {
     console.error('[bot.catch] unhandled error:', err, 'update:', ctx.updateType);
   });
 
-  // 7. Shutdown - preserve active agents for restart/reattach. Use /stop or
-  // /stop-all for an intentional agent stop; process signals only stop the bot.
-  const shutdown = async (signal: string) => {
-    console.log(`\n${signal} received, shutting down...`);
-    clearInterval(inMemoryGcInterval);
-    try {
-      await state.flush();
-    } catch (e) {
-      console.error('[shutdown] error during cleanup:', e);
-    }
-    bot.stop(signal);
-    process.exit(0);
+  // 7. Shutdown — preserve active agents for restart/reattach. Use /stop
+  //    or /stop-all for an intentional agent stop; process signals only
+  //    stop the bot itself. Ordering (bot.stop → state.flush →
+  //    releaseLock → exit) is enforced by `gracefulShutdown` so the
+  //    previous race against `lock.ts`'s synchronous `process.exit(0)`
+  //    can't reappear. D5 (plan): we deliberately do NOT call
+  //    `stopOpenCodeServer()` or `adapter.stopSession()` here — tmux and
+  //    opencode survive the bot process by design and are picked back up
+  //    by `reattachExistingSessions` on the next boot.
+  const shutdown = (signal: string): void => {
+    void gracefulShutdown({
+      signal,
+      bot,
+      state,
+      releaseLock,
+      exit: (code) => process.exit(code),
+      cleanupTimers: () => {
+        clearInterval(inMemoryGcInterval);
+        clearInterval(heartbeatInterval);
+      },
+    });
   };
   process.once('SIGINT', () => shutdown('SIGINT'));
   process.once('SIGTERM', () => shutdown('SIGTERM'));
 
-  // 8. Launch.
-  console.log('Launching Telegraf bot (long polling)...');
+  // 8. Launch. `dropPendingUpdates` follows the boot classifier: on a hot
+  //    reload we KEEP the buffered backlog so a message typed during the
+  //    ~1s reload window still routes to its live agent; on a cold start
+  //    we drop stale updates that piled up while the bot was actually
+  //    down (otherwise the user gets a flood of replies to old messages).
+  console.log(`Launching Telegraf bot (long polling, dropPendingUpdates=${bootMode.dropPendingUpdates})...`);
   try {
-    await bot.launch({ dropPendingUpdates: true });
+    await bot.launch({ dropPendingUpdates: bootMode.dropPendingUpdates });
     console.log('');
     console.log('Bot is running! Waiting for messages...');
     console.log('Press Ctrl+C to stop');

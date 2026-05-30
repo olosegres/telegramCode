@@ -117,4 +117,14 @@ per-backend, persisted agent setting.
 - `yarn test` — unit/integration (`src/__tests__/**/*.test.ts`, node test runner + tsx)
 - `yarn typecheck` — `tsc --noEmit`
 - `yarn build` — `tsc` → `dist/`
-- `yarn dev` — `tsx watch src/cli.ts`
+- `yarn dev` — `tsx watch src/cli.ts` (fast dev — TS errors crash the process)
+- `yarn hot` / `telegramCode hot` — hot-reload mode: `tsc -w` + `nodemon`
+  on `dist/`. A broken intermediate edit can't take the bot down (no
+  emit until the build is green), and `nodemon` waits for the old PID's
+  graceful shutdown before respawning so the lock changes hands cleanly.
+  Agents survive the reload (they run in external `tmux`/`opencode`
+  processes); `reattachExistingSessions()` on the next boot re-adopts
+  them silently if the downtime gap is short (hot reload), with a
+  per-topic notice if it's long (cold start). Globally-installed bin
+  resolves the project root via `fs.realpathSync(__dirname)`, so
+  `telegramCode hot` works from any CWD.

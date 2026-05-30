@@ -50,7 +50,7 @@ export async function runBot(): Promise<void> {
     process.exit(1);
   }
 
-  acquireLock();
+  await acquireLock();
   installLockCleanupHandlers();
 
   // Lazy import so env is fully populated before the bot module's top-level

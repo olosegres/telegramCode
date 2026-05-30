@@ -12,8 +12,10 @@
   },
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js dist/index.js",
+    "build:watch": "tsc -w",
     "start": "node dist/cli.js",
     "dev": "tsx watch src/cli.ts",
+    "hot": "node dist/cli.js hot",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test 'src/__tests__/**/*.test.ts'",
     "claude": "UID=$(id -u) GID=$(id -g) docker compose run --rm claude"
@@ -26,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "nodemon": "^3.1.0",
     "tsx": "^4.21.0",
     "typescript": "^5.7.0"
   },

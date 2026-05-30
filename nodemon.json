@@ -1,0 +1,13 @@
+{
+  "watch": ["dist"],
+  "ext": "js,cjs,mjs,json",
+  "ignore": [
+    "dist/**/*.test.js",
+    "dist/__tests__/**",
+    "**/*.map",
+    "**/*.d.ts"
+  ],
+  "exec": "node dist/cli.js bot",
+  "signal": "SIGTERM",
+  "delay": "300"
+}

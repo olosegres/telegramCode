@@ -45,6 +45,7 @@ import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
 import { downloadFile } from './utils/download';
+import { stripCommandBotMention } from './utils';
 import {
   classifySendError,
   checkIsApiError,
@@ -2949,7 +2950,12 @@ bot.on(message('text'), async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) return;
 
-  const text = ctx.message.text.trim();
+  // In groups Telegram appends `@botusername` to slash commands
+  // (`/compact` → `/compact@my_bot`). Strip it up-front so BOTH the
+  // bot-owned-command check below AND the verbatim forward to the agent see
+  // the bare command — otherwise the agent's CLI gets `/compact@my_bot` and
+  // silently ignores it (the long-standing /compact bug).
+  const text = stripCommandBotMention(ctx.message.text.trim());
   const kStr = keyToString(key);
 
   // Slash commands we don't own → forward to the agent (e.g. `/compact`, `/help`).

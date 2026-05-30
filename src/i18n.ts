@@ -211,6 +211,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.already_active': '{label} уже работает в этом треде. Отправь сообщение или /stop.',
     'agent.starting': 'Запускаю {label} в `{subdir}`…',
     'agent.queued_starting': '⏳ {label} ещё запускается — сообщение в очереди, отправлю как только будет готов.',
+    'agent.question_hint': 'ℹ️ Ответь клавишами: /up /down — выбор, /enter — подтвердить, /y /n /c — быстрый ответ.',
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
 
@@ -440,6 +441,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.already_active': '{label} is already running here. Send a message or /stop.',
     'agent.starting': 'Starting {label} in `{subdir}`…',
     'agent.queued_starting': '⏳ {label} is still starting — your message is queued and will be sent once it is ready.',
+    'agent.question_hint': 'ℹ️ Answer with keys: /up /down to move, /enter to confirm, /y /n /c for a quick reply.',
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
 

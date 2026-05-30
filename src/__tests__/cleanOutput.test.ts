@@ -21,6 +21,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
+  checkIsStatusOutput,
   cleanOutput,
   convertAnsiToMarkdown,
   stripTuiElements,
@@ -226,6 +227,88 @@ test('stripTuiElements: keeps real prose that contains "(5s)"', () => {
   // Guard against an over-eager regex on prose with a plain time stamp.
   const input = 'The build finished in (5s) without errors.';
   assert.equal(stripTuiElements(input), input);
+});
+
+// ─── Echo of a multi-line user prompt must not leak as agent output ────
+
+test('stripTuiElements: drops the whole echoed multi-line prompt block', () => {
+  // Live capture (claude--1001111111111-434): a submitted multi-line prompt
+  // renders as `❯ <first line>` + space-indented continuation. The old code
+  // dropped only the `❯` line, so the continuation (incl. ``` fences) leaked
+  // as a phantom message duplicating the user's own prompt. Only the trailing
+  // spinner should survive here.
+  const input = [
+    '❯ Reply with EXACTLY this and nothing else (literally, do not run any tools):',
+    '  Here is a * *bold* * word and `inline code`, plus chars < > & in prose.',
+    '  ```diff',
+    '  - const oldValue = 1;',
+    '  + const newValue = 2;',
+    '    unchanged < line > here & ok',
+    '  ```',
+    '  Done.',
+    '· Actualizing…',
+    '❯ ',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt    ◉ xhigh · /effort',
+  ].join('\n');
+  const out = stripTuiElements(input);
+  assert.equal(out, '· Actualizing…');
+  // No fence / prompt body leaked.
+  assert.doesNotMatch(out, /```/);
+  assert.doesNotMatch(out, /oldValue/);
+});
+
+test('stripTuiElements: agent output (●) with indented lines is NOT mistaken for an echo', () => {
+  // No preceding `❯ <text>` user turn → nothing is suppressed.
+  const input = '● Here is the result\n  - line one\n  - line two';
+  assert.equal(stripTuiElements(input), input);
+});
+
+test('stripTuiElements: echo block ends at the agent ● output on the next line', () => {
+  const input = '❯ fix the bug\n  in file x\n● Done, fixed it.\n  changed line 5';
+  assert.equal(stripTuiElements(input), '● Done, fixed it.\n  changed line 5');
+});
+
+test('stripTuiElements: drops the "⎿ Tip:" Plan-Mode UI hint', () => {
+  const input =
+    'Real answer.\n⎿  Tip: Use Plan Mode to prepare for a complex request before making changes. Press shift+tab twice to enable.';
+  assert.equal(stripTuiElements(input), 'Real answer.');
+});
+
+test('stripTuiElements: keeps real prose that begins with "Tip:" (no ⎿ marker)', () => {
+  // The ⎿-less form is agent advice, not the Plan-Mode UI hint — must survive.
+  const input = 'Tip: always validate inputs before saving.';
+  assert.equal(stripTuiElements(input), input);
+});
+
+// ─── checkIsStatusOutput — short answer fragments are NOT status ───────
+
+test('checkIsStatusOutput: short sentence answer "Done." is real content, not status', () => {
+  // Live regress: the answer tail "Done." arrived in its own poll frame and
+  // was misclassified as a transient status, so it never reached the durable
+  // message (the user saw the answer with the final line missing).
+  assert.equal(checkIsStatusOutput('Done.'), false);
+});
+
+test('checkIsStatusOutput: "Found 3 bugs." is real content', () => {
+  assert.equal(checkIsStatusOutput('Found 3 bugs.'), false);
+});
+
+test('checkIsStatusOutput: a 2-letter answer "OK." is real content, not status', () => {
+  // Same class as the "Done." drop — a short affirmative answer must survive.
+  assert.equal(checkIsStatusOutput('OK.'), false);
+});
+
+test('checkIsStatusOutput: lone glyph/stat fragments stay status', () => {
+  assert.equal(checkIsStatusOutput('✻ Whirring…'), true);
+  assert.equal(checkIsStatusOutput('· Working… (7s · ↓ 222 tokens)'), true);
+  assert.equal(checkIsStatusOutput('◉ xhigh'), true);
+});
+
+test('checkIsStatusOutput: substantial multi-line content is not status', () => {
+  assert.equal(
+    checkIsStatusOutput('Here is a fairly long answer paragraph that clearly is real content and exceeds the length and structure heuristics used to spot spinners.'),
+    false,
+  );
 });
 
 // ─── N3 — bold around spinner glyph cleanup ────────────────────────────

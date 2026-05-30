@@ -51,6 +51,7 @@ import {
 import { formatPinnedStatus } from './pinnedStatus';
 import { checkIsProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
+import { renderAgentHtml } from './renderAgentHtml';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -1073,10 +1074,10 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
   const forceNew = adapter.outputsDeltas === true;
 
   const sendOrEditFirst = async (text: string): Promise<number | null> => {
-    const escaped = escapeMarkdown(text);
+    const rendered = renderAgentHtml(text);
     const shouldSendNew = forceNew || msgState.needsNewMessage || !msgState.lastMessageId;
     if (shouldSendNew) {
-      const id = await replyChunkWithFallback(key, escaped, text);
+      const id = await replyChunkWithFallback(key, rendered, text);
       if (id) {
         msgState.lastMessageId = id;
         msgState.needsNewMessage = false;
@@ -1084,11 +1085,11 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
       return id;
     }
     // Try edit; on failure send new.
-    const editedOk = await editThreadMessage(key, msgState.lastMessageId!, escaped, {
-      parse_mode: 'Markdown',
+    const editedOk = await editThreadMessage(key, msgState.lastMessageId!, rendered, {
+      parse_mode: 'HTML',
     });
     if (editedOk) return msgState.lastMessageId;
-    const id = await replyChunkWithFallback(key, escaped, text);
+    const id = await replyChunkWithFallback(key, rendered, text);
     if (id) {
       msgState.lastMessageId = id;
       msgState.needsNewMessage = false;
@@ -1099,8 +1100,8 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
   await sendOrEditFirst(chunks[0]);
 
   for (let i = 1; i < chunks.length; i++) {
-    const escaped = escapeMarkdown(chunks[i]);
-    const id = await replyChunkWithFallback(key, escaped, chunks[i]);
+    const rendered = renderAgentHtml(chunks[i]);
+    const id = await replyChunkWithFallback(key, rendered, chunks[i]);
     if (id) {
       msgState.lastMessageId = id;
       msgState.needsNewMessage = false;
@@ -1109,15 +1110,15 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
 }
 
 /**
- * @description Send a chunk with Markdown first; if Markdown is rejected,
+ * @description Send a chunk as HTML first; if Telegram rejects the entities,
  * fall back to plain text so the message reaches the user either way.
  */
 async function replyChunkWithFallback(
   key: ThreadKey,
-  escapedMarkdown: string,
+  renderedHtml: string,
   plainFallback: string,
 ): Promise<number | null> {
-  const id = await replyToThread(key, escapedMarkdown, { parse_mode: 'Markdown' });
+  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' });
   if (id) return id;
   return replyToThread(key, plainFallback);
 }
@@ -3626,23 +3627,23 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<void> {
   const msgState = getThreadMessageState(key);
   const chunks = splitMessage(status);
   try {
-    const firstEscaped = escapeMarkdown(chunks[0]);
+    const firstRendered = renderAgentHtml(chunks[0]);
     if (msgState.statusMessageId) {
-      const ok = await editThreadMessage(key, msgState.statusMessageId, firstEscaped, {
-        parse_mode: 'Markdown',
+      const ok = await editThreadMessage(key, msgState.statusMessageId, firstRendered, {
+        parse_mode: 'HTML',
       });
       if (!ok) {
         msgState.statusMessageId = null;
-        const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
+        const id = await replyChunkWithFallback(key, firstRendered, chunks[0]);
         if (id) msgState.statusMessageId = id;
       }
     } else {
-      const id = await replyChunkWithFallback(key, firstEscaped, chunks[0]);
+      const id = await replyChunkWithFallback(key, firstRendered, chunks[0]);
       if (id) msgState.statusMessageId = id;
     }
     for (let i = 1; i < chunks.length; i++) {
-      const escaped = escapeMarkdown(chunks[i]);
-      const id = await replyChunkWithFallback(key, escaped, chunks[i]);
+      const rendered = renderAgentHtml(chunks[i]);
+      const id = await replyChunkWithFallback(key, rendered, chunks[i]);
       if (id) msgState.statusMessageId = id;
     }
   } catch (err) {

@@ -9,6 +9,7 @@ import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
+import { t } from '../i18n';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -30,6 +31,14 @@ interface ClaudeSession {
   handledAutoAccept: boolean;
   /** Normalized text of last emitted status (for deduplication of spinner updates) */
   lastStatusText: string;
+  /**
+   * Signature of the last emitted interactive-question block (the option-label
+   * set, ignoring which option is highlighted). Moving the `❯` cursor repaints
+   * the whole box every keystroke; comparing signatures lets us deliver the
+   * question once and suppress the cursor-move repaints. Cleared when real
+   * prose follows (the question is over). See {@link extractClaudeQuestion}.
+   */
+  lastQuestionSignature: string;
   /**
    * Handles for the auto-Enter / auto-Accept `setTimeout`s. Audit S9 / #10:
    * the callbacks used to fire 300–400 ms after detection regardless of
@@ -346,7 +355,7 @@ function normalizeToolCallLine(line: string): string {
  * Key insight: real Claude content is substantial (> 200 chars, multi-sentence).
  * Status/progress is short, has few lines, and contains indicators like … or time/token stats.
  */
-function checkIsStatusOutput(text: string): boolean {
+export function checkIsStatusOutput(text: string): boolean {
   // Real content is always substantial
   if (text.length > 200) return false;
 
@@ -363,8 +372,12 @@ function checkIsStatusOutput(text: string): boolean {
     if (/…/.test(trimmed)) return true;
     // Contains progress stats: time patterns (3m 36s), token counts (↓ 12.2k tokens), thought duration
     if (/\d+[smh]\b.*[·↓]|↓\s*[\d.]+k?\s*tokens|thought for \d/i.test(trimmed)) return true;
+    // A short answer fragment that ends a sentence ("Done.", "OK.", "Found 3
+    // bugs.") is real content, not a spinner — spinners always carry a `…`, a
+    // glyph, or token stats (caught above). Don't swallow it into a status.
+    const isShortSentence = /[а-яёa-z]{2,}/i.test(trimmed) && /[.!?]$/.test(trimmed);
     // Very short line without sentence-like structure (two 3+ letter words) — likely a lone spinner/icon
-    if (trimmed.length < 40 && !/[а-яёa-z]{3,}\s+[а-яёa-z]{3,}/i.test(trimmed)) return true;
+    if (trimmed.length < 40 && !isShortSentence && !/[а-яёa-z]{3,}\s+[а-яёa-z]{3,}/i.test(trimmed)) return true;
     return false;
   });
 }
@@ -429,16 +442,186 @@ const SPINNER_TICK_RE =
 const POST_THINKING_TRAILER_RE =
   /^[✻✽✶✢·*●○]\s+\S+\s+for\s+\d+(?:m\s+\d+)?s\s*$/;
 
+/**
+ * @description A single interactive question Claude scraped from the pane,
+ * rendered for durable delivery.
+ */
+export interface ClaudeQuestion {
+  /** Header + every numbered option (highlighted one kept), ready to send. */
+  text: string;
+  /**
+   * Stable across cursor moves — the option-label set, ignoring which option
+   * is currently highlighted. Two `❯`-cursor positions over the same options
+   * yield the same signature, so the bot delivers the question once.
+   */
+  signature: string;
+}
+
+/** Box-drawing chars Claude's TUI wraps option/question lines in. */
+const QUESTION_BORDER_REGEX = /^[│┃]\s?|\s*[│┃]\s*$/g;
+/** Numbered option line, optionally cursor-highlighted, optionally boxed. */
+const QUESTION_OPTION_REGEX = /^(❯\s*)?(\d{1,2})[.)]\s+(\S.*?)\s*$/;
+/** Lines that are pure chrome (borders / blanks / nav hints), never prose. */
+const QUESTION_CHROME_REGEX =
+  /^[╭╮╰╯─━│┃\s]*$|Enter to select|esc to|↑↓|↑\/↓|to cycle|shift\+tab|to confirm|to submit|use arrow/i;
+/** A positive "this is an interactive prompt" signal near the option group. */
+const QUESTION_SELECT_HINT_REGEX = /Enter to select|to select|↑↓|↑\/↓|use arrow|esc to/i;
+const QUESTION_MIN_OPTIONS = 2;
+/** How far below the last option to look for the "Enter to select" hint. */
+const QUESTION_HINT_LOOKAHEAD = 4;
+/**
+ * How far above a non-option line to look for another option when deciding
+ * whether the option group is still open. Real prompts interleave options
+ * with indented description sub-lines and full-width `────` separators (e.g.
+ * AskUserQuestion: option → description → option, or option → separator →
+ * option); a small look-back spans those gaps without merging an unrelated
+ * numbered list that sits further up the pane.
+ */
+const QUESTION_OPTION_LOOKBACK = 4;
+/**
+ * Box corner chars. The upward option-group walk stops at a box edge so a
+ * numbered list in prose sitting just above the box can't merge into the
+ * options — the box top border separates the prompt from preceding prose.
+ */
+const QUESTION_BOX_EDGE_REGEX = /[╭╮╰╯]/;
+
+function stripQuestionBoxBorder(line: string): string {
+  return line.replace(QUESTION_BORDER_REGEX, '');
+}
+
+function checkIsOptionLine(line: string): boolean {
+  return QUESTION_OPTION_REGEX.test(line);
+}
+
+/** Whether another option line sits within {@link QUESTION_OPTION_LOOKBACK} lines above `index`. */
+function checkHasOptionAbove(lines: string[], index: number): boolean {
+  const top = Math.max(0, index - QUESTION_OPTION_LOOKBACK);
+  for (let i = index - 1; i >= top; i--) {
+    if (checkIsOptionLine(lines[i])) return true;
+  }
+  return false;
+}
+
+function checkIsQuestionChrome(line: string): boolean {
+  return QUESTION_CHROME_REGEX.test(line);
+}
+
+/**
+ * @description Detect + extract the active interactive question/choice block
+ * from the FULL Claude pane, returning a durable rendering and a
+ * cursor-invariant signature, or `null` when the pane isn't confidently
+ * showing a question.
+ *
+ * Operates on the whole pane (not a poll diff) on purpose: moving the `❯`
+ * cursor repaints only the two changed option lines, so a signature taken
+ * from the diff would be a partial option set and wouldn't match the full
+ * box — the de-dup would fail and every keystroke would re-spam the thread.
+ * Reading the full option group makes the signature stable across cursor
+ * moves. We take the LAST option group (the active prompt sits at the bottom
+ * of the pane) and the header line(s) just above it.
+ *
+ * Conservative (plan §2026-05-30 / S2): requires a `❯` cursor on an option
+ * OR an "Enter to select"-style hint right below the group — a plain numbered
+ * list in prose has neither, so it returns `null` and falls through to the
+ * normal output path. The `❯`-highlighted option text is preserved (the old
+ * `stripTuiElements` path discarded every `^❯` line, losing the selection).
+ */
+export function extractClaudeQuestion(text: string): ClaudeQuestion | null {
+  const lines = text.split('\n').map(line => stripQuestionBoxBorder(line).trim());
+
+  // Bottom-most option line anchors the active prompt (it sits at the pane
+  // bottom). The option run is NOT contiguous — descriptions / separators sit
+  // between options — so walk up spanning any non-option line while another
+  // option is still within reach above; stop once it isn't (that's the header).
+  let end = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (checkIsOptionLine(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  if (end === -1) return null;
+
+  let start = end;
+  for (let i = end - 1; i >= 0; i--) {
+    if (checkIsOptionLine(lines[i])) {
+      start = i;
+      continue;
+    }
+    if (QUESTION_BOX_EDGE_REGEX.test(lines[i])) break;
+    if (!checkHasOptionAbove(lines, i)) break;
+  }
+
+  const options = lines
+    .slice(start, end + 1)
+    .filter(checkIsOptionLine)
+    .map(line => {
+      const match = line.match(QUESTION_OPTION_REGEX)!;
+      return { highlighted: Boolean(match[1]), number: match[2], label: match[3].trim() };
+    });
+  if (options.length < QUESTION_MIN_OPTIONS) return null;
+
+  // Positive interactive signal, or it's not a real choice prompt.
+  const hasCursor = options.some(option => option.highlighted);
+  const tail = lines.slice(end + 1, end + 1 + QUESTION_HINT_LOOKAHEAD).join('\n');
+  if (!hasCursor && !QUESTION_SELECT_HINT_REGEX.test(tail)) return null;
+
+  // Header: skip the blank/border gap above the options, then collect the
+  // contiguous prose line(s) above that.
+  let h = start - 1;
+  while (h >= 0 && checkIsQuestionChrome(lines[h])) h--;
+  const headerLines: string[] = [];
+  while (h >= 0 && !checkIsOptionLine(lines[h]) && !checkIsQuestionChrome(lines[h])) {
+    headerLines.unshift(lines[h]);
+    h--;
+  }
+
+  const header = headerLines.join('\n').trim();
+  const renderedOptions = options
+    .map(option => `${option.highlighted ? '❯' : ' '} ${option.number}. ${option.label}`)
+    .join('\n');
+  const signature = options.map(option => `${option.number}.${option.label}`).join('|');
+
+  return {
+    text: header ? `${header}\n\n${renderedOptions}` : renderedOptions,
+    signature,
+  };
+}
+
+/** Whether `text` is confidently showing an interactive question/choice block. */
+export function checkIsClaudeQuestionBlock(text: string): boolean {
+  return extractClaudeQuestion(text) !== null;
+}
+
 export function stripTuiElements(text: string): string {
   const lines = text.split('\n');
   const filtered: string[] = [];
+  // A submitted multi-line prompt renders as a `❯ <first line>` user-turn
+  // block followed by space-indented continuation lines. We only dropped the
+  // `❯` line, so the continuation (incl. literal ``` fences) leaked out as a
+  // phantom "agent message" duplicating the user's own prompt. Skip the whole
+  // echo block: continuation lines stay suppressed until a non-indented line
+  // (the spinner, a blank, or the agent's own `●` output) ends it.
+  let inUserTurnEcho = false;
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
 
+    if (inUserTurnEcho) {
+      if (/^\s+\S/.test(line)) continue;
+      inUserTurnEcho = false;
+    }
+    if (/^❯\s+\S/.test(line)) {
+      inUserTurnEcho = true;
+      continue;
+    }
+
     if (/^[─━]+$/.test(line.trim())) continue;
     if (/⏵⏵\s*(bypass permissions|accept edits)\s*(on|off)/i.test(line)) continue;
     if (/^❯/.test(line)) continue;
+    // Ephemeral UI hint Claude prints under a turn ("⎿  Tip: Use Plan Mode…").
+    // Require the `⎿` marker so plain prose starting with "Tip:" is NOT eaten.
+    if (/^\s*⎿\s*Tip:\s/i.test(line)) continue;
     if (/\(shift\+tab to cycle\)/i.test(line)) continue;
     if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) continue;
 
@@ -689,6 +872,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoEnter: false,
       handledAutoAccept: false,
       lastStatusText: '',
+      lastQuestionSignature: '',
       autoEnterTimer: null,
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
@@ -922,6 +1106,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoEnter: false,
       handledAutoAccept: false,
       lastStatusText: '',
+      lastQuestionSignature: '',
       autoEnterTimer: null,
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
@@ -1047,6 +1232,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoEnter: true,  // don't try to auto-Enter on a session that's already past startup
       handledAutoAccept: true, // same — bypass-permissions was accepted on the original launch
       lastStatusText: '',
+      lastQuestionSignature: '',
       autoEnterTimer: null,
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
@@ -1129,23 +1315,43 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       if (newPart) {
         console.log(`[Claude] RAW output (${newPart.length}):\n---\n${newPart}\n---`);
 
-        const cleanedOutput = stripTuiElements(newPart);
-        if (cleanedOutput) {
-          console.log(`[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`);
-
-          if (checkIsStatusOutput(cleanedOutput)) {
-            // Deduplicate spinner updates: normalize spinner character and compare
-            const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
-            if (normalized !== session.lastStatusText) {
-              session.lastStatusText = normalized;
-              this.emit('status', key, cleanedOutput);
-            }
-          } else {
+        // Interactive question/choice prompts are detected on the FULL pane
+        // (not this diff): moving the `❯` cursor repaints only the changed
+        // option lines, so a signature from the diff would be a partial
+        // option set and the de-dup would re-spam the thread on every
+        // keystroke. Reading the whole option group keeps the signature
+        // stable across cursor moves. Deliver once as durable output — not a
+        // transient status frame that gets deleted — and suppress repaints.
+        const question = extractClaudeQuestion(content);
+        if (question) {
+          if (question.signature !== session.lastQuestionSignature) {
+            session.lastQuestionSignature = question.signature;
             session.lastStatusText = '';
-            this.emit('output', key, cleanedOutput);
+            this.emit('output', key, `${question.text}\n\n${t('agent.question_hint')}`);
           }
         } else {
-          console.log(`[Claude] Output filtered out completely`);
+          // No question on screen — clear the de-dup so an identical question
+          // asked again later is delivered, not silently swallowed.
+          session.lastQuestionSignature = '';
+
+          const cleanedOutput = stripTuiElements(newPart);
+          if (cleanedOutput) {
+            console.log(`[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`);
+
+            if (checkIsStatusOutput(cleanedOutput)) {
+              // Deduplicate spinner updates: normalize spinner character and compare
+              const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
+              if (normalized !== session.lastStatusText) {
+                session.lastStatusText = normalized;
+                this.emit('status', key, cleanedOutput);
+              }
+            } else {
+              session.lastStatusText = '';
+              this.emit('output', key, cleanedOutput);
+            }
+          } else {
+            console.log(`[Claude] Output filtered out completely`);
+          }
         }
       }
 

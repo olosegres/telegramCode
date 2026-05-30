@@ -791,6 +791,36 @@ function shellSingleQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * @description A bare slash command (e.g. `/compact`, `/clear`, `/context`) —
+ * a `/` followed only by letters/hyphens with NO argument. Typing one opens
+ * Claude's command-autocomplete popup; an argument (a space) closes it. We
+ * use this to decide whether the trailing `Enter` needs to wait for the popup
+ * to settle (see {@link CLAUDE_SLASH_ENTER_DELAY_MS}).
+ */
+const BARE_SLASH_COMMAND_RE = /^\/[a-zA-Z][a-zA-Z-]*$/;
+
+/**
+ * @description Whether `input` is a bare slash command (matches
+ * {@link BARE_SLASH_COMMAND_RE} after trimming). Exported so the
+ * popup-settle decision is unit-testable without a live tmux session.
+ */
+export function checkIsBareSlashCommand(input: string): boolean {
+  return BARE_SLASH_COMMAND_RE.test(input.trim());
+}
+
+/**
+ * @description Delay between typing a bare slash command and pressing Enter.
+ *
+ * Claude's TUI opens an autocomplete popup the instant `/` is typed. Sending
+ * Enter the same tick the popup is still rendering accepts the highlighted
+ * suggestion instead of RUNNING the command, so e.g. `/compact` silently
+ * no-ops. Letting the popup settle first makes Enter execute the command.
+ * Commands with arguments (`/model sonnet`) don't need this — the space
+ * already dismissed the popup.
+ */
+const CLAUDE_SLASH_ENTER_DELAY_MS = 250;
+
 export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
@@ -1012,7 +1042,22 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // tmux special-key names (so the user typing the word "Enter" wouldn't
     // be rewritten to a newline). A separate call adds the actual Enter.
     tmux('send-keys', '-t', session.sessionName, '-l', input);
-    tmux('send-keys', '-t', session.sessionName, 'Enter');
+
+    // Bare slash commands (`/compact`, `/clear`, …) open Claude's command
+    // autocomplete popup; an Enter fired the same instant accepts the popup
+    // highlight instead of running the command (so it silently no-ops). Defer
+    // the Enter so the popup settles first. Re-check the session is still
+    // alive when the timer fires — it may have been stopped meanwhile.
+    if (checkIsBareSlashCommand(input)) {
+      const sessionName = session.sessionName;
+      setTimeout(() => {
+        if (this.sessions.get(keyToString(key))?.isActive) {
+          tmux('send-keys', '-t', sessionName, 'Enter');
+        }
+      }, CLAUDE_SLASH_ENTER_DELAY_MS);
+    } else {
+      tmux('send-keys', '-t', session.sessionName, 'Enter');
+    }
   }
 
   sendSignal(key: ThreadKey, signal: string): void {

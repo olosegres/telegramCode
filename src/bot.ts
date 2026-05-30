@@ -23,7 +23,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey } from './types';
+import type { ThreadKey, AgentAdapter } from './types';
 import { keyToString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -50,6 +50,7 @@ import {
 } from './sendErrorClassifier';
 import { formatPinnedStatus } from './pinnedStatus';
 import { checkIsProgressChunk } from './progressLine';
+import { StartupPromptBuffer } from './startupPromptBuffer';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -265,6 +266,14 @@ const pendingQuestions = new Map<string, PendingQuestionState>();
 const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
+
+/**
+ * @description Buffers prompts typed while an agent session is still booting so
+ * they are replayed once it's ready, instead of being dropped into the
+ * "no agent running" guidance. Adapter-agnostic — covers both Claude (tmux
+ * boot) and OpenCode (server boot). See {@link StartupPromptBuffer}.
+ */
+const startupPromptBuffer = new StartupPromptBuffer();
 
 /**
  * @description Per-thread snapshot of the last `/sessions` listing. Audit
@@ -1483,6 +1492,10 @@ async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<voi
 }
 
 async function startAgentSession(key: ThreadKey, args?: string): Promise<string> {
+  const kStr = keyToString(key);
+  // Open the startup window synchronously (before the first await) so text
+  // typed right after `/claude` / `/opencode` is buffered, not dropped.
+  startupPromptBuffer.markStarting(kStr);
   markNeedsNewMessage(key);
   const adapter = getThreadAdapter(key);
   const workDir = getWorkDir(key);
@@ -1505,6 +1518,13 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
     }
     await state.setAgent(key, { name: adapter.name });
 
+    // Session is active now — replay anything the user typed while it booted,
+    // in arrival order, through the normal forward path. Fire-and-forget so the
+    // `ready` message isn't delayed; `drainPrompts` runs synchronously here
+    // (before the first await inside) so the startup window is already closed
+    // by the time we return — no message can slip into a second buffer.
+    void replayBufferedPrompts(key);
+
     const subdir = state.getBinding(key)?.subdir ?? path.basename(ENV.workRoot);
     return t('agent.ready', {
       label: adapter.label,
@@ -1512,11 +1532,51 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
       argsSuffix: args ? ` (${args})` : '',
     });
   } catch (e) {
+    // Start failed — the buffered prompts have nowhere to go, so drop them
+    // rather than replaying into a dead session.
+    startupPromptBuffer.discardPrompts(kStr);
     return t('agent.start_failed', {
       label: adapter.label,
       error: e instanceof Error ? e.message : String(e),
     });
   }
+}
+
+/**
+ * @description Replay prompts buffered during the startup window to the now-active
+ * agent, preserving arrival order. Each prompt goes through the same forward
+ * routine as a live message (new-message marker + loader + `sendInput`).
+ */
+async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
+  const adapter = getThreadAdapter(key);
+  const prompts = startupPromptBuffer.drainPrompts(keyToString(key));
+  if (prompts.length === 0 || !adapter.checkIsActive(key)) return;
+  // Sequential await keeps `sendInput` calls in arrival order even when each
+  // forward awaits its own loader send first.
+  for (const prompt of prompts) {
+    try {
+      await forwardPromptToAgent(key, adapter, prompt);
+    } catch (err) {
+      console.error('[replayBufferedPrompts] forward failed:', err);
+    }
+  }
+}
+
+/**
+ * @description Forward one user prompt to a live agent: mark the thread for a
+ * fresh output message, show the `⏳` loader, and hand the text to the adapter.
+ * Shared by the text handler, the voice handler, and startup-prompt replay so
+ * the loader/marker behaviour stays identical across all three.
+ */
+async function forwardPromptToAgent(
+  key: ThreadKey,
+  adapter: AgentAdapter,
+  text: string,
+): Promise<void> {
+  markNeedsNewMessage(key);
+  const loaderId = await replyToThread(key, '⏳');
+  if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
+  adapter.sendInput(key, text);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2879,6 +2939,16 @@ bot.on(message('text'), async (ctx) => {
   // Always track inbound message ids so /clear can delete user messages too.
   await state.pushMessageId(key, ctx.message.message_id);
 
+  // Session is mid-startup → buffer the prompt and replay it once the agent is
+  // ready, instead of dropping it into the "no agent running" guidance below.
+  if (startupPromptBuffer.checkIsStarting(kStr)) {
+    const isFirstBuffered = startupPromptBuffer.addPrompt(kStr, text);
+    if (isFirstBuffered) {
+      await replyToThread(key, t('agent.queued_starting', { label: getThreadAdapter(key).label }));
+    }
+    return;
+  }
+
   // Audit S2 / #5: if `forum_topic_created` was emitted by a non-allowed
   // admin, we stashed the topic name in `pendingTopicNames` without
   // binding. Now that an allowed user is engaging this thread, retry the
@@ -2977,10 +3047,7 @@ bot.on(message('text'), async (ctx) => {
 
   // Forward text to a running agent.
   if (adapter.checkIsActive(key)) {
-    markNeedsNewMessage(key);
-    const loaderId = await replyToThread(key, '⏳');
-    if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
-    adapter.sendInput(key, text);
+    await forwardPromptToAgent(key, adapter, text);
     return;
   }
 
@@ -3048,6 +3115,15 @@ bot.on(message('voice'), async (ctx) => {
     console.log(`[Bot] voice transcribed: "${transcript}"`);
     await replyToThread(key, t('voice.transcribed', { text: transcript }));
 
+    // Session is mid-startup → buffer the transcript and replay it once ready.
+    if (startupPromptBuffer.checkIsStarting(keyToString(key))) {
+      const isFirstBuffered = startupPromptBuffer.addPrompt(keyToString(key), transcript);
+      if (isFirstBuffered) {
+        await replyToThread(key, t('agent.queued_starting', { label: getThreadAdapter(key).label }));
+      }
+      return;
+    }
+
     const adapter = getThreadAdapter(key);
     if (!adapter.checkIsActive(key)) {
       const startMatch = checkIsStartAgentPhrase(transcript);
@@ -3084,10 +3160,7 @@ bot.on(message('voice'), async (ctx) => {
       return;
     }
 
-    markNeedsNewMessage(key);
-    const loaderId = await replyToThread(key, '⏳');
-    if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
-    adapter.sendInput(key, transcript);
+    await forwardPromptToAgent(key, adapter, transcript);
   } catch (err) {
     console.error('[Bot] Voice handling error:', err);
     await replyToThread(key, 'Error processing voice message');

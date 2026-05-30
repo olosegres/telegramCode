@@ -210,6 +210,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.exit_signal_sent': 'Послан двойной Ctrl+C — {label} завершает работу',
     'agent.already_active': '{label} уже работает в этом треде. Отправь сообщение или /stop.',
     'agent.starting': 'Запускаю {label} в `{subdir}`…',
+    'agent.queued_starting': '⏳ {label} ещё запускается — сообщение в очереди, отправлю как только будет готов.',
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
 
@@ -438,6 +439,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.exit_signal_sent': 'Double Ctrl+C sent — {label} exiting',
     'agent.already_active': '{label} is already running here. Send a message or /stop.',
     'agent.starting': 'Starting {label} in `{subdir}`…',
+    'agent.queued_starting': '⏳ {label} is still starting — your message is queued and will be sent once it is ready.',
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
 

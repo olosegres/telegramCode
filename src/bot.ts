@@ -53,7 +53,7 @@ import {
   getErrorDescription,
 } from './sendErrorClassifier';
 import { formatPinnedStatus } from './pinnedStatus';
-import { checkIsProgressChunk } from './progressLine';
+import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 
@@ -3604,7 +3604,11 @@ function handleAgentOutput(key: ThreadKey, output: string): void {
   // OpenCode and any future adapter without touching their code.
   // See `progressLine.ts` for the regex and the chunk-purity rule.
   if (checkIsProgressChunk(output)) {
-    handleAgentStatus(key, output);
+    // Collapse a redraw burst (many stacked ticks / increasing `/compact`
+    // percentages) down to its latest frame before it reaches the
+    // coalescer, so the rolling status message shows only the current
+    // state instead of a growing wall of intermediate percentages.
+    handleAgentStatus(key, collapseProgressChunk(output));
     return;
   }
 

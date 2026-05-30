@@ -6,7 +6,6 @@ import { promises as fsp } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as https from 'https';
-import * as http from 'http';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -42,6 +41,7 @@ import { getStateStore, KeyLock, type StateStore } from './state';
 import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
+import { downloadFile } from './utils/download';
 import {
   classifySendError,
   checkIsApiError,
@@ -1143,63 +1143,11 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
 //  Voice download + transcribe
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * @description Download `url` to `destPath` with hard timeout, capped
- * redirect depth, and async cleanup. Audit S14 / #32: previous version
- * recursed on 3xx with no depth limit (open to redirect loops), had no
- * `request.setTimeout` (a hung CDN blocked the bot indefinitely), and
- * used `fs.unlinkSync` inside the response callback (sync throw inside
- * a callback chain is unhandleable).
- */
+// Voice download timeout is shared with the transcription request below so a
+// single constant governs the whole voice path. `downloadFile` itself (retries,
+// redirects, warm-agent reuse) lives in `./utils/download` so it stays
+// side-effect-free and unit-testable.
 const DOWNLOAD_TIMEOUT_MS = 20_000;
-const MAX_REDIRECTS = 5;
-
-async function downloadFile(url: string, destPath: string, depth = 0): Promise<void> {
-  if (depth > MAX_REDIRECTS) {
-    throw new Error(`Too many redirects (>${MAX_REDIRECTS}) for ${url}`);
-  }
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(destPath);
-    const cleanup = () => fsp.unlink(destPath).catch(() => {});
-
-    const req = client.get(url, (response) => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        const redirectUrl = response.headers.location;
-        if (redirectUrl) {
-          file.close(() => {
-            cleanup().then(() =>
-              downloadFile(redirectUrl, destPath, depth + 1).then(resolve, reject)
-            );
-          });
-          return;
-        }
-      }
-      // Anything outside 2xx/3xx is a real failure — without this check
-      // the error body (HTML or JSON) was being piped into the destination
-      // file, producing a broken "audio" file that Whisper later rejects
-      // with a generic 400 and no useful signal to the operator.
-      if (response.statusCode && (response.statusCode < 200 || response.statusCode >= 300)) {
-        file.close(() => {
-          cleanup().then(() =>
-            reject(new Error(`Download failed: HTTP ${response.statusCode} ${response.statusMessage ?? ''}`))
-          );
-        });
-        return;
-      }
-      response.pipe(file);
-      file.on('finish', () => { file.close(() => resolve()); });
-      file.on('error', (err) => { cleanup(); reject(err); });
-    });
-    req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
-      req.destroy(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS}ms`));
-    });
-    req.on('error', (err) => {
-      cleanup();
-      reject(err);
-    });
-  });
-}
 
 type TranscribeResult =
   | { ok: true; text: string }
@@ -3130,10 +3078,20 @@ bot.on(message('voice'), async (ctx) => {
     const tempDir = '/tmp';
     const tempFile = path.join(tempDir, `voice_${key.chatId}_${key.threadId}_${Date.now()}.ogg`);
     try {
-      await downloadFile(fileUrl, tempFile);
+      // Ride the same warm, IPv4-pinned keep-alive agent as the Telegram API
+      // calls (avoids the cold-handshake stall that used to trip the timeout),
+      // and retry transient failures automatically so the user never has to
+      // re-send the voice note.
+      await downloadFile(fileUrl, tempFile, {
+        agent: telegramAgent,
+        timeoutMs: DOWNLOAD_TIMEOUT_MS,
+        onRetry: (attempt, err, delayMs) => {
+          console.warn(`[Bot] voice download attempt ${attempt} failed (${err.message}); retrying in ${delayMs}ms`);
+        },
+      });
     } catch (downloadErr) {
       const msg = downloadErr instanceof Error ? downloadErr.message : String(downloadErr);
-      console.warn(`[Bot] voice download failed: ${msg}`);
+      console.warn(`[Bot] voice download failed after retries: ${msg}`);
       await replyToThread(key, `${t('voice.failed')} (${msg})`);
       return;
     }

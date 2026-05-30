@@ -12,6 +12,7 @@ import * as assert from 'node:assert/strict';
 import {
   extractClaudeQuestion,
   checkIsClaudeQuestionBlock,
+  checkIsSelectorControlReply,
 } from '../adapters/claudeCliAdapter';
 
 // A realistic permission box as it looks after `cleanOutput` (box borders
@@ -192,4 +193,34 @@ test('a single option line is not a choice block', () => {
 test('non-question text returns null', () => {
   assert.equal(extractClaudeQuestion('just a normal sentence.'), null);
   assert.equal(extractClaudeQuestion(''), null);
+});
+
+// ── Selector reply routing (break-out vs drive-in-place) ──
+//
+// While a selector is on screen, only a bare option number or a single y/n
+// should DRIVE it; anything else is a free-form message that must break out
+// (Escape + send as a fresh turn). This predicate is the routing seam.
+
+test('bare option numbers drive the selector in place', () => {
+  assert.equal(checkIsSelectorControlReply('1'), true);
+  assert.equal(checkIsSelectorControlReply('2'), true);
+  assert.equal(checkIsSelectorControlReply('10'), true);
+  assert.equal(checkIsSelectorControlReply('  3 '), true); // trimmed
+});
+
+test('y/n quick replies drive the selector in place', () => {
+  assert.equal(checkIsSelectorControlReply('y'), true);
+  assert.equal(checkIsSelectorControlReply('n'), true);
+  assert.equal(checkIsSelectorControlReply('Y'), true);
+  assert.equal(checkIsSelectorControlReply('N'), true);
+});
+
+test('free-form text is NOT a control reply → breaks out of the selector', () => {
+  // The exact kind of message that used to be swallowed by the selector.
+  assert.equal(checkIsSelectorControlReply('по-русски спрашивай'), false);
+  assert.equal(checkIsSelectorControlReply('go with option 2 please'), false);
+  assert.equal(checkIsSelectorControlReply('2 looks wrong, do something else'), false);
+  assert.equal(checkIsSelectorControlReply('yes do it'), false);
+  assert.equal(checkIsSelectorControlReply('123'), false); // 3+ digits: not an option index
+  assert.equal(checkIsSelectorControlReply(''), false);
 });

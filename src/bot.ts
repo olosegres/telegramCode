@@ -28,7 +28,7 @@ import { keyToString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
 import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
-import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
+import { ClaudeCliAdapter, checkIsSelectorControlReply } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
   enqueueSend,
@@ -1564,10 +1564,22 @@ async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
 }
 
 /**
+ * @description Time to let an Escape settle in the TUI before typing the next
+ * prompt. Claude needs a beat to tear down a selector / leave the busy state;
+ * sending keys too eagerly can land them in the old screen and get swallowed.
+ */
+const CLAUDE_ESC_SETTLE_MS = 120;
+
+/**
  * @description Forward one user prompt to a live agent: mark the thread for a
  * fresh output message, show the `⏳` loader, and hand the text to the adapter.
  * Shared by the text handler, the voice handler, and startup-prompt replay so
  * the loader/marker behaviour stays identical across all three.
+ *
+ * For TUI backends (Claude) we prepend an Escape: it both cancels any on-screen
+ * selector AND interrupts the "busy" queue, so the prompt is acted on
+ * immediately instead of waiting for the current turn to finish. Backends
+ * without `sendEscape` (OpenCode) skip this and behave as before.
  */
 async function forwardPromptToAgent(
   key: ThreadKey,
@@ -1577,6 +1589,10 @@ async function forwardPromptToAgent(
   markNeedsNewMessage(key);
   const loaderId = await replyToThread(key, '⏳');
   if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
+  if (adapter.sendEscape) {
+    adapter.sendEscape(key);
+    await new Promise((r) => setTimeout(r, CLAUDE_ESC_SETTLE_MS));
+  }
   adapter.sendInput(key, text);
 }
 
@@ -3043,6 +3059,22 @@ bot.on(message('text'), async (ctx) => {
     }
     adapter.answerQuestion(key, answers);
     markNeedsNewMessage(key);
+    return;
+  }
+
+  // Claude selector on screen: a short control reply (a bare option number or
+  // y/n) drives the selector in place — type it straight in, no Escape. Any
+  // other message is free-form: it falls through to forwardPromptToAgent,
+  // which sends Escape first (cancelling the selector) and then the text as a
+  // fresh instruction. This is what lets the user redirect a stuck agent
+  // instead of being forced to answer the exact question.
+  if (
+    adapter.checkIsActive(key) &&
+    adapter.isQuestionPending?.(key) &&
+    checkIsSelectorControlReply(text)
+  ) {
+    markNeedsNewMessage(key);
+    adapter.sendInput(key, text.trim());
     return;
   }
 

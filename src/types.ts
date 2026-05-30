@@ -163,5 +163,22 @@ export interface AgentAdapter extends EventEmitter {
   sendEnter?(key: ThreadKey): void;
   sendArrow?(key: ThreadKey, direction: 'Up' | 'Down'): void;
   sendTab?(key: ThreadKey): void;
+
+  /**
+   * @description Send a bare Escape keystroke to the TUI. For Claude this both
+   * cancels an on-screen selector AND interrupts the "busy" state so the next
+   * prompt is processed immediately instead of being queued until the current
+   * turn finishes. No-op / unimplemented for backends without a live TUI.
+   */
+  sendEscape?(key: ThreadKey): void;
+
+  /**
+   * @description Whether an interactive selector/question is currently on the
+   * TUI screen. Lets the bot decide whether a short reply (a bare option
+   * number or y/n) should DRIVE the selector, versus a free-form message that
+   * should break out of it (Escape + send as a fresh instruction).
+   */
+  isQuestionPending?(key: ThreadKey): boolean;
+
   getFullOutput?(key: ThreadKey, lines?: number): string | null;
 }

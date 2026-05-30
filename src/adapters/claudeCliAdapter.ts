@@ -593,6 +593,20 @@ export function checkIsClaudeQuestionBlock(text: string): boolean {
   return extractClaudeQuestion(text) !== null;
 }
 
+/**
+ * @description Classify a user reply sent WHILE a selector is on screen. A
+ * "control" reply is meant to drive the selector in place — a bare option
+ * number (1–2 digits) or a single `y`/`n` — so it must be typed straight into
+ * the TUI with no Escape. Anything else (a sentence, a new instruction) is a
+ * free-form message: the bot first sends Escape to cancel the selector, then
+ * forwards it as a fresh turn. Kept pure + exported so the routing decision is
+ * unit-testable without a live tmux session.
+ */
+export function checkIsSelectorControlReply(text: string): boolean {
+  const trimmed = text.trim();
+  return /^\d{1,2}$/.test(trimmed) || /^[yYnN]$/.test(trimmed);
+}
+
 export function stripTuiElements(text: string): string {
   const lines = text.split('\n');
   const filtered: string[] = [];
@@ -985,6 +999,33 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     console.log(`[Claude] sendTab`);
     tmux('send-keys', '-t', session.sessionName, 'Tab');
+  }
+
+  /**
+   * @description Send a single Escape. In Claude's TUI this serves two
+   * purposes the bot relies on: (1) cancel an on-screen `AskUserQuestion`
+   * selector, and (2) break Claude out of the "busy" state where a typed
+   * prompt would otherwise be queued and only answered after the current turn
+   * finishes. The bot prepends this before forwarding free-form prompts so
+   * messages are acted on immediately instead of piling up in the queue.
+   */
+  sendEscape(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return;
+
+    console.log(`[Claude] sendEscape`);
+    tmux('send-keys', '-t', session.sessionName, 'Escape');
+  }
+
+  /**
+   * @description Whether a selector is currently on screen. Backed by the same
+   * `lastQuestionSignature` the output pump sets when it scrapes a question
+   * block (see the `extractClaudeQuestion` call in the poll loop) — non-empty
+   * means a question is being shown and awaiting an answer.
+   */
+  isQuestionPending(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
+    return Boolean(session?.isActive && session.lastQuestionSignature);
   }
 
   /**

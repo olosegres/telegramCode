@@ -589,6 +589,7 @@ function computePinnedStatusText(key: ThreadKey): string | null {
 
   let agentLabel: string | null = null;
   let model: string | null = null;
+  let effort: string | null = null;
   let isActive = false;
 
   const agent = state.getAgent(key);
@@ -598,6 +599,7 @@ function computePinnedStatusText(key: ThreadKey): string | null {
       agentLabel = adapter.label;
       isActive = adapter.checkIsActive(key);
       model = adapter.getCurrentModel?.(key) ?? agent.model ?? null;
+      effort = adapter.getEffort?.(key) ?? null;
     } catch {
       // Unknown adapter name from a stale binding — fall back to raw name
       // so the banner is still informative.
@@ -606,7 +608,7 @@ function computePinnedStatusText(key: ThreadKey): string | null {
     }
   }
 
-  return formatPinnedStatus({ binding, agentLabel, model, isActive });
+  return formatPinnedStatus({ binding, agentLabel, model, effort, isActive });
 }
 
 /**
@@ -2559,6 +2561,58 @@ command('model', async (ctx, key) => {
   await replyToThread(key, listText);
 });
 
+command('effort', async (ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+  // Backend must support the effort contract (both methods are optional).
+  if (!adapter.setEffort || !adapter.getAvailableEffortLevels) {
+    await replyToThread(key, t('effort.unsupported_backend', { label: adapter.label }));
+    return;
+  }
+  if (!adapter.checkIsActive(key)) {
+    await replyToThread(key, t('effort.no_session'));
+    return;
+  }
+
+  // Direct set: `/effort <level>`. The adapter validates (Claude against its
+  // canonical set, OpenCode against the model's variants) and returns a
+  // user-facing notice string on any non-success.
+  if (args) {
+    const err = await adapter.setEffort(key, args);
+    if (err) {
+      await replyToThread(key, err);
+    } else {
+      await replyToThread(key, t('effort.set_success', { level: args }));
+      await updatePinnedStatus(key).catch(() => {});
+    }
+    return;
+  }
+
+  // No arg: show current effort + a button per available level.
+  let levels: string[] = [];
+  try {
+    levels = await adapter.getAvailableEffortLevels(key);
+  } catch (e) {
+    console.error('[Bot] getAvailableEffortLevels:', e);
+  }
+  if (levels.length === 0) {
+    // Empty means: OpenCode effort disabled (no command env), the model has
+    // no variants, or Claude isn't reporting any — surface a single hint.
+    await replyToThread(key, t('effort.not_available'));
+    return;
+  }
+  const cur = adapter.getEffort?.(key) ?? null;
+  const buttons = levels.map((l) =>
+    Markup.button.callback(l === cur ? `${l} ✓` : l, `effort_${l}`),
+  );
+  await replyToThread(
+    key,
+    t('effort.choose', { current: cur ?? t('effort.current_none') }),
+    Markup.inlineKeyboard(buttons, { columns: 3 }),
+  );
+});
+
 command('agent', async (_ctx, key) => {
   const available = getAvailableAdapters();
   const currentName = getThreadAdapterName(key);
@@ -3390,6 +3444,26 @@ bot.action(/^model_(.+)$/, async (ctx) => {
   }
 });
 
+bot.action(/^effort_(.+)$/, async (ctx) => {
+  const key = authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  const level = ctx.match[1];
+  const adapter = getThreadAdapter(key);
+  if (!adapter.checkIsActive(key)) {
+    await ctx.answerCbQuery(t('cb.no_active_session'));
+    return;
+  }
+  if (!adapter.setEffort) {
+    await ctx.answerCbQuery(t('cb.not_supported', { label: adapter.label }));
+    return;
+  }
+  const err = await adapter.setEffort(key, level);
+  if (err) { await ctx.answerCbQuery(t('cb.effort_error', { error: err.slice(0, 50) })); return; }
+  await ctx.answerCbQuery(t('cb.effort_set', { level }));
+  await replyToThread(key, t('effort.set_success', { level }));
+  await updatePinnedStatus(key).catch(() => {});
+});
+
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
@@ -3744,6 +3818,7 @@ const COMMANDS_MENU = [
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
   { command: 'model', description: '🧠 Switch model' },
+  { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions' },
   { command: 'stop', description: '⏹ Stop agent (hard kill)' },

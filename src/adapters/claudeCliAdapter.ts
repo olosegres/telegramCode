@@ -10,6 +10,7 @@ import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
 import { t } from '../i18n';
+import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -69,6 +70,53 @@ const claudePath = resolveClaudeBinary();
 // promised isolation. Previously this used `$HOME/.claude-sessions.json`,
 // which silently collided when two bots ran as the same Linux user.
 const sessionsFile = path.join(resolveDataDir(), '.claude-sessions.json');
+
+/**
+ * @description Per-thread Claude `/effort` choice (plan 2026-05-30-effort-command, D6).
+ *
+ * Claude itself persists `effortLevel` GLOBALLY in its own `settings.json`,
+ * so two threads driven by the same Linux user would otherwise overwrite
+ * each other's choice across sessions. We mirror the per-thread model-prefs
+ * pattern (see `openCodeAdapter.ts:modelStateFile`) — a tiny JSON map
+ * `{ "<chatId>:<threadId>": "<level>" }` under DATA_DIR, used for the
+ * banner / picker UI **only**. Live apply still goes through the TUI
+ * keystroke path, and claude clamps unsupported levels for the current
+ * model (plan D2).
+ *
+ * The file is best-effort: a corrupt copy is archived and reset (same
+ * scheme as `loadStoredSessions`), and write failures only log — they
+ * never block the user-facing `/effort` reply.
+ */
+const effortPrefsFile = path.join(resolveDataDir(), '.claude-effort-prefs.json');
+
+function loadEffortPrefs(): Record<string, string> {
+  try {
+    if (!fs.existsSync(effortPrefsFile)) return {};
+    const raw = fs.readFileSync(effortPrefsFile, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch (e) {
+    console.error(`[Claude] loadEffortPrefs failed:`, e instanceof Error ? e.message : e);
+    if (fs.existsSync(effortPrefsFile)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      try { fs.renameSync(effortPrefsFile, `${effortPrefsFile}.corrupted-${ts}`); }
+      catch (re) { console.warn(`[Claude] archive of corrupt effort prefs failed:`, re); }
+    }
+    return {};
+  }
+}
+
+function saveEffortPref(key: ThreadKey, level: string): void {
+  try {
+    const data = loadEffortPrefs();
+    data[keyToString(key)] = level;
+    fs.writeFileSync(effortPrefsFile, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error(`[Claude] saveEffortPref failed:`, e instanceof Error ? e.message : e);
+  }
+}
 
 /**
  * @description Tmux session name for a `ThreadKey`.
@@ -1041,6 +1089,74 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
   getCurrentModel(_key: ThreadKey): string | null {
     return null;
+  }
+
+  /**
+   * @description Set the reasoning effort for this thread by typing claude's
+   * native `/effort <level>` slash command into the running TUI.
+   *
+   * Plan 2026-05-30-effort-command / S3, D2/D6:
+   *
+   * - **Validation** is against the canonical Claude set (`getClaudeAvailableLevels`),
+   *   not per-model: the adapter can't read claude's live model after a
+   *   `/model` switch (`getCurrentModel` returns `null`), so we trust claude
+   *   to clamp an unsupported level for the actual model down to its nearest
+   *   supported one. Caller already filtered against the same canonical list
+   *   when building the picker.
+   * - **Apply** is best-effort via {@link sendInput} (the keystroke path used
+   *   by `setModel`). Returns `null` immediately — claude's TUI doesn't
+   *   acknowledge the change synchronously and we don't poll-and-wait for it.
+   * - **Persist** to the per-thread prefs file so the banner / `/effort`
+   *   picker survives a bot restart (claude's own settings.json is global).
+   *
+   * Returns a short notice instead of `null` when the session isn't running
+   * (we still persist the choice so the next /claude picks it up in the
+   * banner; live apply happens once the agent actually exists).
+   */
+  async setEffort(key: ThreadKey, level: string): Promise<string | null> {
+    if (!checkIsClaudeEffortLevel(level)) {
+      return t('effort.invalid_level', {
+        level,
+        valid: getClaudeAvailableLevels().join(', '),
+      });
+    }
+    // Persist first — the menu/banner must reflect the user's choice even
+    // when there is no running session yet (D6).
+    saveEffortPref(key, level);
+
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) {
+      // Soft notice: choice is recorded, but live apply is deferred until a
+      // session exists. Bot surfaces this distinctly from a hard error so
+      // the user knows to start an agent.
+      return t('effort.start_agent_first');
+    }
+    this.sendInput(key, `/effort ${level}`);
+    return null;
+  }
+
+  /**
+   * @description Last bot-set effort for this thread, or `null` if none.
+   *
+   * Reads from the on-disk prefs file (not an in-memory cache): the file is
+   * tiny and the read happens only on menu / banner refresh paths, so a
+   * cache would just be drift surface. Whatever claude itself stores in
+   * its global `settings.json` is invisible to us by design (D2).
+   */
+  getEffort(key: ThreadKey): string | null {
+    const prefs = loadEffortPrefs();
+    return prefs[keyToString(key)] ?? null;
+  }
+
+  /**
+   * @description Effort levels offered by the `/effort` picker for Claude.
+   *
+   * Returns the canonical set unconditionally (plan D2). The `key` argument
+   * is accepted for interface symmetry with OpenCode (whose set depends on
+   * the per-thread current model) but is intentionally unused here.
+   */
+  async getAvailableEffortLevels(_key: ThreadKey): Promise<string[]> {
+    return getClaudeAvailableLevels();
   }
 
   getFullOutput(key: ThreadKey, lines: number = 500): string | null {

@@ -7,6 +7,13 @@ import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
+import {
+  OPENCODE_EFFORT_COMMAND_ENV,
+  OPENCODE_EFFORT_LEVELS_ENV,
+  parseConfiguredLevels,
+  intersectVariants,
+} from '../effortLevels';
+import { t } from '../i18n';
 
 const execAsync = promisify(exec);
 
@@ -64,6 +71,63 @@ function saveModelPref(key: ThreadKey, label: string): void {
   }
 }
 
+/**
+ * @description Per-thread OpenCode effort (variant) selection. Plan
+ * 2026-05-30-effort-command, D6 — mirrors the model-prefs pattern above
+ * exactly: same DATA_DIR placement, same `{ "<chatId>:<threadId>": "<level>" }`
+ * shape, same corrupt-file archive behaviour.
+ *
+ * Effort is applied **per-prompt** by `sendPromptAsync` via the
+ * `OPENCODE_EFFORT_COMMAND` slash command (plan D3). Persisting it here
+ * means the choice survives bot restarts and re-attached SSE sessions.
+ */
+const effortStateFile = path.join(resolveDataDir(), '.opencode-effort-prefs.json');
+
+function loadEffortPrefs(): Record<string, string> {
+  try {
+    if (!fs.existsSync(effortStateFile)) return {};
+    const raw = fs.readFileSync(effortStateFile, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch (e) {
+    console.error(`[OpenCode] loadEffortPrefs failed:`, e instanceof Error ? e.message : e);
+    if (fs.existsSync(effortStateFile)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      try { fs.renameSync(effortStateFile, `${effortStateFile}.corrupted-${ts}`); }
+      catch (re) { console.warn(`[OpenCode] archive of corrupt effort prefs failed:`, re); }
+    }
+    return {};
+  }
+}
+
+function loadSavedEffort(key: ThreadKey): string | null {
+  const prefs = loadEffortPrefs();
+  return prefs[keyToString(key)] ?? null;
+}
+
+function saveEffortPref(key: ThreadKey, level: string): void {
+  try {
+    const data = loadEffortPrefs();
+    data[keyToString(key)] = level;
+    fs.writeFileSync(effortStateFile, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error(`[OpenCode] Failed to save effort pref:`, e instanceof Error ? e.message : e);
+  }
+}
+
+function clearEffortPref(key: ThreadKey): void {
+  try {
+    const data = loadEffortPrefs();
+    if (!(keyToString(key) in data)) return;
+    delete data[keyToString(key)];
+    fs.writeFileSync(effortStateFile, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error(`[OpenCode] Failed to clear effort pref:`, e instanceof Error ? e.message : e);
+  }
+}
+
 interface OpenCodeModelOverride {
   providerID: string;
   modelID: string;
@@ -92,6 +156,12 @@ interface OpenCodeSession {
   pendingStatus: string | null;
   /** Pending question awaiting user's answer */
   pendingQuestion: OpenCodePendingQuestion | null;
+  /**
+   * Currently selected reasoning-effort level for this thread, or `null`
+   * if none has been chosen. Applied per-prompt by `sendPromptAsync` when
+   * also accompanied by `OPENCODE_EFFORT_COMMAND` in the env (plan D3/D4).
+   */
+  effortLevel: string | null;
   /**
    * Abort controller for the live SSE `fetch` + reader. Set by
    * `pollSse`, cleared on natural exit. `disconnectSse` / `stopSession`
@@ -254,6 +324,78 @@ function validateOpenCodeUrl(raw: string): string {
 let cachedModels: string[] | null = null;
 let modelsCacheTime = 0;
 const modelsCacheTtlMs = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * @description Cache for `GET /config/providers` (OpenCode 1.15.x). Same
+ * 5-minute TTL as the models cache — variant maps change about as often as
+ * the model list (operator edits `opencode.json`, restarts server).
+ *
+ * Plan 2026-05-30-effort-command, R2: log the raw shape ONCE before
+ * relying on it; the docs aren't 100% authoritative across server versions.
+ *
+ * Shape (observed against opencode 1.15.12):
+ *   { providers: [ { id, name, models: { <modelId>: { variants?: {...} } } } ] }
+ * but newer versions may key by provider id directly. The parser below
+ * tolerates both.
+ */
+let cachedProviders: ParsedProvidersConfig | null = null;
+let providersCacheTime = 0;
+const providersCacheTtlMs = 5 * 60 * 1000;
+let isProvidersShapeLogged = false;
+
+/**
+ * @description Provider → model → variant-names map. Keys are provider ids
+ * (e.g. `"anthropic"`, `"openai"`), values are model ids (e.g.
+ * `"claude-3-5-sonnet"`) mapping to the list of variant names declared
+ * on that model. A model with no `variants` entry maps to `[]`, which
+ * the picker treats as "this model has no effort concept".
+ */
+export interface ParsedProvidersConfig {
+  providers: Map<string, Map<string, string[]>>;
+}
+
+export function parseProvidersResponse(raw: unknown): ParsedProvidersConfig {
+  const out: ParsedProvidersConfig = { providers: new Map() };
+  if (!raw || typeof raw !== 'object') return out;
+  const root = raw as Record<string, unknown>;
+
+  // Two shapes seen in the wild: `{ providers: [...] }` (array, opencode
+  // 1.15.x) and `{ providers: { <id>: {...} } }` (older bundles). Parse
+  // both into the same flat (providerId → modelId → variantNames) map so
+  // the rest of the code doesn't care which shape the server sent.
+  const collect = (providerId: string, providerObj: unknown): void => {
+    if (!providerObj || typeof providerObj !== 'object') return;
+    const models = (providerObj as Record<string, unknown>).models;
+    if (!models || typeof models !== 'object') return;
+    const modelMap = new Map<string, string[]>();
+    for (const [modelId, modelObj] of Object.entries(models as Record<string, unknown>)) {
+      const variants = modelObj && typeof modelObj === 'object'
+        ? (modelObj as Record<string, unknown>).variants
+        : undefined;
+      if (variants && typeof variants === 'object' && !Array.isArray(variants)) {
+        modelMap.set(modelId, Object.keys(variants as Record<string, unknown>));
+      } else {
+        modelMap.set(modelId, []);
+      }
+    }
+    out.providers.set(providerId, modelMap);
+  };
+
+  const providersField = root.providers;
+  if (Array.isArray(providersField)) {
+    for (const item of providersField) {
+      if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).id === 'string') {
+        const id = (item as Record<string, unknown>).id as string;
+        collect(id, item);
+      }
+    }
+  } else if (providersField && typeof providersField === 'object') {
+    for (const [id, value] of Object.entries(providersField as Record<string, unknown>)) {
+      collect(id, value);
+    }
+  }
+  return out;
+}
 
 /**
  * @description Fetch available models from OpenCode CLI.
@@ -618,6 +760,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           statusDebounceTimer: null,
           pendingStatus: null,
           pendingQuestion: null,
+          effortLevel: loadSavedEffort(key),
           sseController: null,
           reconnectTimer: null,
         };
@@ -699,6 +842,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /**
    * @description Send message via async endpoint (returns 204, response streams via SSE).
    * Fire-and-forget — errors are logged but don't block.
+   *
+   * **Per-prompt effort apply** (plan 2026-05-30-effort-command, D3/D4):
+   * if the thread has a stored effort level AND `OPENCODE_EFFORT_COMMAND`
+   * is set in the env, we POST `/session/:id/command` BEFORE the prompt
+   * itself. Failures of the effort command surface as adapter `error`
+   * events but do NOT block the actual prompt — falling back to whatever
+   * the server's current default reasoning effort is is strictly better
+   * than dropping the user's message on the floor.
    */
   private sendPromptAsync(key: ThreadKey, input: string): void {
     const session = this.sessions.get(keyToString(key));
@@ -723,10 +874,36 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       body.model = modelParam;
     }
 
-    this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body).catch((e) => {
-      console.error(`[OpenCode] Failed to send message:`, e);
-      this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
-    });
+    const effortCommand = process.env[OPENCODE_EFFORT_COMMAND_ENV];
+    const effortLevel = session.effortLevel;
+
+    void (async () => {
+      // Step 1: best-effort effort apply. Plan R1: this command may render
+      // its own user-visible turn in the thread; verification was deferred
+      // until live behavioral checks (recorded in `agent/NOTES.md` for the
+      // PR description). The failure path is surfaced via `error` so the
+      // bot can show it next to the thread; the prompt still goes through.
+      if (effortLevel && effortCommand) {
+        try {
+          await this.apiRequest('POST', `/session/${session.sessionId}/command`, {
+            command: effortCommand,
+            arguments: effortLevel,
+          });
+        } catch (e) {
+          console.error(`[OpenCode] effort command "${effortCommand}" failed:`, e);
+          this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
+          // Intentional fall-through to step 2: the prompt is more
+          // important than the effort override.
+        }
+      }
+      // Step 2: actual prompt.
+      try {
+        await this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body);
+      } catch (e) {
+        console.error(`[OpenCode] Failed to send message:`, e);
+        this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
+      }
+    })();
   }
 
   sendSignal(key: ThreadKey, signal: string): void {
@@ -763,6 +940,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.currentModelLabel = label;
     saveModelPref(key, label);
     console.log(`[OpenCode] Model set to: ${label}`);
+
+    // Plan 2026-05-30-effort-command / S4: a stored effort the NEW model
+    // can't honour (variant absent) is dropped so the next prompt doesn't
+    // POST an invalid variant — and the user is told why their effort reset.
+    if (session.effortLevel) {
+      const stillValid = (await this.getAvailableEffortLevels(key)).includes(session.effortLevel);
+      if (!stillValid) {
+        const dropped = session.effortLevel;
+        session.effortLevel = null;
+        clearEffortPref(key);
+        this.emit('output', key, t('effort.cleared_on_model_switch', { level: dropped, model: label }));
+      }
+    }
     return null;
   }
 
@@ -777,6 +967,101 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session) return null;
     return session.currentModelLabel;
+  }
+
+  // ── Reasoning effort (variants) ───────────────────────────────────────────
+
+  /**
+   * @description Fetch + cache the provider/variant config
+   * (`GET /config/providers`). 5-minute TTL — variant maps change about as
+   * often as the model list. Plan R2: log the raw shape ONCE before trusting
+   * the parser, since the response shape varies across server versions.
+   */
+  private async getProvidersConfig(): Promise<ParsedProvidersConfig> {
+    const now = Date.now();
+    if (cachedProviders && now - providersCacheTime < providersCacheTtlMs) {
+      return cachedProviders;
+    }
+    const raw = await this.apiRequest<unknown>('GET', '/config/providers');
+    if (!isProvidersShapeLogged) {
+      isProvidersShapeLogged = true;
+      try {
+        console.log(`[OpenCode] /config/providers raw shape:`, JSON.stringify(raw).slice(0, 2000));
+      } catch { /* non-serialisable — skip the one-time log */ }
+    }
+    const parsed = parseProvidersResponse(raw);
+    cachedProviders = parsed;
+    providersCacheTime = now;
+    return parsed;
+  }
+
+  /**
+   * @description Variant names the thread's CURRENT model exposes, or `[]`
+   * when no model is set or the model declares no variants. Resolves the
+   * provider/model id from the live override (preferred) or the label.
+   */
+  private async getModelVariants(session: OpenCodeSession): Promise<string[]> {
+    const label = session.currentModelLabel;
+    const providerID = session.modelOverride?.providerID
+      ?? (label && label.includes('/') ? label.slice(0, label.indexOf('/')) : null);
+    const modelID = session.modelOverride?.modelID
+      ?? (label && label.includes('/') ? label.slice(label.indexOf('/') + 1) : null);
+    if (!providerID || !modelID) return [];
+    try {
+      const config = await this.getProvidersConfig();
+      return config.providers.get(providerID)?.get(modelID) ?? [];
+    } catch (e) {
+      console.warn(`[OpenCode] getProvidersConfig failed:`, e instanceof Error ? e.message : e);
+      return [];
+    }
+  }
+
+  /**
+   * @description Effort levels the current thread can use (plan D5). Empty
+   * when OpenCode effort is disabled (`OPENCODE_EFFORT_COMMAND` unset), no
+   * session is running, or the current model has no (allow-listed) variants.
+   */
+  async getAvailableEffortLevels(key: ThreadKey): Promise<string[]> {
+    // Disabled until the operator wires the per-prompt apply command (D4).
+    if (!process.env[OPENCODE_EFFORT_COMMAND_ENV]) return [];
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return [];
+    const variants = await this.getModelVariants(session);
+    const configured = parseConfiguredLevels(process.env[OPENCODE_EFFORT_LEVELS_ENV]);
+    return intersectVariants(variants, configured);
+  }
+
+  getEffort(key: ThreadKey): string | null {
+    const session = this.sessions.get(keyToString(key));
+    if (session) return session.effortLevel;
+    return loadSavedEffort(key);
+  }
+
+  /**
+   * @description Set the per-thread effort (variant). Validates against the
+   * current model's available variants; persists on success (applied
+   * per-prompt by `sendPromptAsync`, plan D3). Returns a user-facing notice
+   * string on any non-success, `null` on success.
+   */
+  async setEffort(key: ThreadKey, level: string): Promise<string | null> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return 'No active session';
+
+    if (!process.env[OPENCODE_EFFORT_COMMAND_ENV]) {
+      return t('effort.configure_hint', { env: OPENCODE_EFFORT_COMMAND_ENV });
+    }
+    const available = await this.getAvailableEffortLevels(key);
+    if (available.length === 0) {
+      return t('effort.not_supported', { model: session.currentModelLabel ?? '?' });
+    }
+    if (!available.includes(level)) {
+      return t('effort.invalid_level', { level, valid: available.join(', ') });
+    }
+
+    session.effortLevel = level;
+    saveEffortPref(key, level);
+    console.log(`[OpenCode] Effort set to: ${level}`);
+    return null;
   }
 
   getOpenCodeSessionId(key: ThreadKey): string | null {
@@ -846,6 +1131,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         statusDebounceTimer: null,
         pendingStatus: null,
         pendingQuestion: null,
+        effortLevel: loadSavedEffort(key),
         sseController: null,
         reconnectTimer: null,
       };

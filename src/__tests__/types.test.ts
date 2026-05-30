@@ -84,3 +84,24 @@ test('AgentAdapter contract — startSession returns Promise<void>, setModel ret
   assert.equal(typeof start, 'function');
   assert.equal(typeof setModel, 'function');
 });
+
+/**
+ * Plan 2026-05-30-effort-command / S1 — lock the per-thread reasoning-effort
+ * contract via type-only assertions. Same shape as the setModel guard above:
+ * if anyone widens these signatures (drops `string | null`, makes the level
+ * lookup sync without being trivially derivable, etc.) the assignments stop
+ * compiling and `yarn typecheck` blocks the merge.
+ */
+test('AgentAdapter contract — setEffort/getEffort/getAvailableEffortLevels signatures', () => {
+  type SetEffortSig = NonNullable<AgentAdapter['setEffort']>;
+  type GetEffortSig = NonNullable<AgentAdapter['getEffort']>;
+  type GetLevelsSig = NonNullable<AgentAdapter['getAvailableEffortLevels']>;
+
+  const setEffort: SetEffortSig = async () => null;
+  const getEffort: GetEffortSig = () => null;
+  const getLevels: GetLevelsSig = async () => [];
+
+  assert.equal(typeof setEffort, 'function');
+  assert.equal(typeof getEffort, 'function');
+  assert.equal(typeof getLevels, 'function');
+});

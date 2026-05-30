@@ -144,6 +144,42 @@ export interface AgentAdapter extends EventEmitter {
   /** Get available models from backend */
   getAvailableModels?(): Promise<string[]>;
 
+  // — Reasoning-effort selection (per-thread, per-backend) —
+
+  /**
+   * Set the reasoning-effort level for this thread. Same convention as
+   * {@link setModel}: returns `null` on success, a short user-facing
+   * message on failure / notice (e.g. "level X is not valid for model Y").
+   *
+   * Per-backend semantics (plan 2026-05-30-effort-command):
+   *
+   * - **Claude** applies immediately by writing `/effort <level>` into the
+   *   running TUI; the value is also stored for menu/banner display.
+   * - **OpenCode** persists the choice but does NOT mutate the live session
+   *   here — the level is applied **per-prompt** inside the adapter's
+   *   prompt-send path (via `POST /session/:id/command` configured via
+   *   `OPENCODE_EFFORT_COMMAND`).
+   */
+  setEffort?(key: ThreadKey, level: string): Promise<string | null>;
+
+  /**
+   * Currently selected reasoning-effort level for this thread, or `null`
+   * if none has been chosen (adapter default in effect). Mirrors
+   * {@link getCurrentModel}'s sync read pattern.
+   */
+  getEffort?(key: ThreadKey): string | null;
+
+  /**
+   * Levels valid for the thread's current backend + model. Returns an
+   * empty array when the adapter has no opinion on effort (e.g. OpenCode
+   * model with no `variants` and no `OPENCODE_EFFORT_COMMAND` set) — the
+   * caller surfaces a "not supported" notice instead of an empty picker.
+   *
+   * Async because OpenCode needs to query `/config/providers`; Claude
+   * resolves locally and just wraps the canonical list in `Promise.resolve`.
+   */
+  getAvailableEffortLevels?(key: ThreadKey): Promise<string[]>;
+
   // — Interactive questions (OpenCode) —
 
   /** Reply to a pending question with selected answers */

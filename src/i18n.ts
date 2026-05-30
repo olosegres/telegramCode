@@ -107,6 +107,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '*Тред привязан к `{subdir}`.*\n' +
       '/claude /opencode — старт агента\n' +
       '/agent /model /sessions — выбор/переключение\n' +
+      '/effort — уровень reasoning effort\n' +
       '/stop /status /output — контроль\n' +
       '/compact — сжать контекст агента\n' +
       '/clear — удалить сообщения треда\n' +
@@ -215,6 +216,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
 
+    // ── /effort (reasoning effort) ──
+    'effort.choose': '⚙️ Текущий effort: {current}\nВыбери уровень:',
+    'effort.current_none': 'не задан',
+    'effort.set_success': '✅ Effort: {level}',
+    'effort.invalid_level': '⚠️ Уровень `{level}` недопустим. Доступные: {valid}.',
+    'effort.not_available': 'ℹ️ Для текущей модели уровни reasoning effort недоступны.',
+    'effort.not_supported': 'ℹ️ Модель `{model}` не поддерживает уровни reasoning effort.',
+    'effort.configure_hint': 'ℹ️ Effort для OpenCode выключен. Задай переменную окружения `{env}`.',
+    'effort.start_agent_first': 'ℹ️ Уровень сохранён. Агент не запущен — применю при следующем старте.',
+    'effort.cleared_on_model_switch': 'ℹ️ Effort `{level}` сброшен: новая модель `{model}` его не поддерживает.',
+    'effort.unsupported_backend': 'Управление effort не поддерживается для {label}.',
+    'effort.no_session': 'Агент не запущен. Сначала /claude или /opencode.',
+
     // ── /stop-all ──
     'stop_all.none_active': 'Нет активных агентов — нечего останавливать.',
     'stop_all.summary': '🛑 Остановлено {stopped} из {total} активных агентов.',
@@ -271,6 +285,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.no_pending_question': 'Нет ожидающего вопроса',
     'cb.invalid_option': 'Некорректный вариант',
     'cb.sent_option': 'Отправлено: {option}',
+    'cb.effort_set': 'Effort: {level}',
+    'cb.effort_error': 'Ошибка: {error}',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -343,6 +359,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '*Thread bound to `{subdir}`.*\n' +
       '/claude /opencode — start an agent\n' +
       '/agent /model /sessions — choose/switch\n' +
+      '/effort — reasoning-effort level\n' +
       '/stop /status /output — control\n' +
       '/compact — compact agent context\n' +
       '/clear — delete thread messages\n' +
@@ -445,6 +462,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
 
+    // ── /effort (reasoning effort) ──
+    'effort.choose': '⚙️ Current effort: {current}\nPick a level:',
+    'effort.current_none': 'not set',
+    'effort.set_success': '✅ Effort: {level}',
+    'effort.invalid_level': '⚠️ Level `{level}` is not valid. Available: {valid}.',
+    'effort.not_available': 'ℹ️ No reasoning-effort levels are available for the current model.',
+    'effort.not_supported': 'ℹ️ Model `{model}` has no reasoning-effort levels.',
+    'effort.configure_hint': 'ℹ️ OpenCode effort is disabled. Set the `{env}` environment variable.',
+    'effort.start_agent_first': 'ℹ️ Level saved. No agent running — it will apply on next start.',
+    'effort.cleared_on_model_switch': 'ℹ️ Effort `{level}` cleared: the new model `{model}` does not support it.',
+    'effort.unsupported_backend': 'Effort control is not supported for {label}.',
+    'effort.no_session': 'No agent running. Start one with /claude or /opencode.',
+
     'stop_all.none_active': 'No agents running — nothing to stop.',
     'stop_all.summary': '🛑 Stopped {stopped} of {total} active agents.',
     'stop_all.general_only': '`/stop-all` is only available in the General topic.',
@@ -494,6 +524,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.no_pending_question': 'No pending question',
     'cb.invalid_option': 'Invalid option',
     'cb.sent_option': 'Sent: {option}',
+    'cb.effort_set': 'Effort: {level}',
+    'cb.effort_error': 'Error: {error}',
   },
 };
 

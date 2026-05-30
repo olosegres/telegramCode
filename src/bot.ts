@@ -27,7 +27,7 @@ import { keyToString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
 import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
-import { ClaudeCliAdapter, checkIsSelectorControlReply } from './adapters/claudeCliAdapter';
+import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
   enqueueSend,
@@ -3010,23 +3010,12 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // Claude selector on screen: a short control reply (a bare option number or
-  // y/n) drives the selector in place — type it straight in, no Escape. Any
-  // other message is free-form: it falls through to forwardPromptToAgent,
-  // which sends Escape first (cancelling the selector) and then the text as a
-  // fresh instruction. This is what lets the user redirect a stuck agent
-  // instead of being forced to answer the exact question.
-  if (
-    adapter.checkIsActive(key) &&
-    adapter.isQuestionPending?.(key) &&
-    checkIsSelectorControlReply(text)
-  ) {
-    markNeedsNewMessage(key);
-    adapter.sendInput(key, text.trim());
-    return;
-  }
-
-  // Forward text to a running agent.
+  // Forward text to a running agent. Every user message is treated as a fresh
+  // turn that must be acted on immediately: forwardPromptToAgent prepends an
+  // Escape for TUI backends, which both cancels any on-screen selector and
+  // breaks Claude out of the busy state (so the message isn't queued behind
+  // the current turn). Deliberately driving a selector in place is still
+  // available via the explicit /up /down /enter /y /n /c keys.
   if (adapter.checkIsActive(key)) {
     await forwardPromptToAgent(key, adapter, text);
     return;

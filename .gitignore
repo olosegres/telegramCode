@@ -10,6 +10,7 @@ data/
 .claude/
 *.tsbuildinfo
 coverage/
+agent/tmp/
 .yarn/install-state.gz
 .yarn/cache/
 .yarn/unplugged/

@@ -9,12 +9,6 @@ import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpen
 import { resolveDataDir } from '../state';
 import { appendDiagLog } from '../diagLog';
 import {
-  OPENCODE_EFFORT_COMMAND_ENV,
-  OPENCODE_EFFORT_LEVELS_ENV,
-  parseConfiguredLevels,
-  intersectVariants,
-} from '../effortLevels';
-import {
   checkIsEventForSession,
   updateSessionLineage,
 } from '../openCodeSessionRouting';
@@ -82,9 +76,9 @@ function saveModelPref(key: ThreadKey, label: string): void {
  * exactly: same DATA_DIR placement, same `{ "<chatId>:<threadId>": "<level>" }`
  * shape, same corrupt-file archive behaviour.
  *
- * Effort is applied **per-prompt** by `sendPromptAsync` via the
- * `OPENCODE_EFFORT_COMMAND` slash command (plan D3). Persisting it here
- * means the choice survives bot restarts and re-attached SSE sessions.
+ * Effort is applied **per-prompt** by `sendPromptAsync` as the model
+ * `variant` on the prompt body. Persisting it here means the choice
+ * survives bot restarts and re-attached SSE sessions.
  */
 const effortStateFile = path.join(resolveDataDir(), '.opencode-effort-prefs.json');
 
@@ -162,9 +156,9 @@ interface OpenCodeSession {
   /** Pending question awaiting user's answer */
   pendingQuestion: OpenCodePendingQuestion | null;
   /**
-   * Currently selected reasoning-effort level for this thread, or `null`
-   * if none has been chosen. Applied per-prompt by `sendPromptAsync` when
-   * also accompanied by `OPENCODE_EFFORT_COMMAND` in the env (plan D3/D4).
+   * Currently selected reasoning-effort level (a model variant) for this
+   * thread, or `null` if none has been chosen. Applied per-prompt by
+   * `sendPromptAsync` as `body.variant` on the prompt request.
    */
   effortLevel: string | null;
   /**
@@ -393,6 +387,36 @@ let isProvidersShapeLogged = false;
  */
 export interface ParsedProvidersConfig {
   providers: Map<string, Map<string, string[]>>;
+}
+
+/**
+ * @description Build the JSON body for a `prompt_async` POST. Pure + exported
+ * so the two per-prompt overrides — the model selector and the reasoning-effort
+ * `variant` — can be unit-tested without a live session. Both are optional and
+ * ride the same body, parallel to each other.
+ *
+ * @returns Body with `parts` always present; `model` only when a model override
+ * is set; `variant` only when an effort level is set.
+ */
+export function buildPromptBody(
+  input: string,
+  modelOverride: { providerID: string; modelID: string } | null,
+  effortLevel: string | null,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    parts: [{ type: 'text', text: input }],
+  };
+  if (modelOverride) {
+    const modelParam: Record<string, string> = { modelID: modelOverride.modelID };
+    if (modelOverride.providerID) {
+      modelParam.providerID = modelOverride.providerID;
+    }
+    body.model = modelParam;
+  }
+  if (effortLevel) {
+    body.variant = effortLevel;
+  }
+  return body;
 }
 
 export function parseProvidersResponse(raw: unknown): ParsedProvidersConfig {
@@ -894,13 +918,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Send message via async endpoint (returns 204, response streams via SSE).
    * Fire-and-forget — errors are logged but don't block.
    *
-   * **Per-prompt effort apply** (plan 2026-05-30-effort-command, D3/D4):
-   * if the thread has a stored effort level AND `OPENCODE_EFFORT_COMMAND`
-   * is set in the env, we POST `/session/:id/command` BEFORE the prompt
-   * itself. Failures of the effort command surface as adapter `error`
-   * events but do NOT block the actual prompt — falling back to whatever
-   * the server's current default reasoning effort is is strictly better
-   * than dropping the user's message on the floor.
+   * **Per-prompt effort apply:** if the thread has a stored effort level
+   * (a model variant), it's sent as `body.variant` alongside `body.model`
+   * — the same per-prompt override the prompt endpoint already uses for the
+   * model selector. No separate request, no env configuration.
    */
   private sendPromptAsync(key: ThreadKey, input: string): void {
     const session = this.sessions.get(keyToString(key));
@@ -915,40 +936,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Reset accumulated response text for new message
     session.currentResponseText = '';
 
-    const body: Record<string, unknown> = {
-      parts: [{ type: 'text', text: input }],
-    };
-    if (session.modelOverride) {
-      const modelParam: Record<string, string> = { modelID: session.modelOverride.modelID };
-      if (session.modelOverride.providerID) {
-        modelParam.providerID = session.modelOverride.providerID;
-      }
-      body.model = modelParam;
-    }
-
-    const effortCommand = process.env[OPENCODE_EFFORT_COMMAND_ENV];
-    const effortLevel = session.effortLevel;
+    // Model + reasoning-effort overrides ride the prompt body (see buildPromptBody).
+    const body = buildPromptBody(input, session.modelOverride, session.effortLevel);
 
     void (async () => {
-      // Step 1: best-effort effort apply. Plan R1: this command may render
-      // its own user-visible turn in the thread; verification was deferred
-      // until live behavioral checks (recorded in `agent/NOTES.md` for the
-      // PR description). The failure path is surfaced via `error` so the
-      // bot can show it next to the thread; the prompt still goes through.
-      if (effortLevel && effortCommand) {
-        try {
-          await this.apiRequest('POST', `/session/${session.sessionId}/command`, {
-            command: effortCommand,
-            arguments: effortLevel,
-          });
-        } catch (e) {
-          console.error(`[OpenCode] effort command "${effortCommand}" failed:`, e);
-          this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
-          // Intentional fall-through to step 2: the prompt is more
-          // important than the effort override.
-        }
-      }
-      // Step 2: actual prompt.
       try {
         await this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body);
       } catch (e) {
@@ -1069,18 +1060,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Effort levels the current thread can use (plan D5). Empty
-   * when OpenCode effort is disabled (`OPENCODE_EFFORT_COMMAND` unset), no
-   * session is running, or the current model has no (allow-listed) variants.
+   * @description Effort levels the current thread can use: exactly the
+   * variants the current model declares. Empty when no session is running
+   * or the model has no variants.
    */
   async getAvailableEffortLevels(key: ThreadKey): Promise<string[]> {
-    // Disabled until the operator wires the per-prompt apply command (D4).
-    if (!process.env[OPENCODE_EFFORT_COMMAND_ENV]) return [];
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return [];
-    const variants = await this.getModelVariants(session);
-    const configured = parseConfiguredLevels(process.env[OPENCODE_EFFORT_LEVELS_ENV]);
-    return intersectVariants(variants, configured);
+    return this.getModelVariants(session);
   }
 
   getEffort(key: ThreadKey): string | null {
@@ -1099,9 +1086,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return 'No active session';
 
-    if (!process.env[OPENCODE_EFFORT_COMMAND_ENV]) {
-      return t('effort.configure_hint', { env: OPENCODE_EFFORT_COMMAND_ENV });
-    }
     const available = await this.getAvailableEffortLevels(key);
     if (available.length === 0) {
       return t('effort.not_supported', { model: session.currentModelLabel ?? '?' });

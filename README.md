@@ -170,7 +170,7 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/claude`, `/opencode`, `/oc` | Start agent in this topic's bound folder |
 | `/agent` | Pick agent inline |
 | `/model` | Switch model |
-| `/effort` | Set reasoning effort (per-thread). Claude: native `/effort` levels (`low…ultracode`). OpenCode: model variant, applied per-prompt — requires `OPENCODE_EFFORT_COMMAND` |
+| `/effort` | Set reasoning effort (per-thread) via inline buttons. Claude: native `/effort` levels (`low…ultracode`). OpenCode: the current model's variants, applied per-prompt. No env configuration |
 | `/sessions` | List & resume previous sessions in this folder |
 | `/stop` | Kill current agent (tmux/server, brute) |
 | `/quit`, `/q` | Graceful exit — Claude: double Ctrl+C, OpenCode: `stopSession` |
@@ -225,8 +225,6 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 | `DEFAULT_AGENT` | `claude` | `claude` or `opencode` |
 | `BOT_LANG` | `ru` | `ru` or `en` |
 | `OPENCODE_URL` | `http://localhost:4096` | OpenCode server URL — must differ per instance on the same host |
-| `OPENCODE_EFFORT_COMMAND` | — | Name of the OpenCode slash command the bot invokes per-prompt to apply reasoning effort (the chosen level is passed as its argument). **Unset ⇒ `/effort` is disabled for OpenCode** and replies a configure hint. Claude is unaffected (native `/effort`) |
-| `OPENCODE_EFFORT_LEVELS` | (all variants) | Optional comma-separated allow-list narrowing the per-model variants offered by `/effort` (e.g. `low,medium,high,xhigh`). When unset, every variant the model exposes is offered |
 | `OPENCODE_BIN` | (auto) | Custom opencode binary path |
 | `CLAUDE_BIN` | (auto) | Custom Claude binary path for nvm/asdf/systemd PATH differences |
 | `ANTHROPIC_API_KEY` | — | For Claude Code |

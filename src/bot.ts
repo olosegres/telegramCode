@@ -2614,8 +2614,8 @@ command('effort', async (ctx, key) => {
     console.error('[Bot] getAvailableEffortLevels:', e);
   }
   if (levels.length === 0) {
-    // Empty means: OpenCode effort disabled (no command env), the model has
-    // no variants, or Claude isn't reporting any — surface a single hint.
+    // Empty means the current model declares no variants (OpenCode) or the
+    // backend reports no levels — not an error, just nothing to pick.
     await replyToThread(key, t('effort.not_available'));
     return;
   }

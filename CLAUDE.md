@@ -106,13 +106,14 @@ as a command in `bot.ts`.
   `/new`, `/pair`
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw
   TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
-  - `/effort` sets per-thread reasoning effort. **Two backends differ:** Claude
-    has a native `/effort <level>` slash command (typed into the TUI; canonical
-    set `low…ultracode`, claude clamps unsupported levels per model). OpenCode
-    encodes effort as the model's **variant** — applied per-prompt via
-    `POST /session/:id/command` and gated on the `OPENCODE_EFFORT_COMMAND` env
-    (unset ⇒ OpenCode effort disabled). See plan
-    `agent/tasks/actual/2026-05-30-effort-command.md`.
+  - `/effort` sets per-thread reasoning effort and offers tappable inline
+    buttons (one per available level). **Two backends differ:** Claude has a
+    native `/effort <level>` slash command (typed into the TUI; canonical set
+    `low…ultracode`, claude clamps unsupported levels per model). OpenCode
+    encodes effort as the model's **variant** — read live from
+    `GET /config/providers` and applied per-prompt as `body.variant` on the
+    prompt request (no env configuration). See plan
+    `agent/tasks/completed/2026-05-31-effort-buttons-both-backends.md`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
   `/doctor`, `/mcp`
 
@@ -139,3 +140,9 @@ per-backend, persisted agent setting.
   per-topic notice if it's long (cold start). Globally-installed bin
   resolves the project root via `fs.realpathSync(__dirname)`, so
   `telegramCode hot` works from any CWD.
+
+- **Verify a per-prompt OpenCode override actually applied** (model or `/effort`
+  variant): `GET http://127.0.0.1:4096/session/<sessionId>/message` — the stored
+  user + assistant turns echo `model.variant`, proving `body.variant` rode the
+  prompt (stronger proof than "no HTTP 400"). Claude side: the tmux pane +
+  `[Claude] sendInput: "/effort <level>"` in the log.

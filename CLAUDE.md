@@ -68,6 +68,8 @@ config/variants, not a per-message API field).
 | `pinnedStatus.ts` | Per-thread pinned status banner (shows model, etc.) |
 | `agentTrigger.ts` | Detect agent-ready / prompt triggers in output |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
+| `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
+| `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `types.ts` | Shared types incl. the `AgentAdapter` contract and `ThreadKey` |

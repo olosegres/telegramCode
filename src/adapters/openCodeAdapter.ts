@@ -7,12 +7,17 @@ import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
+import { appendDiagLog } from '../diagLog';
 import {
   OPENCODE_EFFORT_COMMAND_ENV,
   OPENCODE_EFFORT_LEVELS_ENV,
   parseConfiguredLevels,
   intersectVariants,
 } from '../effortLevels';
+import {
+  checkIsEventForSession,
+  updateSessionLineage,
+} from '../openCodeSessionRouting';
 import { t } from '../i18n';
 
 const execAsync = promisify(exec);
@@ -175,6 +180,14 @@ interface OpenCodeSession {
    * tornDown session (audit S8 / #14).
    */
   reconnectTimer: NodeJS.Timeout | null;
+  /**
+   * Handle for the SSE stall watchdog `setTimeout`. OpenCode emits a
+   * `server.heartbeat` every ~10 s, so a live stream always delivers bytes
+   * within that window; if none arrive for `sseStallTimeoutMs` the socket is
+   * silently dead (open TCP, no FIN/RST) and `reader.read()` would park
+   * forever. The watchdog aborts the controller so `pollSse` reconnects.
+   */
+  sseStallTimer: NodeJS.Timeout | null;
 }
 
 interface OpenCodeApiSession {
@@ -266,14 +279,51 @@ interface OpenCodeMessageInfo {
   providerID?: string;
 }
 
+/**
+ * Shape of `properties.info` on a `session.updated` event — the only event
+ * that exposes the child→parent session link used for subagent routing.
+ */
+interface OpenCodeSessionUpdatedInfo {
+  id?: string;
+  parentID?: string;
+}
+
 /** Delay (ms) to batch SSE text deltas before emitting output event */
 const sseOutputBatchMs = 500;
 
-/** Max number of SSE reconnection attempts before giving up */
-const maxSseReconnectAttempts = 5;
-
 /** Base delay (ms) for exponential backoff on SSE reconnect */
 const sseReconnectBaseDelayMs = 2000;
+
+/**
+ * SSE reconnect never gives up — the bot must reconnect until success — but the
+ * backoff is capped so steady-state retries settle at a fixed interval instead
+ * of growing unbounded: delay = min(base · 2^min(attempt, exp), maxDelay).
+ */
+const maxSseReconnectBackoffExponent = 5;
+const maxSseReconnectDelayMs = 60_000;
+
+/** Measured cadence of OpenCode `server.heartbeat` on the global event stream. */
+const sseHeartbeatIntervalMs = 10_000;
+/**
+ * If no SSE bytes — not even a heartbeat — arrive within this window, the
+ * stream is silently dead (TCP still open, nothing delivered) and the parked
+ * `reader.read()` would never return. 4× the heartbeat tolerates a few dropped
+ * beats before forcing a reconnect, so it can't false-fire on a healthy idle
+ * stream.
+ */
+const sseStallTimeoutMs = sseHeartbeatIntervalMs * 4;
+
+/** Cap on tracked child→parent session links (subagent lineage). */
+const maxTrackedSessionLineageEntries = 1000;
+
+/** SSE event types whose loss makes a turn silently hang — diag-logged on drop. */
+const criticalSseEventTypes = new Set<string>([
+  'message.part.updated',
+  'message.part.delta',
+  'message.updated',
+  'session.idle',
+  'session.error',
+]);
 
 /**
  * @description Default timeout for non-SSE HTTP requests to OpenCode.
@@ -282,15 +332,6 @@ const sseReconnectBaseDelayMs = 2000;
  * stream uses its own long-lived connection without this timeout.
  */
 const apiRequestTimeoutMs = 30_000;
-
-/**
- * @description Wall-clock cap on SSE reconnect attempts for one session.
- * Audit S7 / #12: a flapping OpenCode server reset `attempt = 0` after
- * each successful connect, so the legacy 5-attempts ceiling never
- * actually bounded retry time. Cap total reconnect lifetime to 10 min
- * before giving up regardless of per-attempt counter.
- */
-const sseReconnectTotalBudgetMs = 10 * 60 * 1000;
 
 /**
  * @description Validate `OPENCODE_URL`. SSRF guard for audit S7 / #34:
@@ -493,6 +534,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * `Map` compares object identity, not structural equality.
    */
   private sessions: Map<string, OpenCodeSession> = new Map();
+
+  /**
+   * child sessionID → parent sessionID, learned from `session.updated` events.
+   * OpenCode runs subagents (e.g. `@explore`) in child sessions whose SSE
+   * events carry the child id; this map routes them back to the topic bound to
+   * the parent. Bounded by `maxTrackedSessionLineageEntries`.
+   */
+  private sessionLineage: Map<string, string> = new Map();
+
   private baseUrl: string;
   private authHeader: string | null;
 
@@ -763,6 +813,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           effortLevel: loadSavedEffort(key),
           sseController: null,
           reconnectTimer: null,
+          sseStallTimer: null,
         };
 
         this.sessions.set(k, session);
@@ -855,6 +906,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) {
       console.log(`[OpenCode] sendInput: no active session for ${keyToString(key)}`);
+      appendDiagLog(`prompt DROPPED no-active-session key=${keyToString(key)}`);
       return;
     }
 
@@ -1137,6 +1189,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         effortLevel: loadSavedEffort(key),
         sseController: null,
         reconnectTimer: null,
+        sseStallTimer: null,
       };
 
       this.sessions.set(k, session);
@@ -1189,6 +1242,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.reconnectTimer);
       session.reconnectTimer = null;
     }
+    // Also disarm the stall watchdog so it can't fire after teardown.
+    this.clearSseStallTimer(session);
   }
 
   /**
@@ -1255,7 +1310,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * with JSON payload { type, properties }. No `event:` field is used.
    *
    * On connection failure: checks if server is alive, attempts restart if dead,
-   * retries with exponential backoff up to maxSseReconnectAttempts.
+   * retries forever with capped exponential backoff until reconnect succeeds.
    */
   private async pollSse(key: ThreadKey, sseUrl: string, reconnectAttempt = 0, reconnectStartTs = Date.now()): Promise<void> {
     const session = this.sessions.get(keyToString(key));
@@ -1289,14 +1344,21 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       }
 
       console.log(`[OpenCode] SSE connected successfully`);
+      appendDiagLog(`sse connected key=${keyToString(key)} attempt=${reconnectAttempt}`);
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
 
+      // Arm the stall watchdog before the first read and re-arm on every chunk;
+      // a silently dead stream (no bytes, not even a heartbeat) would otherwise
+      // park `reader.read()` forever with no reconnect.
+      this.armSseStallWatchdog(session, key, controller);
+
       while (session.isActive) {
         const { done, value } = await reader.read();
         if (done) break;
+        this.armSseStallWatchdog(session, key, controller);
 
         // Audit S7 / #12: a flapping server used to reset `reconnectAttempt`
         // on a *successful TCP connect*, so the 5-attempts ceiling never
@@ -1307,6 +1369,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           sawData = true;
           reconnectAttempt = 0;
           reconnectStartTs = Date.now();
+          appendDiagLog(`sse first-data key=${keyToString(key)}`);
         }
 
         buffer += decoder.decode(value, { stream: true });
@@ -1321,6 +1384,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         }
       }
 
+      // Leaving the read loop: disarm before any reconnect await so the
+      // watchdog can't fire against this (now-finished) controller.
+      this.clearSseStallTimer(session);
       reader.cancel().catch(() => {});
 
       // If session is still active but stream ended (server-side close), try to reconnect
@@ -1329,24 +1395,58 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, 'stream ended');
       }
     } catch (e) {
-      // Aborted fetches are not errors — they're how `stopSession` exits.
-      if (controller.signal.aborted) return;
+      this.clearSseStallTimer(session);
+      // An aborted controller means either `stopSession`/`disconnectSse`
+      // (session no longer active → just exit) or the stall watchdog firing
+      // on a silently dead stream (session still active → reconnect).
+      if (controller.signal.aborted) {
+        if (session.isActive) {
+          await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, 'stall');
+        }
+        return;
+      }
       if (session.isActive) {
         const errorMessage = e instanceof Error ? e.message : String(e);
         console.error(`[OpenCode] SSE error:`, errorMessage);
         await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, errorMessage);
       }
     } finally {
+      this.clearSseStallTimer(session);
       if (session.sseController === controller) session.sseController = null;
+    }
+  }
+
+  /**
+   * @description (Re)arm the SSE stall watchdog. OpenCode emits a
+   * `server.heartbeat` every ~10 s, so a live stream always delivers bytes
+   * within `sseStallTimeoutMs`; if none arrive the socket is silently dead
+   * (open TCP, no FIN/RST) and `reader.read()` would park forever. Aborting
+   * the controller unblocks the reader so `pollSse`'s catch path reconnects.
+   * Re-armed on every chunk, so heartbeats keep a healthy stream alive.
+   */
+  private armSseStallWatchdog(session: OpenCodeSession, key: ThreadKey, controller: AbortController): void {
+    this.clearSseStallTimer(session);
+    session.sseStallTimer = setTimeout(() => {
+      session.sseStallTimer = null;
+      appendDiagLog(`sse stall key=${keyToString(key)} idle>${sseStallTimeoutMs}ms`);
+      controller.abort();
+    }, sseStallTimeoutMs);
+  }
+
+  /** Cancel the SSE stall watchdog if armed. Idempotent. */
+  private clearSseStallTimer(session: OpenCodeSession): void {
+    if (session.sseStallTimer) {
+      clearTimeout(session.sseStallTimer);
+      session.sseStallTimer = null;
     }
   }
 
   /**
    * @description Handle SSE reconnection with server health check, auto-restart, and exponential backoff.
    * If the server is dead, attempts to restart it before reconnecting SSE.
-   * Gives up after `maxSseReconnectAttempts` consecutive failures OR
-   * `sseReconnectTotalBudgetMs` of wall-clock retry time — whichever hits
-   * first (audit S7 / #12).
+   * Never gives up while the session is active — reconnects until success —
+   * with the backoff capped at `maxSseReconnectDelayMs`. The only exits are an
+   * unrestartable server (handled by `restartServer`) or an inactive session.
    */
   private async handleSseReconnect(
     key: ThreadKey,
@@ -1360,25 +1460,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     const elapsed = Date.now() - reconnectStartTs;
-    const overAttemptCap = attempt >= maxSseReconnectAttempts;
-    const overTimeBudget = elapsed >= sseReconnectTotalBudgetMs;
-    if (overAttemptCap || overTimeBudget) {
-      const reasonHint = overTimeBudget
-        ? `after ${Math.round(elapsed / 1000)}s of retries`
-        : `after ${attempt} attempts`;
-      console.error(`[OpenCode] SSE reconnect giving up ${reasonHint}`);
-      this.emit('output', key, `Lost connection to OpenCode server ${reasonHint}. Use /stop and start a new session.`);
-      session.isActive = false;
-      this.sessions.delete(k);
-      // Audit S10 / #40: session died on its own (no explicit
-      // `stopSession`). Emit `closed` (not just `stopped`) so the bot
-      // wipes the persisted opencodeSessionId — otherwise the next
-      // bot restart would try to resume a session the server never
-      // had a chance to reopen.
-      this.emit('stopped', key);
-      this.emit('closed', key);
-      return;
-    }
 
     // Check if the server process is still alive
     const isServerAlive = await checkIsOpenCodeServerRunning();
@@ -1390,15 +1471,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         // restartServer already notified threads and cleaned up sessions
         return;
       }
-      // Server restarted — keep the wall-clock budget but allow another
-      // round of per-attempt retries (in case the freshly-started server
-      // refuses the first connect on its boot path).
+      // Server restarted — reset the attempt counter so backoff starts fresh.
       attempt = 0;
     }
 
-    // Exponential backoff: 2s, 4s, 8s, 16s, 32s
-    const delay = sseReconnectBaseDelayMs * Math.pow(2, attempt);
-    console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}/${maxSseReconnectAttempts}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
+    // Never give up while the session is active: reconnect forever until
+    // success. Cap the exponential backoff so steady-state retries settle at
+    // `maxSseReconnectDelayMs` instead of growing without bound.
+    const delay = Math.min(
+      sseReconnectBaseDelayMs * Math.pow(2, Math.min(attempt, maxSseReconnectBackoffExponent)),
+      maxSseReconnectDelayMs,
+    );
+    console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
+    appendDiagLog(`sse reconnect attempt=${attempt + 1} reason=${reason} delay=${delay}ms`);
 
     // Store the timer handle on the session so `stopSession` / `disconnectSse`
     // can cancel it; otherwise a `setTimeout` fired after the session is
@@ -1442,6 +1527,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     const eventType = event.type;
 
+    // OpenCode runs subagents in CHILD sessions; their events carry the child
+    // sessionID, not the bound parent's. `session.updated` is the only event
+    // exposing the child→parent link — capture it BEFORE the session-id gate
+    // below (which would otherwise drop it as "without sessionID"), so
+    // descendant events can be routed back to the owning topic.
+    if (eventType === 'session.updated') {
+      this.trackSessionLineage(event.properties);
+    }
+
     // Filter events by session ID (SSE stream contains events for all sessions).
     // Audit S5 / #6: the previous filter `if (eventSessionId &&
     // eventSessionId !== session.sessionId) return` LET THROUGH events
@@ -1460,7 +1554,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         console.warn(`[OpenCode] dropping ${eventType} without sessionID`);
         return;
       }
-      if (eventSessionId !== session.sessionId) return;
+      if (!checkIsEventForSession(eventSessionId, session.sessionId, this.sessionLineage)) {
+        if (criticalSseEventTypes.has(eventType)) {
+          appendDiagLog(`sse drop ${eventType} es=${eventSessionId} bound=${session.sessionId}`);
+        }
+        return;
+      }
+      if (eventSessionId !== session.sessionId) {
+        appendDiagLog(`sse route-descendant ${eventType} es=${eventSessionId} -> ${session.sessionId}`);
+      }
     }
 
     switch (eventType) {
@@ -1513,6 +1615,25 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       return (props.info as OpenCodeMessageInfo).sessionID!;
     }
     return null;
+  }
+
+  /**
+   * @description Record a child→parent session link from a `session.updated`
+   * event so subagent (child-session) events can be routed to the topic bound
+   * to the parent. Root sessions (no `parentID`) and non-session ids are
+   * ignored; the map is bounded by `maxTrackedSessionLineageEntries`.
+   */
+  private trackSessionLineage(properties: Record<string, unknown>): void {
+    const info = properties.info as OpenCodeSessionUpdatedInfo | undefined;
+    const recorded = updateSessionLineage(
+      this.sessionLineage,
+      info?.id,
+      info?.parentID,
+      maxTrackedSessionLineageEntries,
+    );
+    if (recorded) {
+      appendDiagLog(`sse lineage child=${info?.id} parent=${info?.parentID}`);
+    }
   }
 
   /**
@@ -1722,7 +1843,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     const sessionId = properties.sessionID as string | undefined;
-    if (sessionId && sessionId !== session.sessionId) return;
+    if (sessionId && !checkIsEventForSession(sessionId, session.sessionId, this.sessionLineage)) return;
 
     console.log(`[OpenCode] Session idle`);
     this.flushOutput(key);

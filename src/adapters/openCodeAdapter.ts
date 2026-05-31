@@ -1068,7 +1068,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return this.sessions.get(keyToString(key))?.sessionId ?? null;
   }
 
-  async getSessions(_key: ThreadKey): Promise<AgentSession[]> {
+  // `_workDir` is part of the shared `getSessions` contract but unused
+  // here: OpenCode's `GET /session` returns a server-wide list with no
+  // directory field to filter on, so the list is not folder-scoped.
+  async getSessions(_key: ThreadKey, _workDir: string): Promise<AgentSession[]> {
     try {
       const apiSessions = await this.apiRequest<OpenCodeApiSession[]>('GET', '/session');
 

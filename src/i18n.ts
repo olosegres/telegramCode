@@ -176,7 +176,6 @@ const dict: Record<Lang, Record<string, string>> = {
     'mcp.source_thread': 'thread (`DATA_DIR`/threads/...)',
 
     // ── extra hints ──
-    'sessions.run_hint': 'Запусти /sessions, чтобы увидеть сессии для resume.',
     'doctor.pin_hint': 'Pinned-статус треда (Этап 7) будет недоступен',
 
     // ── /whoami /version /status (global) ──
@@ -279,14 +278,24 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.agent_switched': 'Переключено на {label}',
     'cb.resume_only_topical': 'Resume работает только в тематических тредах',
     'cb.bind_folder_first': 'Сначала привяжи папку через /bind',
-    'cb.sessions_expired': 'Список сессий устарел — запусти /sessions снова',
-    'cb.resuming': 'Возобновляю сессию…',
     'cb.agent_not_running': 'Агент не запущен',
     'cb.no_pending_question': 'Нет ожидающего вопроса',
     'cb.invalid_option': 'Некорректный вариант',
     'cb.sent_option': 'Отправлено: {option}',
     'cb.effort_set': 'Effort: {level}',
     'cb.effort_error': 'Ошибка: {error}',
+
+    // ── session picker (/sessions, /resume). {label}=агент, {max}=кол-во, {error}=причина ──
+    'session.list_header': 'Сессии для возобновления ({label}):',
+    'session.list_footer': 'Отправьте 1–{max} чтобы возобновить · 0 или /cancel для выхода',
+    'session.none': 'Нет сессий для возобновления в этой папке.',
+    'session.cancelled': 'Отменено. Выбор сессии закрыт.',
+    'session.cancel_noop': 'Нечего отменять — выбор сессии не активен.',
+    'session.invalid': 'Неверный номер. Введите число от 1 до {max}.',
+    'session.resumed': 'Сессия возобновлена. Отправьте сообщение:',
+    'session.resume_failed': 'Не удалось возобновить сессию: {error}',
+    'session.expired': 'Список сессий устарел. Запустите /sessions заново.',
+    'session.load_failed': 'Не удалось загрузить список сессий.',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -423,7 +432,6 @@ const dict: Record<Lang, Record<string, string>> = {
     'mcp.source_thread': 'thread (`DATA_DIR`/threads/...)',
 
     // ── extra hints ──
-    'sessions.run_hint': 'Run /sessions to see resumable agent sessions.',
     'doctor.pin_hint': 'Pinned thread status (Stage 7) will be unavailable',
 
     // ── /whoami /version /status (global) ──
@@ -518,14 +526,24 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.agent_switched': 'Switched to {label}',
     'cb.resume_only_topical': 'Resume only works in topical threads',
     'cb.bind_folder_first': 'Bind a folder first via /bind',
-    'cb.sessions_expired': 'Session list expired — run /sessions again',
-    'cb.resuming': 'Resuming session…',
     'cb.agent_not_running': 'Agent not running',
     'cb.no_pending_question': 'No pending question',
     'cb.invalid_option': 'Invalid option',
     'cb.sent_option': 'Sent: {option}',
     'cb.effort_set': 'Effort: {level}',
     'cb.effort_error': 'Error: {error}',
+
+    // ── session picker (/sessions, /resume). {label}=agent, {max}=count, {error}=reason ──
+    'session.list_header': 'Sessions to resume ({label}):',
+    'session.list_footer': 'Send 1–{max} to resume · 0 or /cancel to exit',
+    'session.none': 'No resumable sessions in this folder.',
+    'session.cancelled': 'Cancelled. Session picker closed.',
+    'session.cancel_noop': 'Nothing to cancel — the session picker is not active.',
+    'session.invalid': 'Invalid number. Enter a value from 1 to {max}.',
+    'session.resumed': 'Session resumed. Send your message:',
+    'session.resume_failed': 'Failed to resume session: {error}',
+    'session.expired': 'Session list is stale. Run /sessions again.',
+    'session.load_failed': 'Failed to load sessions.',
   },
 };
 

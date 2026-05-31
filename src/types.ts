@@ -121,7 +121,16 @@ export interface AgentAdapter extends EventEmitter {
 
   // — Session history —
 
-  getSessions(key: ThreadKey): Promise<AgentSession[]>;
+  /**
+   * List resumable sessions for this `key`. `workDir` is supplied by the
+   * bot from the thread's binding because a thread may have NO live
+   * adapter session when listing (e.g. right after a restart, or to pick
+   * up a conversation started by hand on the laptop), so the folder can't
+   * be inferred from adapter state. Claude reads real
+   * `~/.claude/projects/<cwd>/*.jsonl` transcripts filtered to `workDir`;
+   * OpenCode ignores `workDir` (its server API exposes no folder field).
+   */
+  getSessions(key: ThreadKey, workDir: string): Promise<AgentSession[]>;
   /**
    * Resume an existing backend session under this `key` and `workDir`.
    *

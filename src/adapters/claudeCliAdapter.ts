@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
@@ -65,11 +66,20 @@ interface ClaudeSession {
 const pollInterval = 300;
 
 const claudePath = resolveClaudeBinary();
-// Audit S3 / #9: session-history file belongs under DATA_DIR (the same
-// directory that holds `state.json`), so the two-instance setup keeps its
-// promised isolation. Previously this used `$HOME/.claude-sessions.json`,
-// which silently collided when two bots ran as the same Linux user.
-const sessionsFile = path.join(resolveDataDir(), '.claude-sessions.json');
+
+/**
+ * @description Max number of `.jsonl` transcripts to parse per folder.
+ *
+ * Parsing each transcript is the expensive step (stream the whole file to
+ * collect title/cwd/timestamp). We bound it to the most-recent N by mtime
+ * — the bot only ever shows the top {@link sessionsDisplayLimit}, so 30 is
+ * plenty of headroom even after the `recordedCwd === workDir` filter drops
+ * some entries.
+ */
+const sessionsParseLimit = 30;
+
+/** Cap on a session title's length so the list stays readable in Telegram. */
+const sessionTitleMaxLength = 60;
 
 /**
  * @description Per-thread Claude `/effort` choice (plan 2026-05-30-effort-command, D6).
@@ -728,54 +738,193 @@ export function stripTuiElements(text: string): string {
   return result.trim();
 }
 
-interface StoredSession {
-  id: string;
-  title: string;
-  createdAt: string;
-  updatedAt: string;
+/**
+ * @description Turn an absolute workDir into Claude's transcript-folder slug.
+ *
+ * Claude stores per-project transcripts under
+ * `~/.claude/projects/<slug>/<sessionUuid>.jsonl`, where the slug is the
+ * absolute path with every non-alphanumeric character replaced by `-`
+ * (e.g. `/home/user/src/telegramCode` → `-home-user-src-telegramCode`).
+ *
+ * The slug encoding is undocumented and could drift across Claude versions,
+ * so it is used only to *locate* the candidate folder — the authoritative
+ * correctness gate is the `recordedCwd === workDir` filter in
+ * {@link listClaudeSessionsForWorkDir}.
+ */
+function getClaudeProjectSlug(workDir: string): string {
+  return workDir.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
-function loadStoredSessions(): StoredSession[] {
-  // Audit S15 / #42: previously every read error was swallowed; a
-  // corrupt JSON file (single edit gone wrong) would silently look like
-  // "no sessions" forever. Log so the operator notices; archive the
-  // bad file so subsequent writes start clean.
+/**
+ * @description One transcript's distilled metadata, collected by streaming
+ * its `.jsonl` lines. All fields optional — a partially-written or
+ * unexpected transcript still yields whatever was found.
+ */
+interface ParsedTranscript {
+  recordedCwd: string | null;
+  /** Model-written conversation title (from the matching `summary` entry). */
+  summaryTitle: string | null;
+  /** First user prompt — final fallback title. */
+  firstUser: string | null;
+  /** Last user prompt — preferred over `firstUser` when no summary matches. */
+  lastPrompt: string | null;
+  firstTimestamp: string | null;
+}
+
+/**
+ * @description Narrow an untyped `JSON.parse` result to a plain object so its
+ * fields can be read with `typeof` guards instead of casts (parse-boundary
+ * pattern for untrusted on-disk data; mirrors `isRecord` in `state.ts`).
+ */
+function checkIsRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * @description Stream-parse a single Claude `.jsonl` transcript, pulling out
+ * just the fields we need to render and gate a resumable session. Reads the
+ * whole file synchronously (the caller already bounded the count to
+ * {@link sessionsParseLimit}) and tolerates malformed lines.
+ *
+ * A `.jsonl` can carry many `summary` entries (one per branch ever summarised
+ * in this project file). The one describing THIS conversation is the summary
+ * whose `leafUuid` points at a message `uuid` that lives in this file, so we
+ * collect message uuids + all (leafUuid → summary) pairs, then match.
+ */
+function parseClaudeTranscript(filePath: string): ParsedTranscript {
+  const result: ParsedTranscript = {
+    recordedCwd: null,
+    summaryTitle: null,
+    firstUser: null,
+    lastPrompt: null,
+    firstTimestamp: null,
+  };
+  let raw: string;
   try {
-    if (!fs.existsSync(sessionsFile)) return [];
-    const raw = fs.readFileSync(sessionsFile, 'utf-8');
-    return JSON.parse(raw) as StoredSession[];
+    raw = fs.readFileSync(filePath, 'utf-8');
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    console.error(`[Claude] loadStoredSessions failed (${code ?? 'parse'}):`, e instanceof Error ? e.message : e);
-    if (fs.existsSync(sessionsFile)) {
-      const ts = new Date().toISOString().replace(/[:.]/g, '-');
-      const archive = `${sessionsFile}.corrupted-${ts}`;
-      try {
-        fs.renameSync(sessionsFile, archive);
-        console.warn(`[Claude] archived corrupt sessions file to ${archive}`);
-      } catch (re) {
-        console.warn(`[Claude] failed to archive corrupt sessions file:`, re);
+    console.warn(`[Claude] failed to read transcript ${filePath}:`, e instanceof Error ? e.message : e);
+    return result;
+  }
+
+  const messageUuids = new Set<string>();
+  const summaryByLeaf = new Map<string, string>();
+
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue; // tolerate a half-written trailing line
+    }
+    if (!checkIsRecord(entry)) continue;
+
+    if (typeof entry.uuid === 'string') messageUuids.add(entry.uuid);
+
+    if (entry.type === 'summary' && typeof entry.summary === 'string' && typeof entry.leafUuid === 'string') {
+      summaryByLeaf.set(entry.leafUuid, entry.summary);
+    }
+    if (result.recordedCwd === null && typeof entry.cwd === 'string') {
+      result.recordedCwd = entry.cwd;
+    }
+    if (result.firstTimestamp === null && typeof entry.timestamp === 'string') {
+      result.firstTimestamp = entry.timestamp;
+    }
+    if (entry.type === 'user') {
+      const userText = extractUserText(entry.message);
+      if (userText) {
+        if (result.firstUser === null) result.firstUser = userText;
+        result.lastPrompt = userText; // keep the LAST user prompt
       }
     }
-    return [];
   }
+
+  for (const [leafUuid, summary] of summaryByLeaf) {
+    if (messageUuids.has(leafUuid)) {
+      result.summaryTitle = summary;
+      break;
+    }
+  }
+  return result;
 }
 
-function saveStoredSession(session: StoredSession): void {
-  const sessions = loadStoredSessions();
-  const existingIdx = sessions.findIndex(s => s.id === session.id);
-  if (existingIdx >= 0) {
-    sessions[existingIdx] = session;
-  } else {
-    sessions.unshift(session);
+/**
+ * @description Best-effort extraction of plain text from a transcript's
+ * `user` message. Claude writes the message either as a bare string or as
+ * an array of content blocks (`{ type: 'text', text }`). Returns the first
+ * non-empty text found, or `null`.
+ */
+function extractUserText(message: unknown): string | null {
+  if (typeof message === 'string') return message.trim() || null;
+  if (!checkIsRecord(message)) return null;
+  const content = message.content;
+  if (typeof content === 'string') return content.trim() || null;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (checkIsRecord(block) && block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        return block.text.trim();
+      }
+    }
   }
-  // Keep last 50 sessions
-  const trimmed = sessions.slice(0, 50);
+  return null;
+}
+
+/**
+ * @description List resumable Claude sessions for a workDir by reading the
+ * real `~/.claude/projects/<slug>/*.jsonl` transcripts.
+ *
+ * Exported and pure (filesystem-only, no tmux/adapter boot) so it can be
+ * unit-tested against a temp `projectsRoot`. Steps:
+ *
+ *   1. Resolve `<projectsRoot>/<slug>`; if missing → `[]`.
+ *   2. Take the {@link sessionsParseLimit} most-recently-modified `.jsonl`.
+ *   3. Parse each; KEEP only files whose recorded cwd === `workDir`
+ *      (the load-bearing correctness gate — slug collisions / version drift).
+ *   4. id = filename stem, MUST pass {@link checkIsValidUuid} (else skip).
+ *   5. title = summaryTitle ?? lastPrompt ?? firstUser ?? id (trimmed, capped).
+ *      updatedAt = file mtime; createdAt = first timestamp ?? mtime.
+ *
+ * Result is newest-first by mtime.
+ */
+export function listClaudeSessionsForWorkDir(projectsRoot: string, workDir: string): AgentSession[] {
+  const slugDir = path.join(projectsRoot, getClaudeProjectSlug(workDir));
+  let entries: string[];
   try {
-    fs.writeFileSync(sessionsFile, JSON.stringify(trimmed, null, 2));
-  } catch (e) {
-    console.error(`[Claude] saveStoredSession failed:`, e instanceof Error ? e.message : e);
+    entries = fs.readdirSync(slugDir);
+  } catch {
+    return []; // folder doesn't exist yet → no Claude session ran here
   }
+
+  const candidates = entries
+    .filter(name => name.endsWith('.jsonl'))
+    .map(name => {
+      const fullPath = path.join(slugDir, name);
+      let mtimeMs: number;
+      try {
+        mtimeMs = fs.statSync(fullPath).mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      return { name, fullPath, mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, sessionsParseLimit);
+
+  const sessions: AgentSession[] = [];
+  for (const candidate of candidates) {
+    const id = candidate.name.slice(0, -'.jsonl'.length);
+    if (!checkIsValidUuid(id)) continue;
+    const parsed = parseClaudeTranscript(candidate.fullPath);
+    if (parsed.recordedCwd !== workDir) continue;
+    const rawTitle = parsed.summaryTitle ?? parsed.lastPrompt ?? parsed.firstUser ?? id;
+    const title = rawTitle.trim().slice(0, sessionTitleMaxLength) || id;
+    const updatedAt = new Date(candidate.mtimeMs);
+    const createdAt = parsed.firstTimestamp ? new Date(parsed.firstTimestamp) : updatedAt;
+    sessions.push({ id, title, createdAt, updatedAt });
+  }
+  return sessions;
 }
 
 /**
@@ -944,14 +1093,6 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // sees the failure and skips registering the binding.
       throw new Error(`Failed to start Claude session: ${e instanceof Error ? e.message : String(e)}`);
     }
-
-    const now = new Date().toISOString();
-    saveStoredSession({
-      id: sessionName,
-      title: args || `Session ${sessionName}`,
-      createdAt: now,
-      updatedAt: now,
-    });
 
     const session: ClaudeSession = {
       key,
@@ -1223,14 +1364,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     return this.sessions.get(keyToString(key))?.claudeSessionId ?? null;
   }
 
-  async getSessions(_key: ThreadKey): Promise<AgentSession[]> {
-    const stored = loadStoredSessions();
-    return stored.map(s => ({
-      id: s.id,
-      title: s.title,
-      createdAt: new Date(s.createdAt),
-      updatedAt: new Date(s.updatedAt),
-    }));
+  // Lists REAL resumable sessions from `~/.claude/projects/<cwd>/*.jsonl`,
+  // not a bot-private registry. This makes a conversation started by hand
+  // on the laptop in `workDir` resumable from the bound Telegram thread.
+  // `key` is unused: Claude scopes transcripts by folder, not by thread.
+  async getSessions(_key: ThreadKey, workDir: string): Promise<AgentSession[]> {
+    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+    return listClaudeSessionsForWorkDir(projectsRoot, workDir);
   }
 
   /**

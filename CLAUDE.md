@@ -90,7 +90,16 @@ as a command in `bot.ts`.
 ## Commands (all registered in `bot.ts`)
 
 - **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/stop`, `/stop-all`,
-  `/quit` (`/q`), `/sessions`, `/clear`, `/compact`
+  `/quit` (`/q`), `/sessions` (`/resume`), `/cancel`, `/clear`, `/compact`
+  - `/sessions` and its synonym `/resume` list resumable sessions for the
+    thread's bound folder as numbered text **and** tappable inline buttons,
+    then arm a per-thread pick mode: reply with a bare digit to resume that
+    session, `0` or `/cancel` to exit, out-of-range stays armed, any other
+    text exits and is handled normally. **Two backends differ:** Claude lists
+    real `~/.claude/projects/<cwd-slug>/*.jsonl` transcripts filtered by
+    `recordedCwd === workDir` (so sessions started by hand on the laptop in
+    that folder are resumable too); OpenCode lists server sessions via
+    `GET /session` (not folder-filtered).
 - **Binding & navigation:** `/bind`, `/unbind`, `/where`, `/ls`, `/list`,
   `/new`, `/pair`
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw

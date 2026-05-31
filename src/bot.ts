@@ -22,11 +22,12 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession } from './types';
 import { keyToString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
 import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
+import { checkSessionPickAction } from './sessionPick';
 import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
@@ -291,6 +292,19 @@ const startupPromptBuffer = new StartupPromptBuffer();
 const threadSessionLists = new Map<string, string[]>();
 
 /**
+ * @description Per-thread "session-pick" arming flag. A thread is added here
+ * by `/sessions` (or its `/resume` synonym) and removed when the user picks
+ * a number, cancels, or sends non-numeric text. Only while a key is in this
+ * set is a bare digit reply interpreted as a session pick — so a normal "2"
+ * prompt is never hijacked. Mirrors the existing `awaitingModelSelection`
+ * pattern (see the `/model` numeric-selection flow).
+ */
+const awaitingSessionSelection = new Set<string>();
+
+/** Max sessions shown in a `/sessions` list (Telegram-friendly, plan S3). */
+const sessionsDisplayLimit = 10;
+
+/**
  * @description Forum-topic names that arrived via `forum_topic_created`
  * but couldn't be processed because the creator wasn't in
  * `ALLOWED_USERS` (audit S2 / #5). We can't read a thread's title later
@@ -523,6 +537,8 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   pendingQuestions.delete(k);
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
+  threadSessionLists.delete(k);
+  awaitingSessionSelection.delete(k);
   pinnedStatusTextCache.delete(k);
   // Drop any pending status frame so it doesn't surface in a freshly-bound
   // session. The `inFlight` loop, if running, will exit on its next tick
@@ -2238,16 +2254,13 @@ async function sendBindingWelcome(key: ThreadKey, subdir: string): Promise<void>
 }
 
 // `open_sessions` callback wires the [📋 Resume…] button to the `/sessions`
-// flow — same handler the slash command calls into, so the picker source
-// stays single-sourced.
+// flow — same `handleSessionsList` helper the slash command calls into, so
+// the picker source (list rendering + pick-mode arming) stays single-sourced.
 bot.action('open_sessions', async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   await ctx.answerCbQuery();
-  // Cheapest UX without duplicating the /sessions picker: ask the user to
-  // type /sessions, which opens the same flow. Refactoring the slash
-  // handler into a reusable helper is Stage 7 polish.
-  await replyToThread(key, t('sessions.run_hint'));
+  await handleSessionsList(key);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2627,32 +2640,108 @@ command('agent', async (_ctx, key) => {
   await replyToThread(key, 'Choose agent:', Markup.inlineKeyboard(buttons, { columns: 2 }));
 });
 
-command('sessions', async (_ctx, key) => {
+/** Max chars of a session title rendered on an inline resume button. */
+const sessionButtonTitleMaxLength = 40;
+
+/**
+ * @description Shared `/sessions` (and `/resume` synonym) handler.
+ *
+ * Lists resumable sessions for the thread's bound folder as BOTH numbered
+ * text and tappable inline buttons, then arms session-pick mode so a bare
+ * digit reply resumes the matching session. Guards mirror the `resume_<idx>`
+ * button: topical-thread-only + binding required. Reused by the `/sessions`
+ * and `/resume` commands and the `open_sessions` inline button so the picker
+ * source stays single-sourced.
+ */
+async function handleSessionsList(key: ThreadKey): Promise<void> {
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('cb.resume_only_topical'));
+    return;
+  }
+  if (!state.getBinding(key)) {
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await replyToThread(key, t('thread.no_binding'), extra);
+    return;
+  }
+
   const adapter = getThreadAdapter(key);
+  let sessions: AgentSession[];
   try {
-    const sessions = await adapter.getSessions(key);
-    if (sessions.length === 0) {
-      await replyToThread(key, 'No previous sessions');
-      return;
-    }
-    // Audit S4 / #7: stash the full id list per thread so the `resume_<idx>`
-    // callback can recover the full id (Telegram's callback_data cap
-    // would otherwise truncate long OpenCode session ids).
-    const shown = sessions.slice(0, 10);
-    threadSessionLists.set(keyToString(key), shown.map(s => s.id));
-    const buttons = shown.map((s, idx) => {
-      const timeAgo = formatTimeAgo(s.updatedAt);
-      const title = (s.title || s.id).slice(0, 40);
-      return Markup.button.callback(`${title} (${timeAgo})`, `resume_${idx}`);
-    });
-    await replyToThread(
-      key,
-      `Previous sessions (${adapter.label}):`,
-      Markup.inlineKeyboard(buttons, { columns: 1 }),
-    );
+    sessions = await adapter.getSessions(key, getWorkDir(key));
   } catch (e) {
     console.error('[Bot] getSessions:', e);
-    await replyToThread(key, 'Failed to load sessions');
+    await replyToThread(key, t('session.load_failed'));
+    return;
+  }
+
+  if (sessions.length === 0) {
+    await replyToThread(key, t('session.none'));
+    return;
+  }
+
+  // Audit S4 / #7: stash the full id list per thread so the `resume_<idx>`
+  // callback (and the digit reply) can recover the full id — Telegram's
+  // callback_data cap would otherwise truncate long OpenCode session ids.
+  const shown = sessions.slice(0, sessionsDisplayLimit);
+  const kStr = keyToString(key);
+  threadSessionLists.set(kStr, shown.map(s => s.id));
+  awaitingSessionSelection.add(kStr);
+
+  const lines = [t('session.list_header', { label: adapter.label })];
+  const buttons = shown.map((s, idx) => {
+    const timeAgo = formatTimeAgo(s.updatedAt);
+    const title = (s.title || s.id).slice(0, sessionButtonTitleMaxLength);
+    lines.push(`${idx + 1}. ${title} (${timeAgo})`);
+    return Markup.button.callback(`${title} (${timeAgo})`, `resume_${idx}`);
+  });
+  lines.push('');
+  lines.push(t('session.list_footer', { max: shown.length }));
+
+  await replyToThread(key, lines.join('\n'), Markup.inlineKeyboard(buttons, { columns: 1 }));
+}
+
+/**
+ * @description Resume the session at `idx` in the thread's last shown list.
+ *
+ * Core shared by the `resume_<idx>` inline button and the digit-reply path.
+ * Recovers the full session id from `threadSessionLists`; if the cache was
+ * lost (bot restarted between showing the list and the pick), reports it
+ * via `onExpired`. Returns the user-facing result message to send, or
+ * `null` when `onExpired` already handled the stale-cache case.
+ */
+async function resumeSessionByIndex(
+  key: ThreadKey,
+  idx: number,
+  onExpired: () => Promise<void>,
+): Promise<string | null> {
+  const list = threadSessionLists.get(keyToString(key));
+  if (!list || idx < 0 || idx >= list.length) {
+    await onExpired();
+    return null;
+  }
+  const sessionId = list[idx];
+  const adapter = getThreadAdapter(key);
+  markNeedsNewMessage(key);
+  try {
+    await adapter.resumeSession(key, getWorkDir(key), sessionId);
+    return t('session.resumed');
+  } catch (e) {
+    return t('session.resume_failed', { error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+command(['sessions', 'resume'], (_ctx, key) => handleSessionsList(key));
+
+// Exit session-pick mode without resuming. No-op (friendly notice) when the
+// thread wasn't armed, so a stray /cancel never looks broken.
+command('cancel', async (_ctx, key) => {
+  const kStr = keyToString(key);
+  if (awaitingSessionSelection.has(kStr)) {
+    awaitingSessionSelection.delete(kStr);
+    await replyToThread(key, t('session.cancelled'));
+  } else {
+    await replyToThread(key, t('session.cancel_noop'));
   }
 });
 
@@ -2936,7 +3025,7 @@ command('clear', async (ctx, key) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const botCommands = new Set([
-  'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'model',
+  'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'whoami', 'version', 'help',
   'doctor', 'mcp',
@@ -3032,6 +3121,34 @@ bot.on(message('text'), async (ctx) => {
       await replyToThread(key, 'Invalid number. Run /model to see the list.');
     }
     return;
+  }
+
+  // Session-pick mode (armed by `/sessions` / `/resume`). Only while the
+  // thread is armed is a bare digit treated as a pick — a normal numeric
+  // prompt is never hijacked. See `checkSessionPickAction` for the rules.
+  if (awaitingSessionSelection.has(kStr)) {
+    const sessionList = threadSessionLists.get(kStr) ?? [];
+    const pick = checkSessionPickAction(text, sessionList.length);
+    if (pick.kind === 'invalid') {
+      // Stay armed so the user can retry with a valid number.
+      await replyToThread(key, t('session.invalid', { max: sessionList.length }));
+      return;
+    }
+    if (pick.kind === 'cancel') {
+      awaitingSessionSelection.delete(kStr);
+      await replyToThread(key, t('session.cancelled'));
+      return;
+    }
+    if (pick.kind === 'select') {
+      awaitingSessionSelection.delete(kStr);
+      const result = await resumeSessionByIndex(key, pick.index, async () => {
+        await replyToThread(key, t('session.expired'));
+      });
+      if (result !== null) await replyToThread(key, result);
+      return;
+    }
+    // passthrough: not a number — exit pick-mode and let normal handling run.
+    awaitingSessionSelection.delete(kStr);
   }
 
   // Natural-language start.
@@ -3495,46 +3612,21 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
   }
 });
 
+// Inline [resume] buttons posted by `handleSessionsList`. The button only
+// carries the list index (`resume_<idx>`) because Telegram caps callback_data
+// at 64 bytes; the full id lives in `threadSessionLists`. Shares the resume
+// core with the digit-reply path via `resumeSessionByIndex`.
 bot.action(/^resume_(\d+)$/, async (ctx) => {
   const key = authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // Resume must respect the same binding invariant as every other start
-  // path — otherwise picking an old session here would silently spawn an
-  // adapter against WORK_ROOT itself (review HIGH #2).
-  if (checkIsGeneral(key)) {
-    await ctx.answerCbQuery(t('cb.resume_only_topical'));
-    return;
-  }
-  if (!state.getBinding(key)) {
-    await ctx.answerCbQuery(t('cb.bind_folder_first'));
-    const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
-    await replyToThread(key, t('thread.no_binding'), extra);
-    return;
-  }
-  // Audit S4 / #7: callback_data is just an index into the list we
-  // showed during the last `/sessions`. Recover the full id from
-  // `threadSessionLists`; if the cache was lost (bot restarted between
-  // showing the list and the user clicking), ask for a refresh.
-  const idx = parseInt(ctx.match[1], 10);
-  const list = threadSessionLists.get(keyToString(key));
-  if (!list || idx < 0 || idx >= list.length) {
-    await ctx.answerCbQuery(t('cb.sessions_expired'));
-    return;
-  }
-  const sessionId = list[idx];
-  const adapter = getThreadAdapter(key);
-  markNeedsNewMessage(key);
-  await ctx.answerCbQuery(t('cb.resuming'));
-  try {
-    await adapter.resumeSession(key, getWorkDir(key), sessionId);
-    await replyToThread(key, 'Session resumed. Send your message:');
-  } catch (e) {
-    await replyToThread(
-      key,
-      `Failed to resume: ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
+  await ctx.answerCbQuery();
+  const idx = Number(ctx.match[1]);
+  // A pick from the button also closes pick-mode (mirrors a digit reply).
+  awaitingSessionSelection.delete(keyToString(key));
+  const result = await resumeSessionByIndex(key, idx, async () => {
+    await replyToThread(key, t('session.expired'));
+  });
+  if (result !== null) await replyToThread(key, result);
 });
 
 bot.action(/^opt_(\d+)$/, async (ctx) => {
@@ -3833,7 +3925,9 @@ const COMMANDS_MENU = [
   { command: 'model', description: '🧠 Switch model' },
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'agent', description: '🔄 Choose agent' },
-  { command: 'sessions', description: '📋 Previous sessions' },
+  { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
+  { command: 'resume', description: '📋 Resume a previous session' },
+  { command: 'cancel', description: '🚫 Cancel the session picker' },
   { command: 'stop', description: '⏹ Stop agent (hard kill)' },
   { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },
   { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
@@ -4122,6 +4216,9 @@ export async function startBot(): Promise<void> {
       }
       for (const k of awaitingModelSelection) {
         if (!live.has(k)) { awaitingModelSelection.delete(k); removed += 1; }
+      }
+      for (const k of awaitingSessionSelection) {
+        if (!live.has(k)) { awaitingSessionSelection.delete(k); removed += 1; }
       }
       // Per-topic-name cache also benefits from the same sweep — entries
       // for live keys are valid until TTL; for dead keys, drop now.

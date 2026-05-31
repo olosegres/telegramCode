@@ -293,3 +293,34 @@ test('runBot refuses to start when a foreign lockfile holds the data dir', () =>
   const stillThere = fs.existsSync(path.join(dataDir, 'instance.lock'));
   assert.equal(stillThere, true);
 });
+
+test('runBot accepts an empty ALLOWED_GROUP_ID and boots into pairing mode', () => {
+  // Auto-pair: leaving ALLOWED_GROUP_ID empty must NOT trip the fatal
+  // "ALLOWED_GROUP_ID must be numeric / is required" guard (the pre-auto-pair
+  // behavior) — instead the bot boots with no effective group and the startup
+  // banner announces pairing mode. Fresh DATA_DIR ⇒ no persisted pairing ⇒
+  // pairing mode is the expected state. Fake token ⇒ the bot fails fast after
+  // the banner, exactly like the WORK_ROOT-default test above.
+  const projectDir = fs.mkdtempSync(path.join(tmpRoot, 'project-'));
+  const r = spawnSync(process.execPath, [cliPath, 'bot'], {
+    env: {
+      ...process.env,
+      CLAUDE_BIN: claudeShim,
+      HOME: tmpRoot,
+      DATA_DIR: path.join(tmpRoot, 'data-pairing'),
+      TELEGRAM_BOT_TOKEN: 'fake-token-' + Date.now(),
+      ALLOWED_USERS: '1',
+      ALLOWED_GROUP_ID: '', // empty ⇒ auto-pair mode
+      WORK_ROOT: projectDir,
+    },
+    cwd: projectDir,
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+
+  const out = r.stdout + r.stderr;
+  // The old fatal guard must be gone for the empty case.
+  assert.doesNotMatch(out, /ALLOWED_GROUP_ID (must be|is required)/);
+  // Startup banner reached and announced pairing mode.
+  assert.match(out, /pairing mode/);
+});

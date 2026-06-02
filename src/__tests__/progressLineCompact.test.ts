@@ -1,15 +1,19 @@
 /**
- * @description `/compact` has a different progress shape than the thinking
- * spinner — a `Compacting conversation… N%` verb line plus a `▰▰▱▱` bar
- * line, with NO token stats. The original `PROGRESS_LINE_RE` matches neither,
- * so a `/compact` run used to flood the topic with one message per redraw,
- * each stacking every intermediate percentage.
+ * @description Compaction (`/compact` and the automatic context compaction)
+ * has a different progress shape than the thinking spinner — a `Compacting
+ * conversation…` verb line, sometimes with a `▰▰▱▱` bar line, sometimes with
+ * a `(48s · ↑ 3.1k tokens)` stats parenthesis, sometimes neither. The
+ * original `PROGRESS_LINE_RE` matches none of these, so a compaction run used
+ * to flood the topic with one message per redraw.
  *
- * These cases pin the two halves of the fix:
- *  - `checkIsProgressChunk` now also accepts the compaction shape (anchored
- *    on a bar line so a real `●`-prefixed answer is never swallowed);
+ * These cases pin the fix:
+ *  - `COMPACT_LINE_RE` is anchored on the literal `Compacting conversation`
+ *    phrase, so a verb line is admitted on its own — no bar line required.
+ *    This is the auto-compaction repro from the live bug report: bursts of
+ *    `· Compacting conversation… (48s · ↑ 3.1k tokens)` verb lines with NO
+ *    bar in the diff used to reach `handleAgentOutput` as real content;
  *  - `collapseProgressChunk` trims a redraw burst down to its latest frame so
- *    the coalesced status message shows only the current percentage.
+ *    the coalesced status message shows only the current state.
  */
 
 import { test } from 'node:test';
@@ -47,18 +51,45 @@ test('checkIsProgressChunk: multi-frame compaction burst (the flood repro)', () 
   assert.equal(checkIsProgressChunk(burst), true);
 });
 
-// ─── checkIsProgressChunk: /compact negatives ──────────────────────────
+// ─── checkIsProgressChunk: compaction without a bar line ───────────────
+
+test('checkIsProgressChunk: auto-compaction burst with token stats and NO bar (the live repro)', () => {
+  // The exact flood from the bug report: auto-compaction redrew the verb
+  // line every second, each carrying `(Ns · ↑ X.Xk tokens)`, with no bar in
+  // the diff. The old bar-anchored logic rejected this → one message per tick.
+  const burst = [
+    '· Compacting conversation… (48s · ↑ 3.1k tokens)',
+    '✻ Compacting conversation… (49s · ↑ 3.1k tokens)',
+    '✢ Compacting conversation… (50s · ↑ 3.1k tokens)',
+    '✻ Compacting conversation… (51s · ↑ 3.1k tokens)',
+    '· Compacting conversation… (52s · ↑ 3.1k tokens)',
+  ].join('\n');
+  assert.equal(checkIsProgressChunk(burst), true);
+});
+
+test('checkIsProgressChunk: single compaction verb line with token stats', () => {
+  assert.equal(checkIsProgressChunk('· Compacting conversation… (48s · ↑ 3.1k tokens)'), true);
+});
+
+test('checkIsProgressChunk: lone compaction verb line (no bar, no stats) is progress', () => {
+  // The phrase anchor (`Compacting conversation`) is specific enough that no
+  // bar line is needed to admit it — auto-compaction redraws the bare verb
+  // line on its own before the timer shows.
+  assert.equal(checkIsProgressChunk('✶ Compacting conversation…'), true);
+});
+
+// ─── checkIsProgressChunk: compaction negatives ────────────────────────
 
 test('checkIsProgressChunk: real answer ending in an ellipsis is NOT compaction', () => {
-  // `●` is in the glyph set and the line ends in `…`, but there is no bar
-  // line to anchor it — must stay real content, not a transient status.
+  // `●` is in the glyph set and the line ends in `…`, but it is not the
+  // `Compacting conversation` phrase — must stay real content.
   assert.equal(checkIsProgressChunk('● Готово — продолжаю дальше…'), false);
 });
 
-test('checkIsProgressChunk: lone compaction verb line (no bar) is NOT progress', () => {
-  // Without the bar anchor a single glyph+ellipsis line is too ambiguous to
-  // collapse, so it falls through to the normal output path.
-  assert.equal(checkIsProgressChunk('✶ Compacting conversation…'), false);
+test('checkIsProgressChunk: a non-compaction sentence with "conversation" is NOT progress', () => {
+  // The anchor is the exact `Compacting conversation…` phrase, not the word
+  // "conversation" anywhere — guards against eating a real answer.
+  assert.equal(checkIsProgressChunk('● I am compacting the conversation history now…'), false);
 });
 
 test('checkIsProgressChunk: prose that merely contains a bar line is NOT progress', () => {

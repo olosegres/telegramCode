@@ -999,9 +999,11 @@ const CLAUDE_SUBAGENT_MANAGE_RE = /↓ to manage/;
 
 /**
  * @description Phrase the TUI shows while compacting context (manual `/compact`
- * or auto), e.g. `✶ Compacting conversation… (57s · ↑ 3.1k tokens)`. We key on
- * the literal phrase rather than the compaction-verb regex in `progressLine.ts`,
- * because that regex deliberately rejects the `· ↑ Nk tokens` variant.
+ * or auto), e.g. `✶ Compacting conversation… (57s · ↑ 3.1k tokens)`. A bare
+ * substring match on the phrase is enough here: this only gates the
+ * interrupt decision (don't Escape during compaction), so it deliberately
+ * stays looser than the anchored {@link COMPACT_LINE_RE} in `progressLine.ts`
+ * (which must be line-exact to safely collapse a redraw burst).
  */
 const CLAUDE_COMPACTING_RE = /Compacting conversation/i;
 

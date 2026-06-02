@@ -210,12 +210,14 @@ export interface AgentAdapter extends EventEmitter {
   sendTab?(key: ThreadKey): void;
 
   /**
-   * @description Send a bare Escape keystroke to the TUI. For Claude this both
-   * cancels an on-screen selector AND interrupts the "busy" state so the next
-   * prompt is processed immediately instead of being queued until the current
-   * turn finishes. No-op / unimplemented for backends without a live TUI.
+   * @description Interrupt the current turn and resolve only once the agent is
+   * idle again, so the caller can forward a fresh prompt without it being
+   * queued behind the running turn. For Claude this sends Escape (which also
+   * cancels an on-screen selector) then polls the TUI until it leaves the busy
+   * state. Unimplemented for backends without a live TUI (OpenCode), where the
+   * caller forwards the prompt directly.
    */
-  sendEscape?(key: ThreadKey): void;
+  interruptAndWaitIdle?(key: ThreadKey): Promise<void>;
 
   /**
    * @description Whether an interactive selector/question is currently on the

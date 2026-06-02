@@ -1534,22 +1534,17 @@ async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
 }
 
 /**
- * @description Time to let an Escape settle in the TUI before typing the next
- * prompt. Claude needs a beat to tear down a selector / leave the busy state;
- * sending keys too eagerly can land them in the old screen and get swallowed.
- */
-const CLAUDE_ESC_SETTLE_MS = 120;
-
-/**
  * @description Forward one user prompt to a live agent: mark the thread for a
  * fresh output message, show the `⏳` loader, and hand the text to the adapter.
  * Shared by the text handler, the voice handler, and startup-prompt replay so
  * the loader/marker behaviour stays identical across all three.
  *
- * For TUI backends (Claude) we prepend an Escape: it both cancels any on-screen
- * selector AND interrupts the "busy" queue, so the prompt is acted on
- * immediately instead of waiting for the current turn to finish. Backends
- * without `sendEscape` (OpenCode) skip this and behave as before.
+ * For TUI backends (Claude) we first interrupt: this cancels any on-screen
+ * selector AND breaks Claude out of the "busy" state, then waits until it is
+ * actually idle before typing. Waiting (instead of a fixed delay) is what
+ * keeps the prompt from being queued behind a still-running turn — a heavy
+ * thinking turn can take longer than any fixed guess to tear down. Backends
+ * without `interruptAndWaitIdle` (OpenCode) forward directly.
  */
 async function forwardPromptToAgent(
   key: ThreadKey,
@@ -1559,9 +1554,8 @@ async function forwardPromptToAgent(
   markNeedsNewMessage(key);
   const loaderId = await replyToThread(key, '⏳');
   if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
-  if (adapter.sendEscape) {
-    adapter.sendEscape(key);
-    await new Promise((r) => setTimeout(r, CLAUDE_ESC_SETTLE_MS));
+  if (adapter.interruptAndWaitIdle) {
+    await adapter.interruptAndWaitIdle(key);
   }
   adapter.sendInput(key, text);
 }
@@ -3191,11 +3185,13 @@ bot.on(message('text'), async (ctx) => {
   }
 
   // Forward text to a running agent. Every user message is treated as a fresh
-  // turn that must be acted on immediately: forwardPromptToAgent prepends an
-  // Escape for TUI backends, which both cancels any on-screen selector and
-  // breaks Claude out of the busy state (so the message isn't queued behind
-  // the current turn). Deliberately driving a selector in place is still
-  // available via the explicit /up /down /enter /y /n /c keys.
+  // turn: forwardPromptToAgent interrupts the current turn for TUI backends
+  // (cancelling any on-screen selector and breaking Claude out of the busy
+  // state) and waits for idle before typing, so the message isn't queued
+  // behind the current turn — EXCEPT while a sub-agent runs or context is
+  // compacting, where it deliberately does NOT interrupt and lets the message
+  // queue. Deliberately driving a selector in place is still available via the
+  // explicit /up /down /enter /y /n /c keys.
   if (adapter.checkIsActive(key)) {
     await forwardPromptToAgent(key, adapter, text);
     return;

@@ -970,6 +970,74 @@ export function checkIsBareSlashCommand(input: string): boolean {
  */
 const CLAUDE_SLASH_ENTER_DELAY_MS = 250;
 
+/**
+ * @description The TUI footer shows this hint exactly while a turn is in
+ * flight (thinking or running a tool) and drops it the instant Claude returns
+ * to idle. It's our single reliable "still busy" signal scraped from the pane.
+ */
+const CLAUDE_BUSY_FOOTER_RE = /esc to interrupt/i;
+
+/**
+ * @description Whether Claude is mid-turn, judged from a captured pane. A
+ * selector/permission prompt shows `Esc to cancel`, NOT `esc to interrupt`, so
+ * it reads as idle here (correct — we only wait out a running turn). Exported
+ * so the busy detection is unit-testable without a live tmux session.
+ */
+export function checkIsClaudeBusy(paneText: string): boolean {
+  return CLAUDE_BUSY_FOOTER_RE.test(paneText);
+}
+
+/**
+ * @description Markers of a live sub-agent (Task tool) on the pane. While a
+ * sub-agent runs the TUI shows a task line led by `◯` (U+25EF LARGE CIRCLE —
+ * NOT the spinner glyph `○` U+25CB used elsewhere in this file), e.g.
+ * `◯ general-purpose  <task>  7s`, and the footer gains a `↓ to manage` hint.
+ * Either is enough.
+ */
+const CLAUDE_SUBAGENT_TASK_RE = /^\s*◯\s+\S/m;
+const CLAUDE_SUBAGENT_MANAGE_RE = /↓ to manage/;
+
+/**
+ * @description Phrase the TUI shows while compacting context (manual `/compact`
+ * or auto), e.g. `✶ Compacting conversation… (57s · ↑ 3.1k tokens)`. We key on
+ * the literal phrase rather than the compaction-verb regex in `progressLine.ts`,
+ * because that regex deliberately rejects the `· ↑ Nk tokens` variant.
+ */
+const CLAUDE_COMPACTING_RE = /Compacting conversation/i;
+
+/**
+ * @description Whether Claude is doing work that must NOT be interrupted: a
+ * running sub-agent (Escape would kill the child) or an in-flight compaction
+ * (Escape would abort it and lose the summary). In these states the caller
+ * forwards the prompt without Escape so it queues behind the current turn and
+ * runs once the work finishes. Exported for unit testing without a live tmux.
+ */
+export function checkIsClaudeUninterruptible(paneText: string): boolean {
+  return (
+    CLAUDE_COMPACTING_RE.test(paneText) ||
+    CLAUDE_SUBAGENT_TASK_RE.test(paneText) ||
+    CLAUDE_SUBAGENT_MANAGE_RE.test(paneText)
+  );
+}
+
+/**
+ * @description Poll cadence while waiting for an interrupt to land. Each tick
+ * is a cheap read-only `tmux capture-pane`.
+ */
+const CLAUDE_INTERRUPT_POLL_MS = 100;
+
+/**
+ * @description Upper bound on how long we wait for Claude to leave the busy
+ * state after Escape before forwarding the prompt anyway. Escape reliably
+ * interrupts a *thinking* turn within well under a second (observed
+ * ~200 ms–1 s, vs the old 120 ms fixed guess that raced and let the prompt
+ * queue). It does NOT interrupt an in-flight tool/subprocess — those run to
+ * this timeout and then forward (the message queues behind the tool, which is
+ * unavoidable, but is never dropped). So the bound is sized to cover
+ * thinking-interrupt latency, not to wait out a running tool.
+ */
+const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
+
 export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
@@ -1236,19 +1304,48 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Send a single Escape. In Claude's TUI this serves two
-   * purposes the bot relies on: (1) cancel an on-screen `AskUserQuestion`
-   * selector, and (2) break Claude out of the "busy" state where a typed
-   * prompt would otherwise be queued and only answered after the current turn
-   * finishes. The bot prepends this before forwarding free-form prompts so
-   * messages are acted on immediately instead of piling up in the queue.
+   * @description Interrupt the current turn, then wait until Claude is
+   * actually idle before resolving, so the caller can type a fresh prompt
+   * without it being queued behind the running turn.
+   *
+   * Sends a single Escape — which both cancels an on-screen selector AND
+   * breaks Claude out of the "busy" state — then polls the pane footer until
+   * the `esc to interrupt` hint clears. A fixed post-Escape delay was
+   * unreliable: heavy extended-thinking turns take longer than the old 120 ms
+   * to tear down, so the prompt landed while Claude was still busy and got
+   * queued (the "voice message arrives before the interrupt, then the agent
+   * waits" bug). On timeout we forward anyway rather than drop the message.
+   *
+   * Exception: if Claude is running a sub-agent or compacting context, we do
+   * NOT interrupt — Escape would kill the child / abort the compaction. We
+   * return without Escape so the caller's prompt queues behind the current
+   * turn and runs once that work finishes.
    */
-  sendEscape(key: ThreadKey): void {
+  async interruptAndWaitIdle(key: ThreadKey): Promise<void> {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
-    console.log(`[Claude] sendEscape`);
+    const paneBefore = tmux('capture-pane', '-t', session.sessionName, '-p');
+    if (checkIsClaudeUninterruptible(paneBefore)) {
+      console.log(`[Claude] sub-agent/compaction in progress — queueing prompt, not interrupting`);
+      return;
+    }
+
+    console.log(`[Claude] sendEscape (interrupt)`);
     tmux('send-keys', '-t', session.sessionName, 'Escape');
+
+    const deadline = Date.now() + CLAUDE_INTERRUPT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, CLAUDE_INTERRUPT_POLL_MS));
+      const current = this.sessions.get(keyToString(key));
+      if (!current?.isActive) return;
+      const pane = tmux('capture-pane', '-t', current.sessionName, '-p');
+      if (!checkIsClaudeBusy(pane)) {
+        console.log(`[Claude] interrupt landed — idle, forwarding prompt`);
+        return;
+      }
+    }
+    console.log(`[Claude] interrupt: still busy after ${CLAUDE_INTERRUPT_TIMEOUT_MS}ms, forwarding anyway`);
   }
 
   /**

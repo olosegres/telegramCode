@@ -162,6 +162,25 @@ interface OpenCodeSession {
    */
   effortLevel: string | null;
   /**
+   * Whether this session is mid-generation. Tracked from SSE `session.status`
+   * (and cleared on `session.idle`); set optimistically when a prompt is sent.
+   * Drives {@link getOpenCodeInterruptAction} — a busy session is aborted
+   * before a new prompt so it starts fresh instead of queuing behind the turn.
+   */
+  isBusy: boolean;
+  /**
+   * Whether context compaction is in flight (between
+   * `session.next.compaction.started` and `…ended` / `session.compacted`).
+   * Compaction must never be aborted — the new prompt queues instead.
+   */
+  isCompacting: boolean;
+  /**
+   * Child (sub-agent) session ids currently busy, learned from routed
+   * `session.status` events. A running sub-agent must never be aborted — the
+   * new prompt queues. Cleared per-child when that child goes idle.
+   */
+  busyChildSessionIds: Set<string>;
+  /**
    * Abort controller for the live SSE `fetch` + reader. Set by
    * `pollSse`, cleared on natural exit. `disconnectSse` / `stopSession`
    * call `.abort()` so the reader unblocks immediately instead of
@@ -318,6 +337,76 @@ const criticalSseEventTypes = new Set<string>([
   'session.idle',
   'session.error',
 ]);
+
+/** Poll cadence for the in-memory busy flag while waiting for an abort to land. */
+const openCodeInterruptPollMs = 100;
+/**
+ * @description Upper bound on waiting for the aborted generation to go idle
+ * before forwarding the new prompt anyway (never drops the message). The
+ * busy→idle transition is driven by SSE (`session.status` / `session.idle`),
+ * which arrives within a beat of the `abort` POST.
+ */
+const openCodeInterruptTimeoutMs = 3000;
+
+/**
+ * @description Live interrupt-relevant state of an OpenCode session, derived
+ * from SSE events (not an HTTP poll — the stream catches sub-100 ms busy/idle
+ * transitions an HTTP poll races past).
+ */
+export interface OpenCodeInterruptState {
+  /** Own session is mid-generation (`session.status` = busy). */
+  isBusy: boolean;
+  /** Context compaction is in flight (must not be aborted — would lose the summary). */
+  isCompacting: boolean;
+  /** Number of child (sub-agent) sessions currently busy (must not be aborted — kills the child). */
+  busyChildCount: number;
+}
+
+export type OpenCodeInterruptAction = 'abort' | 'queue-compacting' | 'queue-subagent' | 'skip-idle';
+
+/**
+ * @description Decide how to handle a new prompt for a (possibly busy) OpenCode
+ * session. Compaction and a running sub-agent must NOT be aborted (abort would
+ * lose the summary / kill the child) — the prompt queues behind the current
+ * turn instead. A plain busy generation IS aborted so the prompt starts fresh.
+ * An idle session needs no interrupt. Compaction is checked before sub-agent
+ * before busy so the most-protective rule wins when several overlap. Pure +
+ * exported for unit testing.
+ */
+export function getOpenCodeInterruptAction(state: OpenCodeInterruptState): OpenCodeInterruptAction {
+  if (state.isCompacting) return 'queue-compacting';
+  if (state.busyChildCount > 0) return 'queue-subagent';
+  if (!state.isBusy) return 'skip-idle';
+  return 'abort';
+}
+
+/** Mutable busy-tracking slice of a session, updated from SSE status/idle events. */
+export interface OpenCodeBusyTracking {
+  isBusy: boolean;
+  busyChildSessionIds: Set<string>;
+}
+
+/**
+ * @description Apply a busy/idle transition (from `session.status` or
+ * `session.idle`) to a session's busy-tracking state. The own session's status
+ * drives `isBusy`; a routed CHILD (sub-agent) session's status maintains
+ * `busyChildSessionIds` — a child going idle must NOT clear the parent's
+ * `isBusy`. Pure + exported so the own-vs-child routing is unit-testable.
+ */
+export function applyOpenCodeStatusEvent(
+  tracking: OpenCodeBusyTracking,
+  ownSessionId: string,
+  eventSessionId: string | null,
+  isBusy: boolean,
+): void {
+  if (!eventSessionId || eventSessionId === ownSessionId) {
+    tracking.isBusy = isBusy;
+  } else if (isBusy) {
+    tracking.busyChildSessionIds.add(eventSessionId);
+  } else {
+    tracking.busyChildSessionIds.delete(eventSessionId);
+  }
+}
 
 /**
  * @description Default timeout for non-SSE HTTP requests to OpenCode.
@@ -835,6 +924,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           pendingStatus: null,
           pendingQuestion: null,
           effortLevel: loadSavedEffort(key),
+          isBusy: false,
+          isCompacting: false,
+          busyChildSessionIds: new Set(),
           sseController: null,
           reconnectTimer: null,
           sseStallTimer: null,
@@ -935,6 +1027,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     // Reset accumulated response text for new message
     session.currentResponseText = '';
+    // Mark busy optimistically so an immediately-following message correctly
+    // sees a turn in flight; the `session.status` stream corrects/confirms it.
+    session.isBusy = true;
 
     // Model + reasoning-effort overrides ride the prompt body (see buildPromptBody).
     const body = buildPromptBody(input, session.modelOverride, session.effortLevel);
@@ -943,6 +1038,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       try {
         await this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body);
       } catch (e) {
+        // The optimistic `isBusy = true` above never gets a `session.status`
+        // idle to clear it if the POST failed — clear it so the next prompt
+        // doesn't eat a spurious abort + wait.
+        const current = this.sessions.get(keyToString(key));
+        if (current) current.isBusy = false;
         console.error(`[OpenCode] Failed to send message:`, e);
         this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
       }
@@ -959,6 +1059,57 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         console.error(`[OpenCode] abort error:`, e);
       });
     }
+  }
+
+  /**
+   * @description Interrupt the running turn (HTTP `abort`) and resolve only
+   * once the session is idle, so the caller can forward a fresh prompt without
+   * it queuing behind the current generation — the OpenCode counterpart of the
+   * Claude TUI's Escape-and-wait. OpenCode is not keystroke-driven, so there is
+   * no Escape (single or double) — the interrupt is `POST /session/:id/abort`.
+   *
+   * Exceptions ({@link getOpenCodeInterruptAction}): while a sub-agent (child
+   * session) is running or context is compacting, we do NOT abort — that would
+   * kill the child / discard the summary — so we return without aborting and
+   * the prompt queues behind the current turn. An idle session needs no abort.
+   * Busy/compaction/sub-agent state is tracked live from the SSE stream.
+   */
+  async interruptAndWaitIdle(key: ThreadKey): Promise<void> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return;
+
+    const action = getOpenCodeInterruptAction({
+      isBusy: session.isBusy,
+      isCompacting: session.isCompacting,
+      busyChildCount: session.busyChildSessionIds.size,
+    });
+
+    if (action === 'queue-compacting') {
+      console.log(`[OpenCode] compaction in progress — queueing prompt, not aborting`);
+      return;
+    }
+    if (action === 'queue-subagent') {
+      console.log(`[OpenCode] sub-agent running — queueing prompt, not aborting`);
+      return;
+    }
+    if (action === 'skip-idle') return;
+
+    console.log(`[OpenCode] aborting current generation before new prompt`);
+    await this.apiRequest('POST', `/session/${session.sessionId}/abort`).catch((e) => {
+      console.warn(`[OpenCode] abort before prompt failed:`, e instanceof Error ? e.message : e);
+    });
+
+    const deadline = Date.now() + openCodeInterruptTimeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, openCodeInterruptPollMs));
+      const current = this.sessions.get(keyToString(key));
+      if (!current?.isActive) return;
+      if (!current.isBusy) {
+        console.log(`[OpenCode] abort landed — idle, forwarding prompt`);
+        return;
+      }
+    }
+    console.log(`[OpenCode] still busy after ${openCodeInterruptTimeoutMs}ms, forwarding anyway`);
   }
 
   /**
@@ -1171,6 +1322,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         pendingStatus: null,
         pendingQuestion: null,
         effortLevel: loadSavedEffort(key),
+        isBusy: false,
+        isCompacting: false,
+        busyChildSessionIds: new Set(),
         sseController: null,
         reconnectTimer: null,
         sseStallTimer: null,
@@ -1563,6 +1717,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         this.handleSessionIdle(key, event.properties);
         break;
 
+      case 'session.status':
+        this.handleSessionStatus(key, eventSessionId, event.properties);
+        break;
+
+      case 'session.next.compaction.started':
+        this.setCompacting(key, true);
+        break;
+
+      case 'session.next.compaction.ended':
+      case 'session.compacted':
+        this.setCompacting(key, false);
+        break;
+
       case 'session.error':
         this.handleSessionError(key, event.properties);
         break;
@@ -1829,8 +1996,45 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const sessionId = properties.sessionID as string | undefined;
     if (sessionId && !checkIsEventForSession(sessionId, session.sessionId, this.sessionLineage)) return;
 
+    // Idle = busy/idle transition to idle; also a defensive clear if a
+    // `session.status` idle was missed. Own idle also ends any compaction
+    // (the `.ended` / `session.compacted` event may be lost) — without this the
+    // latched flag would force every later prompt down the queue path.
+    if (!sessionId || sessionId === session.sessionId) session.isCompacting = false;
+    applyOpenCodeStatusEvent(session, session.sessionId, sessionId ?? null, false);
+
     console.log(`[OpenCode] Session idle`);
     this.flushOutput(key);
+  }
+
+  /**
+   * @description Track live busy/idle from `session.status`. The own session's
+   * status drives {@link OpenCodeSession.isBusy}; a routed child (sub-agent)
+   * status maintains {@link OpenCodeSession.busyChildSessionIds} so a new
+   * prompt never aborts a running sub-agent.
+   */
+  private handleSessionStatus(
+    key: ThreadKey,
+    eventSessionId: string | null,
+    properties: Record<string, unknown>,
+  ): void {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return;
+
+    const status = properties.status as { type?: string } | undefined;
+    applyOpenCodeStatusEvent(session, session.sessionId, eventSessionId, status?.type === 'busy');
+  }
+
+  /**
+   * @description Flip the compaction flag from `session.next.compaction.*` /
+   * `session.compacted` events. While set, a new prompt queues instead of
+   * aborting (an abort would discard the in-progress summary).
+   */
+  private setCompacting(key: ThreadKey, value: boolean): void {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return;
+    if (session.isCompacting !== value) console.log(`[OpenCode] compacting=${value}`);
+    session.isCompacting = value;
   }
 
   private handleSessionError(key: ThreadKey, properties: Record<string, unknown>): void {

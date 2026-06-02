@@ -1539,12 +1539,13 @@ async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
  * Shared by the text handler, the voice handler, and startup-prompt replay so
  * the loader/marker behaviour stays identical across all three.
  *
- * For TUI backends (Claude) we first interrupt: this cancels any on-screen
- * selector AND breaks Claude out of the "busy" state, then waits until it is
- * actually idle before typing. Waiting (instead of a fixed delay) is what
- * keeps the prompt from being queued behind a still-running turn — a heavy
- * thinking turn can take longer than any fixed guess to tear down. Backends
- * without `interruptAndWaitIdle` (OpenCode) forward directly.
+ * If the adapter implements `interruptAndWaitIdle`, we interrupt the running
+ * turn and wait until it is actually idle before handing over the text —
+ * waiting (instead of a fixed delay) is what keeps the prompt from queuing
+ * behind a still-running turn. Claude does this via Escape + a TUI poll,
+ * OpenCode via `POST /abort` + an SSE-state wait; both leave a running
+ * sub-agent / compaction untouched and let the prompt queue instead. An
+ * adapter without the method forwards directly.
  */
 async function forwardPromptToAgent(
   key: ThreadKey,

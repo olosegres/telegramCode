@@ -78,6 +78,25 @@ test('convertAnsiToMarkdown: strips two OSC 8 sequences on the same line', () =>
   assert.equal(convertAnsiToMarkdown(input), 'a and b');
 });
 
+test('convertAnsiToMarkdown: strips OSC 8 with an ANSI reset before the closer', () => {
+  // Live capture of the data-usage survey "Learn more" line: a colour reset
+  // (ESC[39m) sits between the visible text and the closing ESC]8;;. The old
+  // `[^\x1B\x07]*` capture stopped at that ESC and then failed to find
+  // `ESC]8;;`, leaking the whole sequence as `8;id=...;<url><url>8;;`.
+  const url = 'https://code.claude.com/docs/en/data-usage#session-quality-surveys';
+  const input = `\x1b]8;id=1xlc6kt;${url}\x1b\\${url}\x1b[39m\x1b]8;;\x1b\\`;
+  assert.equal(convertAnsiToMarkdown(input), url);
+});
+
+test('cleanOutput: survey "Learn more" line keeps only the URL (no OSC 8 leak)', () => {
+  const url = 'https://code.claude.com/docs/en/data-usage#session-quality-surveys';
+  const input = `  Learn more: \x1b[38;5;246m\x1b]8;id=1xlc6kt;${url}\x1b\\${url}\x1b[39m\x1b]8;;\x1b\\`;
+  const out = cleanOutput(input);
+  assert.ok(!out.includes('8;id='), `OSC 8 params leaked: ${JSON.stringify(out)}`);
+  assert.ok(!out.includes('8;;'), `OSC 8 closer leaked: ${JSON.stringify(out)}`);
+  assert.equal(out, `Learn more: ${url}`);
+});
+
 test('convertAnsiToMarkdown: malformed OSC 8 (missing closer) is left alone — no crash', () => {
   const input = '\x1b]8;;file://x\x07Edit(x)';
   // No closer → regex does not match → bytes pass through to the

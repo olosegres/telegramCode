@@ -282,9 +282,18 @@ export function convertAnsiToMarkdown(text: string): string {
   //
   // `\\` inside the character class matches a literal backslash, so
   // `(?:\x07|\x1B\\\\)` is "BEL  or  ESC followed by `\`".
+  //
+  // Visible text is captured NON-greedily (`[\s\S]*?`) rather than
+  // `[^\x1B\x07]*`: Claude emits an ANSI colour reset BETWEEN the visible
+  // text and the closing `ESC]8;;` (live capture of the data-usage survey
+  // prompt: `…<url>ESC\<url>ESC[39mESC]8;;ESC\`). The old class stopped at
+  // that ESC and then failed to find `ESC]8;;`, so the whole sequence leaked
+  // as `8;id=…;<url><url>8;;`. Non-greedy still stops at the FIRST `ESC]8;;`
+  // (correct for multiple links on a line, and no closer → no match), and any
+  // ANSI codes that ride along in $1 are stripped by Step 2 below.
   result = result.replace(
     // eslint-disable-next-line no-control-regex
-    /\x1B\]8;[^;\x07\x1B]*;[^\x07\x1B]*(?:\x07|\x1B\\)([^\x1B\x07]*)\x1B\]8;;(?:\x07|\x1B\\)/g,
+    /\x1B\]8;[^;\x07\x1B]*;[^\x07\x1B]*(?:\x07|\x1B\\)([\s\S]*?)\x1B\]8;;(?:\x07|\x1B\\)/g,
     '$1',
   );
 

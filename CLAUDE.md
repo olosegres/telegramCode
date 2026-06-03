@@ -141,6 +141,19 @@ per-backend, persisted agent setting.
   resolves the project root via `fs.realpathSync(__dirname)`, so
   `telegramCode hot` works from any CWD.
 
+- **ALWAYS verify output/rendering changes LIVE via Telegram MCP — unit tests
+  and code review are NOT enough.** Anything touching how agent output reaches a
+  topic (`stripTuiElements`, `cleanOutput`, `getNewPaneContent`, fencing,
+  progress-collapse in `progressLine.ts`, `renderAgentHtml`, message splitting)
+  must be confirmed in a real topic with `mcp__telegram-mcp__get_history` before
+  it's considered done. Why: these bugs only show under the real tmux-scrape +
+  per-poll-diff timing (e.g. a sub-agent `◯` line fenced → flood) that no
+  unit test reproduced — they shipped green and the user caught them. This
+  session is itself relayed to a topic, so your own tool calls are live test
+  data; in `get_history` raw text a Bash result still showing `⎿` means it was
+  NOT fenced, a clean code block (no `⎿`, no literal ```` ``` ````) means the
+  HTML `<pre>` was accepted.
+
 - **Verify a per-prompt OpenCode override actually applied** (model or `/effort`
   variant): `GET http://127.0.0.1:4096/session/<sessionId>/message` — the stored
   user + assistant turns echo `model.variant`, proving `body.variant` rode the

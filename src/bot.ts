@@ -57,6 +57,7 @@ import { formatPinnedStatus } from './pinnedStatus';
 import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
+import { splitMessage } from './messageSplit';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -189,9 +190,6 @@ bot.use(async (ctx, next) => {
  * (the pure routing module owns it so unit tests can reach it without
  * booting Telegraf). Plan §4.3 point 3 / R2.
  */
-
-/** Telegram caps a message at 4096 chars; we leave headroom for markdown noise. */
-const MAX_MESSAGE_LEN = 4000;
 
 /** Debounce window for output batching. Telegram tolerates ~1 msg/sec/chat. */
 const OUTPUT_DEBOUNCE_MS = 1000;
@@ -953,23 +951,6 @@ async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
 //  Output rendering — split, escape, queued edits
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function splitMessage(text: string, maxLen: number = MAX_MESSAGE_LEN): string[] {
-  if (text.length <= maxLen) return [text];
-  const parts: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      parts.push(remaining);
-      break;
-    }
-    let cutAt = maxLen;
-    const lastNewline = remaining.lastIndexOf('\n', maxLen);
-    if (lastNewline > maxLen * 0.5) cutAt = lastNewline;
-    parts.push(remaining.slice(0, cutAt));
-    remaining = remaining.slice(cutAt).replace(/^\n/, '');
-  }
-  return parts;
-}
 
 function escapeMarkdownChars(text: string): string {
   return text

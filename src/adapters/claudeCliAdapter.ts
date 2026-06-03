@@ -61,6 +61,13 @@ interface ClaudeSession {
    * one are skipped silently.
    */
   isPolling: boolean;
+  /**
+   * Tool-result kind still open at the end of the last emitted poll, threaded
+   * into the next poll so a slow command's orphan output (whose `● Bash(…)`
+   * header was suppressed by the line-set diff) is still fenced (B2). See
+   * {@link fenceToolResultBodies}.
+   */
+  openToolKind: ToolResultKind | null;
 }
 
 const pollInterval = 300;
@@ -665,7 +672,239 @@ export function checkIsSelectorControlReply(text: string): boolean {
   return /^\d{1,2}$/.test(trimmed) || /^[yYnN]$/.test(trimmed);
 }
 
-export function stripTuiElements(text: string): string {
+/**
+ * @description Code-producing tool headers whose `⎿` result is code / diff /
+ * command output and should render as a monospaced Telegram code block. Two
+ * classes, differing in what the `⎿` line itself holds:
+ *
+ *  - OUTPUT tools (`Bash`/`Grep`/`Glob`): the `⎿`-line content IS the first
+ *    line of stdout, so it goes INSIDE the fence with the indented body;
+ *  - FILE tools (`Read`/`Edit`/`Update`/`Write`/`MultiEdit`/`NotebookEdit`):
+ *    the `⎿` line is a one-line summary (`Added N lines, removed M`) that
+ *    stays as prose — only the deeper-indented diff/file body below it is
+ *    fenced.
+ *
+ * Anchored on the tool NAME (optionally glyph-led and/or `*bold*` from the
+ * ANSI-bold conversion), NEVER on body indent: Claude wraps long thinking
+ * prose at the 300-col pane width into space-indented continuation lines
+ * byte-identical in shape to a diff/output body, so only a known code header
+ * may license fencing (a thinking block has no such header). Allowlist, not
+ * blocklist — unknown shapes stay prose.
+ */
+const OUTPUT_TOOL_HEADER_RE = /^\s*[●○⏳✓]?\s*\*?(?:Bash|Grep|Glob)\*?\s*\(/;
+const FILE_TOOL_HEADER_RE =
+  /^\s*[●○⏳✓]?\s*\*?(?:Read|Edit|Update|Write|MultiEdit|NotebookEdit)\*?\s*\(/;
+/** Tool RESULT marker line: `  ⎿  <summary or first output line>`. */
+const TOOL_RESULT_MARKER_RE = /^(\s*)⎿/;
+/** An agent-authored fenced code block delimiter, possibly indented. */
+const CODE_FENCE_LINE_RE = /^\s*```/;
+/**
+ * A line-numbered diff row (`   88 + code`, `   90  context`, bare `   89`),
+ * recognisable WITHOUT its tool header — the fallback for a diff that arrived
+ * split from its header across two polls. Diff rows never occur in agent prose.
+ */
+const DIFF_ROW_RE = /^\s+\d+(?:\s|$)/;
+/** Min consecutive diff rows for the header-less fallback to fence them. */
+const DIFF_FALLBACK_MIN_ROWS = 2;
+
+/**
+ * @description Lines the bot's progress-collapse owns and must receive
+ * UN-fenced: a sub-agent task line (`◯`, optionally `❯`-cursor-led, U+25EF —
+ * NOT the `○`/`●` glyphs) and a compaction progress bar (`▰▱`). They are
+ * indented in the pane, so a stale `output` tool kind would otherwise route
+ * them through the orphan-continuation fence; the resulting ```` ``` ````
+ * delimiters then fail `checkIsProgressChunk` (progressLine.ts), so the burst
+ * is NOT coalesced and the topic floods with one fenced tick per second.
+ */
+const PROGRESS_PASSTHROUGH_RE = /^\s*(?:❯\s+)?◯\s|^\s*[▰▱]/;
+
+/**
+ * @description Which tool a `⎿` result body belongs to, deciding how it is
+ * fenced: `output` (Bash/Grep/Glob — the `⎿` line is stdout, fenced with the
+ * body) vs `file` (Read/Edit/Update/Write — the `⎿` line is a prose summary,
+ * only the body below is fenced).
+ */
+type ToolResultKind = 'output' | 'file';
+
+function getLeadingSpaceCount(line: string): number {
+  return line.match(/^(\s*)/)![1].length;
+}
+
+/** Strip the largest leading-whitespace prefix common to all non-blank lines. */
+function getDedented(lines: string[]): string[] {
+  const indents = lines.filter(line => line.trim()).map(getLeadingSpaceCount);
+  if (indents.length === 0) return lines;
+  const min = Math.min(...indents);
+  return lines.map(line => line.slice(min));
+}
+
+/**
+ * @description Wrap body lines in a ```` ``` ```` fence for `renderAgentHtml`
+ * to turn into `<pre><code>`. Any run of 3+ backticks inside the body (e.g. a
+ * diff of a markdown file with its own fences) is broken up with zero-width
+ * spaces so it can't prematurely close our fence — the body is for reading,
+ * not byte-exact copy.
+ */
+function getFenced(bodyLines: string[]): string[] {
+  const safe = bodyLines.map(line =>
+    line.replace(/`{3,}/g, run => run.split('').join('​')),
+  );
+  return ['```', ...safe, '```'];
+}
+
+/**
+ * @description Wrap each code-producing tool's `⎿` result body in a code fence
+ * (B2). Operates on the already echo-suppressed / chrome-filtered line array.
+ * See {@link OUTPUT_TOOL_HEADER_RE} for the header→body classification.
+ *
+ * Stateful across the chunk AND across polls: a tool header sets the active
+ * kind; a `⎿` result or its orphan indented continuation is fenced for that
+ * kind; a solid non-tool line (prose, a `Thinking…` header) clears the kind so
+ * thinking prose is never fenced. The kind is threaded across polls by the
+ * caller — Claude's TUI redraws the whole pane each poll and the line-set diff
+ * ({@link getNewPaneContent}) emits only NEW lines, so a slow command's output
+ * (`yarn test`, a build) arrives in a later poll WITHOUT its `● Bash(…)` header
+ * (suppressed as a duplicate). `incomingKind` carries the header poll's kind
+ * forward; the returned `outgoingKind` is fed back next poll. This is tracked
+ * via the clean emitted deltas, NOT by scanning the racy live pane (the spinner
+ * repaints every tick, so a pane scan flickers between frames).
+ *
+ * An agent-authored ```` ``` ```` block is passed through untouched (and
+ * suppresses the diff-row fallback inside it) so a real code block is never
+ * double-wrapped.
+ */
+function fenceToolResultBodies(
+  lines: string[],
+  incomingKind: ToolResultKind | null = null,
+): { out: string[]; outgoingKind: ToolResultKind | null } {
+  const out: string[] = [];
+  let inAgentFence = false;
+  let currentKind: ToolResultKind | null = incomingKind;
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (CODE_FENCE_LINE_RE.test(line)) {
+      inAgentFence = !inAgentFence;
+      out.push(line);
+      i++;
+      continue;
+    }
+    if (inAgentFence) {
+      out.push(line);
+      i++;
+      continue;
+    }
+
+    if (OUTPUT_TOOL_HEADER_RE.test(line)) {
+      currentKind = 'output';
+      out.push(line);
+      i++;
+      continue;
+    }
+    if (FILE_TOOL_HEADER_RE.test(line)) {
+      currentKind = 'file';
+      out.push(line);
+      i++;
+      continue;
+    }
+
+    // Sub-agent task / compaction-bar progress lines: the bot collapses these,
+    // so they must pass through un-fenced and they end any open tool body.
+    if (PROGRESS_PASSTHROUGH_RE.test(line)) {
+      currentKind = null;
+      out.push(line);
+      i++;
+      continue;
+    }
+
+    const markerMatch = line.match(TOOL_RESULT_MARKER_RE);
+    if (markerMatch) {
+      if (currentKind === null) {
+        // Unknown owner (e.g. a thinking `⎿` body) — leave it as prose.
+        out.push(line);
+        i++;
+        continue;
+      }
+      const markerIndent = markerMatch[1].length;
+      const body: string[] = [];
+      let j = i + 1;
+      while (
+        j < lines.length &&
+        lines[j].trim() !== '' &&
+        getLeadingSpaceCount(lines[j]) > markerIndent
+      ) {
+        body.push(lines[j]);
+        j++;
+      }
+      if (currentKind === 'output') {
+        // `⎿`-content is stdout → drop the marker glyph (keep alignment), fence all.
+        out.push(...getFenced(getDedented([line.replace('⎿', ' '), ...body])));
+      } else {
+        out.push(line); // summary line stays prose
+        if (body.length > 0) out.push(...getFenced(getDedented(body)));
+      }
+      i = j;
+      continue;
+    }
+
+    // Orphan indented continuation of a known tool body (header was in a prior
+    // poll, or the `⎿` summary already streamed): fence the indented run.
+    if (currentKind !== null && /^\s/.test(line) && line.trim() !== '') {
+      const block: string[] = [];
+      let j = i;
+      while (
+        j < lines.length &&
+        lines[j].trim() !== '' &&
+        /^\s/.test(lines[j]) &&
+        !TOOL_RESULT_MARKER_RE.test(lines[j]) &&
+        !CODE_FENCE_LINE_RE.test(lines[j])
+      ) {
+        block.push(lines[j]);
+        j++;
+      }
+      out.push(...getFenced(getDedented(block)));
+      i = j;
+      continue;
+    }
+
+    // Header-less diff-row run (cross-poll split with no known kind): fence on shape.
+    if (currentKind === null && DIFF_ROW_RE.test(line)) {
+      const block: string[] = [];
+      let j = i;
+      while (j < lines.length && DIFF_ROW_RE.test(lines[j])) {
+        block.push(lines[j]);
+        j++;
+      }
+      if (block.length >= DIFF_FALLBACK_MIN_ROWS) {
+        out.push(...getFenced(getDedented(block)));
+      } else {
+        out.push(...block);
+      }
+      i = j;
+      continue;
+    }
+
+    // Any solid prose line ends the tool context (blanks leave it intact).
+    if (line.trim() !== '') currentKind = null;
+    out.push(line);
+    i++;
+  }
+
+  return { out, outgoingKind: currentKind };
+}
+
+/**
+ * @description Strip Claude TUI chrome from a pane diff and fence tool-result
+ * bodies, returning the cleaned text AND the tool-result kind still open at the
+ * end of the chunk. The caller (`pollOutput`) threads `toolKind` back in as the
+ * next poll's `incomingKind` so a slow command's orphan output is fenced (B2).
+ */
+export function stripTuiElementsWithContext(
+  text: string,
+  incomingKind: ToolResultKind | null = null,
+): { text: string; toolKind: ToolResultKind | null } {
   const lines = text.split('\n');
   const filtered: string[] = [];
   // A submitted multi-line prompt renders as a `❯ <first line>` user-turn
@@ -678,6 +917,12 @@ export function stripTuiElements(text: string): string {
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
+
+    // B3: the `(ctrl+o …)` affordance is terminal-only — Telegram can't send
+    // ctrl+o — so drop the parenthetical while keeping the rest of the line
+    // (`… +2 lines`, `Thought for 4s`, `Read 50 lines`). Trailing-anchored, so
+    // it never disturbs the leading-anchored echo / chrome detection below.
+    line = line.replace(/\s*\(ctrl\+o[^)]*\)/gi, '');
 
     if (inUserTurnEcho) {
       if (/^\s+\S/.test(line)) continue;
@@ -733,9 +978,23 @@ export function stripTuiElements(text: string): string {
     filtered.push(line);
   }
 
-  let result = filtered.join('\n');
+  const { out, outgoingKind } = fenceToolResultBodies(filtered, incomingKind);
+  let result = out.join('\n');
   result = result.replace(/\n{3,}/g, '\n\n');
-  return result.trim();
+  return { text: result.trim(), toolKind: outgoingKind };
+}
+
+/**
+ * @description Strip Claude TUI chrome and fence tool-result bodies (B2),
+ * returning just the cleaned text. Thin wrapper over
+ * {@link stripTuiElementsWithContext} for call sites (and tests) that don't
+ * thread the cross-poll tool kind.
+ */
+export function stripTuiElements(
+  text: string,
+  incomingKind: ToolResultKind | null = null,
+): string {
+  return stripTuiElementsWithContext(text, incomingKind).text;
 }
 
 /**
@@ -1040,6 +1299,73 @@ const CLAUDE_INTERRUPT_POLL_MS = 100;
  */
 const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
 
+/**
+ * @description Normalise a pane line for the line-set diff: trim, drop a
+ * leading status/tool glyph so a tool header is matched regardless of which
+ * `●/○/⏳/✓` state it was last rendered in.
+ */
+function normalizeForComparison(line: string): string {
+  return line.trim().replace(/^[●○⏳✓]\s*/, '');
+}
+
+/**
+ * @description Diff a freshly-captured pane against the last one and return
+ * only the NEW lines, as a line-SET difference (positions ignored — Claude's
+ * TUI redraws the whole pane every poll, so a positional diff would re-emit
+ * everything that scrolled).
+ *
+ * Blank lines are NOT part of the matched set (they aren't unique), but a
+ * single blank that sat BETWEEN two runs of new content is preserved as a
+ * paragraph separator: the previous implementation `continue`d past every
+ * empty line, so multi-paragraph answers arrived in Telegram with every
+ * paragraph glued to the next (the `cleanOutput` C1 fix only kept blanks in
+ * the FULL pane; this delta path still dropped them). The pending-blank flag
+ * is flushed only right before the next emitted new line, so leading/trailing
+ * blanks and blanks adjacent to suppressed (duplicate) lines never leak out.
+ *
+ * Exported + pure so the diff is unit-testable without booting tmux.
+ */
+export function getNewPaneContent(oldContent: string, newContent: string): string {
+  if (!oldContent) return newContent;
+  if (oldContent === newContent) return '';
+
+  const oldLines = oldContent.split('\n');
+  const newLines = newContent.split('\n');
+
+  const oldLineCounts = new Map<string, number>();
+  for (const line of oldLines) {
+    const normalized = normalizeForComparison(line);
+    if (normalized) {
+      oldLineCounts.set(normalized, (oldLineCounts.get(normalized) || 0) + 1);
+    }
+  }
+
+  const newParts: string[] = [];
+  const usedOldLines = new Map<string, number>();
+  let pendingBlank = false;
+
+  for (const line of newLines) {
+    const normalized = normalizeForComparison(line);
+    if (!normalized) {
+      pendingBlank = true;
+      continue;
+    }
+
+    const oldCount = oldLineCounts.get(normalized) || 0;
+    const usedCount = usedOldLines.get(normalized) || 0;
+
+    if (usedCount < oldCount) {
+      usedOldLines.set(normalized, usedCount + 1);
+    } else {
+      if (pendingBlank && newParts.length > 0) newParts.push('');
+      newParts.push(line);
+    }
+    pendingBlank = false;
+  }
+
+  return newParts.join('\n').trim();
+}
+
 export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
@@ -1180,6 +1506,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
       isPolling: false,
+      openToolKind: null,
     };
 
     this.sessions.set(keyToString(key), session);
@@ -1552,6 +1879,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
       isPolling: false,
+      openToolKind: null,
     };
 
     this.sessions.set(keyToString(key), claudeSession);
@@ -1678,13 +2006,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
       isPolling: false,
+      openToolKind: null,
     };
 
     // Seed `lastContent` with the current pane snapshot **before** the
     // first poll fires. Without this, the bot's first `pollOutput` after
     // re-adoption would diff a ~2000-line scrollback (hours of stale
     // conversation that survived the restart inside tmux) against `''`
-    // — `getNewContent('', x) === x` — and emit every line of it to
+    // — `getNewPaneContent('', x) === x` — and emit every line of it to
     // Telegram as if it were brand new output. Symptom: user restarts
     // the bot, types a fresh message in an existing thread, and the
     // thread gets flooded with answers from previous sessions before
@@ -1750,7 +2079,8 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const content = cleanOutput(raw);
 
     if (content !== session.lastContent) {
-      const newPart = this.getNewContent(session.lastContent, content);
+      const previousPane = session.lastContent;
+      const newPart = getNewPaneContent(previousPane, content);
       session.lastContent = content;
 
       if (newPart) {
@@ -1768,6 +2098,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           if (question.signature !== session.lastQuestionSignature) {
             session.lastQuestionSignature = question.signature;
             session.lastStatusText = '';
+            session.openToolKind = null; // a question ends any prior tool output
             this.emit('output', key, `${question.text}\n\n${t('agent.question_hint')}`);
           }
         } else {
@@ -1775,7 +2106,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           // asked again later is delivered, not silently swallowed.
           session.lastQuestionSignature = '';
 
-          const cleanedOutput = stripTuiElements(newPart);
+          // Thread the tool-result kind across polls: the owning `● Bash(…)`
+          // header of a slow command's output streamed in an earlier poll (the
+          // line-set diff drops it as a duplicate), so `session.openToolKind`
+          // carries it forward to fence the orphan `⎿` body (B2). Tracked via
+          // the clean deltas, not a scan of the racy live pane.
+          const stripped = stripTuiElementsWithContext(newPart, session.openToolKind);
+          session.openToolKind = stripped.toolKind;
+          const cleanedOutput = stripped.text;
           if (cleanedOutput) {
             console.log(`[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`);
 
@@ -1845,42 +2183,4 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     return hasWarning && hasAccept;
   }
 
-  private normalizeForComparison(line: string): string {
-    return line.trim().replace(/^[●○⏳✓]\s*/, '');
-  }
-
-  private getNewContent(oldContent: string, newContent: string): string {
-    if (!oldContent) return newContent;
-    if (oldContent === newContent) return '';
-
-    const oldLines = oldContent.split('\n');
-    const newLines = newContent.split('\n');
-
-    const oldLinesSet = new Map<string, number>();
-    for (const line of oldLines) {
-      const normalized = this.normalizeForComparison(line);
-      if (normalized) {
-        oldLinesSet.set(normalized, (oldLinesSet.get(normalized) || 0) + 1);
-      }
-    }
-
-    const newParts: string[] = [];
-    const usedOldLines = new Map<string, number>();
-
-    for (const line of newLines) {
-      const normalized = this.normalizeForComparison(line);
-      if (!normalized) continue;
-
-      const oldCount = oldLinesSet.get(normalized) || 0;
-      const usedCount = usedOldLines.get(normalized) || 0;
-
-      if (usedCount < oldCount) {
-        usedOldLines.set(normalized, usedCount + 1);
-      } else {
-        newParts.push(line);
-      }
-    }
-
-    return newParts.join('\n').trim();
-  }
 }

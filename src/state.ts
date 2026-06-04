@@ -53,6 +53,17 @@ export interface BindingData {
    * stack of stale pins).
    */
   pinnedStatusMessageId?: number;
+  /**
+   * Last banner text we successfully sent/edited for {@link pinnedStatusMessageId}.
+   * The in-memory `pinnedStatusTextCache` is rebuilt from this at boot so the
+   * startup banner-refresh wave skips the `editMessageText` round-trip when the
+   * computed banner equals what is already displayed (B8) — every restart
+   * otherwise re-edits ~9 identical banners, each a wasted "message is not
+   * modified" 400 burning the chat-wide send budget. Cleared whenever the
+   * banner message is unpinned/deleted or its id is nulled, so a stale text
+   * can never suppress a needed edit for a fresh banner message.
+   */
+  pinnedStatusText?: string;
 }
 
 export interface AgentData {
@@ -501,6 +512,33 @@ export class StateStore {
       } else {
         if (existing.pinnedStatusMessageId === messageId) return;
         this.state.bindings[k] = { ...existing, pinnedStatusMessageId: messageId };
+      }
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Persist the last banner text sent/edited for a thread, or
+   * clear it (pass `null`). Mirrors {@link setBindingPinnedStatusMessageId}:
+   * skipped if the binding doesn't exist, and a no-op (no save) when the value
+   * is unchanged. Read back at boot to seed `pinnedStatusTextCache` so the
+   * startup refresh wave skips identical-banner edits (B8).
+   */
+  async setBindingPinnedStatusText(
+    key: ThreadKey,
+    text: string | null,
+  ): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.bindings[k];
+      if (!existing) return;
+      if (text === null) {
+        if (existing.pinnedStatusText === undefined) return;
+        const { pinnedStatusText: _drop, ...rest } = existing;
+        this.state.bindings[k] = rest;
+      } else {
+        if (existing.pinnedStatusText === text) return;
+        this.state.bindings[k] = { ...existing, pinnedStatusText: text };
       }
       this.scheduleSave();
     });

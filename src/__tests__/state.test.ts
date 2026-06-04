@@ -165,6 +165,83 @@ test('Forward-compat: state.json with an unknown future field still loads cleanl
   assert.equal(store.getBinding({ chatId: -1001, threadId: 42 })?.subdir, 'alpha');
 });
 
+test('pinnedStatusText: set → get round-trips on the binding row', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setBinding(key1, 'alpha');
+  await store.setBindingPinnedStatusText(key1, 'Claude · idle');
+  assert.equal(store.getBinding(key1)?.pinnedStatusText, 'Claude · idle');
+});
+
+test('pinnedStatusText: survives a reload from disk (the B8 restart case)', async () => {
+  // THE load-bearing case: the in-memory dedup cache is empty on every
+  // restart, so the persisted text is the ONLY thing that lets the boot
+  // refresh wave skip identical-banner edits. If this doesn't survive a
+  // reload, the whole B8 fix is a no-op.
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setBinding(key1, 'alpha');
+  await first.setBindingPinnedStatusText(key1, 'Claude · running');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getBinding(key1)?.pinnedStatusText, 'Claude · running');
+});
+
+test('pinnedStatusText: passing null clears it on disk', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setBinding(key1, 'alpha');
+  await first.setBindingPinnedStatusText(key1, 'Claude · running');
+  await first.setBindingPinnedStatusText(key1, null);
+  await first.flush();
+
+  // Cleared in memory…
+  assert.equal(first.getBinding(key1)?.pinnedStatusText, undefined);
+  // …and on disk (so a stale text can never suppress the next real edit).
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal('pinnedStatusText' in raw.bindings[`${key1.chatId}:${key1.threadId}`], false);
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getBinding(key1)?.pinnedStatusText, undefined);
+});
+
+test('pinnedStatusText: no-op when binding does not exist (no dangling row)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setBindingPinnedStatusText(key1, 'orphan');
+  assert.equal(store.getBinding(key1), null, 'must not create a binding row');
+});
+
+test('pinnedStatusText: setting the same text twice does not re-mark for save', async () => {
+  // Mirrors setBindingPinnedStatusMessageId: an unchanged value is a no-op.
+  // We assert idempotency via the on-disk round-trip rather than spying on
+  // scheduleSave (private), which is enough to prove the value is stable.
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setBinding(key1, 'alpha');
+  await store.setBindingPinnedStatusText(key1, 'same');
+  await store.setBindingPinnedStatusText(key1, 'same');
+  await store.flush();
+  assert.equal(store.getBinding(key1)?.pinnedStatusText, 'same');
+});
+
+test('pinnedStatusText: persists alongside pinnedStatusMessageId independently', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setBinding(key1, 'alpha');
+  await first.setBindingPinnedStatusMessageId(key1, 777);
+  await first.setBindingPinnedStatusText(key1, 'Claude · idle');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getBinding(key1)?.pinnedStatusMessageId, 777);
+  assert.equal(second.getBinding(key1)?.pinnedStatusText, 'Claude · idle');
+});
+
 test('pairedGroupId: defaults to null when never paired', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();

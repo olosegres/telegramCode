@@ -65,6 +65,7 @@ import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import { getPinnedBannerSkipDecision } from './utils/pinnedBannerSkipDecision';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -677,8 +678,9 @@ const unbindingKeys = new Set<string>();
  * round-trip entirely when nothing actually changed (rapid succession of
  * `started → status → output` events on a busy agent).
  *
- * Not persisted: bot restart re-pins via `updatePinnedStatus` anyway and
- * the cache rebuilds on the first event.
+ * In-memory, but seeded at boot from `binding.pinnedStatusText` (persisted
+ * in state.json) via `getPinnedBannerSkipDecision` — so a restart's banner
+ * refresh wave skips unchanged banners without burning API calls (B8).
  */
 const pinnedStatusTextCache = new Map<string, string>();
 
@@ -766,11 +768,25 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
     const text = computePinnedStatusText(key);
     if (text === null) return;
 
-    // Skip if nothing changed since the last send/edit.
-    if (pinnedStatusTextCache.get(k) === text) return;
-
     const binding = state.getBinding(key);
     if (!binding) return;
+
+    // Skip the edit when nothing changed since the last send/edit. The
+    // in-memory cache is empty on every restart, so fall back to the text
+    // persisted in state.json — this lets the boot-time refresh wave skip
+    // re-editing banners that are already current (B8) instead of spending a
+    // wasted "message is not modified" 400 per binding on the chat-wide budget.
+    const skipDecision = getPinnedBannerSkipDecision({
+      computedText: text,
+      cachedText: pinnedStatusTextCache.get(k),
+      persistedText: binding.pinnedStatusText,
+    });
+    if (skipDecision === 'skip') return;
+    if (skipDecision === 'seedAndSkip') {
+      pinnedStatusTextCache.set(k, text);
+      return;
+    }
+
     const existingId = binding.pinnedStatusMessageId;
 
     if (existingId !== undefined) {
@@ -780,11 +796,13 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
           'status',
         );
         pinnedStatusTextCache.set(k, text);
+        persistPinnedStatusText(key, text);
         return;
       } catch (e) {
         const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
         if (/message is not modified/i.test(desc)) {
           pinnedStatusTextCache.set(k, text);
+          persistPinnedStatusText(key, text);
           return;
         }
         if (!/message to edit not found|MESSAGE_ID_INVALID|message can't be edited/i.test(desc)) {
@@ -795,8 +813,13 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
           return;
         }
         // Pinned message was deleted out from under us — fall through to
-        // send a fresh one.
+        // send a fresh one. Clear BOTH the id and the persisted text: the
+        // stale text must never suppress the edit for the NEW banner message
+        // (B8). The in-memory cache is cleared too so the fresh send isn't
+        // short-circuited by a leftover match.
+        pinnedStatusTextCache.delete(k);
         await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
+        await state.setBindingPinnedStatusText(key, null).catch(() => {});
       }
     }
 
@@ -835,7 +858,21 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
       console.warn(`[pinned] persist id for ${k} failed:`, err),
     );
     pinnedStatusTextCache.set(k, text);
+    persistPinnedStatusText(key, text);
   });
+}
+
+/**
+ * @description Fire-and-forget persist of the banner text for a thread so a
+ * later restart can seed `pinnedStatusTextCache` and skip identical-banner
+ * edits (B8). Mirrors the `state.setBindingPinnedStatusMessageId(...).catch`
+ * pattern used for the id — the banner is convenience UI, so a failed persist
+ * is logged, not surfaced.
+ */
+function persistPinnedStatusText(key: ThreadKey, text: string): void {
+  state.setBindingPinnedStatusText(key, text).catch(err =>
+    console.warn(`[pinned] persist text for ${keyToString(key)} failed:`, err),
+  );
 }
 
 /**
@@ -875,6 +912,9 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
       // Older than 48h or already deleted — silently ignored.
     }
     await state.setBindingPinnedStatusMessageId(key, null).catch(() => {});
+    // Clear the persisted text alongside the id so a future /bind in the same
+    // thread can't have its first banner edit suppressed by a stale match (B8).
+    await state.setBindingPinnedStatusText(key, null).catch(() => {});
   });
 }
 

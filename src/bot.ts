@@ -61,6 +61,7 @@ import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage } from './messageSplit';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
+import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -412,6 +413,19 @@ function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
   return s;
 }
 
+/**
+ * @description Drop a thread's bot-side queued-but-unsent agent output on
+ * stop, so nothing coalesced *before* the stop posts *after* the "stopped"
+ * confirmation (live repro: a 429 backlog let trailing outputs land seconds
+ * later). Looks the existing state up with `.get()` — no lazy creation, since
+ * clearing a thread that never queued anything is a no-op. The pure clear
+ * logic lives in `utils/clearThreadOutputQueues` for unit testing.
+ */
+function clearThreadQueues(key: ThreadKey): void {
+  const k = keyToString(key);
+  clearThreadOutputQueues(outputQueues.get(k), statusCoalescers.get(k));
+}
+
 function markNeedsNewMessage(key: ThreadKey): void {
   getThreadMessageState(key).needsNewMessage = true;
 }
@@ -602,6 +616,11 @@ async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
  */
 function clearInMemoryThreadState(key: ThreadKey): void {
   const k = keyToString(key);
+  // Drop queued output AND status frame (incl. cancelling the output
+  // debounce timer) BEFORE deleting the map entries — otherwise an armed
+  // `debounceTimer` would survive the `outputQueues.delete` as an orphan and
+  // still fire into a freshly-bound session.
+  clearThreadQueues(key);
   threadMessageStates.delete(k);
   outputQueues.delete(k);
   pendingQuestions.delete(k);
@@ -610,11 +629,6 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   threadSessionLists.delete(k);
   awaitingSessionSelection.delete(k);
   pinnedStatusTextCache.delete(k);
-  // Drop any pending status frame so it doesn't surface in a freshly-bound
-  // session. The `inFlight` loop, if running, will exit on its next tick
-  // because `pendingText` is now `null`.
-  const sc = statusCoalescers.get(k);
-  if (sc) sc.pendingText = null;
   statusCoalescers.delete(k);
 }
 
@@ -3942,9 +3956,10 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
 }
 
 function handleAgentClosed(key: ThreadKey): void {
-  // Session is gone — drop any not-yet-sent status frame so it doesn't
-  // surface after the "session ended" notice.
-  getStatusCoalesceState(key).pendingText = null;
+  // Session is gone — drop any not-yet-sent output AND status frame so they
+  // don't surface after the "session ended" notice (the trailing-output bug:
+  // a 429 backlog could let queued deltas land seconds after the close).
+  clearThreadQueues(key);
   deleteStatusMessage(key).catch(() => {});
   pendingQuestions.delete(keyToString(key));
   const adapter = getThreadAdapter(key);
@@ -3977,6 +3992,11 @@ function handleAgentStarted(key: ThreadKey): void {
  * stop-then-unbind sequence doesn't re-pin a stale banner.
  */
 function handleAgentStopped(key: ThreadKey): void {
+  // Single convergence point for every `stopSession`-driven stop path —
+  // `/stop`, `/stop-all`, `/quit` (OpenCode), `/unbind`, and adapter switch
+  // all emit `stopped`. Drop the thread's queued-but-unsent output here so
+  // nothing coalesced before the stop posts after the "stopped" confirmation.
+  clearThreadQueues(key);
   updatePinnedStatus(key).catch(() => {});
 }
 

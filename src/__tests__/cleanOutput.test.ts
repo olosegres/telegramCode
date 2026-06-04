@@ -299,6 +299,38 @@ test('stripTuiElements: keeps real prose that begins with "Tip:" (no ⎿ marker)
   assert.equal(stripTuiElements(input), input);
 });
 
+// ─── B3 — interrupt frame "Interrupted · What should Claude do instead?" ───
+
+test('stripTuiElements: drops the "⎿ Interrupted ·…" interrupt frame, keeps surrounding content', () => {
+  // Real trace: after the bot sends Escape, the TUI repaints a transient frame
+  // with this line; the pane-diff pipeline relayed it as a scary "agent is
+  // waiting" message. The legit "Read *2* files" above and the spinner below
+  // survive per the existing pipeline (spinner is filtered as a status tick).
+  const input = 'Read *2* files\n  ⎿  Interrupted · What should Claude do instead?\n\n✢ Evaporating…';
+  const out = stripTuiElements(input);
+  assert.ok(!/Interrupted · What should Claude do instead\?/.test(out), `interrupt frame leaked: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('Read *2* files'), `legit content lost: ${JSON.stringify(out)}`);
+});
+
+test('stripTuiElements: drops a trailing "⎿ Interrupted ·…" frame with no content after it', () => {
+  const input = 'Read *1* file\n  ⎿  Interrupted · What should Claude do instead?';
+  assert.equal(stripTuiElements(input), 'Read *1* file');
+});
+
+test('stripTuiElements: drops the bare "Interrupted ·…" frame (no ⎿ prefix, trailing spaces)', () => {
+  // The phrase may render without the ⎿ marker and with trailing pad spaces.
+  const input = 'Interrupted · What should Claude do instead?   ';
+  assert.equal(stripTuiElements(input), '');
+});
+
+test('stripTuiElements: keeps prose where the agent text contains the phrase mid-sentence', () => {
+  // Negative case: the filter anchors on the TUI shape (line-start, optional
+  // ⎿/whitespace, phrase to line-end), so agent/user text discussing the
+  // phrase mid-sentence must NOT be stripped.
+  const input = 'Я увидел Interrupted · What should Claude do instead? в логе';
+  assert.equal(stripTuiElements(input), input);
+});
+
 // ─── checkIsStatusOutput — short answer fragments are NOT status ───────
 
 test('checkIsStatusOutput: short sentence answer "Done." is real content, not status', () => {

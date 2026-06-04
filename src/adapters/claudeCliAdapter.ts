@@ -955,6 +955,13 @@ export function stripTuiElementsWithContext(
     // Ephemeral UI hint Claude prints under a turn ("⎿  Tip: Use Plan Mode…").
     // Require the `⎿` marker so plain prose starting with "Tip:" is NOT eaten.
     if (/^\s*⎿\s*Tip:\s/i.test(line)) continue;
+    // Transient frame the TUI repaints right after an Escape interrupt
+    // ("  ⎿  Interrupted · What should Claude do instead?"). The pane-diff
+    // pipeline relayed it as a scary "agent is waiting" message even though
+    // the next prompt is already being typed. Anchored to the exact TUI shape
+    // (line-start, optional ⎿/whitespace, the literal phrase to line-end) so
+    // prose merely mentioning the word "Interrupted" is NOT stripped.
+    if (/^\s*(?:⎿\s*)?Interrupted · What should Claude do instead\?\s*$/.test(line)) continue;
     if (/\(shift\+tab to cycle\)/i.test(line)) continue;
     if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) continue;
 

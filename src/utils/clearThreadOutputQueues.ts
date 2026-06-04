@@ -14,11 +14,16 @@ export interface ClearableOutputQueue {
 /**
  * @description Minimal shape of the bot's per-thread status coalescer that
  * {@link clearThreadOutputQueues} needs to drop. Mirrors the load-bearing
- * field of `bot.ts`'s `StatusCoalesceState`.
+ * fields of `bot.ts`'s `StatusCoalesceState`.
  */
 export interface ClearableStatusCoalescer {
   /** Latest status frame not yet sent. `null` = nothing pending. */
   pendingText: string | null;
+  /**
+   * Armed timer that would resume a flush deferred during a 429 cooldown.
+   * `null` = none. Optional so older callers that don't track it still type.
+   */
+  deferRetryTimer?: NodeJS.Timeout | null;
 }
 
 /**
@@ -48,9 +53,14 @@ export function clearThreadOutputQueues(
     }
   }
   if (coalescer) {
-    // The status coalescer has no timer of its own — it is a `pendingText` +
-    // `inFlight` loop. Nulling `pendingText` makes the running loop (if any)
-    // exit on its next iteration without sending a stale frame.
+    // Nulling `pendingText` makes the running flush loop (if any) exit on its
+    // next iteration without sending a stale frame. The coalescer can also
+    // hold a defer-retry timer armed during a 429 cooldown — cancel it too,
+    // otherwise it would fire into a stopped session.
     coalescer.pendingText = null;
+    if (coalescer.deferRetryTimer) {
+      clearTimeout(coalescer.deferRetryTimer);
+      coalescer.deferRetryTimer = null;
+    }
   }
 }

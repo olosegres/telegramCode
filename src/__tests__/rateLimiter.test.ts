@@ -22,10 +22,40 @@
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { enqueueSend, withRateLimitRetry, checkIsRateLimited, getRateLimitRemainingMs } from '../rateLimiter';
+import {
+  enqueueSend,
+  withRateLimitRetry,
+  checkIsRateLimited,
+  getRateLimitRemainingMs,
+  TokenBucket,
+  rateLimiterConstants,
+  type BucketClock,
+  type SendPriority,
+} from '../rateLimiter';
 import type { ThreadKey } from '../types';
 
 const k = (chatId: number, threadId: number): ThreadKey => ({ chatId, threadId });
+
+/**
+ * A deterministic clock + timer for {@link TokenBucket}: time only advances
+ * when the test calls `advance`, which both moves `now` and fires every timer
+ * whose deadline has passed. No real `setTimeout`, so refill-math tests run
+ * instantly instead of sleeping seconds of wall-clock.
+ */
+function createFakeClock(): BucketClock & { advance: (ms: number) => void } {
+  let current = 0;
+  let timers: Array<{ at: number; fn: () => void }> = [];
+  return {
+    now: () => current,
+    setTimeout: (fn, ms) => { timers.push({ at: current + ms, fn }); },
+    advance: (ms) => {
+      current += ms;
+      const due = timers.filter(t => t.at <= current).sort((a, b) => a.at - b.at);
+      timers = timers.filter(t => t.at > current);
+      for (const t of due) t.fn();
+    },
+  };
+}
 
 test('R7: enqueueSend runs back-to-back sends in queue order', async () => {
   const key = k(7001, 1);
@@ -43,27 +73,128 @@ test('R7: enqueueSend runs back-to-back sends in queue order', async () => {
   assert.deepEqual(order, [1, 2, 3, 4, 5]);
 });
 
-test('R7: bucket allows a burst of 5 sends without delay, then paces', async () => {
+test('R7: bucket allows a full burst without delay, then paces at the group ceiling', async () => {
   const key = k(7002, 1);
+  const burst = Array.from({ length: rateLimiterConstants.bucketCapacity }, (_, i) => i + 1);
   const t0 = Date.now();
-  // Burst of 5 — fits the bucket capacity.
-  await Promise.all([1, 2, 3, 4, 5].map(i =>
-    enqueueSend(key, async () => i)
-  ));
+  // Burst exactly fills the bucket capacity — no token waits.
+  await Promise.all(burst.map(i => enqueueSend(key, async () => i)));
   const burstMs = Date.now() - t0;
 
-  // Burst should complete in well under a second — well below the 1
-  // token/sec refill rate. Allow some slack for slow CI (200 ms).
-  assert.ok(burstMs < 200, `burst of 5 took ${burstMs}ms, expected < 200ms`);
+  // Burst should complete near-instantly. Allow slack for slow CI (200 ms).
+  assert.ok(burstMs < 200, `burst of ${burst.length} took ${burstMs}ms, expected < 200ms`);
 
-  // The 6-th send has to wait for a refill — at 1 token/sec it should
-  // need ~1 s. Cap the upper bound generously (2 s) so a sluggish CI
-  // host doesn't fail the test.
+  // The next send drains an empty bucket → must wait one refill interval.
+  // At ~0.333 tokens/sec (group ceiling) that's ~3 s. Bound generously so a
+  // sluggish CI host doesn't fail, but enough to prove pacing slowed below
+  // the old 1 token/sec.
+  const expectedWaitMs = 1000 / rateLimiterConstants.bucketRefillPerSec; // ≈ 3000
   const t1 = Date.now();
-  await enqueueSend(key, async () => 'sixth');
-  const sixthMs = Date.now() - t1;
-  assert.ok(sixthMs >= 800, `6th send returned in ${sixthMs}ms, expected ≥ 800ms`);
-  assert.ok(sixthMs < 2000, `6th send returned in ${sixthMs}ms, expected < 2000ms`);
+  await enqueueSend(key, async () => 'overflow');
+  const overflowMs = Date.now() - t1;
+  assert.ok(
+    overflowMs >= expectedWaitMs * 0.8,
+    `overflow send returned in ${overflowMs}ms, expected ≥ ${Math.round(expectedWaitMs * 0.8)}ms (paced below group ceiling)`,
+  );
+});
+
+test('refill math: sustained rate ≈ groupMessagesPerMinute/60 (≈3s per token after drain)', () => {
+  const clock = createFakeClock();
+  const { bucketCapacity, bucketRefillPerSec } = rateLimiterConstants;
+  const bucket = new TokenBucket(bucketCapacity, bucketRefillPerSec, clock);
+
+  // Drain the whole burst capacity instantly (no time advance). The fast
+  // path grants these immediately (a free token + no prior waiters).
+  for (let i = 0; i < bucketCapacity; i++) void bucket.take('interactive');
+
+  // Now the bucket is empty. Queue 3 more takers and prove each needs one
+  // refill interval (~3s) — i.e. N tokens take ≈ N * (1000 / refillPerSec) ms.
+  const msPerToken = 1000 / bucketRefillPerSec;
+  assert.ok(Math.abs(msPerToken - 3000) < 1, `expected ~3000ms/token, got ${msPerToken}`);
+
+  const order: number[] = [];
+  bucket.take('interactive').then(() => order.push(1));
+  bucket.take('interactive').then(() => order.push(2));
+  bucket.take('interactive').then(() => order.push(3));
+
+  return (async () => {
+    // Before any time passes, none of the queued takers can be granted.
+    await Promise.resolve();
+    assert.deepEqual(order, [], 'no token should be granted before time advances');
+
+    // Advance just under one interval → still none.
+    clock.advance(msPerToken - 100);
+    await Promise.resolve();
+    assert.deepEqual(order, [], `nothing granted at ${msPerToken - 100}ms`);
+
+    // Cross the first interval → exactly one token.
+    clock.advance(200);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(order, [1], 'one token after ~one interval');
+
+    // Two more intervals → the remaining two, in order.
+    clock.advance(msPerToken);
+    await Promise.resolve();
+    await Promise.resolve();
+    clock.advance(msPerToken);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(order, [1, 2, 3], 'remaining tokens granted one per interval, in order');
+  })();
+});
+
+test('priority: under congestion the bucket grants interactive → output → status', async () => {
+  const clock = createFakeClock();
+  // Capacity 1 so the very first take drains it and everything else queues.
+  const bucket = new TokenBucket(1, rateLimiterConstants.bucketRefillPerSec, clock);
+
+  // Drain the single burst token.
+  await bucket.take('interactive');
+
+  // Now enqueue waiters in the WORST order for priority: status first,
+  // then output, then interactive. Correct behaviour grants them in the
+  // reverse (priority) order regardless of submission order.
+  const grantOrder: SendPriority[] = [];
+  const waiters = [
+    bucket.take('status').then(() => grantOrder.push('status')),
+    bucket.take('output').then(() => grantOrder.push('output')),
+    bucket.take('interactive').then(() => grantOrder.push('interactive')),
+  ];
+
+  // Hand out three tokens, one per refill interval.
+  const msPerToken = 1000 / rateLimiterConstants.bucketRefillPerSec;
+  for (let i = 0; i < 3; i++) {
+    clock.advance(msPerToken);
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  await Promise.all(waiters);
+
+  assert.deepEqual(grantOrder, ['interactive', 'output', 'status']);
+});
+
+test('priority: FIFO within a class (two output waiters granted in submission order)', async () => {
+  const clock = createFakeClock();
+  const bucket = new TokenBucket(1, rateLimiterConstants.bucketRefillPerSec, clock);
+  await bucket.take('interactive'); // drain
+
+  const order: string[] = [];
+  const waiters = [
+    bucket.take('output').then(() => order.push('output-1')),
+    bucket.take('output').then(() => order.push('output-2')),
+    bucket.take('output').then(() => order.push('output-3')),
+  ];
+
+  const msPerToken = 1000 / rateLimiterConstants.bucketRefillPerSec;
+  for (let i = 0; i < 3; i++) {
+    clock.advance(msPerToken);
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  await Promise.all(waiters);
+
+  assert.deepEqual(order, ['output-1', 'output-2', 'output-3']);
 });
 
 test('R7: withRateLimitRetry retries once on 429 then succeeds', async () => {

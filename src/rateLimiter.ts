@@ -19,14 +19,20 @@ import { keyToString } from './types';
  *      within a single thread it let a burst of `status` edits pile up
  *      ahead of a real `output` send.
  *
- *   2. **Token-bucket**. Keyed by **chatId**. Proactive shaping: 1 token
- *      per second, burst of 5. Telegram's documented per-chat ceiling
- *      applies to the *whole* supergroup, so the bucket has to stay
- *      chat-wide; if threads each had their own bucket, N parallel
- *      threads would burst at ~N msgs/sec and get 429'd. Threads
- *      awaiting the bucket do so on independent async paths
- *      (`bucket.take()` doesn't block the event loop), so the bucket no
- *      longer creates head-of-line blocking the way a single FIFO did.
+ *   2. **Token-bucket**. Keyed by **chatId**. Proactive shaping sized to
+ *      Telegram's *sustained* per-supergroup ceiling (≈20 msg/min, see
+ *      {@link groupMessagesPerMinute}) so multi-topic streaming doesn't
+ *      systematically overrun it and trip a chat-wide 429 cooldown. A
+ *      small burst capacity keeps interactive bursts snappy. Telegram's
+ *      ceiling applies to the *whole* supergroup, so the bucket has to
+ *      stay chat-wide; if threads each had their own bucket, N parallel
+ *      threads would burst at ~N msgs/sec and get 429'd. The bucket
+ *      grants tokens to waiting takers in **priority order** ({@link
+ *      SendPriority}) so command confirmations never queue behind a
+ *      firehose of disposable status edits. Threads awaiting the bucket
+ *      do so on independent async paths (`bucket.take()` doesn't block
+ *      the event loop), so the bucket no longer creates head-of-line
+ *      blocking the way a single FIFO did.
  *
  *   3. **`withRateLimitRetry`.** Keyed by **chatId**. Reactive: if
  *      Telegram still returns 429, sleep `retry_after + jitter` and
@@ -43,36 +49,144 @@ import { keyToString } from './types';
  * (e.g. one-off admin / health-check operations during boot).
  */
 
-const BUCKET_CAPACITY = 5;
-/** Tokens added per second. Telegram's documented ceiling is ~1 msg/sec per chat. */
-const BUCKET_REFILL_PER_SEC = 1;
+/**
+ * @name SendPriority
+ * @description Priority class for a send competing for the chat-wide
+ * token budget. The bucket grants the next token to the highest-priority
+ * waiter, FIFO within a class.
+ *
+ * - `interactive` — command replies, menus, loaders, deletes tied to UX.
+ *   The user is waiting on these *now*; they must win the budget.
+ * - `output` — agent answer chunks streamed into a topic.
+ * - `status` — rolling spinner/thinking frames. Disposable: a stale
+ *   frame that never sends is no loss, so under congestion `status`
+ *   **intentionally starves** behind `interactive`/`output`.
+ */
+export type SendPriority = 'interactive' | 'output' | 'status';
 
-class TokenBucket {
+/** Highest-first order the bucket drains waiters in. */
+const priorityOrder: readonly SendPriority[] = ['interactive', 'output', 'status'];
+
+/**
+ * Telegram's documented sustained ceiling for messages into one group is
+ * ~20 messages/minute. Sizing the refill below this (rather than the old
+ * 1 token/sec = 60/min = 3× overrun) keeps multi-topic streaming under the
+ * limit so we stop tripping chat-wide 429 cooldowns.
+ */
+const groupMessagesPerMinute = 20;
+const secondsPerMinute = 60;
+/** Sustained refill ≈ 0.333 tokens/sec — the group ceiling expressed per second. */
+const bucketRefillPerSec = groupMessagesPerMinute / secondsPerMinute;
+/**
+ * Burst capacity: a short interactive flurry (a few quick command replies
+ * back-to-back) drains the bucket instantly without waiting on the slow
+ * sustained refill. Sized so a typical command's reply + follow-ups land
+ * immediately, while the sustained rate still pulls the average down to the
+ * group ceiling.
+ */
+const bucketCapacity = 6;
+
+/** A taker parked on an empty bucket, waiting for a token. */
+interface BucketWaiter {
+  resolve: () => void;
+}
+
+/**
+ * @description Injectable clock + timer, so timing tests can drive the
+ * bucket deterministically with a tiny refill interval / fake clock
+ * instead of real-time sleeps.
+ */
+export interface BucketClock {
+  now: () => number;
+  setTimeout: (fn: () => void, ms: number) => void;
+}
+
+const realClock: BucketClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => { setTimeout(fn, ms); },
+};
+
+export class TokenBucket {
   private tokens: number;
   private lastRefill: number;
+  /** Waiters per priority class, FIFO within each class. */
+  private waiters: Record<SendPriority, BucketWaiter[]> = {
+    interactive: [],
+    output: [],
+    status: [],
+  };
+  /** A refill timer is already armed for the current waiter set. */
+  private refillTimerArmed = false;
 
-  constructor(private capacity: number, private refillPerSec: number) {
+  constructor(
+    private capacity: number,
+    private refillPerSec: number,
+    private clock: BucketClock = realClock,
+  ) {
     this.tokens = capacity;
-    this.lastRefill = Date.now();
+    this.lastRefill = clock.now();
   }
 
-  /** Block until at least one token is available, then consume it. */
-  async take(): Promise<void> {
-    while (true) {
-      this.refill();
-      if (this.tokens >= 1) {
-        this.tokens -= 1;
-        return;
-      }
-      // Sleep just long enough for the next token to be available.
-      const deficit = 1 - this.tokens;
-      const waitMs = Math.ceil((deficit / this.refillPerSec) * 1000);
-      await sleep(waitMs);
+  /**
+   * Block until a token is granted, then consume it. Tokens are granted in
+   * priority order ({@link priorityOrder}), FIFO within a class, so an
+   * `interactive` reply submitted *after* a backlog of `status` edits still
+   * wins the next token.
+   */
+  take(priority: SendPriority = 'interactive'): Promise<void> {
+    this.refill();
+    // Fast path: a token is free AND nobody is already queued. If anyone is
+    // waiting we must NOT jump them — queue and let priority dispatch decide,
+    // otherwise a fresh low-priority taker could steal a token from an
+    // already-waiting higher-priority one.
+    if (this.tokens >= 1 && this.countWaiters() === 0) {
+      this.tokens -= 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => {
+      this.waiters[priority].push({ resolve });
+      this.dispatch();
+    });
+  }
+
+  private countWaiters(): number {
+    return this.waiters.interactive.length
+      + this.waiters.output.length
+      + this.waiters.status.length;
+  }
+
+  /** Grant available tokens to waiting takers, highest priority first. */
+  private dispatch(): void {
+    this.refill();
+    while (this.tokens >= 1) {
+      const waiter = this.takeNextWaiter();
+      if (!waiter) return; // no one waiting — keep the spare tokens
+      this.tokens -= 1;
+      waiter.resolve();
+    }
+    // Tokens exhausted but waiters remain → arm one timer to re-dispatch
+    // when the next token will have accrued. One timer for the whole waiter
+    // set, not one per waiter.
+    if (this.countWaiters() > 0 && !this.refillTimerArmed) {
+      this.refillTimerArmed = true;
+      const deficitMs = Math.ceil(((1 - this.tokens) / this.refillPerSec) * 1000);
+      this.clock.setTimeout(() => {
+        this.refillTimerArmed = false;
+        this.dispatch();
+      }, Math.max(deficitMs, 1));
     }
   }
 
+  private takeNextWaiter(): BucketWaiter | undefined {
+    for (const priority of priorityOrder) {
+      const next = this.waiters[priority].shift();
+      if (next) return next;
+    }
+    return undefined;
+  }
+
   private refill(): void {
-    const now = Date.now();
+    const now = this.clock.now();
     const elapsedSec = (now - this.lastRefill) / 1000;
     if (elapsedSec <= 0) return;
     this.tokens = Math.min(this.capacity, this.tokens + elapsedSec * this.refillPerSec);
@@ -86,11 +200,17 @@ const buckets = new Map<number, TokenBucket>();
 function getBucket(chatId: number): TokenBucket {
   let bucket = buckets.get(chatId);
   if (!bucket) {
-    bucket = new TokenBucket(BUCKET_CAPACITY, BUCKET_REFILL_PER_SEC);
+    bucket = new TokenBucket(bucketCapacity, bucketRefillPerSec);
     buckets.set(chatId, bucket);
   }
   return bucket;
 }
+
+export const rateLimiterConstants = {
+  groupMessagesPerMinute,
+  bucketRefillPerSec,
+  bucketCapacity,
+} as const;
 
 /**
  * @description Per-thread FIFO of in-flight sends, keyed by serialised
@@ -224,25 +344,35 @@ export async function withRateLimitRetry<T>(
  *   *different* threads in the same chat run concurrently, gated only
  *   by the chat-wide token bucket.
  * - **Paced per chat**: token bucket waits before passing the call to
- *   Telegram. Bucket waits are async (don't block the event loop), so
- *   threads contending for the bucket interleave fairly as tokens
- *   become available.
+ *   Telegram. Bucket waits are async (don't block the event loop) and are
+ *   granted in {@link SendPriority} order, so threads contending for the
+ *   bucket interleave by priority as tokens become available.
  * - **Retry on 429**: reactive backoff via {@link withRateLimitRetry}.
  *
  * Errors from the operation are returned to the caller (we don't swallow
  * them — only the queue tail is swallowed so a single failure doesn't
  * poison every subsequent send on that thread).
  *
+ * `priority` only affects which *waiting* send gets the next token under
+ * congestion (across threads / independent chains). Per-thread FIFO
+ * ordering is unchanged: a thread's earlier `enqueueSend` always reaches
+ * `bucket.take()` before its later one regardless of priority, because the
+ * later call's `exec` doesn't run until the earlier one settles.
+ *
  * @example
  *   await enqueueSend(key, () =>
  *     bot.telegram.sendMessage(key.chatId, text, { message_thread_id: key.threadId }));
  */
-export async function enqueueSend<T>(key: ThreadKey, fn: () => Promise<T>): Promise<T> {
+export async function enqueueSend<T>(
+  key: ThreadKey,
+  fn: () => Promise<T>,
+  priority: SendPriority = 'interactive',
+): Promise<T> {
   const queueKey = keyToString(key);
   const prev = queues.get(queueKey);
 
   const exec = async (): Promise<T> => {
-    await getBucket(key.chatId).take();
+    await getBucket(key.chatId).take(priority);
     return withRateLimitRetry(key.chatId, fn);
   };
 

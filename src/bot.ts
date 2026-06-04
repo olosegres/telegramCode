@@ -33,6 +33,8 @@ import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCo
 import {
   enqueueSend,
   checkIsRateLimited,
+  getRateLimitRemainingMs,
+  type SendPriority,
 } from './rateLimiter';
 import {
   stopOpenCodeServer,
@@ -62,6 +64,7 @@ import { splitMessage } from './messageSplit';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
+import { getStatusFlushAction } from './utils/statusFlushDecision';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -252,6 +255,13 @@ bot.use(async (ctx, next) => {
 /** Debounce window for output batching. Telegram tolerates ~1 msg/sec/chat. */
 const OUTPUT_DEBOUNCE_MS = 1000;
 
+/**
+ * Small slack added on top of the remaining 429 cooldown before the status
+ * coalescer retries a deferred frame, so the re-flush fires *after* the
+ * cooldown has actually lifted rather than racing its boundary.
+ */
+const STATUS_COOLDOWN_RETRY_SLACK_MS = 250;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  State store — singleton populated in startBot(), referenced by handlers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -327,6 +337,18 @@ interface StatusCoalesceState {
   pendingText: string | null;
   /** A `flushStatusCoalescer` loop is currently running. */
   inFlight: boolean;
+  /**
+   * Last status frame that actually reached Telegram for this thread.
+   * Lets the flush loop skip a re-send of identical text (which only earns
+   * a `400 "message is not modified"` and wastes a send-budget token).
+   */
+  lastSentText: string | null;
+  /**
+   * Armed timer that resumes a flush deferred during a 429 cooldown. While
+   * set, new status events only refresh `pendingText` (the newest frame
+   * wins) instead of arming a second timer. `null` = none armed.
+   */
+  deferRetryTimer: NodeJS.Timeout | null;
 }
 
 const threadMessageStates = new Map<string, ThreadMessageState>();
@@ -407,7 +429,7 @@ function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
   const k = keyToString(key);
   let s = statusCoalescers.get(k);
   if (!s) {
-    s = { pendingText: null, inFlight: false };
+    s = { pendingText: null, inFlight: false, lastSentText: null, deferRetryTimer: null };
     statusCoalescers.set(k, s);
   }
   return s;
@@ -755,6 +777,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
       try {
         await enqueueSend(key, () =>
           bot.telegram.editMessageText(key.chatId, existingId, undefined, text),
+          'status',
         );
         pinnedStatusTextCache.set(k, text);
         return;
@@ -784,6 +807,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
           message_thread_id: key.threadId,
           disable_notification: true,
         }),
+        'status',
       );
       messageId = (sent as { message_id: number }).message_id;
     } catch (e) {
@@ -796,6 +820,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
         bot.telegram.pinChatMessage(key.chatId, messageId, {
           disable_notification: true,
         }),
+        'status',
       );
     } catch (e) {
       // Most common reason: bot is not admin or lacks `can_pin_messages`.
@@ -835,6 +860,7 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
     try {
       await enqueueSend(key, () =>
         bot.telegram.unpinChatMessage(key.chatId, existingId),
+        'status',
       );
     } catch (e) {
       const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
@@ -843,6 +869,7 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
     try {
       await enqueueSend(key, () =>
         bot.telegram.deleteMessage(key.chatId, existingId),
+        'status',
       );
     } catch {
       // Older than 48h or already deleted — silently ignored.
@@ -898,6 +925,7 @@ async function replyToThread(
   key: ThreadKey,
   text: string,
   extra: SendExtra = {},
+  priority: SendPriority = 'interactive',
 ): Promise<number | null> {
   const sendOnce = (sendExtra: Record<string, unknown>) =>
     enqueueSend(key, () =>
@@ -906,6 +934,7 @@ async function replyToThread(
         text,
         sendExtra as Parameters<typeof bot.telegram.sendMessage>[2],
       ),
+      priority,
     );
 
   try {
@@ -958,6 +987,7 @@ async function editThreadMessage(
   messageId: number,
   text: string,
   extra: SendExtra = {},
+  priority: SendPriority = 'interactive',
 ): Promise<boolean> {
   const editOnce = (editExtra: Record<string, unknown>) =>
     enqueueSend(key, () =>
@@ -965,6 +995,7 @@ async function editThreadMessage(
         key.chatId, messageId, undefined, text,
         editExtra as Parameters<typeof bot.telegram.editMessageText>[4],
       ),
+      priority,
     );
 
   try {
@@ -1005,9 +1036,13 @@ async function editThreadMessage(
   }
 }
 
-async function deleteThreadMessage(key: ThreadKey, messageId: number): Promise<void> {
+async function deleteThreadMessage(
+  key: ThreadKey,
+  messageId: number,
+  priority: SendPriority = 'interactive',
+): Promise<void> {
   try {
-    await enqueueSend(key, () => bot.telegram.deleteMessage(key.chatId, messageId));
+    await enqueueSend(key, () => bot.telegram.deleteMessage(key.chatId, messageId), priority);
   } catch {
     /* messages older than 48h or already deleted — silently ignore */
   }
@@ -1166,7 +1201,7 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
     const rendered = renderAgentHtml(text);
     const shouldSendNew = forceNew || msgState.needsNewMessage || !msgState.lastMessageId;
     if (shouldSendNew) {
-      const id = await replyChunkWithFallback(key, rendered, text);
+      const id = await replyChunkWithFallback(key, rendered, text, 'output');
       if (id) {
         msgState.lastMessageId = id;
         msgState.needsNewMessage = false;
@@ -1176,9 +1211,9 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
     // Try edit; on failure send new.
     const editedOk = await editThreadMessage(key, msgState.lastMessageId!, rendered, {
       parse_mode: 'HTML',
-    });
+    }, 'output');
     if (editedOk) return msgState.lastMessageId;
-    const id = await replyChunkWithFallback(key, rendered, text);
+    const id = await replyChunkWithFallback(key, rendered, text, 'output');
     if (id) {
       msgState.lastMessageId = id;
       msgState.needsNewMessage = false;
@@ -1190,7 +1225,7 @@ async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void
 
   for (let i = 1; i < chunks.length; i++) {
     const rendered = renderAgentHtml(chunks[i]);
-    const id = await replyChunkWithFallback(key, rendered, chunks[i]);
+    const id = await replyChunkWithFallback(key, rendered, chunks[i], 'output');
     if (id) {
       msgState.lastMessageId = id;
       msgState.needsNewMessage = false;
@@ -1206,10 +1241,11 @@ async function replyChunkWithFallback(
   key: ThreadKey,
   renderedHtml: string,
   plainFallback: string,
+  priority: SendPriority = 'interactive',
 ): Promise<number | null> {
-  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' });
+  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' }, priority);
   if (id) return id;
-  return replyToThread(key, plainFallback);
+  return replyToThread(key, plainFallback, {}, priority);
 }
 
 async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
@@ -1225,6 +1261,10 @@ async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
 
 async function deleteStatusMessage(key: ThreadKey): Promise<void> {
   const s = getThreadMessageState(key);
+  // The next status frame will create a *new* message, so the dedup baseline
+  // is stale — clear it, otherwise an identical-text frame after a delete
+  // would be wrongly skipped and the fresh status message never appear.
+  getStatusCoalesceState(key).lastSentText = null;
   if (s.statusMessageId === null) return;
   const id = s.statusMessageId;
   s.statusMessageId = null;
@@ -3829,7 +3869,11 @@ function handleAgentStatus(key: ThreadKey, status: string): void {
 
   const c = getStatusCoalesceState(key);
   c.pendingText = status;
-  if (!c.inFlight) {
+  // Don't start a flush while one is already running OR while a deferred
+  // retry is armed for a 429 cooldown — in both cases the newest
+  // `pendingText` is picked up by the running loop / the armed timer, and a
+  // fresh flush would only re-defer and try to arm a second timer.
+  if (!c.inFlight && !c.deferRetryTimer) {
     void flushStatusCoalescer(key);
   }
 }
@@ -3838,15 +3882,20 @@ function handleAgentStatus(key: ThreadKey, status: string): void {
  * @description Drain the per-thread status coalescer.
  *
  * Loops while `pendingText` keeps being refreshed by new `handleAgentStatus`
- * calls. Each iteration consumes the *current* `pendingText` and sends it,
- * so:
+ * calls. Each iteration consults {@link getStatusFlushAction} for the current
+ * `pendingText`, so:
  *
  *  - intermediate frames that arrive during a send are dropped (the loop
  *    only sees the latest one on its next iteration);
  *  - at most one send per thread is in flight at any time, regardless of
  *    how fast Claude's poller emits new frames;
  *  - if `handleAgentOutput` clears `pendingText`, the loop exits cleanly
- *    on the next iteration without queueing a stale edit.
+ *    on the next iteration without queueing a stale edit;
+ *  - an identical frame is skipped (no `400 "message is not modified"`);
+ *  - while the chat is in a 429 cooldown the loop *defers*: it stops sending
+ *    disposable spinner frames (which would burn the budget interactive
+ *    replies and real output need) and re-arms once after the cooldown so the
+ *    newest frame still shows.
  */
 async function flushStatusCoalescer(key: ThreadKey): Promise<void> {
   const c = getStatusCoalesceState(key);
@@ -3855,8 +3904,26 @@ async function flushStatusCoalescer(key: ThreadKey): Promise<void> {
   try {
     while (c.pendingText !== null) {
       const text = c.pendingText;
+      const action = getStatusFlushAction({
+        nextText: text,
+        lastSentText: c.lastSentText,
+        isRateLimited: checkIsRateLimited(key.chatId),
+      });
+
+      if (action === 'defer') {
+        // Leave the newest frame in `pendingText`; resume once after the
+        // cooldown lifts. Arm at most one timer — new events meanwhile only
+        // refresh `pendingText` (see `handleAgentStatus`).
+        armStatusDeferRetry(key, c);
+        break;
+      }
+
+      // Consume the frame for both `send` and `skip`.
       c.pendingText = null;
-      await sendStatusFrame(key, text);
+      if (action === 'skip') continue;
+
+      const sent = await sendStatusFrame(key, text);
+      if (sent) c.lastSentText = text;
     }
   } finally {
     c.inFlight = false;
@@ -3864,37 +3931,58 @@ async function flushStatusCoalescer(key: ThreadKey): Promise<void> {
 }
 
 /**
+ * @description Arm a one-shot timer to resume a status flush deferred during
+ * a 429 cooldown. Idempotent: if a retry is already armed, does nothing (the
+ * newest `pendingText` will be picked up when it fires).
+ */
+function armStatusDeferRetry(key: ThreadKey, c: StatusCoalesceState): void {
+  if (c.deferRetryTimer) return;
+  const waitMs = getRateLimitRemainingMs(key.chatId) + STATUS_COOLDOWN_RETRY_SLACK_MS;
+  c.deferRetryTimer = setTimeout(() => {
+    c.deferRetryTimer = null;
+    void flushStatusCoalescer(key);
+  }, waitMs);
+}
+
+/**
  * @description Edit (or create) the thread's transient status message
  * with `status`. Lifted out of the old `handleAgentStatus` body so the
  * coalescer loop can call it once per latest-frame, instead of one
  * IIFE per incoming event.
+ *
+ * Returns `true` if the (first chunk of the) frame reached Telegram, so the
+ * coalescer can record it as `lastSentText` and skip a redundant re-send.
  */
-async function sendStatusFrame(key: ThreadKey, status: string): Promise<void> {
+async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean> {
   const msgState = getThreadMessageState(key);
   const chunks = splitMessage(status);
+  let landed = false;
   try {
     const firstRendered = renderAgentHtml(chunks[0]);
     if (msgState.statusMessageId) {
       const ok = await editThreadMessage(key, msgState.statusMessageId, firstRendered, {
         parse_mode: 'HTML',
-      });
-      if (!ok) {
+      }, 'status');
+      if (ok) {
+        landed = true;
+      } else {
         msgState.statusMessageId = null;
-        const id = await replyChunkWithFallback(key, firstRendered, chunks[0]);
-        if (id) msgState.statusMessageId = id;
+        const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
+        if (id) { msgState.statusMessageId = id; landed = true; }
       }
     } else {
-      const id = await replyChunkWithFallback(key, firstRendered, chunks[0]);
-      if (id) msgState.statusMessageId = id;
+      const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
+      if (id) { msgState.statusMessageId = id; landed = true; }
     }
     for (let i = 1; i < chunks.length; i++) {
       const rendered = renderAgentHtml(chunks[i]);
-      const id = await replyChunkWithFallback(key, rendered, chunks[i]);
+      const id = await replyChunkWithFallback(key, rendered, chunks[i], 'status');
       if (id) msgState.statusMessageId = id;
     }
   } catch (err) {
     console.error('[sendStatusFrame] Failed:', err);
   }
+  return landed;
 }
 
 function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuestion): void {

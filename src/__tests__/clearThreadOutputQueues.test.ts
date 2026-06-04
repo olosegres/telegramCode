@@ -37,6 +37,26 @@ describe('clearThreadOutputQueues', () => {
     assert.equal(timerFired, false, 'cancelled debounce timer must never fire');
   });
 
+  it('cancels the status defer-retry timer so it never fires after stop', async () => {
+    let retryFired = false;
+    const coalescer: ClearableStatusCoalescer = {
+      pendingText: 'Thinking… deferred during a 429 cooldown',
+      // A real armed timer mirroring the cooldown-defer retry: if the clear
+      // does NOT cancel it, it fires into a stopped session.
+      deferRetryTimer: setTimeout(() => {
+        retryFired = true;
+      }, 10),
+    };
+
+    clearThreadOutputQueues(undefined, coalescer);
+
+    assert.equal(coalescer.pendingText, null, 'status pendingText must be dropped');
+    assert.equal(coalescer.deferRetryTimer, null, 'defer-retry timer handle must be nulled');
+
+    await delay(30);
+    assert.equal(retryFired, false, 'cancelled defer-retry timer must never fire');
+  });
+
   it('is a no-op on an already-empty queue and coalescer', () => {
     const queue: ClearableOutputQueue = { pendingOutput: null, debounceTimer: null };
     const coalescer: ClearableStatusCoalescer = { pendingText: null };

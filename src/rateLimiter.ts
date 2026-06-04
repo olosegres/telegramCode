@@ -272,6 +272,36 @@ interface TelegramErrorLike {
   };
 }
 
+/**
+ * @name RateLimitedError
+ * @description Thrown by {@link withRateLimitRetry} when a send still gets a
+ * 429 *after* the single retry. Carries the chat id and the remaining
+ * cooldown so a caller that owns recoverable content (interactive command
+ * replies) can schedule ONE redelivery after the cooldown instead of
+ * dropping the message permanently (B14).
+ *
+ * The original Telegram error payload is preserved on `response` so the
+ * existing classifier helpers (`checkIsApiError`, `getErrorCode`,
+ * `getErrorDescription`) keep working unchanged on this error.
+ */
+export class RateLimitedError extends Error {
+  readonly response?: TelegramErrorLike['response'];
+
+  constructor(
+    readonly chatId: number,
+    readonly retryAfterMs: number,
+    original?: TelegramErrorLike,
+  ) {
+    super(`Telegram rate limit on chat ${chatId}, cooldown ${Math.ceil(retryAfterMs / 1000)}s`);
+    this.name = 'RateLimitedError';
+    this.response = original?.response;
+  }
+}
+
+export function checkIsRateLimitedError(err: unknown): err is RateLimitedError {
+  return err instanceof RateLimitedError;
+}
+
 function checkIsTelegramRateLimitError(err: unknown): err is TelegramErrorLike {
   if (typeof err !== 'object' || err === null) return false;
   const e = err as TelegramErrorLike;
@@ -329,6 +359,11 @@ export async function withRateLimitRetry<T>(
         const secondWaitMs = getRetryAfterMs(retryErr);
         state.blockedUntil = Date.now() + secondWaitMs;
         console.error(`[RateLimit] chat ${chatId} still 429 after retry, blocked for ${Math.ceil(secondWaitMs / 1000)}s`);
+        // Surface a typed error so a content-owning caller (interactive
+        // replies) can decide to redeliver once after the cooldown instead
+        // of dropping the message (B14). Cooldown is already set above so
+        // the redelivery waits before re-hitting the API.
+        throw new RateLimitedError(chatId, secondWaitMs, retryErr);
       }
       throw retryErr;
     }

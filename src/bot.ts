@@ -34,8 +34,10 @@ import {
   enqueueSend,
   checkIsRateLimited,
   getRateLimitRemainingMs,
+  checkIsRateLimitedError,
   type SendPriority,
 } from './rateLimiter';
+import { scheduleRedelivery } from './redeliverDecision';
 import {
   stopOpenCodeServer,
   ensureOpenCodeServer,
@@ -257,11 +259,12 @@ bot.use(async (ctx, next) => {
 const OUTPUT_DEBOUNCE_MS = 1000;
 
 /**
- * Small slack added on top of the remaining 429 cooldown before the status
- * coalescer retries a deferred frame, so the re-flush fires *after* the
- * cooldown has actually lifted rather than racing its boundary.
+ * Small slack added on top of the remaining 429 cooldown before a deferred
+ * send is retried, so the retry fires *after* the cooldown has actually
+ * lifted rather than racing its boundary. Shared by the status coalescer's
+ * deferred-frame retry and the B14 interactive-reply redelivery.
  */
-const STATUS_COOLDOWN_RETRY_SLACK_MS = 250;
+const COOLDOWN_RETRY_SLACK_MS = 250;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  State store — singleton populated in startBot(), referenced by handlers
@@ -966,7 +969,19 @@ async function replyToThread(
   text: string,
   extra: SendExtra = {},
   priority: SendPriority = 'interactive',
+  /**
+   * Internal guard against an infinite redelivery loop. The B14 cooldown
+   * redelivery (see below) calls back into `replyToThread` once with this
+   * set to `false` so a second double-429 just drops instead of requeueing
+   * forever. Callers never pass this.
+   */
+  allowRedeliver = true,
 ): Promise<number | null> {
+  // Snapshot binding presence now so the eventual redelivery can tell a
+  // fresh (still-unbound) folder-picker thread apart from one the user
+  // unbound / deleted between this send and the cooldown (B14).
+  const hadBindingAtSend = state.getBinding(key) !== null;
+
   const sendOnce = (sendExtra: Record<string, unknown>) =>
     enqueueSend(key, () =>
       bot.telegram.sendMessage(
@@ -1010,9 +1025,50 @@ async function replyToThread(
         return null;
       }
     }
+
+    // B14: a double-429 (rate-limited even after the single retry) would
+    // otherwise drop an interactive reply permanently (live: the `/bind`
+    // folder list that never arrived). For interactive content, schedule ONE
+    // redelivery after the cooldown instead of dropping. Bounded — the
+    // requeued send passes `allowRedeliver = false`, so a second double-429
+    // drops normally with no loop. The requeue goes back through
+    // `replyToThread` → `enqueueSend`, so FIFO / bucket / blockedUntil are
+    // all respected. Edits/deletes don't reach here (only fresh sends).
+    if (allowRedeliver && checkIsRateLimitedError(e)) {
+      scheduleInteractiveRedelivery(key, text, extra, priority, hadBindingAtSend);
+      return null;
+    }
+
     await handleSendError(key, e);
     return null;
   }
+}
+
+/**
+ * @description Schedule the single B14 redelivery of a rate-limited
+ * interactive reply, fired once the chat's 429 cooldown has lifted.
+ *
+ * Wires the real clock / timer / binding-read / send into the testable
+ * {@link scheduleRedelivery} orchestration. The redelivery re-enters
+ * `replyToThread` with `allowRedeliver = false` so it can't loop.
+ */
+function scheduleInteractiveRedelivery(
+  key: ThreadKey,
+  text: string,
+  extra: SendExtra,
+  priority: SendPriority,
+  hadBindingAtSend: boolean,
+): void {
+  console.warn(
+    `[send] ${keyToString(key)} interactive reply hit double-429; redelivery scheduled after cooldown`,
+  );
+  scheduleRedelivery(priority, hadBindingAtSend, COOLDOWN_RETRY_SLACK_MS, {
+    getRemainingCooldownMs: () => getRateLimitRemainingMs(key.chatId),
+    scheduleAfter: (fn, ms) => { setTimeout(fn, ms); },
+    getBindingNow: () => state.getBinding(key),
+    redeliver: () => { void replyToThread(key, text, extra, priority, false); },
+    onSkip: reason => console.log(`[send] ${keyToString(key)} skipping redelivery — ${reason}`),
+  });
 }
 
 /**
@@ -4058,7 +4114,7 @@ async function flushStatusCoalescer(key: ThreadKey): Promise<void> {
  */
 function armStatusDeferRetry(key: ThreadKey, c: StatusCoalesceState): void {
   if (c.deferRetryTimer) return;
-  const waitMs = getRateLimitRemainingMs(key.chatId) + STATUS_COOLDOWN_RETRY_SLACK_MS;
+  const waitMs = getRateLimitRemainingMs(key.chatId) + COOLDOWN_RETRY_SLACK_MS;
   c.deferRetryTimer = setTimeout(() => {
     c.deferRetryTimer = null;
     void flushStatusCoalescer(key);

@@ -27,12 +27,16 @@ import {
   withRateLimitRetry,
   checkIsRateLimited,
   getRateLimitRemainingMs,
+  checkIsRateLimitedError,
+  RateLimitedError,
   TokenBucket,
   rateLimiterConstants,
   type BucketClock,
   type SendPriority,
 } from '../rateLimiter';
+import { scheduleRedelivery } from '../redeliverDecision';
 import type { ThreadKey } from '../types';
+import type { BindingData } from '../state';
 
 const k = (chatId: number, threadId: number): ThreadKey => ({ chatId, threadId });
 
@@ -216,7 +220,7 @@ test('R7: withRateLimitRetry retries once on 429 then succeeds', async () => {
   assert.equal(checkIsRateLimited(chatId), false);
 });
 
-test('R7: withRateLimitRetry surfaces a second 429 and leaves cooldown set', async () => {
+test('R7: withRateLimitRetry surfaces a second 429 as a typed RateLimitedError and leaves cooldown set', async () => {
   const chatId = 7004;
   let calls = 0;
   const fakeError = {
@@ -229,15 +233,149 @@ test('R7: withRateLimitRetry surfaces a second 429 and leaves cooldown set', asy
       throw fakeError;
     }),
     (e: unknown) => {
-      // The thrown error is the same shape we passed in (or a wrapper);
-      // we only care that the retry happened and the cooldown is set.
-      return e !== null;
+      // B14: the double-429 must surface as a typed RateLimitedError so a
+      // content-owning caller can detect it and redeliver. It must carry the
+      // chat id and a positive cooldown.
+      assert.ok(checkIsRateLimitedError(e), 'must be a RateLimitedError');
+      const rle = e as RateLimitedError;
+      assert.equal(rle.chatId, chatId);
+      assert.ok(rle.retryAfterMs > 0, 'retryAfterMs must be positive');
+      return true;
     },
   );
 
   assert.equal(calls, 2, 'must attempt twice');
   assert.equal(checkIsRateLimited(chatId), true, 'cooldown must be active');
   assert.ok(getRateLimitRemainingMs(chatId) > 0, 'remaining ms must be positive');
+});
+
+// ── B14: redelivery of a rate-limited interactive reply ────────────────────
+
+const binding = (closed = false): BindingData => ({
+  subdir: 'proj',
+  createdAt: '2026-06-04T00:00:00.000Z',
+  ...(closed ? { closed } : {}),
+});
+
+/**
+ * A manual timer so the redelivery's scheduled tick fires deterministically
+ * under the test's control instead of waiting wall-clock.
+ */
+function createManualTimer() {
+  const pending: Array<{ fn: () => void; ms: number }> = [];
+  return {
+    scheduleAfter: (fn: () => void, ms: number) => { pending.push({ fn, ms }); },
+    fireAll: () => { const due = pending.splice(0); for (const t of due) t.fn(); },
+    count: () => pending.length,
+    lastDelay: () => pending[pending.length - 1]?.ms,
+  };
+}
+
+test('B14: bucket drained + chat blocked → double-429 → interactive reply redelivered exactly once after cooldown', async () => {
+  const chatId = 7100;
+  const key = k(chatId, 1);
+  const fakeError = { response: { error_code: 429, parameters: { retry_after: 1 } } };
+
+  // Drain the bucket so the original send is also bucket-paced, mirroring the
+  // live "flooded topic" precondition.
+  const burst = Array.from({ length: rateLimiterConstants.bucketCapacity }, (_, i) => i);
+  await Promise.all(burst.map(() => enqueueSend(key, async () => 'warm')));
+
+  // Original interactive send: both attempts 429 → withRateLimitRetry throws
+  // a typed RateLimitedError and arms the cooldown.
+  let sendAttempts = 0;
+  await assert.rejects(
+    () => withRateLimitRetry(chatId, async () => {
+      sendAttempts += 1;
+      throw fakeError;
+    }),
+    (e: unknown) => checkIsRateLimitedError(e),
+  );
+  assert.equal(sendAttempts, 2, 'original send tried twice (first + retry)');
+  assert.ok(getRateLimitRemainingMs(chatId) > 0, 'cooldown must be armed after double-429');
+
+  // Now drive the redelivery orchestration the bot wires up. The redelivery
+  // must fire after the cooldown and deliver the content exactly once.
+  const timer = createManualTimer();
+  let delivered = 0;
+  const slackMs = 250;
+  scheduleRedelivery('interactive', /* hadBindingAtSend */ true, slackMs, {
+    getRemainingCooldownMs: () => getRateLimitRemainingMs(chatId),
+    scheduleAfter: timer.scheduleAfter,
+    getBindingNow: () => binding(),
+    redeliver: () => { delivered += 1; },
+  });
+
+  // The scheduled wait must be the remaining cooldown plus slack — proving it
+  // defers past the cooldown boundary, not fires immediately.
+  assert.ok(
+    (timer.lastDelay() ?? 0) >= slackMs,
+    `redelivery wait ${timer.lastDelay()}ms must include cooldown + slack`,
+  );
+  assert.equal(delivered, 0, 'nothing delivered before the cooldown tick');
+
+  timer.fireAll();
+  assert.equal(delivered, 1, 'redelivered exactly once after the cooldown');
+
+  // Bounded: firing again does not re-deliver (the timer is one-shot).
+  timer.fireAll();
+  assert.equal(delivered, 1, 'no second redelivery — bounded to one requeue');
+});
+
+test('B14: no redelivery for output/status priority classes (disposable content)', () => {
+  for (const priority of ['output', 'status'] as const) {
+    const timer = createManualTimer();
+    let delivered = 0;
+    scheduleRedelivery(priority, true, 250, {
+      getRemainingCooldownMs: () => 1000,
+      scheduleAfter: timer.scheduleAfter,
+      getBindingNow: () => binding(),
+      redeliver: () => { delivered += 1; },
+    });
+    timer.fireAll();
+    assert.equal(delivered, 0, `${priority} must never be redelivered`);
+  }
+});
+
+test('B14: no redelivery when the thread was unbound between send and cooldown', () => {
+  const timer = createManualTimer();
+  let delivered = 0;
+  // Had a binding at send time, but it is gone now → torn down → skip.
+  scheduleRedelivery('interactive', /* hadBindingAtSend */ true, 250, {
+    getRemainingCooldownMs: () => 1000,
+    scheduleAfter: timer.scheduleAfter,
+    getBindingNow: () => null,
+    redeliver: () => { delivered += 1; },
+  });
+  timer.fireAll();
+  assert.equal(delivered, 0, 'must not redeliver into an unbound/torn-down thread');
+});
+
+test('B14: redelivers a still-unbound fresh folder-picker thread (no binding at send, still none)', () => {
+  const timer = createManualTimer();
+  let delivered = 0;
+  // The live repro: bare /bind folder list on a thread with no binding yet.
+  scheduleRedelivery('interactive', /* hadBindingAtSend */ false, 250, {
+    getRemainingCooldownMs: () => 1000,
+    scheduleAfter: timer.scheduleAfter,
+    getBindingNow: () => null,
+    redeliver: () => { delivered += 1; },
+  });
+  timer.fireAll();
+  assert.equal(delivered, 1, 'fresh folder-picker thread is a valid redelivery target');
+});
+
+test('B14: no redelivery into a closed topic', () => {
+  const timer = createManualTimer();
+  let delivered = 0;
+  scheduleRedelivery('interactive', true, 250, {
+    getRemainingCooldownMs: () => 1000,
+    scheduleAfter: timer.scheduleAfter,
+    getBindingNow: () => binding(/* closed */ true),
+    redeliver: () => { delivered += 1; },
+  });
+  timer.fireAll();
+  assert.equal(delivered, 0, 'must not redeliver into a closed topic');
 });
 
 test('R7: non-429 errors propagate without retry', async () => {

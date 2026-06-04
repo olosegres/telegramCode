@@ -12,10 +12,10 @@ test('OpenCode SSE: accepts direct /event envelope', () => {
   );
 });
 
-test('OpenCode SSE: unwraps /global/event payload envelope', () => {
+test('OpenCode SSE: unwraps /global/event payload envelope and keeps the instance directory', () => {
   assert.deepEqual(
     normaliseOpenCodeSseEvent({
-      directory: 'global',
+      directory: '/home/user/src/someProject',
       project: 'abc',
       payload: {
         id: 'evt_1',
@@ -26,8 +26,20 @@ test('OpenCode SSE: unwraps /global/event payload envelope', () => {
     {
       type: 'message.updated',
       properties: { info: { sessionID: 'ses_1', role: 'assistant' } },
+      // The envelope's directory names the owning project instance — replies
+      // to instance-local requests (questions/permissions) must carry it.
+      directory: '/home/user/src/someProject',
     },
   );
+});
+
+test('OpenCode SSE: direct /event envelope has no directory field', () => {
+  const normalised = normaliseOpenCodeSseEvent({
+    type: 'question.asked',
+    properties: { id: 'que_1', sessionID: 'ses_1', questions: [] },
+  });
+  assert.ok(normalised);
+  assert.equal('directory' in normalised, false);
 });
 
 test('OpenCode SSE: invalid envelopes are ignored', () => {

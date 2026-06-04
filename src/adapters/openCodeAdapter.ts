@@ -249,6 +249,16 @@ interface OpenCodeApiSession {
 interface OpenCodeSseEvent {
   type: string;
   properties: Record<string, unknown>;
+  /**
+   * Owning project-instance directory from the `/global/event` envelope
+   * (`{ directory, payload }`). The server multiplexes one PROJECT INSTANCE
+   * per directory, and instance-local state (pending questions, permissions)
+   * is only reachable when the request selects that instance via
+   * `?directory=` — a reply sent without it lands in the serve-cwd default
+   * instance and 404s (`QuestionNotFoundError`). Absent on the bare
+   * `/event` shape, which is instance-local by construction.
+   */
+  directory?: string;
 }
 
 /**
@@ -267,7 +277,24 @@ export function normaliseOpenCodeSseEvent(raw: unknown): OpenCodeSseEvent | null
   const properties = event.properties && typeof event.properties === 'object'
     ? event.properties as Record<string, unknown>
     : {};
-  return { type: event.type, properties };
+  const directory = typeof candidate.directory === 'string' && candidate.directory
+    ? candidate.directory
+    : undefined;
+  return directory !== undefined
+    ? { type: event.type, properties, directory }
+    : { type: event.type, properties };
+}
+
+/**
+ * @description Append the `?directory=` instance selector to an API path when
+ * the owning instance is known. Without it the server resolves its serve-cwd
+ * default instance, whose in-memory state (questions, permissions) does not
+ * contain requests raised in other project instances — the reply then fails
+ * with 404 even though the request is alive in its own instance.
+ */
+export function buildDirectoryScopedPath(basePath: string, directory: string | undefined): string {
+  if (!directory) return basePath;
+  return `${basePath}?directory=${encodeURIComponent(directory)}`;
 }
 
 interface OpenCodePart {
@@ -308,6 +335,12 @@ export interface OpenCodeQuestion {
 export interface OpenCodePendingQuestion {
   requestId: string;
   questions: OpenCodeQuestion[];
+  /**
+   * Project-instance directory that owns the question request (from the
+   * `/global/event` envelope). The reply must select the same instance via
+   * `?directory=` — see {@link buildDirectoryScopedPath}.
+   */
+  directory?: string;
 }
 
 interface OpenCodeMessageInfo {
@@ -2002,11 +2035,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         break;
 
       case 'permission.asked':
-        this.handlePermissionAsked(key, event.properties);
+        this.handlePermissionAsked(key, event.properties, event.directory);
         break;
 
       case 'question.asked':
-        this.handleQuestionAsked(key, event.properties);
+        this.handleQuestionAsked(key, event.properties, event.directory);
         break;
 
       case 'server.connected':
@@ -2412,7 +2445,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     this.emit('output', key, `OpenCode error: ${errorMsg}`);
   }
 
-  private handlePermissionAsked(_key: ThreadKey, properties: Record<string, unknown>): void {
+  private handlePermissionAsked(_key: ThreadKey, properties: Record<string, unknown>, directory?: string): void {
     console.log(`[OpenCode] Permission requested:`, JSON.stringify(properties));
     // Auto-approve all permissions (headless mode). Symmetry with the
     // claude adapter, which always passes `--dangerously-skip-permissions`
@@ -2420,7 +2453,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // — if it ever comes back, this is where it'd hook in.
     const requestId = (properties.requestID || properties.id) as string | undefined;
     if (requestId) {
-      this.apiRequest('POST', `/permission/${requestId}/reply`, {
+      // Permission state is instance-local, like questions: an approve sent
+      // without the owning `?directory=` 404s silently and the agent hangs
+      // on the permission forever.
+      this.apiRequest('POST', buildDirectoryScopedPath(`/permission/${requestId}/reply`, directory), {
         reply: 'always',
       }).catch((e) => {
         console.error(`[OpenCode] Failed to reply to permission:`, e);
@@ -2435,30 +2471,33 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    *
    * Event properties: { id, sessionID, questions: QuestionInfo[], tool? }
    */
-  private handleQuestionAsked(key: ThreadKey, properties: Record<string, unknown>): void {
+  private handleQuestionAsked(key: ThreadKey, properties: Record<string, unknown>, directory?: string): void {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
     const requestId = (properties.requestID || properties.id) as string | undefined;
     const questions = properties.questions as OpenCodeQuestion[] | undefined;
 
-    console.log(`[OpenCode] Question asked (${requestId}):`, JSON.stringify(properties).slice(0, 500));
+    console.log(`[OpenCode] Question asked (${requestId}, instance=${directory ?? 'default'}):`, JSON.stringify(properties).slice(0, 500));
 
     if (!requestId || !questions || questions.length === 0) {
       // No valid question — reply empty to unblock
       if (requestId) {
-        this.apiRequest('POST', `/question/${requestId}/reply`, {
+        this.apiRequest('POST', buildDirectoryScopedPath(`/question/${requestId}/reply`, directory), {
           answers: [['']],
         }).catch((e) => console.error(`[OpenCode] Failed to reply to question:`, e));
       }
       return;
     }
 
-    // Store pending question so we can reply later when user answers
-    session.pendingQuestion = { requestId, questions };
+    // Store pending question so we can reply later when user answers.
+    // `directory` rides along: the reply must target the instance that owns
+    // the request, not the serve-cwd default (QuestionNotFoundError bug —
+    // sessions live in whatever instance was current at their creation).
+    session.pendingQuestion = { requestId, questions, directory };
 
     // Emit question event for the bot to display to user
-    this.emit('question', key, { requestId, questions });
+    this.emit('question', key, session.pendingQuestion);
   }
 
   /**
@@ -2469,12 +2508,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive || !session.pendingQuestion) return;
 
-    const { requestId } = session.pendingQuestion;
+    const { requestId, directory } = session.pendingQuestion;
     session.pendingQuestion = null;
 
     // Audit S15 / #41: surface failures via `error` so the bot's
     // handleAgentError shows them in the thread, not just in console.
-    this.apiRequest('POST', `/question/${requestId}/reply`, {
+    this.apiRequest('POST', buildDirectoryScopedPath(`/question/${requestId}/reply`, directory), {
       answers,
     }).catch((e) => {
       console.error(`[OpenCode] Failed to reply to question:`, e);

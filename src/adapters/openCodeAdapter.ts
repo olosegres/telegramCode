@@ -1446,10 +1446,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         return;
       }
     } catch (e) {
+      // Transient failure (server booting / sick). Do NOT claim "not set":
+      // leave isModelInfoShown false and currentModelLabel untouched so the
+      // next assistant message (handleMessageUpdate) corrects it with the
+      // real model label.
       console.log(`[OpenCode] fetchModelInfo failed:`, e instanceof Error ? e.message : e);
+      return;
     }
 
-    // 3. No model resolved
+    // 3. Server answered but reported no default model — genuinely not set.
     console.log(`[OpenCode] No default model resolved`);
     session.currentModelLabel = 'not set';
     this.emit('output', key, `Model: not set (use /model to select)`);

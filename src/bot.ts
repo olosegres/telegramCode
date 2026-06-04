@@ -276,6 +276,13 @@ interface ThreadMessageState {
   needsNewMessage: boolean;
   /** Loader (⏳) message id — deleted when the first real output arrives. */
   loaderMessageId: number | null;
+  /**
+   * True once output superseded the loader. The loader send is fire-and-forget
+   * (it can stall behind a chat-wide 429 cooldown), so the agent's reply can
+   * land BEFORE the loader's own send resolves; this flag tells the late
+   * loader to delete itself on arrival instead of sticking under the answer.
+   */
+  loaderObsolete: boolean;
   /** Transient status/spinner message id — replaced by permanent text. */
   statusMessageId: number | null;
 }
@@ -379,7 +386,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, needsNewMessage: true, loaderMessageId: null, statusMessageId: null };
+    s = { lastMessageId: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -1193,6 +1200,9 @@ async function replyChunkWithFallback(
 
 async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
   const s = getThreadMessageState(key);
+  // Mark even when no id is stored yet: an in-flight loader send (stalled in
+  // the rate-limit queue) checks this flag on arrival and self-deletes.
+  s.loaderObsolete = true;
   if (s.loaderMessageId === null) return;
   const id = s.loaderMessageId;
   s.loaderMessageId = null;
@@ -1599,8 +1609,23 @@ async function forwardPromptToAgent(
   text: string,
 ): Promise<void> {
   markNeedsNewMessage(key);
-  const loaderId = await replyToThread(key, '⏳');
-  if (loaderId) getThreadMessageState(key).loaderMessageId = loaderId;
+  const msgState = getThreadMessageState(key);
+  msgState.loaderObsolete = false;
+  // Deliberately NOT awaited (B6): during a chat-wide 429 cooldown this send
+  // can stall for tens of seconds, and the prompt's local tmux/HTTP delivery
+  // must never wait on Telegram send capacity. If the agent's reply lands
+  // first, `deleteLoaderMessage` flips `loaderObsolete` and the late ⏳
+  // deletes itself on arrival instead of sticking under the answer.
+  void replyToThread(key, '⏳')
+    .then((loaderId) => {
+      if (!loaderId) return;
+      if (msgState.loaderObsolete) {
+        void deleteThreadMessage(key, loaderId).catch(() => {});
+        return;
+      }
+      msgState.loaderMessageId = loaderId;
+    })
+    .catch(() => {});
   if (adapter.interruptAndWaitIdle) {
     await adapter.interruptAndWaitIdle(key);
   }

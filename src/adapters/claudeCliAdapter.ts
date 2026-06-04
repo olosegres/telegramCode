@@ -1303,13 +1303,26 @@ export function checkIsClaudeBusy(paneText: string): boolean {
 }
 
 /**
+ * @description Markers that a frame carries real agent content (a tool header
+ * `●`, a tool-result `⎿`, or a ``` ``` ``` code fence). Their presence vetoes
+ * the input-echo classification in {@link checkIsInputEchoFrame}.
+ */
+const CONTENT_MARKER_RE = /^(?:●|⎿|```)/;
+
+/**
  * @description Whether a cleaned output frame is nothing but the TUI input box
  * echoing typed text (`❯ <draft>`). The poll can catch the input row between
  * the literal-text keystrokes and the deferred submit Enter (B5 window), and
  * that draft echo is pure noise in Telegram — the user already sees their own
- * message (B7). Only frames made ENTIRELY of ❯-rows match: a ❯ inside real
- * tool output (e.g. a pane capture printed by a Bash command) survives
- * because its frame carries other content lines.
+ * message (B7).
+ *
+ * A frame is an echo when its FIRST non-empty line starts with `❯` AND no line
+ * carries a content marker (`●`, `⎿`, or a ``` ``` ``` fence). The old
+ * predicate required EVERY line to start with `❯`, but a long draft wraps in
+ * the input box so only the first row carries `❯` and the continuation rows are
+ * plain — those frames leaked into the topic (B7b). Anchoring on the first line
+ * + a content-marker veto keeps a `❯` inside real tool output (e.g. a pane
+ * capture printed by a Bash command) classified as content, not an echo.
  */
 export function checkIsInputEchoFrame(frameText: string): boolean {
   const contentLines = frameText
@@ -1317,7 +1330,8 @@ export function checkIsInputEchoFrame(frameText: string): boolean {
     .map((line) => line.trim())
     .filter(Boolean);
   if (contentLines.length === 0) return false;
-  return contentLines.every((line) => line.startsWith('❯'));
+  if (!contentLines[0].startsWith('❯')) return false;
+  return !contentLines.some((line) => CONTENT_MARKER_RE.test(line));
 }
 
 /**
@@ -1455,6 +1469,22 @@ function normalizeForComparison(line: string): string {
  * is flushed only right before the next emitted new line, so leading/trailing
  * blanks and blanks adjacent to suppressed (duplicate) lines never leak out.
  *
+ * Suppression is by SET membership, not multiset count (B10): a line that
+ * appeared in `oldContent` at all is suppressed for EVERY occurrence in
+ * `newContent`, not just the first `oldCount` of them. Why: typing a draft
+ * that wraps to several rows grows Claude's input box; the viewport is fixed
+ * height, so the transcript scrolls and tmux re-renders the lines straddling
+ * the scrollback↔visible boundary twice in one capture. The old multiset diff
+ * suppressed only as many copies as `oldContent` held, so the extra copy of an
+ * already-sent answer line counted as new and was re-emitted (a chunk of the
+ * previous answer reappeared before the next turn). Set membership errs toward
+ * DROPPING such a re-render duplicate — the locked tradeoff, since a re-send is
+ * the user-visible bug while a genuinely-new line that merely repeats an
+ * earlier transcript line is a rare, low-cost loss. (Note: `lastContent`
+ * advances to the full pane on every change in `pollOutput`, NOT only on emit,
+ * so a suppressed line does NOT self-heal next poll — hence we suppress only
+ * lines that were truly already present.)
+ *
  * Exported + pure so the diff is unit-testable without booting tmux.
  */
 export function getNewPaneContent(oldContent: string, newContent: string): string {
@@ -1464,16 +1494,13 @@ export function getNewPaneContent(oldContent: string, newContent: string): strin
   const oldLines = oldContent.split('\n');
   const newLines = newContent.split('\n');
 
-  const oldLineCounts = new Map<string, number>();
+  const oldLineSet = new Set<string>();
   for (const line of oldLines) {
     const normalized = normalizeForComparison(line);
-    if (normalized) {
-      oldLineCounts.set(normalized, (oldLineCounts.get(normalized) || 0) + 1);
-    }
+    if (normalized) oldLineSet.add(normalized);
   }
 
   const newParts: string[] = [];
-  const usedOldLines = new Map<string, number>();
   let pendingBlank = false;
 
   for (const line of newLines) {
@@ -1483,15 +1510,13 @@ export function getNewPaneContent(oldContent: string, newContent: string): strin
       continue;
     }
 
-    const oldCount = oldLineCounts.get(normalized) || 0;
-    const usedCount = usedOldLines.get(normalized) || 0;
-
-    if (usedCount < oldCount) {
-      usedOldLines.set(normalized, usedCount + 1);
-    } else {
-      if (pendingBlank && newParts.length > 0) newParts.push('');
-      newParts.push(line);
+    if (oldLineSet.has(normalized)) {
+      pendingBlank = false;
+      continue;
     }
+
+    if (pendingBlank && newParts.length > 0) newParts.push('');
+    newParts.push(line);
     pendingBlank = false;
   }
 

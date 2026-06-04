@@ -417,3 +417,25 @@ test('checkIsInputEchoFrame: ordinary answer text is NOT an echo frame', () => {
 test('checkIsInputEchoFrame: empty/whitespace-only frame is NOT an echo (already filtered upstream)', () => {
   assert.equal(checkIsInputEchoFrame('   \n  '), false);
 });
+
+// ─── B7b — wrapped multi-row draft (only first row carries ❯) is an echo ────
+
+test('checkIsInputEchoFrame: a wrapped multi-row draft is an echo (live 13:59:12 fixture)', () => {
+  // A long draft wraps in the input box: only the FIRST row carries ❯, the
+  // continuation rows are plain. The old all-lines-❯ predicate missed it, so
+  // the 322-char draft leaked into the topic as a ghost message. New predicate:
+  // first non-empty line starts with ❯ AND no line carries a content marker.
+  const input = [
+    '❯ А ещё меня смущает, что знания разложены по слоям — от кросс-',
+    '  проектных правил до локального состояния агента, и я не уверен',
+    '  что это лучшая структура для нашего случая',
+  ].join('\n');
+  assert.equal(checkIsInputEchoFrame(input), true);
+});
+
+test('checkIsInputEchoFrame: frame with a ❯ first line but a ● tool line later is NOT an echo', () => {
+  // The first non-empty line starts with ❯ but a later line carries a content
+  // marker (●) — real agent output, must NOT be classified as a pure echo.
+  const input = '❯ fix the bug\n  in file x\n● Done, fixed it.';
+  assert.equal(checkIsInputEchoFrame(input), false);
+});

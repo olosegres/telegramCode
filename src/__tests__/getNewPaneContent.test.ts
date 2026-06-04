@@ -64,3 +64,43 @@ test('getNewPaneContent: a redrawn tool line with a changed glyph is deduped', (
   // genuinely new line is.
   assert.equal(getNewPaneContent('● Done', '✓ Done\nNew line'), 'New line');
 });
+
+// ─── B10 — already-sent answer re-emitted when a wrapped draft grows the box ──
+
+test('getNewPaneContent: an already-sent line duplicated in the new pane is NOT re-emitted (B10)', () => {
+  // Live trace (2026-06-04 13:57:54): a chunk of the previous, already-relayed
+  // answer ("*Знания* *разложены* *по* *слоям*…") was re-emitted as fresh
+  // output while the user typed a long wrapped draft. Mechanism: typing a draft
+  // that wraps to several rows grows the input box; the viewport is fixed
+  // height, so the transcript scrolls and tmux re-renders the lines straddling
+  // the scrollback↔visible boundary TWICE in one capture. The previous
+  // multiset diff suppressed only as many occurrences as `oldContent` had, so
+  // the SECOND copy of the answer line counted as new and was re-sent.
+  //
+  // Observed transition: oldContent has the answer line ONCE (count 1); the new
+  // capture shows it TWICE (count 2) plus the genuinely-new ❯ draft row. The
+  // load-bearing assertion: the answer line (count 2 > 1) must NOT leak — only
+  // the never-before-seen draft row is new.
+  const answerLine =
+    '● *Знания* *разложены* *по* *слоям* — от кросс-проектных правил до локального';
+  const oldContent = [answerLine, '  состояния агента.', '', '❯'].join('\n');
+  const newContent = [
+    answerLine,
+    '  состояния агента.',
+    answerLine, // re-rendered duplicate straddling the scroll boundary
+    '  состояния агента.',
+    '',
+    '❯ А ещё меня смущает',
+  ].join('\n');
+  assert.equal(getNewPaneContent(oldContent, newContent), '❯ А ещё меня смущает');
+});
+
+test('getNewPaneContent: scrollback growth still emits genuinely-new bottom lines', () => {
+  // Guard the B10 fix against over-suppression: when real new output appears at
+  // the bottom while older content scrolls up, the new lines (absent from
+  // oldContent) must still be emitted. Only lines that were ALREADY present are
+  // suppressed.
+  const oldContent = ['line A', 'line B', 'line C'].join('\n');
+  const newContent = ['line B', 'line C', 'line D', 'line E'].join('\n');
+  assert.equal(getNewPaneContent(oldContent, newContent), 'line D\nline E');
+});

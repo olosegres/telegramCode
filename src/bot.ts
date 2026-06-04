@@ -1954,12 +1954,19 @@ command('bind', async (ctx, key) => {
   const parts = ctx.message.text.trim().split(/\s+/).slice(1);
   const arg = parts.join(' ');
   if (!arg) {
+    // Show where the topic points now, so the picker message itself answers
+    // "what am I bound to?" without a separate /where.
+    const binding = state.getBinding(key);
+    const currentLine = binding
+      ? t('bind.current', { subdir: binding.subdir })
+      : t('bind.current_none');
+    const usage = `${currentLine}\n\n${t('bind.usage')}`;
     const subdirs = listAvailableSubdirs(ENV.workRoot);
     if (subdirs.length === 0) {
-      await replyToThread(key, t('bind.usage'));
+      await replyToThread(key, usage);
       return;
     }
-    await replyToThread(key, t('bind.usage'), buildBindKeyboard(subdirs));
+    await replyToThread(key, usage, buildBindKeyboard(subdirs));
     return;
   }
   const result = await applyBinding(key, arg);

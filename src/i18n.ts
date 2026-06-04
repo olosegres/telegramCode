@@ -62,6 +62,8 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── /bind validation errors ──
     'bind.usage': 'Использование: /bind <subdir>\nПример: /bind overview',
+    'bind.current': '📂 Сейчас привязано: `{subdir}`',
+    'bind.current_none': '📂 Пока не привязано',
     'bind.in_general':
       '/bind работает только в тематических тредах, не в General.',
     'bind.invalid_chars': '❌ В имени папки запрещены управляющие символы.',
@@ -323,6 +325,8 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── /bind validation errors ──
     'bind.usage': 'Usage: /bind <subdir>\nExample: /bind overview',
+    'bind.current': '📂 Currently bound: `{subdir}`',
+    'bind.current_none': '📂 Not bound yet',
     'bind.in_general':
       '/bind only works in topical threads, not in General.',
     'bind.invalid_chars': '❌ Folder name must not contain control characters.',

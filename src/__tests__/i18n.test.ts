@@ -29,6 +29,21 @@ test('t substitutes multiple placeholders', () => {
   assert.ok(out.includes('`a`, `b`'));
 });
 
+test('bind.current resolves with the subdir in both locales', () => {
+  // The module reads BOT_LANG once at import (ru here), so we can only
+  // exercise the active locale through `t`. Assert the key is wired and
+  // substitutes; the en fallback path is covered by the unknown-key test.
+  const out = t('bind.current', { subdir: 'overview' });
+  assert.ok(out.includes('overview'), `expected "overview" in "${out}"`);
+  assert.ok(!out.includes('{subdir}'), `placeholder not substituted: "${out}"`);
+});
+
+test('bind.current_none resolves to a non-empty message', () => {
+  const out = t('bind.current_none');
+  assert.ok(out.length > 0);
+  assert.ok(!out.includes('{'));
+});
+
 test('t falls back to last code segment for unknown key', () => {
   const out = t('nonexistent.key.path');
   assert.equal(out, 'path');

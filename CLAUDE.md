@@ -127,6 +127,14 @@ as a command in `bot.ts`.
     `recordedCwd === workDir` (so sessions started by hand on the laptop in
     that folder are resumable too); OpenCode lists server sessions via
     `GET /session` (not folder-filtered).
+    - **OpenCode session naming:** bot-created OpenCode sessions are created
+      WITHOUT a title, so opencode's own LLM auto-titles them from the first
+      prompt (e.g. "Debug broken login flow") instead of the old identical
+      `Telegram session <chatId>:<threadId>` wall. `/opencode <args>` keeps
+      an explicit, never-auto-renamed title. If auto-title never lands the
+      adapter falls back to a ~60-char snippet of the first meaningful (non
+      slash, ≥10-char) raw prompt via `PATCH /session/:id`. See plan
+      `agent/tasks/completed/2026-06-04-opencode-session-autonaming.md`.
 - **Binding & navigation:** `/bind`, `/unbind`, `/where`, `/ls`, `/list`,
   `/new`, `/pair`
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw

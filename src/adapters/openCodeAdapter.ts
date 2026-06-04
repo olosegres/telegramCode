@@ -17,6 +17,12 @@ import {
 } from '../openCodeSessionRouting';
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
+import { stripThreadContextPreamble } from '../threadContextPreamble';
+import {
+  buildSessionTitleSnippet,
+  checkIsMeaningfulPrompt,
+  checkIsPlaceholderTitle,
+} from '../openCodeSessionTitle';
 
 const execAsync = promisify(exec);
 
@@ -214,6 +220,15 @@ interface OpenCodeSession {
    * forever. The watchdog aborts the controller so `pollSse` reconnects.
    */
   sseStallTimer: NodeJS.Timeout | null;
+  /**
+   * Whether this session may still be renamed by the bot-side fallback. Set
+   * `true` only for sessions the bot created WITHOUT explicit `/opencode args`
+   * (those rely on opencode's native auto-title — R1). Cleared on the first
+   * meaningful prompt once the fallback has run (or decided auto-title already
+   * named it), so the bot never overwrites a real name and PATCHes at most
+   * once. Resumed / args-titled sessions start `false` — never auto-renamed.
+   */
+  isAutoNamePending: boolean;
 }
 
 interface OpenCodeApiSession {
@@ -405,6 +420,15 @@ const criticalSseEventTypes = new Set<string>([
   'session.idle',
   'session.error',
 ]);
+
+/**
+ * @description Grace period before the bot-side fallback rename checks whether
+ * opencode's native auto-title has landed. Auto-title is generated as a side
+ * effect of the first prompt's LLM turn; it was observed live to appear within
+ * ~2-3 s. We wait comfortably longer so the fallback only fires when auto-title
+ * genuinely failed — it must never overwrite a real LLM name with a raw snippet.
+ */
+const fallbackRenameGraceMs = 8000;
 
 /** Poll cadence for the in-memory busy flag while waiting for an abort to land. */
 const openCodeInterruptPollMs = 100;
@@ -735,6 +759,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   private authHeader: string | null;
 
   /**
+   * Grace period (ms) the fallback rename waits for opencode's native
+   * auto-title before stepping in. Instance field (initialised from
+   * {@link fallbackRenameGraceMs}) purely so the naming test can drive it to 0
+   * and assert the PATCH path deterministically — production never changes it.
+   */
+  private fallbackRenameGraceMs = fallbackRenameGraceMs;
+
+  /**
    * @description Per-key start/stop serialisation queue (audit S8 / #13).
    * Two near-simultaneous `startSession(key, …)` calls otherwise both
    * progress through `POST /session`; the second's `stopSession(key)`
@@ -996,9 +1028,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[OpenCode] Starting session for ${k} in ${workDir}`);
 
       try {
-        const apiSession = await this.apiRequest<OpenCodeApiSession>('POST', '/session', {
-          title: args || `Telegram session ${k}`,
-        });
+        // R1 (verified live 2026-06-04): a session created WITHOUT a title is
+        // auto-named by opencode from its first prompt's LLM turn — nicer than
+        // a raw snippet and it ignores the glued thread-context preamble. A
+        // session created WITH a title is treated as user-set and NEVER
+        // auto-renamed, which is exactly why the old `Telegram session <k>`
+        // default left every session stuck. So only pass a title for the
+        // explicit `/opencode <args>` case (explicit title, no auto-rename).
+        const createBody: Record<string, unknown> = {};
+        if (args) createBody.title = args;
+        const apiSession = await this.apiRequest<OpenCodeApiSession>('POST', '/session', createBody);
 
         const session: OpenCodeSession = {
           key,
@@ -1022,6 +1061,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           sseController: null,
           reconnectTimer: null,
           sseStallTimer: null,
+          // Only untitled (no-args) sessions are eligible for the bot-side
+          // fallback rename; an explicit `args` title is user-set and final.
+          isAutoNamePending: !args,
         };
 
         this.detachDuplicateSessionOwners(k, session.sessionId);
@@ -1124,6 +1166,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     console.log(`[OpenCode] sendPromptAsync: "${input}"`);
 
+    // Bot-side fallback naming (R1 safety net): on the first MEANINGFUL prompt
+    // of an untitled session, schedule a rename that only fires if opencode's
+    // own auto-title never lands. Uses the RAW user text (preamble stripped) so
+    // a fallback title can never carry the service header. Fire-and-forget — it
+    // must not gate prompt delivery, and a failure leaves the placeholder.
+    this.maybeScheduleFallbackRename(session, input);
+
     // Reset accumulated response text for new message
     session.currentResponseText = '';
     session.lastEmittedLength = 0;
@@ -1145,6 +1194,47 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         if (current) current.isBusy = false;
         console.error(`[OpenCode] Failed to send message:`, e);
         this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
+      }
+    })();
+  }
+
+  /**
+   * @description Bot-side fallback for naming an untitled session (R1 safety
+   * net). The primary mechanism is opencode's own LLM auto-title; this runs
+   * ONLY if that never lands.
+   *
+   * On the first MEANINGFUL prompt of an eligible (untitled, not-yet-renamed)
+   * session it clears the pending flag — so it tries at most once — then, after
+   * a grace period that lets auto-title land, reads the live title and PATCHes a
+   * snippet ONLY when the title is still the bare placeholder. The snippet
+   * derives from the RAW user text (preamble stripped) so it can never carry the
+   * thread-context header. Fire-and-forget; a failure leaves the placeholder.
+   */
+  private maybeScheduleFallbackRename(session: OpenCodeSession, input: string): void {
+    if (!session.isAutoNamePending) return;
+    // The text arriving here is the preamble-glued prompt; meaningfulness and
+    // the snippet must both be judged on the RAW user text, never the glue.
+    const rawText = stripThreadContextPreamble(input);
+    if (!checkIsMeaningfulPrompt(rawText)) return;
+
+    // First meaningful prompt: try at most once, regardless of the outcome.
+    session.isAutoNamePending = false;
+    const snippet = buildSessionTitleSnippet(rawText);
+    if (!snippet) return;
+    const { sessionId } = session;
+
+    void (async () => {
+      await new Promise((resolve) => setTimeout(resolve, this.fallbackRenameGraceMs));
+      try {
+        const apiSession = await this.apiRequest<OpenCodeApiSession>('GET', `/session/${sessionId}`);
+        // Auto-title already produced a real (LLM) name — leave it; the native
+        // name is better than our snippet.
+        if (!checkIsPlaceholderTitle(apiSession.title)) return;
+        await this.apiRequest('PATCH', `/session/${sessionId}`, { title: snippet });
+        console.log(`[OpenCode] Fallback-renamed untitled session ${sessionId} to "${snippet}"`);
+      } catch (e) {
+        // Best-effort: a failed rename just leaves the placeholder title.
+        console.warn(`[OpenCode] fallback session rename failed:`, e instanceof Error ? e.message : e);
       }
     })();
   }
@@ -1450,6 +1540,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         sseController: null,
         reconnectTimer: null,
         sseStallTimer: null,
+        // A resumed session already has a name and history — never auto-rename.
+        isAutoNamePending: false,
       };
 
       this.detachDuplicateSessionOwners(k, session.sessionId);

@@ -14,3 +14,4 @@ agent/tmp/
 .yarn/install-state.gz
 .yarn/cache/
 .yarn/unplugged/
+logs/

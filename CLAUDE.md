@@ -167,6 +167,11 @@ per-backend, persisted agent setting.
   `get_history`: recv→sendOk latency per command, `sendErr` 429s with
   `retryAfterSec`, emit-vs-sendOk order per topic.
 
+- **`OpenCode error: Invalid authentication credentials` → restart the OpenCode
+  server** (the `opencode serve` process on port 4096) — its provider credentials
+  went stale; new sessions keep failing until the server restarts. (User
+  instruction, 2026-06-04.)
+
 - **Verify a per-prompt OpenCode override actually applied** (model or `/effort`
   variant): `GET http://127.0.0.1:4096/session/<sessionId>/message` — the stored
   user + assistant turns echo `model.variant`, proving `body.variant` rode the

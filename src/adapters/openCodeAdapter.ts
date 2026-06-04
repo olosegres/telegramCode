@@ -1278,8 +1278,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       return apiSessions.map(s => ({
         id: s.id,
         title: s.title || s.id,
-        createdAt: s.time?.created ? new Date(s.time.created * 1000) : new Date(),
-        updatedAt: s.time?.updated ? new Date(s.time.updated * 1000) : new Date(),
+        // `time.created`/`time.updated` are already epoch MILLISECONDS
+        // (13-digit values verified live via GET /session). The old `* 1000`
+        // pushed every date millennia into the future, so the /sessions list
+        // showed "(just now)" for every entry (B13).
+        createdAt: s.time?.created ? new Date(s.time.created) : new Date(),
+        updatedAt: s.time?.updated ? new Date(s.time.updated) : new Date(),
       }));
     } catch (e) {
       console.error(`[OpenCode] Failed to get sessions:`, e);

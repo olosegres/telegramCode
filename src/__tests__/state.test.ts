@@ -261,3 +261,51 @@ test('pairedGroupId: set → get round-trips and survives a reload from disk', a
   await second.init();
   assert.equal(second.getPairedGroupId(), groupId);
 });
+
+test('clearAgentSessionIds: removes both session ids but keeps name and model', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgent(key1, { name: 'opencode', model: 'anthropic/claude-3-5-sonnet' });
+  await store.setClaudeSessionId(key1, 'claude-uuid-1');
+  await store.setOpenCodeSessionId(key1, 'oc-id-1');
+
+  // Pre-condition: both ids are present (proves the wipe really changed state,
+  // not a vacuous pass on an already-empty record).
+  assert.equal(store.getClaudeSessionId(key1), 'claude-uuid-1');
+  assert.equal(store.getOpenCodeSessionId(key1), 'oc-id-1');
+
+  await store.clearAgentSessionIds(key1);
+
+  assert.equal(store.getClaudeSessionId(key1), null, 'claudeSessionId must be gone');
+  assert.equal(store.getOpenCodeSessionId(key1), null, 'opencodeSessionId must be gone');
+  const agent = store.getAgent(key1);
+  assert.equal(agent?.name, 'opencode', 'name must survive the wipe');
+  assert.equal(agent?.model, 'anthropic/claude-3-5-sonnet', 'model must survive the wipe');
+});
+
+test('clearAgentSessionIds: no-op when the thread has no agent record', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.clearAgentSessionIds(key1);
+  assert.equal(store.getAgent(key1), null, 'must not create a dangling agent row');
+});
+
+test('clearAgentSessionIds: the wipe is persisted to disk', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setAgent(key1, { name: 'opencode' });
+  await first.setOpenCodeSessionId(key1, 'oc-id-1');
+  await first.clearAgentSessionIds(key1);
+  await first.flush();
+
+  // Reload from disk: the persisted record must have the name but no ids,
+  // so a later bot restart can't auto-reattach the released session.
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getAgent(key1)?.name, 'opencode');
+  assert.equal(second.getOpenCodeSessionId(key1), null);
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  const persistedAgent = raw.agents[`${key1.chatId}:${key1.threadId}`];
+  assert.ok(persistedAgent, 'agent row must still exist on disk');
+  assert.equal('opencodeSessionId' in persistedAgent, false, 'id key must be absent on disk');
+});

@@ -651,6 +651,23 @@ export class StateStore {
     });
   }
 
+  /**
+   * @description Release both persisted session ids for `key` while keeping
+   * `name` / `model`. Called on explicit user stop (`/stop`, `/stop-all`,
+   * `/quit`, `/unbind`) so a later bot restart won't auto-reattach a session
+   * the user deliberately ended. No-op when the thread has no agent record.
+   */
+  async clearAgentSessionIds(key: ThreadKey): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.agents[k];
+      if (!existing) return;
+      const { claudeSessionId, opencodeSessionId, ...rest } = existing;
+      this.state.agents[k] = rest;
+      this.scheduleSave();
+    });
+  }
+
   // ── messages (`/clear` support) ──
 
   getMessageIds(key: ThreadKey): number[] {

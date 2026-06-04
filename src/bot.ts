@@ -2002,6 +2002,9 @@ command('unbind', async (_ctx, key) => {
         console.warn(`[unbind] stopSession failed for ${kStr}:`, e);
       }
     }
+    // Release persisted session ids too — otherwise re-binding this thread
+    // later + a bot restart would resurrect the old session the user unbound.
+    await state.clearAgentSessionIds(key);
     await state.removeBinding(key);
     clearInMemoryThreadState(key);
     await replyToThread(key, t('thread.unbound'));
@@ -3004,6 +3007,11 @@ command('stop', async (_ctx, key) => {
   // points at — keeps `/stop` working when state and reality have drifted
   // apart (a previous switch left a live session on the other adapter).
   const { stopped, attempted } = stopAllAdaptersFor(key);
+  // Explicit stop = release the session for good: wipe the persisted ids
+  // unconditionally (even when nothing was running) so a later bot restart
+  // won't auto-reattach, and so half-dead state from a crash/SSE-giveup is
+  // cleared too.
+  await state.clearAgentSessionIds(key);
   if (attempted === 0) {
     await replyToThread(key, 'No agent running');
     return;
@@ -3045,6 +3053,8 @@ command(['stop-all', 'stopall'], async (_ctx, key) => {
     const result = stopAllAdaptersFor(bKey);
     active += result.attempted;
     stopped += result.stopped.length;
+    // Same release-for-good semantics as `/stop`, per swept thread.
+    await state.clearAgentSessionIds(bKey);
   }
 
   if (active === 0) {
@@ -3104,6 +3114,8 @@ command(['quit', 'q'], async (_ctx, key) => {
 
   if (adapterName === 'opencode') {
     adapter.stopSession(key);
+    // Explicit quit releases the session for good — no auto-reattach later.
+    await state.clearAgentSessionIds(key);
     await replyToThread(key, t('agent.stopped', { label: adapter.label }));
     return;
   }
@@ -3111,6 +3123,8 @@ command(['quit', 'q'], async (_ctx, key) => {
   adapter.sendSignal(key, 'SIGINT');
   await new Promise((r) => setTimeout(r, CLAUDE_DOUBLE_SIGINT_GAP_MS));
   adapter.sendSignal(key, 'SIGINT');
+  // Explicit quit releases the session for good — no auto-reattach later.
+  await state.clearAgentSessionIds(key);
   await replyToThread(key, t('agent.exit_signal_sent', { label: adapter.label }));
 });
 

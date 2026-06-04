@@ -777,25 +777,37 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       await ensureOpenCodeServer();
       console.log(`[OpenCode] Server restarted successfully`);
 
-      // Audit S8 / #14: after a restart the new server doesn't know any
-      // previous session ids, so every in-memory session is effectively
-      // orphaned — SSE reconnects would succeed at the TCP layer but
-      // never see traffic for these ids. Tear them down explicitly so
-      // the bot's state store can clean up too (via `emit('closed')`,
-      // wired through createAdapter.ts). Take a snapshot first.
+      // OpenCode persists sessions to disk, so the restarted server still
+      // knows the previous session ids — that's the basis of this recovery.
+      // For each in-memory session that was active, re-resume the SAME id
+      // (verify it on the new server, rebuild the session object, reconnect
+      // SSE) via the normal resume path. Only if the id is genuinely gone
+      // (e.g. GET /session/:id 404) do we fall back to teardown. Take a
+      // snapshot first so the resume/teardown loop can mutate `this.sessions`.
       const snapshot = Array.from(this.sessions.entries());
       for (const [k, session] of snapshot) {
         if (!session.isActive) continue;
-        this.emit('output', session.key, `OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /stop to release).`);
-        this.stopSessionInner(session.key);
-        // `stopSessionInner` already emits `stopped`. Also emit `closed`
-        // so downstream (bot.ts) wipes the persisted session id, not
-        // just the in-memory state — otherwise the next bot restart
-        // would try to resume an id the server doesn't recognise.
-        this.emit('closed', session.key);
-        // Defensive: stopSessionInner deletes from `this.sessions`, but
-        // emit order matters for downstream cleanup races.
-        this.sessions.delete(k);
+        const { key: sessionKey, sessionId, workDir } = session;
+        try {
+          // resumeSessionInner is the lock-free body; we acquire the per-key
+          // lifecycle lock here exactly like the public resumeSession does, so
+          // the lock is taken once (no double-acquire from the crash handler).
+          await this.withLifecycleLock(k, () => this.resumeSessionInner(sessionKey, workDir, sessionId));
+          this.emit('output', sessionKey, `OpenCode server restarted; session restored. In-flight reply was lost — resend if needed.`);
+        } catch (e) {
+          // The id is gone on the restarted server (or resume otherwise
+          // failed). Tear the session down and notify, same as before. Emit
+          // `closed` so downstream (bot.ts, wired through createAdapter.ts)
+          // wipes the persisted session id too — otherwise the next bot
+          // restart would try to resume an id the server no longer has.
+          console.error(`[OpenCode] Could not restore session ${sessionId} after restart:`, e);
+          this.emit('output', sessionKey, `OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /stop to release).`);
+          this.stopSessionInner(sessionKey);
+          this.emit('closed', sessionKey);
+          // Defensive: stopSessionInner deletes from `this.sessions`, but
+          // emit order matters for downstream cleanup races.
+          this.sessions.delete(k);
+        }
       }
       return true;
     } catch (e) {

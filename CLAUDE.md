@@ -42,6 +42,12 @@ config/variants, not a per-message API field).
 - **Restart-safe.** State is persisted to `state.json`; on restart the bot
   re-attaches to the `tmux` session (Claude) or re-connects SSE (OpenCode).
   Per-thread prefs (e.g. OpenCode model) live in `DATA_DIR` JSON files.
+  If the `opencode serve` process crashes, the bot auto-restarts the server
+  and **restores** each active session by re-resuming its persisted id
+  (sessions persist on opencode disk; the in-flight reply is lost). Explicit
+  `/stop`, `/stop-all`, `/quit`, `/unbind` instead **release** the persisted
+  session ids — so a later bot restart does NOT auto-reattach those sessions
+  (they stay reachable only via the `/sessions` picker).
 - **Startup-safe input.** A session has an async boot window (Claude tmux/pty,
   OpenCode server + `POST /session`). Prompts typed during it are buffered
   (`startupPromptBuffer.ts`) and replayed in order when ready — never dropped.

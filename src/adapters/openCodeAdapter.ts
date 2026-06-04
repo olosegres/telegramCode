@@ -1347,7 +1347,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       };
 
       this.sessions.set(k, session);
-      this.restoreSavedModel(key, session, false);
+      // Re-resolve the model on every resume so a session that took its model
+      // from the server default (no saved /model pref) keeps a populated
+      // modelOverride/currentModelLabel after a bot restart — otherwise /effort
+      // can't resolve the model and reports "levels unavailable" (B17).
+      // Silent (emitOutput=false): the label is unchanged from the previous run
+      // and already shown in the topic, so re-emitting on each restart is noise.
+      await this.fetchModelInfo(key, false);
       this.connectSse(key);
       this.emit('started', key);
     } catch (e) {
@@ -1405,13 +1411,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * 1. Thread's saved preference (from previous /model selection)
    * 2. OpenCode server's defaultModel (config.model -> model.json recent -> first provider)
    * 3. "not set"
+   *
+   * `emitOutput` controls whether the resolved `Model: <label>` line is sent to
+   * the topic. A fresh `startSession` emits it (the user just opened the
+   * session); a `resumeSession` after a bot restart re-resolves the SAME model
+   * silently — the label is already in the topic from the previous run, so
+   * re-emitting on every hot-restart is noise (B17). Resolution must still run
+   * to repopulate `modelOverride`/`currentModelLabel` so `/effort` can read them.
    */
-  private async fetchModelInfo(key: ThreadKey): Promise<void> {
+  private async fetchModelInfo(key: ThreadKey, emitOutput = true): Promise<void> {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive || session.isModelInfoShown) return;
 
     // 1. Check this thread's saved model preference
-    if (this.restoreSavedModel(key, session, true)) return;
+    if (this.restoreSavedModel(key, session, emitOutput)) return;
 
     // 2. Ask OpenCode server for default model
     try {
@@ -1431,7 +1444,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         };
         session.isModelInfoShown = true;
         console.log(`[OpenCode] Default model: ${label}`);
-        this.emit('output', key, `Model: ${label}`);
+        if (emitOutput) this.emit('output', key, `Model: ${label}`);
         return;
       }
 
@@ -1446,7 +1459,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         session.currentModelLabel = config.model;
         session.isModelInfoShown = true;
         console.log(`[OpenCode] Default model (config): ${config.model}`);
-        this.emit('output', key, `Model: ${config.model}`);
+        if (emitOutput) this.emit('output', key, `Model: ${config.model}`);
         return;
       }
     } catch (e) {
@@ -1461,7 +1474,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // 3. Server answered but reported no default model — genuinely not set.
     console.log(`[OpenCode] No default model resolved`);
     session.currentModelLabel = 'not set';
-    this.emit('output', key, `Model: not set (use /model to select)`);
+    if (emitOutput) this.emit('output', key, `Model: not set (use /model to select)`);
   }
 
   /**

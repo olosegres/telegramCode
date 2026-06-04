@@ -101,10 +101,6 @@ export function checkIsGeneralTopic(key: ThreadKey): boolean {
 /** Inputs for the auto-pairing decision (side-effect free). */
 export interface PairingInput {
   chat: RouteChat | undefined;
-  /** `ctx.from?.id` — the user who triggered the update. */
-  userId: number | undefined;
-  /** Numeric user ids allowed to operate the bot. */
-  allowedUsers: number[];
   /** Already-effective group id (env or previously paired), or `null`. */
   currentGroupId: number | null;
   /** True when `ALLOWED_GROUP_ID` env is set numerically — pairing disabled. */
@@ -112,20 +108,23 @@ export interface PairingInput {
 }
 
 /**
- * @description Decide whether an incoming update should auto-pair its chat
- * as the bot's forum supergroup. Returns the chat id to pair, or `null`.
+ * @description Decide whether an incoming update's chat is STRUCTURALLY a
+ * pairing candidate. Returns the chat id to pair, or `null`.
  *
- * Pairs only when ALL hold:
+ * Eligible only when ALL hold:
  *   1. Not locked by a numeric `ALLOWED_GROUP_ID` env.
  *   2. No effective group id yet (`currentGroupId === null`).
- *   3. The actor is in `allowedUsers` — a random group can't hijack pairing.
- *   4. The chat is a forum supergroup (same gate as {@link resolveThreadKey}).
+ *   3. The chat is a forum supergroup (same gate as {@link resolveThreadKey}).
+ *
+ * The actor's authority — they must be a creator/administrator of the group, so
+ * a random group can't hijack pairing — is verified separately and
+ * asynchronously by the caller via `getChatAdministrators`; it can't live in a
+ * pure helper.
  */
 export function resolvePairingCandidate(input: PairingInput): number | null {
   if (input.isEnvLocked) return null;
   if (input.currentGroupId !== null) return null;
-  const { chat, userId } = input;
-  if (!userId || !input.allowedUsers.includes(userId)) return null;
+  const { chat } = input;
   if (!chat || chat.type !== 'supergroup' || !chat.is_forum) return null;
   return chat.id;
 }

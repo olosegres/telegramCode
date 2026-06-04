@@ -59,6 +59,7 @@ config/variants, not a per-message API field).
 | `cli/lock.ts` | Single-instance lockfile |
 | `bot.ts` | **The bot.** Telegram handlers, all slash commands, output streaming. Large — most logic lives here |
 | `threadRouting.ts` | Resolve which project folder a forum topic is bound to |
+| `accessControl.ts` | Who may use the bot: `extractAdminIds` + `AdminCache` (the served group's creator/admins, read live via `getChatAdministrators`, cached 1h). No allow-list env, no `/grant` |
 | `state.ts` | Persistence (`state.json`): bindings, sessions, pairing; `resolveDataDir()` |
 | `mcpConfig.ts` | Merge MCP server config across the user/group/project/thread hierarchy |
 | `i18n.ts` | `t(key, vars)` translations for all user-facing strings |

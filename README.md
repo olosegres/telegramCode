@@ -86,7 +86,7 @@ npm install -g .            # registers the `telegramCode` command
 
 mkdir -p ~/.config/telegram-code
 cp .env.example ~/.config/telegram-code/.env
-$EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN, ALLOWED_USERS (group auto-pairs)
+$EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN (group auto-pairs; access = its admins)
 
 cd ~/projects && telegramCode          # WORK_ROOT defaults to $PWD = ~/projects
 ```
@@ -213,14 +213,21 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 | Variable | Description |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | From @BotFather |
-| `ALLOWED_USERS` | Comma-separated Telegram user IDs (numeric) |
 | `WORK_ROOT` | Host parent folder; topics bind to its subdirs. Defaults to `$PWD` when launched via the `telegramCode` wrapper |
+
+**Access control.** There is no user allow-list. Whoever is a **creator or
+administrator of the served forum group** may talk to the agent — read live from
+Telegram (`getChatAdministrators`) and cached for 1h. Promote someone in the
+group to grant access; demote/remove them to revoke it (takes effect on the next
+refresh). The bot must be a group admin itself (it already needs that to create
+topics and pin). Anonymous admins can't be matched from their messages, so post
+non-anonymously.
 
 ### Optional
 
 | Variable | Default | Description |
 |---|---|---|
-| `ALLOWED_GROUP_ID` | (auto-pair) | Numeric forum supergroup id (`-100…`). Leave empty to auto-pair with the first group an allowed user contacts the bot from (id is saved to `state.json`; re-point with `/pair`). A **name** is not accepted. A numeric value disables auto-pairing |
+| `ALLOWED_GROUP_ID` | (auto-pair) | Numeric forum supergroup id (`-100…`). Leave empty to auto-pair with the first forum group a group **admin/creator** contacts the bot from (id is saved to `state.json`; re-point with `/pair`). A **name** is not accepted. A numeric value disables auto-pairing |
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
 | `DEFAULT_AGENT` | `claude` | `claude` or `opencode` |
 | `BOT_LANG` | `ru` | `ru` or `en` |

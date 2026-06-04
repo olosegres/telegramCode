@@ -10,7 +10,7 @@ import { acquireLock, installLockCleanupHandlers } from './lock';
  *   1. Load `.env` files (global, then local override). Must happen BEFORE
  *      the bot module is imported, because `src/bot.ts` reads many
  *      `process.env.*` values at top-level (TELEGRAM_BOT_TOKEN, WORK_ROOT,
- *      ALLOWED_*, etc.).
+ *      ALLOWED_GROUP_ID, etc.).
  *   2. Default `WORK_ROOT` to `process.cwd()` if still unset, with a stderr
  *      warning so the user knows what happened. This replaces the historical
  *      fatal error at `src/bot.ts:101-103`.
@@ -30,9 +30,9 @@ export async function runBot(): Promise<void> {
   if (loaded.length === 0) {
     process.stderr.write(
       `Warning: no .env file found in $PWD or ~/.config/telegram-code/. ` +
-        `Required env (TELEGRAM_BOT_TOKEN, ALLOWED_USERS) ` +
+        `Required env (TELEGRAM_BOT_TOKEN) ` +
         `must come from the shell instead. ALLOWED_GROUP_ID is optional ` +
-        `(auto-pairs on first contact if unset).\n`,
+        `(auto-pairs on first contact if unset; access = the group's admins).\n`,
     );
   }
 

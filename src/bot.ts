@@ -45,6 +45,7 @@ import { classifyBoot } from './bootClassifier';
 import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
+import { AdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
 import { downloadFile } from './utils/download';
 import { stripCommandBotMention } from './utils';
 import {
@@ -77,18 +78,9 @@ function parseEnv() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) errors.push('TELEGRAM_BOT_TOKEN is required');
 
-  const allowedUsersEnv = process.env.ALLOWED_USERS ?? '';
-  const allowedUsers = allowedUsersEnv
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(Number)
-    .filter(n => Number.isFinite(n));
-  if (allowedUsers.length === 0) {
-    // P3 fix from plan §16.3: empty list after filter would silently ban
-    // everyone, which looks like a working bot that just never answers.
-    errors.push('ALLOWED_USERS must contain at least one numeric user id');
-  }
+  // Access authority is fully runtime: the creator + administrators of the
+  // served forum group (read live via getChatAdministrators, cached). There is
+  // no static user allow-list env any more — the old ALLOWED_USERS is removed.
 
   // ALLOWED_GROUP_ID is optional: leave it empty to auto-pair with the
   // first forum supergroup an allowed user contacts the bot from (the id
@@ -136,7 +128,6 @@ function parseEnv() {
 
   return {
     botToken: botToken!,
-    allowedUsers,
     allowedGroupId,
     workRoot: workRoot!,
     defaultAgent: process.env.DEFAULT_AGENT || 'claude',
@@ -171,6 +162,46 @@ const telegramAgent = new https.Agent({
   family: 4,
 });
 const bot = new Telegraf(ENV.botToken, { telegram: { agent: telegramAgent } });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Access control — who may talk to the agent
+//
+//  Authority is fully runtime: the creator + administrators of the served forum
+//  group. The set is read live via `getChatAdministrators` and cached for an
+//  hour (lazy refresh on the first access after expiry); a demoted/left user
+//  drops out on the next refresh and is silently ignored thereafter. There is
+//  no static allow-list env and no /grant command.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const adminCache = new AdminCache({
+  fetchAdmins: () => {
+    const groupId = getAllowedGroupId();
+    return groupId === null ? Promise.resolve([]) : bot.telegram.getChatAdministrators(groupId);
+  },
+  ttlMs: ADMIN_CACHE_TTL_MS,
+});
+
+/** True iff `userId` is currently a creator/admin of the served group (cached). */
+async function checkIsAllowedUser(userId: number): Promise<boolean> {
+  const adminIds = await adminCache.getAdminIds();
+  return adminIds.has(userId);
+}
+
+/**
+ * @description Direct (uncached) check that `userId` is a creator/administrator
+ * of `chatId`. Used only at pairing time, where the served group isn't fixed yet
+ * so the cache (keyed to the served group) doesn't apply. Returns `false` on any
+ * API failure — pairing should fail closed.
+ */
+async function checkIsForumAdmin(chatId: number, userId: number): Promise<boolean> {
+  try {
+    const members = await bot.telegram.getChatAdministrators(chatId);
+    return extractAdminIds(members).includes(userId);
+  } catch (e) {
+    console.warn(`[pair] getChatAdministrators(${chatId}) failed:`, e instanceof Error ? e.message : e);
+    return false;
+  }
+}
 
 // Auto-pairing must run before any command / `on` handler so a freshly
 // discovered group id is already in effect by the time the routing gates
@@ -304,15 +335,15 @@ const sessionsDisplayLimit = 10;
 
 /**
  * @description Forum-topic names that arrived via `forum_topic_created`
- * but couldn't be processed because the creator wasn't in
- * `ALLOWED_USERS` (audit S2 / #5). We can't read a thread's title later
- * via Telegram Bot API in any portable way, so keeping the name here
- * lets the first message from an allowed user trigger fuzzy auto-bind.
+ * but couldn't be processed because the creator wasn't an authorised user
+ * (a group admin/creator) (audit S2 / #5). We can't read a thread's title
+ * later via Telegram Bot API in any portable way, so keeping the name here
+ * lets the first message from an authorised user trigger fuzzy auto-bind.
  *
  * In-memory by design: this is a UX nicety, not a security boundary —
  * losing the cache on restart just means the user has to bind manually
  * once. The TTL guards against unbounded growth in a busy group where
- * non-allowed admins keep creating topics.
+ * non-authorised members keep creating topics.
  */
 interface PendingTopicNameEntry { name: string; ts: number; }
 const pendingTopicNames = new Map<string, PendingTopicNameEntry>();
@@ -413,26 +444,33 @@ async function tryAutoPair(ctx: Context): Promise<void> {
   // While unpaired, log every incoming update so the operator can see
   // exactly what reaches the bot. Without this, the three ways pairing
   // can silently fail — privacy mode (no update at all), a non-forum chat,
-  // or a sender outside ALLOWED_USERS — are indistinguishable from "bot
+  // or a sender who isn't a group admin — are indistinguishable from "bot
   // is broken". Gated to pairing mode so normal operation stays quiet.
   if (!isGroupLockedByEnv && getAllowedGroupId() === null) {
     console.log(
       `[pair] incoming ${ctx.updateType} update: chat=${chat?.id} type=${chat?.type} ` +
-        `is_forum=${chat?.is_forum} from=${ctx.from?.id} (allowed users: ${ENV.allowedUsers.join(',')})`,
+        `is_forum=${chat?.is_forum} from=${ctx.from?.id}`,
     );
   }
 
   const candidate = resolvePairingCandidate({
     chat,
-    userId: ctx.from?.id,
-    allowedUsers: ENV.allowedUsers,
     currentGroupId: getAllowedGroupId(),
     isEnvLocked: isGroupLockedByEnv,
   });
   if (candidate === null) return;
 
+  // Authority probe: only a creator/administrator of the candidate group may
+  // pair the bot, so a random group the bot is added to can't hijack it.
+  const userId = ctx.from?.id;
+  if (!userId || !(await checkIsForumAdmin(candidate, userId))) {
+    console.warn(`[pair] ignored pairing from chat ${candidate} user ${userId ?? '?'} (not a group admin)`);
+    return;
+  }
+
   effectiveGroupId = candidate;
   await state.setPairedGroupId(candidate);
+  adminCache.invalidate();
   console.log(`[pair] auto-paired forum supergroup ${candidate} (persisted to state.json)`);
 
   const key = getThreadKey(ctx) ?? { chatId: candidate, threadId: GENERAL_THREAD_ID };
@@ -441,16 +479,17 @@ async function tryAutoPair(ctx: Context): Promise<void> {
 
 /**
  * @description Combined access check. Returns the `ThreadKey` if the
- * context is from an authorised user in the configured forum supergroup,
- * else `null`. Logs (but does not reply to) chats / users we don't accept
- * so foreign chats / spam stay silent (plan §13.13, D21).
+ * context is from an authorised user (a creator/admin of the served forum
+ * group) in the configured forum supergroup, else `null`. Logs (but does not
+ * reply to) chats / users we don't accept so foreign chats / spam stay silent
+ * (plan §13.13, D21).
  */
-function authoriseContext(ctx: Context): ThreadKey | null {
+async function authoriseContext(ctx: Context): Promise<ThreadKey | null> {
   const userId = ctx.from?.id;
-  if (!userId || !ENV.allowedUsers.includes(userId)) {
+  if (!userId || !(await checkIsAllowedUser(userId))) {
     if (ctx.chat) {
       console.warn(
-        `[security] ignored update from chat ${ctx.chat.id} user ${userId ?? '?'} (not in ALLOWED_USERS)`,
+        `[security] ignored update from chat ${ctx.chat.id} user ${userId ?? '?'} (not a group admin)`,
       );
     }
     return null;
@@ -1590,7 +1629,7 @@ function command(
   handler: (ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>, key: ThreadKey) => Promise<void> | void,
 ): void {
   bot.command(name, async (ctx) => {
-    const key = authoriseContext(ctx);
+    const key = await authoriseContext(ctx);
     if (!key) return;
     await handler(ctx, key);
   });
@@ -2026,7 +2065,7 @@ command('version', async (_ctx, key) => {
 
 command('whoami', async (ctx, key) => {
   const userId = ctx.from?.id ?? 0;
-  const allowed = ENV.allowedUsers.includes(userId) && ctx.chat?.id === getAllowedGroupId();
+  const allowed = (await checkIsAllowedUser(userId)) && ctx.chat?.id === getAllowedGroupId();
   const binding = state.getBinding(key);
   await replyToThread(
     key,
@@ -2045,12 +2084,12 @@ command('whoami', async (ctx, key) => {
  * @description Re-point the bot to the forum supergroup this command was
  * sent in. Registered raw (not via the group-gated `command()` wrapper) so
  * it can switch the bot from one group to another. Refused when the id is
- * locked by `ALLOWED_GROUP_ID` env. Allowed-user check is kept so a random
- * group can't hijack the binding.
+ * locked by `ALLOWED_GROUP_ID` env. Only a creator/administrator of the target
+ * group may pair, so a random group can't hijack the binding.
  */
 bot.command('pair', async (ctx) => {
   const userId = ctx.from?.id;
-  if (!userId || !ENV.allowedUsers.includes(userId)) return;
+  if (!userId) return;
 
   const routeChat = getRouteChat(ctx);
   const fallbackThreadId =
@@ -2068,9 +2107,14 @@ bot.command('pair', async (ctx) => {
     await replyToThread(replyKey, t('pair.only_forum')).catch(() => {});
     return;
   }
+  if (!(await checkIsForumAdmin(routeChat.id, userId))) {
+    await replyToThread(replyKey, t('pair.not_admin')).catch(() => {});
+    return;
+  }
 
   effectiveGroupId = routeChat.id;
   await state.setPairedGroupId(routeChat.id);
+  adminCache.invalidate();
   console.log(`[pair] re-paired to forum supergroup ${routeChat.id} via /pair`);
   const key = getThreadKey(ctx) ?? { chatId: routeChat.id, threadId: GENERAL_THREAD_ID };
   await replyToThread(key, t('pair.success', { groupId: routeChat.id }));
@@ -2233,7 +2277,7 @@ async function sendBindingWelcome(key: ThreadKey, subdir: string): Promise<void>
 // flow — same `handleSessionsList` helper the slash command calls into, so
 // the picker source (list rendering + pick-mode arming) stays single-sourced.
 bot.action('open_sessions', async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   await ctx.answerCbQuery();
   await handleSessionsList(key);
@@ -3012,7 +3056,7 @@ const botCommands = new Set([
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bot.on(message('text'), async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) return;
 
   // In groups Telegram appends `@botusername` to slash commands
@@ -3202,7 +3246,7 @@ bot.on(message('text'), async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bot.on(message('voice'), async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) return;
 
   await state.pushMessageId(key, ctx.message.message_id);
@@ -3310,7 +3354,7 @@ bot.on(message('voice'), async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bot.on('edited_message', async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) return;
   // Reply once per edit so the user isn't left wondering. The bot does NOT
   // treat the edit as a re-prompt to the agent (plan §16.3, E6).
@@ -3380,20 +3424,20 @@ bot.on(message('forum_topic_created'), async (ctx) => {
   // user has already seen the binding ack.
   if (existing) return;
 
-  // Audit S2 / #5: any group admin (not just ALLOWED_USERS) can create a
-  // topic. If the creator isn't authorised, we MUST NOT auto-bind — a
-  // malicious admin could pick a name that fuzzy-matches a sensitive
-  // WORK_ROOT subdir, the bot would auto-bind, and the next message from
-  // an allowed user would launch an agent against the attacker-chosen
-  // folder. Stash the topic name so a later allowed-user message in the
-  // same thread can still benefit from fuzzy auto-bind.
+  // Audit S2 / #5: topic creation may be open to all members (group setting),
+  // not only admins. If the creator isn't an authorised user (group
+  // admin/creator), we MUST NOT auto-bind — a non-admin could pick a name that
+  // fuzzy-matches a sensitive WORK_ROOT subdir, the bot would auto-bind, and the
+  // next message from an authorised user would launch an agent against the
+  // attacker-chosen folder. Stash the topic name so a later authorised-user
+  // message in the same thread can still benefit from fuzzy auto-bind.
   const userId = ctx.from?.id;
-  if (!userId || !ENV.allowedUsers.includes(userId)) {
+  if (!userId || !(await checkIsAllowedUser(userId))) {
     if (topicName) {
       pendingTopicNames.set(keyToString(key), { name: topicName, ts: Date.now() });
     }
     console.warn(
-      `[security] forum_topic_created in chat ${ctx.chat.id} by user ${userId ?? '?'} (not in ALLOWED_USERS) — name cached, no auto-bind`,
+      `[security] forum_topic_created in chat ${ctx.chat.id} by user ${userId ?? '?'} (not a group admin) — name cached, no auto-bind`,
     );
     return;
   }
@@ -3421,18 +3465,18 @@ bot.on(message('forum_topic_created'), async (ctx) => {
   await replyToThread(key, t('thread.welcome_pick'), extra);
 });
 
-// Audit S2 / #5: closed/reopened events also come from any group admin,
-// who may not be in ALLOWED_USERS. We deliberately diverge from "trust
-// Telegram's state": better to leave our `closed` flag stale than to let
-// a non-allowed admin shape what the bot remembers about a thread. An
-// allowed user re-engaging the thread will surface any drift via the
-// `topic-closed` send-error path (which retries / surfaces a hint).
+// Audit S2 / #5: closed/reopened events can come from a member who isn't an
+// authorised user. We deliberately diverge from "trust Telegram's state":
+// better to leave our `closed` flag stale than to let a non-authorised user
+// shape what the bot remembers about a thread. An authorised user re-engaging
+// the thread will surface any drift via the `topic-closed` send-error path
+// (which retries / surfaces a hint).
 bot.on(message('forum_topic_closed'), async (ctx) => {
   const key = getThreadKey(ctx);
   if (!key) return;
   const userId = ctx.from?.id;
-  if (!userId || !ENV.allowedUsers.includes(userId)) {
-    console.warn(`[security] forum_topic_closed in chat ${ctx.chat.id} by user ${userId ?? '?'} (not in ALLOWED_USERS) — state not updated`);
+  if (!userId || !(await checkIsAllowedUser(userId))) {
+    console.warn(`[security] forum_topic_closed in chat ${ctx.chat.id} by user ${userId ?? '?'} (not a group admin) — state not updated`);
     return;
   }
   await state.setBindingClosed(key, true);
@@ -3446,8 +3490,8 @@ bot.on(message('forum_topic_reopened'), async (ctx) => {
   const key = getThreadKey(ctx);
   if (!key) return;
   const userId = ctx.from?.id;
-  if (!userId || !ENV.allowedUsers.includes(userId)) {
-    console.warn(`[security] forum_topic_reopened in chat ${ctx.chat.id} by user ${userId ?? '?'} (not in ALLOWED_USERS) — state not updated`);
+  if (!userId || !(await checkIsAllowedUser(userId))) {
+    console.warn(`[security] forum_topic_reopened in chat ${ctx.chat.id} by user ${userId ?? '?'} (not a group admin) — state not updated`);
     return;
   }
   await state.setBindingClosed(key, false);
@@ -3487,7 +3531,7 @@ bot.on(message('forum_topic_reopened'), async (ctx) => {
  * matters in Telegraf's action regex dispatch — first match wins.
  */
 bot.action(/^bind_page_(\d+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   if (checkIsGeneral(key)) {
     await ctx.answerCbQuery(t('cb.bind_only_topical'));
@@ -3513,7 +3557,7 @@ bot.action('bind_page_noop', async (ctx) => {
 });
 
 bot.action(/^bind_(.+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   if (checkIsGeneral(key)) {
     await ctx.answerCbQuery(t('cb.bind_only_topical'));
@@ -3527,7 +3571,7 @@ bot.action(/^bind_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^model_(.+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const modelId = ctx.match[1];
   const adapter = getThreadAdapter(key);
@@ -3549,7 +3593,7 @@ bot.action(/^model_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^effort_(.+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const level = ctx.match[1];
   const adapter = getThreadAdapter(key);
@@ -3569,7 +3613,7 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^agent_(.+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const adapterName = ctx.match[1];
   try {
@@ -3595,7 +3639,7 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
 // at 64 bytes; the full id lives in `threadSessionLists`. Shares the resume
 // core with the digit-reply path via `resumeSessionByIndex`.
 bot.action(/^resume_(\d+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   await ctx.answerCbQuery();
   const idx = Number(ctx.match[1]);
@@ -3608,7 +3652,7 @@ bot.action(/^resume_(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^opt_(\d+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const optNum = ctx.match[1];
   const adapter = getThreadAdapter(key);
@@ -3622,7 +3666,7 @@ bot.action(/^opt_(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
-  const key = authoriseContext(ctx);
+  const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const qIdx = parseInt(ctx.match[1], 10);
   const optIdx = parseInt(ctx.match[2], 10);
@@ -4066,7 +4110,7 @@ export async function startBot(): Promise<void> {
   console.log('=================================');
   console.log('  Telegram Code Bot (multi-thread) starting...');
   console.log('=================================');
-  console.log(`Allowed users:    ${ENV.allowedUsers.join(', ')}`);
+  console.log('Access:           forum-group admins/creator (live, cached)');
   console.log(`Work root:        ${ENV.workRoot}`);
   console.log(`Default agent:    ${getDefaultAdapterName()}`);
   console.log(`Available agents: ${getAvailableAdapters().map(a => a.name).join(', ')}`);

@@ -212,7 +212,6 @@ test('runBot defaults WORK_ROOT to $PWD when unset and proceeds past preflight',
       DATA_DIR: path.join(tmpRoot, 'data'),
       // Required envs the bot reads — kept fake so it can't talk to Telegram.
       TELEGRAM_BOT_TOKEN: 'fake-token-' + Date.now(),
-      ALLOWED_USERS: '1',
       ALLOWED_GROUP_ID: '-100',
       // Unset WORK_ROOT so the default kicks in.
       WORK_ROOT: undefined as unknown as string,
@@ -241,7 +240,6 @@ test('runBot exits 1 when WORK_ROOT points at a non-existent directory', () => {
       HOME: tmpRoot,
       DATA_DIR: path.join(tmpRoot, 'data'),
       TELEGRAM_BOT_TOKEN: 'fake-token-' + Date.now(),
-      ALLOWED_USERS: '1',
       ALLOWED_GROUP_ID: '-100',
       WORK_ROOT: bogus,
     },
@@ -275,7 +273,6 @@ test('runBot refuses to start when a foreign lockfile holds the data dir', () =>
       HOME: tmpRoot,
       DATA_DIR: dataDir,
       TELEGRAM_BOT_TOKEN: 'fake-token-' + Date.now(),
-      ALLOWED_USERS: '1',
       ALLOWED_GROUP_ID: '-100',
       WORK_ROOT: tmpRoot,
     },
@@ -309,7 +306,6 @@ test('runBot accepts an empty ALLOWED_GROUP_ID and boots into pairing mode', () 
       HOME: tmpRoot,
       DATA_DIR: path.join(tmpRoot, 'data-pairing'),
       TELEGRAM_BOT_TOKEN: 'fake-token-' + Date.now(),
-      ALLOWED_USERS: '1',
       ALLOWED_GROUP_ID: '', // empty ⇒ auto-pair mode
       WORK_ROOT: projectDir,
     },

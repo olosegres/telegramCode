@@ -190,6 +190,7 @@ const dict: Record<Lang, Record<string, string>> = {
       'ℹ️ id группы задан через `ALLOWED_GROUP_ID` — авто-привязка отключена. ' +
       'Чтобы сменить группу, измени переменную и перезапусти бота.',
     'pair.only_forum': '❌ /pair работает только в forum-супергруппе (включи Topics).',
+    'pair.not_admin': '❌ Привязать бота может только администратор или создатель группы.',
     'pair.not_paired': 'группа ещё не привязана (режим pairing)',
     'version.report':
       '*telegramCode {bot}*\n' +
@@ -445,6 +446,7 @@ const dict: Record<Lang, Record<string, string>> = {
       'ℹ️ The group id is set via `ALLOWED_GROUP_ID` — auto-pairing is disabled. ' +
       'To switch groups, change the variable and restart the bot.',
     'pair.only_forum': '❌ /pair only works inside a forum supergroup (enable Topics).',
+    'pair.not_admin': '❌ Only a group administrator or creator can pair the bot.',
     'pair.not_paired': 'group not paired yet (pairing mode)',
     'version.report':
       '*telegramCode {bot}*\n' +

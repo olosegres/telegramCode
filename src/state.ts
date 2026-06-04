@@ -64,6 +64,15 @@ export interface BindingData {
    * can never suppress a needed edit for a fresh banner message.
    */
   pinnedStatusText?: string;
+  /**
+   * Forum-topic display name, when known. The Bot API can't query a topic
+   * title on demand — the bot only learns it from events (`forum_topic_created`
+   * / `forum_topic_edited`) or when it creates the topic itself (`/new`).
+   * Persisted so the thread-context preamble (see `threadContextPreamble.ts`)
+   * can tell the agent which topic it works in across restarts. Absent for
+   * pre-existing topics until a rename event reveals the name.
+   */
+  topicName?: string;
 }
 
 export interface AgentData {
@@ -453,7 +462,7 @@ export class StateStore {
   async setBinding(
     key: ThreadKey,
     subdir: string,
-    options: { closed?: boolean } = {},
+    options: { closed?: boolean; topicName?: string } = {},
   ): Promise<void> {
     const k = keyToString(key);
     await this.withLock(key, async () => {
@@ -474,7 +483,32 @@ export class StateStore {
       if (existing?.pinnedStatusMessageId !== undefined) {
         next.pinnedStatusMessageId = existing.pinnedStatusMessageId;
       }
+      // Carry the known topic name through a re-bind. A caller that learned
+      // the name (e.g. `/new`, deferred pending-name copy) passes it
+      // explicitly; otherwise we keep whatever was already stored.
+      if (options.topicName !== undefined) {
+        next.topicName = options.topicName;
+      } else if (existing?.topicName !== undefined) {
+        next.topicName = existing.topicName;
+      }
       this.state.bindings[k] = next;
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Persist the forum-topic display name for a thread. Used by
+   * `forum_topic_edited` (rename) when a binding already exists. No-op (no
+   * save) when the binding is absent or the name is unchanged — symmetric to
+   * {@link setBindingPinnedStatusText}.
+   */
+  async setBindingTopicName(key: ThreadKey, topicName: string): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.bindings[k];
+      if (!existing) return;
+      if (existing.topicName === topicName) return;
+      this.state.bindings[k] = { ...existing, topicName };
       this.scheduleSave();
     });
   }

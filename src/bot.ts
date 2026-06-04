@@ -67,6 +67,12 @@ import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import {
+  buildThreadContextPreamble,
+  prependThreadContextPreamble,
+  checkShouldInjectPreamble,
+  checkShouldSkipPreambleForText,
+} from './threadContextPreamble';
 import { getPinnedBannerSkipDecision } from './utils/pinnedBannerSkipDecision';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -409,6 +415,37 @@ interface PendingTopicNameEntry { name: string; ts: number; }
 const pendingTopicNames = new Map<string, PendingTopicNameEntry>();
 const PENDING_TOPIC_NAME_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * @description In-memory `chatId → chat.title` cache for the served group.
+ * Every authorised group update carries `chat.title`, so we refresh it for
+ * free on each accepted message; read at thread-context-preamble build time
+ * so the agent learns the group name. Not persisted — the next authorised
+ * update repopulates it after a restart, and the preamble simply omits an
+ * unknown group title until then.
+ */
+const groupTitleCache = new Map<number, string>();
+
+/**
+ * @description Per-thread marker holding the last thread-context preamble the
+ * bot injected ahead of a prompt (keyed by `keyToString`). The preamble rides
+ * the next prompt only when the freshly-built text differs from this marker
+ * (see `checkShouldInjectPreamble`): a fresh session (marker cleared on
+ * start/stop/closed), a rename (built text changes), or `/clear` (marker
+ * reset) all trigger a re-inject. In-memory by design — a duplicate preamble
+ * after a bot restart / session resume is acceptable (the marker isn't
+ * persisted).
+ */
+const threadContextMarkers = new Map<string, string>();
+
+/**
+ * @description Forget the last-injected preamble for a thread so the next
+ * prompt re-carries it. Called on every session lifecycle boundary (start,
+ * stop, closed) and on forwarding a bare `/clear`.
+ */
+function clearThreadContextMarker(key: ThreadKey): void {
+  threadContextMarkers.delete(keyToString(key));
+}
+
 function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
@@ -575,6 +612,13 @@ async function authoriseContext(ctx: Context): Promise<ThreadKey | null> {
       );
     }
     return null;
+  }
+  // Refresh the group-title cache from this authorised update — group chats
+  // (supergroups) always carry `chat.title`. Feeds the thread-context
+  // preamble (S2). Cheap, idempotent, and the only place every accepted
+  // update funnels through.
+  if (ctx.chat && 'title' in ctx.chat && ctx.chat.title) {
+    groupTitleCache.set(ctx.chat.id, ctx.chat.title);
   }
   return key;
 }
@@ -1674,6 +1718,9 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
   // typed right after `/claude` / `/opencode` is buffered, not dropped.
   startupPromptBuffer.markStarting(kStr);
   markNeedsNewMessage(key);
+  // Fresh session — the agent's context is empty, so the next prompt must
+  // re-carry the thread-context preamble. Forget the last-injected marker.
+  clearThreadContextMarker(key);
   const adapter = getThreadAdapter(key);
   const workDir = getWorkDir(key);
 
@@ -1758,6 +1805,13 @@ async function forwardPromptToAgent(
   adapter: AgentAdapter,
   text: string,
 ): Promise<void> {
+  // Glue the thread-context preamble (topic / group / thread / folder) ahead
+  // of the prompt so the agent knows WHERE it works. Slash commands forwarded
+  // to the agent (`/clear`, `/compact`, …) are skipped — a preamble would
+  // corrupt them into plain text. The preamble rides only when it differs
+  // from the last one we injected this session (fresh session, rename, or
+  // post-`/clear` marker reset). See `threadContextPreamble.ts`.
+  const promptText = getPromptWithThreadContext(key, text);
   markNeedsNewMessage(key);
   const msgState = getThreadMessageState(key);
   msgState.loaderObsolete = false;
@@ -1779,7 +1833,40 @@ async function forwardPromptToAgent(
   if (adapter.interruptAndWaitIdle) {
     await adapter.interruptAndWaitIdle(key);
   }
-  adapter.sendInput(key, text);
+  adapter.sendInput(key, promptText);
+}
+
+/**
+ * @description Return the prompt text with the thread-context preamble glued
+ * in front when it should ride this turn, or the text unchanged otherwise.
+ *
+ * Slash commands forwarded to the agent skip the preamble (gluing it on would
+ * turn `/clear` into plain text). For normal prompts we build the preamble
+ * from the thread's binding (subdir + known topic name) and the cached group
+ * title, then inject only when it differs from the last preamble sent for this
+ * thread — a fresh session (marker cleared on start/stop/closed), a topic
+ * rename, or a `/clear` (marker reset) all flip the decision to inject. On
+ * inject we record the preamble as the new marker so identical follow-up
+ * prompts don't repeat it.
+ */
+function getPromptWithThreadContext(key: ThreadKey, text: string): string {
+  if (checkShouldSkipPreambleForText(text)) return text;
+
+  const binding = state.getBinding(key);
+  const subdir = binding?.subdir ?? path.basename(ENV.workRoot);
+  const preamble = buildThreadContextPreamble({
+    topicName: binding?.topicName,
+    groupTitle: groupTitleCache.get(key.chatId),
+    key,
+    subdir,
+  });
+
+  const kStr = keyToString(key);
+  if (!checkShouldInjectPreamble(preamble, threadContextMarkers.get(kStr))) {
+    return text;
+  }
+  threadContextMarkers.set(kStr, preamble);
+  return prependThreadContextPreamble(preamble, text);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1908,7 +1995,11 @@ type ApplyBindingResult =
   | { ok: true;  message: string; subdir: string }
   | { ok: false; message: string };
 
-async function applyBinding(key: ThreadKey, rawSubdir: string): Promise<ApplyBindingResult> {
+async function applyBinding(
+  key: ThreadKey,
+  rawSubdir: string,
+  options: { topicName?: string } = {},
+): Promise<ApplyBindingResult> {
   let subdir: string;
   try {
     subdir = validateSubdir(ENV.workRoot, rawSubdir);
@@ -1932,7 +2023,7 @@ async function applyBinding(key: ThreadKey, rawSubdir: string): Promise<ApplyBin
   // user should know they're about to join an existing workspace rather
   // than start a fresh one.
   const peers = state.listKeysForSubdir(subdir).filter(k => keyToString(k) !== keyToString(key));
-  await state.setBinding(key, subdir);
+  await state.setBinding(key, subdir, options.topicName !== undefined ? { topicName: options.topicName } : {});
 
   const message = peers.length > 0
     ? t('thread.bind_collision', {
@@ -2191,7 +2282,9 @@ command('new', async (ctx, key) => {
   // a topic for an already-bound subdir gets the collision warning that
   // `/bind` would surface. Going around it would silently join two
   // threads to one workspace without acknowledgement.
-  const result = await applyBinding(newKey, requestedSubdir);
+  // The bot created the topic, so its display name is known here — persist it
+  // on the binding for the thread-context preamble (S1).
+  const result = await applyBinding(newKey, requestedSubdir, { topicName: name });
   if (result.ok) {
     await replyToThread(
       key,
@@ -3231,7 +3324,11 @@ command('output', async (_ctx, key) => {
  *   - Requires `can_delete_messages` admin right; we degrade gracefully
  *     if Telegram says we can't.
  */
-command('clear', async (ctx, key) => {
+// `/clear_messages` (formerly `/clear`): delete the thread's Telegram
+// messages. The bare `/clear` was freed for the agent — it now falls through
+// to the verbatim-forward path (Claude TUI wipes its context, OpenCode treats
+// it as plain text), and that path resets the thread-context preamble marker.
+command('clear_messages', async (ctx, key) => {
   // Audit S11 / #19: snapshot and clear under the state lock so the
   // agent's concurrent `pushMessageId` writes between snapshot and
   // wipe don't get dropped without being deleted. New ids pushed
@@ -3244,7 +3341,7 @@ command('clear', async (ctx, key) => {
     return [...snap, currentMsgId];
   });
   if (all.length === 0) {
-    await replyToThread(key, t('clear.no_messages'));
+    await replyToThread(key, t('clearMessages.no_messages'));
     return;
   }
 
@@ -3284,8 +3381,8 @@ command('clear', async (ctx, key) => {
   ms.lastMessageId = null;
   ms.needsNewMessage = true;
 
-  console.log(`[clear] ${keyToString(key)}: deleted ${deleted}/${all.length}`);
-  await replyToThread(key, t('clear.summary', { deleted, total: all.length }));
+  console.log(`[clear_messages] ${keyToString(key)}: deleted ${deleted}/${all.length}`);
+  await replyToThread(key, t('clearMessages.summary', { deleted, total: all.length }));
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3294,10 +3391,18 @@ command('clear', async (ctx, key) => {
 
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
-  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear',
+  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'whoami', 'version', 'help',
   'doctor', 'mcp',
 ]);
+
+/**
+ * @description The bare `/clear` is no longer bot-owned (it was renamed to
+ * `/clear_messages`); it's forwarded verbatim to the agent. Forwarding it
+ * resets the thread-context preamble marker so the next prompt re-informs the
+ * agent of its context after its own context is wiped.
+ */
+const forwardedClearCommand = '/clear';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Text message handler — main conversational entrypoint
@@ -3346,7 +3451,9 @@ bot.on(message('text'), async (ctx) => {
       if (match) {
         try {
           const subdir = validateSubdir(ENV.workRoot, match);
-          await state.setBinding(key, subdir);
+          // The pending entry carries the topic name (cached at creation) —
+          // copy it onto the binding for the thread-context preamble (S1).
+          await state.setBinding(key, subdir, pending.name ? { topicName: pending.name } : {});
           pendingTopicNames.delete(kStr);
           await replyToThread(key, t('thread.welcome_bound', { subdir }));
           await sendBindingWelcome(key, subdir);
@@ -3467,6 +3574,10 @@ bot.on(message('text'), async (ctx) => {
   // queue. Deliberately driving a selector in place is still available via the
   // explicit /up /down /enter /y /n /c keys.
   if (adapter.checkIsActive(key)) {
+    // A bare `/clear` forwarded to the agent wipes its context (Claude TUI),
+    // so the next prompt must re-carry the thread-context preamble. Reset the
+    // marker before forwarding — the slash text itself never gets a preamble.
+    if (text === forwardedClearCommand) clearThreadContextMarker(key);
     await forwardPromptToAgent(key, adapter, text);
     return;
   }
@@ -3699,7 +3810,9 @@ bot.on(message('forum_topic_created'), async (ctx) => {
   if (match) {
     try {
       const subdir = validateSubdir(ENV.workRoot, match);
-      await state.setBinding(key, subdir);
+      // The creation event carries the topic name — persist it on the binding
+      // for the thread-context preamble (S1).
+      await state.setBinding(key, subdir, topicName ? { topicName } : {});
       await replyToThread(key, t('thread.welcome_bound', { subdir }));
       await sendBindingWelcome(key, subdir);
       return;
@@ -3711,6 +3824,35 @@ bot.on(message('forum_topic_created'), async (ctx) => {
 
   const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
   await replyToThread(key, t('thread.welcome_pick'), extra);
+});
+
+/**
+ * @description A forum topic was renamed (or its icon changed). When the name
+ * changed, persist it so the thread-context preamble can tell the agent its
+ * current topic name. Admin-gated like the created/closed/reopened trio: a
+ * non-authorised member's rename must not reshape what the bot remembers.
+ *
+ * This is also the ONLY way the bot learns the name of a pre-existing topic
+ * (the Bot API can't query a topic title on demand). If the topic isn't bound
+ * yet, refresh `pendingTopicNames` so a later auto-bind still gets the name.
+ */
+bot.on(message('forum_topic_edited'), async (ctx) => {
+  const key = getThreadKey(ctx);
+  if (!key) return;
+  const newName = ctx.message.forum_topic_edited.name;
+  // Icon-only edit (no `name`) — nothing for the preamble to track.
+  if (!newName) return;
+  const userId = ctx.from?.id;
+  if (!userId || !(await checkIsAllowedUser(userId))) {
+    console.warn(`[security] forum_topic_edited in chat ${ctx.chat.id} by user ${userId ?? '?'} (not a group admin) — name not updated`);
+    return;
+  }
+  if (state.getBinding(key)) {
+    await state.setBindingTopicName(key, newName);
+  } else {
+    // No binding yet — keep the freshest name for a later fuzzy auto-bind.
+    pendingTopicNames.set(keyToString(key), { name: newName, ts: Date.now() });
+  }
 });
 
 // Audit S2 / #5: closed/reopened events can come from a member who isn't an
@@ -3728,6 +3870,11 @@ bot.on(message('forum_topic_closed'), async (ctx) => {
     return;
   }
   await state.setBindingClosed(key, true);
+  // Topic closed — the session is no longer reachable from here, so any
+  // re-engagement starts fresh. Drop the last-injected preamble so the next
+  // prompt re-informs the agent of its context (the `closed` boundary in the
+  // plan's start/stop/closed marker-reset rule).
+  clearThreadContextMarker(key);
   // Refresh the banner so the `🔒 closed` marker appears immediately. Edits
   // INTO a closed topic are still allowed by Telegram even when sends aren't,
   // so we can update the existing pinned message without re-pinning.
@@ -4283,6 +4430,9 @@ function handleAgentStopped(key: ThreadKey): void {
   // all emit `stopped`. Drop the thread's queued-but-unsent output here so
   // nothing coalesced before the stop posts after the "stopped" confirmation.
   clearThreadQueues(key);
+  // Session ended — a future session starts with empty context, so forget the
+  // last-injected thread-context preamble; the next prompt re-carries it.
+  clearThreadContextMarker(key);
   updatePinnedStatus(key).catch(() => {});
 }
 
@@ -4324,7 +4474,7 @@ const COMMANDS_MENU = [
   { command: 'y', description: '✅ Send "y"' },
   { command: 'n', description: '❌ Send "n"' },
   { command: 'c', description: '🛑 Ctrl+C' },
-  { command: 'clear', description: '🗑 Clear messages' },
+  { command: 'clear_messages', description: '🗑 Delete this thread\'s messages' },
 ];
 
 /**

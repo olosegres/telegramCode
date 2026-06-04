@@ -55,6 +55,15 @@ config/variants, not a per-message API field).
   isolated `DATA_DIR`, group, and OpenCode port.
 - **MCP hierarchy.** MCP servers merge across user / group / project / thread
   scopes with `${VAR}` env expansion.
+- **Thread-context preamble.** The bot prepends a `[Telegram thread context]`
+  block (topic name, group title, `chatId:threadId`, bound folder) to the
+  forwarded prompt so the agent knows WHERE it works. Built in
+  `threadContextPreamble.ts`; injected in `forwardPromptToAgent` (the single
+  choke point). Rides the next prompt only when it changed since last sent —
+  per-thread in-memory marker, reset on session start/stop/closed and on
+  forwarding a bare `/clear`. Topic name comes from `forum_topic_created` /
+  `_edited` / `/new` (persisted on the binding); the group title from an
+  in-memory cache fed by authorised updates. Slash commands skip the preamble.
 
 ## Module map (`src/`)
 
@@ -74,6 +83,7 @@ config/variants, not a per-message API field).
 | `progressLine.ts` | Render the live progress / spinner line |
 | `pinnedStatus.ts` | Per-thread pinned status banner (shows model, etc.) |
 | `agentTrigger.ts` | Detect agent-ready / prompt triggers in output |
+| `threadContextPreamble.ts` | Pure helpers: build the `[Telegram thread context]` preamble (`buildThreadContextPreamble`), decide whether to inject it (`checkShouldInjectPreamble`, `checkShouldSkipPreambleForText`), and glue it ahead of the prompt (`prependThreadContextPreamble`) |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
@@ -100,7 +110,14 @@ as a command in `bot.ts`.
 ## Commands (all registered in `bot.ts`)
 
 - **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/stop`, `/stop-all`,
-  `/quit` (`/q`), `/sessions` (`/resume`), `/cancel`, `/clear`, `/compact`
+  `/quit` (`/q`), `/sessions` (`/resume`), `/cancel`, `/clear_messages`,
+  `/compact`
+  - `/clear_messages` (formerly `/clear`) deletes this thread's Telegram
+    messages (up to 48h, Telegram limit). The bare `/clear` is **no longer
+    bot-owned** — it's forwarded verbatim to the agent like `/compact` (Claude
+    TUI wipes its context; OpenCode treats it as plain text), and forwarding it
+    resets the thread-context preamble marker so the next prompt re-informs the
+    agent of its topic.
   - `/sessions` and its synonym `/resume` list resumable sessions for the
     thread's bound folder as numbered text **and** tappable inline buttons,
     then arm a per-thread pick mode: reply with a bare digit to resume that

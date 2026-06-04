@@ -235,11 +235,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'stop_all.summary': '🛑 Остановлено {stopped} из {total} активных агентов.',
     'stop_all.general_only': 'Команда `/stop-all` доступна только в General-топике.',
 
-    // ── /clear ──
-    'clear.summary':
+    // ── /clear_messages ──
+    'clearMessages.summary':
       '🗑 Удалено {deleted} сообщений из {total}. ' +
       'Telegram не отдаёт ничего старше 48 ч — остальные останутся в истории.',
-    'clear.no_messages': 'Нет сообщений для удаления в этом треде.',
+    'clearMessages.no_messages': 'Нет сообщений для удаления в этом треде.',
 
     // ── edited message UX hint ──
     'edited.hint':
@@ -496,10 +496,10 @@ const dict: Record<Lang, Record<string, string>> = {
     'stop_all.summary': '🛑 Stopped {stopped} of {total} active agents.',
     'stop_all.general_only': '`/stop-all` is only available in the General topic.',
 
-    'clear.summary':
+    'clearMessages.summary':
       '🗑 Deleted {deleted} of {total} messages. ' +
       'Telegram refuses to delete anything older than 48 h — the rest stays in history.',
-    'clear.no_messages': 'No messages to delete in this thread.',
+    'clearMessages.no_messages': 'No messages to delete in this thread.',
 
     'edited.hint':
       '✏️ I don\'t treat edited messages as new input — send the correction as a separate message.',

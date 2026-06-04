@@ -40,7 +40,7 @@ project for parallel work.
 2. Open group settings → enable **Topics** (Forum mode).
 3. Promote the bot to admin with these rights:
    - `Manage Topics` (required — bind/create threads)
-   - `Delete Messages` (for `/clear`)
+   - `Delete Messages` (for `/clear_messages`)
    - `Pin Messages` (per-thread status banner — `/doctor` warns if missing
      but the bot still operates without it)
 4. **Remove the bot from the group and add it again.** Telegram caches the
@@ -122,8 +122,8 @@ and vice versa.
 4. In the new topic: `/bind <subdir>` (auto-bound if the topic name
    matches a subdir).
 5. `/claude` or `/opencode` → talk to the agent.
-6. `/stop` to kill the session; `/where` to inspect; `/clear` to delete the
-   topic's bot messages.
+6. `/stop` to kill the session; `/where` to inspect; `/clear_messages` to
+   delete the topic's bot messages.
 
 ## Architecture
 
@@ -178,7 +178,8 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/output` | Last 500 lines of agent output |
 | `/c`, `/y`, `/n` | Ctrl+C / "y" / "n" |
 | `/enter`, `/up`, `/down`, `/tab` | tmux key passthrough |
-| `/clear` | Delete bot messages in this topic (up to 48h, Telegram limit) |
+| `/clear_messages` | Delete bot messages in this topic (up to 48h, Telegram limit) |
+| `/clear` | Forwarded to the agent (Claude wipes context; OpenCode plain text) — not a bot command anymore |
 | `/where` | Show bound folder, branch, agent, status |
 | `/unbind` | Stop agent, drop binding |
 | `/mcp` | List MCP servers active for this thread |
@@ -353,7 +354,7 @@ or fix the host path. Path-traversal attempts (`../`, absolute paths,
 NUL bytes, NFC-vs-NFD mismatches) are rejected by design — see
 `validateSubdir` in `src/bot.ts`.
 
-### "Missing right" / `/clear` does nothing
+### "Missing right" / `/clear_messages` does nothing
 
 The bot needs admin rights `can_delete_messages` and `can_pin_messages`
 in addition to `can_manage_topics`. Open group settings → admins →

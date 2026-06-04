@@ -309,3 +309,52 @@ test('clearAgentSessionIds: the wipe is persisted to disk', async () => {
   assert.ok(persistedAgent, 'agent row must still exist on disk');
   assert.equal('opencodeSessionId' in persistedAgent, false, 'id key must be absent on disk');
 });
+
+// ── topicName (thread-context preamble) ──
+
+test('topicName: setBinding with topicName persists it and survives a reload', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  // Mirrors the `/new` and pending-name-copy-on-bind paths: the caller knows
+  // the topic name at bind time and passes it through `setBinding`.
+  await first.setBinding(key1, 'alpha', { topicName: 'Fix login bug' });
+  assert.equal(first.getBinding(key1)?.topicName, 'Fix login bug');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getBinding(key1)?.topicName, 'Fix login bug', 'name must survive restart');
+  assert.equal(second.getBinding(key1)?.subdir, 'alpha');
+});
+
+test('topicName: re-binding WITHOUT a name keeps the previously stored name', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setBinding(key1, 'alpha', { topicName: 'Fix login bug' });
+  // A later re-bind that doesn't know the name (e.g. a picker tap) must not
+  // wipe the name we already learned — the carry-through branch in setBinding.
+  await store.setBinding(key1, 'beta');
+  assert.equal(store.getBinding(key1)?.subdir, 'beta', 'subdir must update');
+  assert.equal(store.getBinding(key1)?.topicName, 'Fix login bug', 'name must be carried through');
+});
+
+test('setBindingTopicName: updates an existing binding and persists', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setBinding(key1, 'alpha', { topicName: 'Old name' });
+  // The forum_topic_edited (rename) path.
+  await first.setBindingTopicName(key1, 'New name');
+  assert.equal(first.getBinding(key1)?.topicName, 'New name');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getBinding(key1)?.topicName, 'New name', 'rename must survive restart');
+});
+
+test('setBindingTopicName: no-op when the binding does not exist (no dangling row)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setBindingTopicName(key1, 'orphan');
+  assert.equal(store.getBinding(key1), null, 'must not create a binding row');
+});

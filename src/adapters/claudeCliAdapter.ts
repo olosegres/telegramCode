@@ -1,15 +1,17 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { promisify } from 'util';
 import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
+import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
 import { t } from '../i18n';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 
@@ -26,6 +28,7 @@ interface ClaudeSession {
   sessionName: string;
   /** UUID we pass via `--session-id` (or, on resume, via `--resume`). */
   claudeSessionId: string;
+  queue: SerialQueue;
   pollTimer: NodeJS.Timeout | null;
   lastContent: string;
   isActive: boolean;
@@ -221,13 +224,16 @@ function checkArgsAreSafe(args: string): boolean {
   return !/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(args);
 }
 
+const execFilePromise = promisify(execFile);
+
 /** Best-effort tmux call: returns stdout on success, empty string on any error. */
-function tmux(...args: string[]): string {
+export async function tmuxAsync(...args: string[]): Promise<string> {
   try {
-    return execFileSync('tmux', args, {
+    const { stdout } = await execFilePromise('tmux', args, {
       encoding: 'utf-8',
       timeout: 5000,
-    }).trim();
+    });
+    return stdout.toString().trim();
   } catch {
     return '';
   }
@@ -240,11 +246,12 @@ function tmux(...args: string[]): string {
  * started when it didn't. Callers should wrap and translate to a friendly
  * error for the user.
  */
-function tmuxOrThrow(...args: string[]): string {
-  return execFileSync('tmux', args, {
+async function tmuxOrThrowAsync(...args: string[]): Promise<string> {
+  const { stdout } = await execFilePromise('tmux', args, {
     encoding: 'utf-8',
     timeout: 5000,
-  }).trim();
+  });
+  return stdout.toString().trim();
 }
 
 /**
@@ -1387,6 +1394,85 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    */
   private sessions: Map<string, ClaudeSession> = new Map();
 
+  private createSession(
+    params: Omit<
+      ClaudeSession,
+      | 'queue'
+      | 'pollTimer'
+      | 'lastContent'
+      | 'lastStatusText'
+      | 'lastQuestionSignature'
+      | 'autoEnterTimer'
+      | 'autoAcceptOuterTimer'
+      | 'autoAcceptInnerTimer'
+      | 'isPolling'
+      | 'openToolKind'
+    >,
+  ): ClaudeSession {
+    return {
+      ...params,
+      queue: createSerialQueue(),
+      pollTimer: null,
+      lastContent: '',
+      lastStatusText: '',
+      lastQuestionSignature: '',
+      autoEnterTimer: null,
+      autoAcceptOuterTimer: null,
+      autoAcceptInnerTimer: null,
+      isPolling: false,
+      openToolKind: null,
+    };
+  }
+
+  private enqueueTmux<T>(session: ClaudeSession, fn: () => Promise<T>): Promise<T> {
+    return session.queue.run(fn);
+  }
+
+  private enqueueTmuxBestEffort(session: ClaudeSession, fn: () => Promise<string>): void {
+    void this.enqueueTmux(session, fn).catch((e) => {
+      console.warn(`[Claude] tmux operation failed:`, e instanceof Error ? e.message : e);
+    });
+  }
+
+  private async stopSessionInternal(key: ThreadKey): Promise<void> {
+    const k = keyToString(key);
+    const session = this.sessions.get(k);
+    if (!session) return;
+
+    console.log(`[Claude] Stopping session for ${k}`);
+
+    session.isActive = false;
+    // pollTimer is now a `setTimeout` handle (not interval), but
+    // clearTimeout safely handles either type.
+    if (session.pollTimer) {
+      clearTimeout(session.pollTimer);
+      session.pollTimer = null;
+    }
+    // Audit S9 / #10: cancel pending auto-Enter / auto-Accept callbacks
+    // so they don't land in a replacement session.
+    if (session.autoEnterTimer) {
+      clearTimeout(session.autoEnterTimer);
+      session.autoEnterTimer = null;
+    }
+    if (session.autoAcceptOuterTimer) {
+      clearTimeout(session.autoAcceptOuterTimer);
+      session.autoAcceptOuterTimer = null;
+    }
+    if (session.autoAcceptInnerTimer) {
+      clearTimeout(session.autoAcceptInnerTimer);
+      session.autoAcceptInnerTimer = null;
+    }
+
+    const killPromise = this.enqueueTmux(session, () => tmuxAsync('kill-session', '-t', session.sessionName));
+    // Remove the tmp MCP files we wrote on startSession — claude inlines
+    // their content into the session at boot, so once tmux is killed they
+    // serve no purpose and would just leak secrets on disk (plan §13.18).
+    cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
+    this.sessions.delete(k);
+    this.emit('stopped', key);
+    await killPromise;
+  }
+
   /**
    * @description Schedule the next `pollOutput` for a session. Audit S9 /
    * #37: replaces `setInterval` so a slow `tmux capture-pane` cannot
@@ -1396,19 +1482,21 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   private schedulePoll(key: ThreadKey, session: ClaudeSession): void {
     if (!session.isActive) return;
     session.pollTimer = setTimeout(() => {
-      if (!session.isActive) return;
-      if (session.isPolling) {
-        // Previous poll still in-flight; skip this tick and reschedule.
-        this.schedulePoll(key, session);
-        return;
-      }
-      session.isPolling = true;
-      try {
-        this.pollOutput(key);
-      } finally {
-        session.isPolling = false;
-        this.schedulePoll(key, session);
-      }
+      void (async () => {
+        if (!session.isActive) return;
+        if (session.isPolling) {
+          // Previous poll still in-flight; skip this tick and reschedule.
+          this.schedulePoll(key, session);
+          return;
+        }
+        session.isPolling = true;
+        try {
+          await this.pollOutput(key);
+        } finally {
+          session.isPolling = false;
+          this.schedulePoll(key, session);
+        }
+      })();
     }, pollInterval);
   }
 
@@ -1418,7 +1506,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     args?: string,
     sessionId?: string,
   ): Promise<void> {
-    this.stopSession(key);
+    await this.stopSessionInternal(key);
 
     if (!checkIsInstalled('claude')) {
       this.emit('output', key, 'Installing Claude Code...');
@@ -1446,7 +1534,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     );
 
     // Make sure no stale session with the same name is lingering.
-    tmux('kill-session', '-t', sessionName);
+    await tmuxAsync('kill-session', '-t', sessionName);
 
     // Build the claude command line as an argv list, then assemble the final
     // shell-command for tmux by single-quoting every element. tmux execs the
@@ -1477,7 +1565,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     try {
       // `-c <workDir>` sets the new session's start directory, avoiding a
       // preceding `cd && …` chain (which would have to be shell-quoted too).
-      tmuxOrThrow(
+      await tmuxOrThrowAsync(
         'new-session',
         '-d',
         '-s', sessionName,
@@ -1492,31 +1580,22 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // Audit S9 / #14: even when the spawn fails, tmux can leave a
       // half-built session and we wrote MCP tmp files we don't want to
       // leak. Best-effort cleanup before bubbling up the error.
-      tmux('kill-session', '-t', sessionName);
+      await tmuxAsync('kill-session', '-t', sessionName);
       cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
       // Audit S10 / #16: throw so the caller's `await startSession()`
       // sees the failure and skips registering the binding.
       throw new Error(`Failed to start Claude session: ${e instanceof Error ? e.message : String(e)}`);
     }
 
-    const session: ClaudeSession = {
+    const session = this.createSession({
       key,
       workDir,
       sessionName,
       claudeSessionId,
-      pollTimer: null,
-      lastContent: '',
       isActive: true,
       handledAutoEnter: false,
       handledAutoAccept: false,
-      lastStatusText: '',
-      lastQuestionSignature: '',
-      autoEnterTimer: null,
-      autoAcceptOuterTimer: null,
-      autoAcceptInnerTimer: null,
-      isPolling: false,
-      openToolKind: null,
-    };
+    });
 
     this.sessions.set(keyToString(key), session);
     this.schedulePoll(key, session);
@@ -1524,49 +1603,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   stopSession(key: ThreadKey): void {
-    const k = keyToString(key);
-    const session = this.sessions.get(k);
-    if (!session) return;
-
-    console.log(`[Claude] Stopping session for ${k}`);
-
-    session.isActive = false;
-    // pollTimer is now a `setTimeout` handle (not interval), but
-    // clearTimeout safely handles either type.
-    if (session.pollTimer) {
-      clearTimeout(session.pollTimer);
-      session.pollTimer = null;
-    }
-    // Audit S9 / #10: cancel pending auto-Enter / auto-Accept callbacks
-    // so they don't land in a replacement session.
-    if (session.autoEnterTimer) {
-      clearTimeout(session.autoEnterTimer);
-      session.autoEnterTimer = null;
-    }
-    if (session.autoAcceptOuterTimer) {
-      clearTimeout(session.autoAcceptOuterTimer);
-      session.autoAcceptOuterTimer = null;
-    }
-    if (session.autoAcceptInnerTimer) {
-      clearTimeout(session.autoAcceptInnerTimer);
-      session.autoAcceptInnerTimer = null;
-    }
-
-    tmux('kill-session', '-t', session.sessionName);
-    // Remove the tmp MCP files we wrote on startSession — claude inlines
-    // their content into the session at boot, so once tmux is killed they
-    // serve no purpose and would just leak secrets on disk (plan §13.18).
-    cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
-    this.sessions.delete(k);
-    this.emit('stopped', key);
+    void this.stopSessionInternal(key).catch((e) => {
+      console.warn(`[Claude] stopSession failed:`, e instanceof Error ? e.message : e);
+    });
   }
 
   checkIsActive(key: ThreadKey): boolean {
     const session = this.sessions.get(keyToString(key));
-    if (!session) return false;
-
-    const sessions = tmux('list-sessions', '-F', '#{session_name}');
-    return sessions.includes(session.sessionName);
+    return session?.isActive ?? false;
   }
 
   sendInput(key: ThreadKey, input: string): void {
@@ -1588,7 +1632,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // `-l` tells tmux to treat the next argument as literal keys, not as
     // tmux special-key names (so the user typing the word "Enter" wouldn't
     // be rewritten to a newline). A separate call adds the actual Enter.
-    tmux('send-keys', '-t', session.sessionName, '-l', input);
+    this.enqueueTmuxBestEffort(session, async () => {
+      if (!session.isActive) return '';
+      return tmuxAsync('send-keys', '-t', session.sessionName, '-l', input);
+    });
 
     // Bare slash commands (`/compact`, `/clear`, …) open Claude's command
     // autocomplete popup; an Enter fired the same instant accepts the popup
@@ -1598,12 +1645,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (checkIsBareSlashCommand(input)) {
       const sessionName = session.sessionName;
       setTimeout(() => {
-        if (this.sessions.get(keyToString(key))?.isActive) {
-          tmux('send-keys', '-t', sessionName, 'Enter');
-        }
+        const current = this.sessions.get(keyToString(key));
+        if (!current?.isActive || current.sessionName !== sessionName) return;
+        this.enqueueTmuxBestEffort(current, async () => {
+          if (!current.isActive) return '';
+          return tmuxAsync('send-keys', '-t', sessionName, 'Enter');
+        });
       }, CLAUDE_SLASH_ENTER_DELAY_MS);
     } else {
-      tmux('send-keys', '-t', session.sessionName, 'Enter');
+      this.enqueueTmuxBestEffort(session, async () => {
+        if (!session.isActive) return '';
+        return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+      });
     }
   }
 
@@ -1612,7 +1665,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     if (signal === 'SIGINT') {
-      tmux('send-keys', '-t', session.sessionName, 'C-c');
+      this.enqueueTmuxBestEffort(session, async () => {
+        if (!session.isActive) return '';
+        return tmuxAsync('send-keys', '-t', session.sessionName, 'C-c');
+      });
       console.log(`[Claude] sent Ctrl+C`);
     }
   }
@@ -1622,7 +1678,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     console.log(`[Claude] sendEnter`);
-    tmux('send-keys', '-t', session.sessionName, 'Enter');
+    this.enqueueTmuxBestEffort(session, async () => {
+      if (!session.isActive) return '';
+      return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+    });
   }
 
   sendArrow(key: ThreadKey, direction: 'Up' | 'Down'): void {
@@ -1630,7 +1689,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     console.log(`[Claude] sendArrow: ${direction}`);
-    tmux('send-keys', '-t', session.sessionName, direction);
+    this.enqueueTmuxBestEffort(session, async () => {
+      if (!session.isActive) return '';
+      return tmuxAsync('send-keys', '-t', session.sessionName, direction);
+    });
   }
 
   sendTab(key: ThreadKey): void {
@@ -1638,7 +1700,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     console.log(`[Claude] sendTab`);
-    tmux('send-keys', '-t', session.sessionName, 'Tab');
+    this.enqueueTmuxBestEffort(session, async () => {
+      if (!session.isActive) return '';
+      return tmuxAsync('send-keys', '-t', session.sessionName, 'Tab');
+    });
   }
 
   /**
@@ -1663,21 +1728,24 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
-    const paneBefore = tmux('capture-pane', '-t', session.sessionName, '-p');
+    const paneBefore = await this.enqueueTmux(session, () => tmuxAsync('capture-pane', '-t', session.sessionName, '-p'));
+    if (!session.isActive) return;
     if (checkIsClaudeUninterruptible(paneBefore)) {
       console.log(`[Claude] sub-agent/compaction in progress — queueing prompt, not interrupting`);
       return;
     }
 
     console.log(`[Claude] sendEscape (interrupt)`);
-    tmux('send-keys', '-t', session.sessionName, 'Escape');
+    await this.enqueueTmux(session, () => tmuxAsync('send-keys', '-t', session.sessionName, 'Escape'));
+    if (!session.isActive) return;
 
     const deadline = Date.now() + CLAUDE_INTERRUPT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, CLAUDE_INTERRUPT_POLL_MS));
       const current = this.sessions.get(keyToString(key));
       if (!current?.isActive) return;
-      const pane = tmux('capture-pane', '-t', current.sessionName, '-p');
+      const pane = await this.enqueueTmux(current, () => tmuxAsync('capture-pane', '-t', current.sessionName, '-p'));
+      if (!current.isActive) return;
       if (!checkIsClaudeBusy(pane)) {
         console.log(`[Claude] interrupt landed — idle, forwarding prompt`);
         return;
@@ -1784,10 +1852,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return null;
 
-    const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-S', `-${lines}`);
-    if (!raw) return null;
-
-    return cleanOutput(raw);
+    return session.lastContent.split('\n').slice(-lines).join('\n') || null;
   }
 
   /**
@@ -1826,7 +1891,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    *    we surface that to the user (T8 in plan §16.3).
    */
   async resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
-    this.stopSession(key);
+    await this.stopSessionInternal(key);
 
     if (!checkIsInstalled('claude')) {
       this.emit('output', key, 'Installing Claude Code...');
@@ -1839,7 +1904,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const sessionName = buildTmuxSessionName(key);
     console.log(`[Claude] Resuming session ${sessionId} in ${workDir} for ${keyToString(key)}`);
 
-    tmux('kill-session', '-t', sessionName);
+    await tmuxAsync('kill-session', '-t', sessionName);
 
     // Pass the UUID explicitly. If it's unknown to claude, it'll just print a
     // notice and start fresh — better than hanging on a picker. MCP flags
@@ -1856,7 +1921,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const claudeShellCmd = claudeArgv.map(shellSingleQuote).join(' ');
 
     try {
-      tmuxOrThrow(
+      await tmuxOrThrowAsync(
         'new-session',
         '-d',
         '-s', sessionName,
@@ -1867,29 +1932,20 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       );
     } catch (e) {
       console.error(`[Claude] Failed to resume session:`, e);
-      tmux('kill-session', '-t', sessionName);
+      await tmuxAsync('kill-session', '-t', sessionName);
       cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
       throw new Error(`Failed to resume Claude session: ${e instanceof Error ? e.message : String(e)}`);
     }
 
-    const claudeSession: ClaudeSession = {
+    const claudeSession = this.createSession({
       key,
       workDir,
       sessionName,
       claudeSessionId: sessionId,
-      pollTimer: null,
-      lastContent: '',
       isActive: true,
       handledAutoEnter: false,
       handledAutoAccept: false,
-      lastStatusText: '',
-      lastQuestionSignature: '',
-      autoEnterTimer: null,
-      autoAcceptOuterTimer: null,
-      autoAcceptInnerTimer: null,
-      isPolling: false,
-      openToolKind: null,
-    };
+    });
 
     this.sessions.set(keyToString(key), claudeSession);
     this.schedulePoll(key, claudeSession);
@@ -1912,7 +1968,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * Returns an empty array if tmux isn't installed or no matching sessions exist.
    */
   async listExistingTmuxSessions(): Promise<Array<{ key: ThreadKey; sessionName: string }>> {
-    const raw = tmux('list-sessions', '-F', '#{session_name}');
+    const raw = await tmuxAsync('list-sessions', '-F', '#{session_name}');
     if (!raw) return [];
     const names = raw.split('\n').map(s => s.trim()).filter(Boolean);
     const result: Array<{ key: ThreadKey; sessionName: string }> = [];
@@ -1941,10 +1997,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * Returns `null` if no UUID can be recovered (caller falls back to
    * killing the session as an orphan).
    */
-  recoverSessionIdFromTmux(sessionName: string): string | null {
-    const sessions = tmux('list-sessions', '-F', '#{session_name}');
-    if (!sessions.includes(sessionName)) return null;
-    const cmd = tmux('display-message', '-p', '-t', sessionName, '#{pane_start_command}');
+  async recoverSessionIdFromTmux(sessionName: string): Promise<string | null> {
+    const sessions = await tmuxAsync('list-sessions', '-F', '#{session_name}');
+    if (!sessions.split('\n').includes(sessionName)) return null;
+    const cmd = await tmuxAsync('display-message', '-p', '-t', sessionName, '#{pane_start_command}');
     if (!cmd) return null;
     return parseClaudeSessionIdFromCommand(cmd);
   }
@@ -1963,14 +2019,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * Returns `true` on success, `false` if the tmux session disappeared between
    * the `list` call and now (race with manual `tmux kill-session`).
    */
-  adoptExistingTmuxSession(
+  async adoptExistingTmuxSession(
     key: ThreadKey,
     sessionName: string,
     workDir: string,
     claudeSessionId: string,
-  ): boolean {
-    const sessions = tmux('list-sessions', '-F', '#{session_name}');
-    if (!sessions.includes(sessionName)) {
+  ): Promise<boolean> {
+    const sessions = await tmuxAsync('list-sessions', '-F', '#{session_name}');
+    if (!sessions.split('\n').includes(sessionName)) {
       console.log(`[Claude] adopt: tmux session ${sessionName} no longer exists`);
       return false;
     }
@@ -1979,7 +2035,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // not just an empty pane. With `remain-on-exit` semantics or a crashed
     // claude, a session can exist but produce no output forever; adopting
     // it would silently swallow further user input.
-    const panesRaw = tmux('list-panes', '-t', sessionName, '-F', '#{pane_pid}');
+    const panesRaw = await tmuxAsync('list-panes', '-t', sessionName, '-F', '#{pane_pid}');
     const pids = panesRaw.split('\n').map(s => s.trim()).filter(s => /^\d+$/.test(s));
     const anyAlive = pids.some(pidStr => {
       try { process.kill(Number(pidStr), 0); return true; }
@@ -1987,7 +2043,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     });
     if (!anyAlive) {
       console.log(`[Claude] adopt: ${sessionName} has no live child process, killing as zombie`);
-      tmux('kill-session', '-t', sessionName);
+      await tmuxAsync('kill-session', '-t', sessionName);
       return false;
     }
 
@@ -1999,24 +2055,15 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     console.log(`[Claude] adopt: re-attaching to ${sessionName} in ${workDir}`);
-    const session: ClaudeSession = {
+    const session = this.createSession({
       key,
       workDir,
       sessionName,
       claudeSessionId,
-      pollTimer: null,
-      lastContent: '',
       isActive: true,
       handledAutoEnter: true,  // don't try to auto-Enter on a session that's already past startup
       handledAutoAccept: true, // same — bypass-permissions was accepted on the original launch
-      lastStatusText: '',
-      lastQuestionSignature: '',
-      autoEnterTimer: null,
-      autoAcceptOuterTimer: null,
-      autoAcceptInnerTimer: null,
-      isPolling: false,
-      openToolKind: null,
-    };
+    });
 
     // Seed `lastContent` with the current pane snapshot **before** the
     // first poll fires. Without this, the bot's first `pollOutput` after
@@ -2035,7 +2082,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // first diff. Best-effort — if `capture-pane` fails the seed stays
     // empty and we fall back to the pre-fix (noisy) behaviour, which
     // is still better than refusing to adopt.
-    const initialRaw = tmux('capture-pane', '-t', sessionName, '-p', '-e', '-S', '-2000');
+    const initialRaw = await this.enqueueTmux(session, () => tmuxAsync('capture-pane', '-t', sessionName, '-p', '-e', '-S', '-2000'));
     if (initialRaw) {
       session.lastContent = cleanOutput(initialRaw);
     }
@@ -2053,9 +2100,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * (`claude-<chatId>-<threadId>` names with no corresponding binding in
    * state.json). See plan §10.2 / §13.19.
    */
-  killOrphanTmuxSession(sessionName: string): void {
+  async killOrphanTmuxSession(sessionName: string): Promise<void> {
     console.log(`[Claude] kill orphan tmux session: ${sessionName}`);
-    tmux('kill-session', '-t', sessionName);
+    await tmuxAsync('kill-session', '-t', sessionName);
   }
 
   // Exposed for tests (see §11 Этап 7, R10): keeps the tmux-name parsing
@@ -2064,7 +2111,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   static parseTmuxSessionName = parseTmuxSessionName;
   static buildTmuxSessionName = buildTmuxSessionName;
 
-  private pollOutput(key: ThreadKey): void {
+  private async probeSessionAlive(session: ClaudeSession): Promise<boolean> {
+    const sessions = await this.enqueueTmux(session, () => tmuxAsync('list-sessions', '-F', '#{session_name}'));
+    return sessions.split('\n').includes(session.sessionName);
+  }
+
+  private async pollOutput(key: ThreadKey): Promise<void> {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
@@ -2074,12 +2126,15 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // 2000 lines comfortably covers a long Claude tool-call block; we
     // still diff against `session.lastContent` in memory so the larger
     // capture doesn't grow the output we send to Telegram.
-    const raw = tmux('capture-pane', '-t', session.sessionName, '-p', '-e', '-S', '-2000');
+    const raw = await this.enqueueTmux(session, () => tmuxAsync('capture-pane', '-t', session.sessionName, '-p', '-e', '-S', '-2000'));
+    if (!session.isActive) return;
 
     if (!raw) {
-      if (!this.checkIsActive(key)) {
+      const alive = await this.probeSessionAlive(session);
+      if (!session.isActive) return;
+      if (!alive) {
         console.log(`[Claude] Session died, cleaning up`);
-        this.stopSession(key);
+        await this.stopSessionInternal(key);
         this.emit('closed', key);
       }
       return;
@@ -2154,7 +2209,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         session.autoEnterTimer = setTimeout(() => {
           session.autoEnterTimer = null;
           if (!session.isActive) return;
-          tmux('send-keys', '-t', session.sessionName, 'Enter');
+          this.enqueueTmuxBestEffort(session, async () => {
+            if (!session.isActive) return '';
+            return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+          });
         }, 300);
       }
 
@@ -2164,11 +2222,17 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         session.autoAcceptOuterTimer = setTimeout(() => {
           session.autoAcceptOuterTimer = null;
           if (!session.isActive) return;
-          tmux('send-keys', '-t', session.sessionName, 'Down');
+          this.enqueueTmuxBestEffort(session, async () => {
+            if (!session.isActive) return '';
+            return tmuxAsync('send-keys', '-t', session.sessionName, 'Down');
+          });
           session.autoAcceptInnerTimer = setTimeout(() => {
             session.autoAcceptInnerTimer = null;
             if (!session.isActive) return;
-            tmux('send-keys', '-t', session.sessionName, 'Enter');
+            this.enqueueTmuxBestEffort(session, async () => {
+              if (!session.isActive) return '';
+              return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+            });
           }, 100);
         }, 300);
       }

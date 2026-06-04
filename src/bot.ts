@@ -59,6 +59,7 @@ import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage } from './messageSplit';
+import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -3736,13 +3737,12 @@ function handleAgentOutput(key: ThreadKey, output: string): void {
   const msgState = getThreadMessageState(key);
   const hadStatusMessage = msgState.statusMessageId !== null;
 
-  deleteStatusMessage(key).then(() => {
-    if (hadStatusMessage) {
-      const adapter = getThreadAdapter(key);
-      if (adapter.outputsDeltas) msgState.needsNewMessage = true;
-    }
-    queueOutput(key, output);
-  });
+  if (hadStatusMessage) {
+    const adapter = getThreadAdapter(key);
+    if (adapter.outputsDeltas) msgState.needsNewMessage = true;
+    void deleteStatusMessage(key).catch(() => {});
+  }
+  queueOutput(key, output);
 }
 
 /**
@@ -4026,7 +4026,7 @@ async function reattachExistingSessions(
         const binding = state.getBinding(key);
         if (!binding) {
           // No binding at all → genuine orphan, no thread owns it.
-          claudeAdapter.killOrphanTmuxSession(sessionName);
+          await claudeAdapter.killOrphanTmuxSession(sessionName);
           killed += 1;
           continue;
         }
@@ -4040,7 +4040,7 @@ async function reattachExistingSessions(
         // call left a leftover session of the other adapter alive.
         const needsReconcile = !agent || agent.name !== 'claude' || !agent.claudeSessionId;
         if (needsReconcile) {
-          const recovered = claudeAdapter.recoverSessionIdFromTmux(sessionName);
+          const recovered = await claudeAdapter.recoverSessionIdFromTmux(sessionName);
           if (recovered) {
             const patched: { name: string; model?: string; claudeSessionId: string } = {
               name: 'claude',
@@ -4056,19 +4056,19 @@ async function reattachExistingSessions(
             reconciled += 1;
             console.log(`[reattach] reconciled state for ${keyToString(key)} (recovered claudeSessionId=${recovered})`);
           } else {
-            claudeAdapter.killOrphanTmuxSession(sessionName);
+            await claudeAdapter.killOrphanTmuxSession(sessionName);
             killed += 1;
             continue;
           }
         }
         // After reconcile, agent is always populated with claudeSessionId.
         if (!agent?.claudeSessionId) {
-          claudeAdapter.killOrphanTmuxSession(sessionName);
+          await claudeAdapter.killOrphanTmuxSession(sessionName);
           killed += 1;
           continue;
         }
         const workDir = path.join(ENV.workRoot, binding.subdir);
-        if (claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
+        if (await claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
           adopted += 1;
           if (!opts.quietReattach) {
             replyToThread(key, t('agent.reattached')).catch(() => {});
@@ -4276,6 +4276,10 @@ export async function startBot(): Promise<void> {
 
   // 6. Global catch — Telegraf swallows handler errors otherwise.
   bot.catch((err, ctx) => {
+    if (checkIsStaleAnswerCallbackQueryError(err)) {
+      console.debug('[bot.catch] stale answerCallbackQuery ignored:', ctx.updateType);
+      return;
+    }
     console.error('[bot.catch] unhandled error:', err, 'update:', ctx.updateType);
   });
 

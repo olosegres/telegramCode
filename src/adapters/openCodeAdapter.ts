@@ -139,6 +139,15 @@ interface OpenCodeSession {
   isActive: boolean;
   /** Accumulated text parts for current response */
   currentResponseText: string;
+  /**
+   * Length (chars) of {@link currentResponseText} that has already been
+   * emitted as an `output` event. Both emit sites (the debounce timer in
+   * `handleTextDelta` and `flushOutput`) send only the unsent tail
+   * `currentResponseText.slice(lastEmittedLength)` and advance this, so the
+   * full response reaches Telegram exactly once. Reset to 0 wherever
+   * `currentResponseText` is reset to `''`.
+   */
+  lastEmittedLength: number;
   /** Timer for batching SSE deltas before emitting output */
   outputTimer: NodeJS.Timeout | null;
   /** Whether model info has been shown to the user (shown once on first response) */
@@ -915,6 +924,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           workDir,
           isActive: true,
           currentResponseText: '',
+          lastEmittedLength: 0,
           outputTimer: null,
           isModelInfoShown: false,
           modelOverride: null,
@@ -1027,6 +1037,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     // Reset accumulated response text for new message
     session.currentResponseText = '';
+    session.lastEmittedLength = 0;
     // Mark busy optimistically so an immediately-following message correctly
     // sees a turn in flight; the `session.status` stream corrects/confirms it.
     session.isBusy = true;
@@ -1313,6 +1324,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         workDir,
         isActive: true,
         currentResponseText: '',
+        lastEmittedLength: 0,
         outputTimer: null,
         isModelInfoShown: false,
         modelOverride: null,
@@ -1860,10 +1872,24 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     session.outputTimer = setTimeout(() => {
       session.outputTimer = null;
-      if (session.currentResponseText.trim()) {
-        this.emit('output', key, session.currentResponseText);
-      }
+      this.emitResponseTail(key, session);
     }, sseOutputBatchMs);
+  }
+
+  /**
+   * @description Emit only the part of `currentResponseText` not yet sent as
+   * an `output` event, then advance `lastEmittedLength`. The bot does not
+   * delta-render OpenCode output (`outputsDeltas` is unset), so each emit is a
+   * standalone message/chunk; `queueOutput` joins pending chunks with `\n`, so
+   * successive tails reconstruct the full response exactly once. Without this,
+   * the debounce timer and `flushOutput` both emitted the whole accumulated
+   * text, duplicating the response in Telegram.
+   */
+  private emitResponseTail(key: ThreadKey, session: OpenCodeSession): void {
+    const tail = session.currentResponseText.slice(session.lastEmittedLength);
+    if (!tail.trim()) return;
+    this.emit('output', key, tail);
+    session.lastEmittedLength = session.currentResponseText.length;
   }
 
   /**
@@ -2154,11 +2180,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       session.pendingStatus = null;
     }
 
-    if (session.currentResponseText.trim()) {
-      this.emit('output', key, session.currentResponseText);
-    }
+    this.emitResponseTail(key, session);
 
     session.currentResponseText = '';
+    session.lastEmittedLength = 0;
     session.partTypes.clear();
   }
 }

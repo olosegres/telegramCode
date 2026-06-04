@@ -60,6 +60,7 @@ import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage } from './messageSplit';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
+import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -164,6 +165,11 @@ const telegramAgent = new https.Agent({
 });
 const bot = new Telegraf(ENV.botToken, { telegram: { agent: telegramAgent } });
 
+// Output-trace special mode (`OUTPUT_TRACE=1`): record every outgoing Bot API
+// call with its outcome at the single `callApi` chokepoint. Installed
+// unconditionally — when the mode is off each call costs one env check.
+installCallApiTrace(bot.telegram);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Access control — who may talk to the agent
 //
@@ -203,6 +209,25 @@ async function checkIsForumAdmin(chatId: number, userId: number): Promise<boolea
     return false;
   }
 }
+
+// Output-trace `recv` hook — must be the FIRST middleware so every update is
+// recorded before any gating (access control, group routing) can drop it.
+bot.use(async (ctx, next) => {
+  const message = ctx.message;
+  const messageText = message && 'text' in message ? message.text : undefined;
+  const callbackData =
+    ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
+  traceRecvUpdate({
+    updateType: ctx.updateType,
+    updateId: ctx.update.update_id,
+    fromId: ctx.from?.id,
+    chatId: ctx.chat?.id,
+    threadId: message?.message_thread_id,
+    preview: messageText ?? callbackData,
+    tgDateSec: message?.date,
+  });
+  return next();
+});
 
 // Auto-pairing must run before any command / `on` handler so a freshly
 // discovered group id is already in effect by the time the routing gates
@@ -3706,6 +3731,7 @@ bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
 function handleAgentOutput(key: ThreadKey, output: string): void {
   console.log(`[Bot] output ${keyToString(key)} (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
+  traceAgentEmit('output', key, output);
 
   // Bot-side safety net for Claude-CLI "thinking" bursts that slip past
   // the adapter classifier (`checkIsStatusOutput`'s ≤200-char / ≤3-line
@@ -3758,6 +3784,7 @@ function handleAgentOutput(key: ThreadKey, output: string): void {
 function handleAgentStatus(key: ThreadKey, status: string): void {
   if (!status.trim()) return;
   console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
+  traceAgentEmit('status', key, status);
 
   deleteLoaderMessage(key).catch(() => {});
 

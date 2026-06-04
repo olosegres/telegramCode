@@ -71,6 +71,7 @@ config/variants, not a per-message API field).
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
+| `outputTrace.ts` | Output-trace special mode (`OUTPUT_TRACE=1`): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `types.ts` | Shared types incl. the `AgentAdapter` contract and `ThreadKey` |
@@ -154,6 +155,17 @@ per-backend, persisted agent setting.
   data; in `get_history` raw text a Bash result still showing `⎿` means it was
   NOT fenced, a clean code block (no `⎿`, no literal ```` ``` ````) means the
   HTML `<pre>` was accepted.
+
+- **Live tests touch ONLY the "Telegram code testing" topic** (root message id
+  `9085` in ExampleGroup `-1001111111111`). Never send commands, prompts, or
+  button presses to any other topic — those are the user's working threads with
+  live agent sessions. (User instruction, 2026-06-04.)
+
+- **For send-path / responsiveness / ordering verification, enable the
+  output-trace mode** (`OUTPUT_TRACE=1` in the instance `.env`, hot-restart
+  picks it up) and assert against `DATA_DIR/output-trace.jsonl`, not just
+  `get_history`: recv→sendOk latency per command, `sendErr` 429s with
+  `retryAfterSec`, emit-vs-sendOk order per topic.
 
 - **Verify a per-prompt OpenCode override actually applied** (model or `/effort`
   variant): `GET http://127.0.0.1:4096/session/<sessionId>/message` — the stored

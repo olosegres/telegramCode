@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { promisify } from 'util';
+import { sleep } from '../utils';
 import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
@@ -1253,6 +1254,38 @@ export function checkIsBareSlashCommand(input: string): boolean {
 const CLAUDE_SLASH_ENTER_DELAY_MS = 250;
 
 /**
+ * @description Delay between the literal-text burst and the Enter that submits
+ * a plain (non-slash) prompt.
+ *
+ * Claude's TUI aggregates a fast burst of input as a paste; an Enter that lands
+ * inside that aggregation window (observed: tens of ms after a 100+ char burst)
+ * is absorbed as a paste newline instead of submitting, leaving the prompt
+ * typed-but-unsubmitted in the input box (B5, live-reproduced ~1 in 4). Sending
+ * the text and the Enter back-to-back on the serial queue is exactly that race.
+ * Deferring the Enter past the window makes it register as a submit. Kept small
+ * so the prompt still feels instant; the slash-command delay is larger because
+ * it solves a different problem (popup settle), not this one.
+ */
+const CLAUDE_TEXT_ENTER_DELAY_MS = 80;
+
+/**
+ * @description Inputs shorter than this skip the deferred Enter + verification
+ * entirely: a few characters (`y`, `n`, an option digit) cannot trigger the
+ * TUI's paste aggregation, and these control replies were instant before B5 —
+ * keep them instant.
+ */
+const CLAUDE_PASTE_RACE_MIN_LENGTH = 8;
+
+/**
+ * @description How long to wait after the submit-Enter before capturing the
+ * pane to verify the prompt actually submitted (B5 post-Enter verification).
+ * Must outlast the TUI repaint that follows a real submit (the input box clears
+ * and Claude either goes busy or echoes the user turn). One capture only; if it
+ * still looks unsubmitted we re-send Enter exactly once (no infinite retries).
+ */
+const CLAUDE_ENTER_VERIFY_DELAY_MS = 600;
+
+/**
  * @description The TUI footer shows this hint exactly while a turn is in
  * flight (thinking or running a tool) and drops it the instant Claude returns
  * to idle. It's our single reliable "still busy" signal scraped from the pane.
@@ -1267,6 +1300,64 @@ const CLAUDE_BUSY_FOOTER_RE = /esc to interrupt/i;
  */
 export function checkIsClaudeBusy(paneText: string): boolean {
   return CLAUDE_BUSY_FOOTER_RE.test(paneText);
+}
+
+/**
+ * @description Min chars of the typed prompt that must still sit in the live
+ * input box for {@link checkLooksUnsubmitted} to call it unsubmitted. A short
+ * prefix (vs the whole prompt) is enough — the input box shows only the first
+ * wrapped line of a long prompt — while guarding against a one-glyph false
+ * match. Below this length we compare the full trimmed text.
+ */
+const CLAUDE_INPUT_MATCH_PREFIX_LEN = 12;
+
+/**
+ * @description Whether a captured pane looks like the typed prompt is still
+ * sitting UNSUBMITTED in Claude's live input box (the B5 paste-race symptom).
+ *
+ * Submission predicate (the load-bearing "did it submit?" check): a prompt has
+ * submitted iff EITHER Claude went busy (`esc to interrupt` in the footer — the
+ * turn started) OR the live input box at the bottom is empty (`❯ ` with no
+ * text — Claude consumed the input and is idle again, e.g. a fast/no-op turn).
+ * It looks UNSUBMITTED only when Claude is idle AND the last `❯`-led input row
+ * still carries the typed text. We deliberately key on the LAST `❯` line: a
+ * SUBMITTED prompt echoes as a `❯ <text>` user-turn block in scrollback, but
+ * the live input box below it is the final `❯` line and is empty — so matching
+ * the last one ignores the harmless scrollback echo.
+ *
+ * Tradeoff (locked in plan B5): if a single verification capture is ambiguous
+ * we err toward reporting unsubmitted and let the caller retry Enter once — a
+ * duplicate Enter on an already-submitted prompt is a harmless no-op in the
+ * Claude TUI (submits an empty input = ignored), whereas a missed submit silently
+ * loses the user's message.
+ *
+ * Exported so the predicate is unit-testable without a live tmux session.
+ */
+export function checkLooksUnsubmitted(paneText: string, typedText: string): boolean {
+  if (checkIsClaudeBusy(paneText)) return false;
+
+  const typed = typedText.trim();
+  if (!typed) return false;
+  // The input box renders the first visual line of the prompt; compare against
+  // the prompt's first line so a multi-line paste doesn't fail to match.
+  const firstLine = typed.split('\n', 1)[0].trim();
+  if (!firstLine) return false;
+
+  const lines = paneText.split('\n');
+  let lastInputRow: string | null = null;
+  for (const line of lines) {
+    const match = line.match(/^\s*❯\s?(.*)$/);
+    if (match) lastInputRow = match[1].trim();
+  }
+  // No input box at all (e.g. a selector/question is on screen) → not our case.
+  if (lastInputRow === null) return false;
+  if (lastInputRow === '') return false;
+
+  const needle =
+    firstLine.length <= CLAUDE_INPUT_MATCH_PREFIX_LEN
+      ? firstLine
+      : firstLine.slice(0, CLAUDE_INPUT_MATCH_PREFIX_LEN);
+  return lastInputRow.startsWith(needle);
 }
 
 /**
@@ -1659,12 +1750,61 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           return tmuxAsync('send-keys', '-t', sessionName, 'Enter');
         });
       }, CLAUDE_SLASH_ENTER_DELAY_MS);
-    } else {
+    } else if (input.length < CLAUDE_PASTE_RACE_MIN_LENGTH) {
+      // Short control replies (y/n/option digits) can't trigger paste
+      // aggregation — submit instantly, no verification capture.
       this.enqueueTmuxBestEffort(session, async () => {
         if (!session.isActive) return '';
         return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
       });
+    } else {
+      // Plain prompt: defer the Enter past the TUI's paste-aggregation window
+      // (see CLAUDE_TEXT_ENTER_DELAY_MS) so it submits instead of being absorbed
+      // as a paste newline. The delay runs INSIDE the queued fn (not a bare
+      // setTimeout): the per-session queue is the ordering guarantee, so any op
+      // enqueued later — the next prompt's text, an interrupt Escape from
+      // startup-prompt replay — physically cannot land between this text and
+      // its submit Enter. An 80ms hold of THIS session's queue is harmless
+      // (polls run every 300ms); other sessions' queues are independent.
+      this.enqueueTmuxBestEffort(session, async () => {
+        if (!session.isActive) return '';
+        await sleep(CLAUDE_TEXT_ENTER_DELAY_MS);
+        if (!session.isActive) return '';
+        return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+      });
+      this.scheduleEnterVerification(key, session.sessionName, input);
     }
+  }
+
+  /**
+   * @description Post-Enter verification for a plain prompt (B5). After a short
+   * settle, capture the pane through the session queue and — if the prompt still
+   * looks unsubmitted (see {@link checkLooksUnsubmitted}) — re-send Enter exactly
+   * ONCE. No further retries: a duplicate Enter on an already-submitted prompt is
+   * a harmless no-op, but an unbounded retry loop on a genuinely-stuck pane would
+   * spam keystrokes. Same staleness guards as the deferred Enter.
+   */
+  private scheduleEnterVerification(key: ThreadKey, sessionName: string, typedText: string): void {
+    setTimeout(() => {
+      const current = this.sessions.get(keyToString(key));
+      if (!current?.isActive || current.sessionName !== sessionName) return;
+      void this.enqueueTmux(current, () =>
+        tmuxAsync('capture-pane', '-t', sessionName, '-p'),
+      )
+        .then((pane) => {
+          const live = this.sessions.get(keyToString(key));
+          if (!live?.isActive || live.sessionName !== sessionName) return;
+          if (!checkLooksUnsubmitted(pane, typedText)) return;
+          console.log(`[Claude] Enter retry (paste-race)`);
+          this.enqueueTmuxBestEffort(live, async () => {
+            if (!live.isActive) return '';
+            return tmuxAsync('send-keys', '-t', sessionName, 'Enter');
+          });
+        })
+        .catch(() => {
+          /* capture failures are non-fatal: the next poll still drives the UI */
+        });
+    }, CLAUDE_ENTER_VERIFY_DELAY_MS);
   }
 
   sendSignal(key: ThreadKey, signal: string): void {

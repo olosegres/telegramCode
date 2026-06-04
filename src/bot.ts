@@ -2743,6 +2743,21 @@ command('model', async (ctx, key) => {
   await replyToThread(key, listText);
 });
 
+/**
+ * @description Build the `/effort` level picker keyboard.
+ *
+ * One callback button per available reasoning-effort level (3 per row);
+ * the level matching `current` carries a `✓` marker. Shared by the
+ * `/effort` command (initial render) and the `effort_<level>` callback
+ * (re-render after a press) so the marker can never drift between the two.
+ */
+function buildEffortKeyboard(levels: readonly string[], current: string | null) {
+  const buttons = levels.map((l) =>
+    Markup.button.callback(l === current ? `${l} ✓` : l, `effort_${l}`),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: 3 });
+}
+
 command('effort', async (ctx, key) => {
   const adapter = getThreadAdapter(key);
   const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
@@ -2785,13 +2800,10 @@ command('effort', async (ctx, key) => {
     return;
   }
   const cur = adapter.getEffort?.(key) ?? null;
-  const buttons = levels.map((l) =>
-    Markup.button.callback(l === cur ? `${l} ✓` : l, `effort_${l}`),
-  );
   await replyToThread(
     key,
     t('effort.choose', { current: cur ?? t('effort.current_none') }),
-    Markup.inlineKeyboard(buttons, { columns: 3 }),
+    buildEffortKeyboard(levels, cur),
   );
 });
 
@@ -3755,6 +3767,37 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery(t('cb.effort_set', { level }));
   await replyToThread(key, t('effort.set_success', { level }));
   await updatePinnedStatus(key).catch(() => {});
+
+  // Re-render the picker so the `✓` marker follows the new level instead of
+  // staying stuck on the previously-selected one (B12). The current level is
+  // the freshly-set one; fall back to `level` if the adapter can't report it.
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  if (cbMsg && adapter.getAvailableEffortLevels) {
+    let levels: string[] = [];
+    try {
+      levels = await adapter.getAvailableEffortLevels(key);
+    } catch (e) {
+      console.error('[effort_cb] getAvailableEffortLevels:', e);
+    }
+    if (levels.length > 0) {
+      const cur = adapter.getEffort?.(key) ?? level;
+      const keyboard = buildEffortKeyboard(levels, cur);
+      try {
+        await enqueueSend(
+          key,
+          () => bot.telegram.editMessageReplyMarkup(
+            key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
+          ),
+          'interactive',
+        );
+      } catch (e) {
+        const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+        if (!/message is not modified/i.test(desc)) {
+          console.warn('[effort_cb] keyboard re-render failed:', desc || e);
+        }
+      }
+    }
+  }
 });
 
 bot.action(/^agent_(.+)$/, async (ctx) => {

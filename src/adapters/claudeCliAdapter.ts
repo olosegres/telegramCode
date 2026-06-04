@@ -1303,6 +1303,24 @@ export function checkIsClaudeBusy(paneText: string): boolean {
 }
 
 /**
+ * @description Whether a cleaned output frame is nothing but the TUI input box
+ * echoing typed text (`❯ <draft>`). The poll can catch the input row between
+ * the literal-text keystrokes and the deferred submit Enter (B5 window), and
+ * that draft echo is pure noise in Telegram — the user already sees their own
+ * message (B7). Only frames made ENTIRELY of ❯-rows match: a ❯ inside real
+ * tool output (e.g. a pane capture printed by a Bash command) survives
+ * because its frame carries other content lines.
+ */
+export function checkIsInputEchoFrame(frameText: string): boolean {
+  const contentLines = frameText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (contentLines.length === 0) return false;
+  return contentLines.every((line) => line.startsWith('❯'));
+}
+
+/**
  * @description Min chars of the typed prompt that must still sit in the live
  * input box for {@link checkLooksUnsubmitted} to call it unsubmitted. A short
  * prefix (vs the whole prompt) is enough — the input box shows only the first
@@ -2325,7 +2343,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           const stripped = stripTuiElementsWithContext(newPart, session.openToolKind);
           session.openToolKind = stripped.toolKind;
           const cleanedOutput = stripped.text;
-          if (cleanedOutput) {
+          if (cleanedOutput && checkIsInputEchoFrame(cleanedOutput)) {
+            // B7: the frame is just the input box echoing a typed draft —
+            // relaying it reads as a ghost message in the topic.
+            console.log(`[Claude] input-echo frame filtered`);
+          } else if (cleanedOutput) {
             console.log(`[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`);
 
             if (checkIsStatusOutput(cleanedOutput)) {

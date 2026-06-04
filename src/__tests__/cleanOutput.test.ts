@@ -21,6 +21,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
+  checkIsInputEchoFrame,
   checkIsStatusOutput,
   cleanOutput,
   convertAnsiToMarkdown,
@@ -387,4 +388,32 @@ test('convertAnsiToMarkdown: keeps real bold for multi-char prose "*important*"'
 test('convertAnsiToMarkdown: keeps real bold for tool name "*Bash*"', () => {
   const input = '\x1b[1mBash\x1b[0m';
   assert.equal(convertAnsiToMarkdown(input), '*Bash*');
+});
+
+// ─── B7 — typed-draft input-box echo frame must not reach Telegram ─────────
+
+test('checkIsInputEchoFrame: a frame that is only the ❯ draft row is an echo (live 12:51:52 fixture)', () => {
+  assert.equal(
+    checkIsInputEchoFrame('❯ передумал — просто скажи сколько функций экспортирует src/state.ts'),
+    true,
+  );
+});
+
+test('checkIsInputEchoFrame: multi-row frame of only ❯ lines (draft + empty prompt) is an echo', () => {
+  assert.equal(checkIsInputEchoFrame('❯ draft text\n\n  ❯'), true);
+});
+
+test('checkIsInputEchoFrame: a ❯ row inside real tool output is NOT an echo frame', () => {
+  assert.equal(
+    checkIsInputEchoFrame('● Bash(tmux capture-pane -p)\n  ⎿  ❯ some pane content\nRead 1 file'),
+    false,
+  );
+});
+
+test('checkIsInputEchoFrame: ordinary answer text is NOT an echo frame', () => {
+  assert.equal(checkIsInputEchoFrame('● В src/bot.ts — 4355 строк.'), false);
+});
+
+test('checkIsInputEchoFrame: empty/whitespace-only frame is NOT an echo (already filtered upstream)', () => {
+  assert.equal(checkIsInputEchoFrame('   \n  '), false);
 });

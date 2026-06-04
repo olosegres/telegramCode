@@ -298,6 +298,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'session.resume_failed': 'Не удалось возобновить сессию: {error}',
     'session.expired': 'Список сессий устарел. Запустите /sessions заново.',
     'session.load_failed': 'Не удалось загрузить список сессий.',
+
+    // ── resume context block (last {count} turns shown on resume) ──
+    'resume.context_header': '↩️ Возобновлено — последние {count} сообщений:',
+    'resume.context_user_label': '👤',
+    'resume.context_assistant_label': '🤖',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -548,6 +553,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'session.resume_failed': 'Failed to resume session: {error}',
     'session.expired': 'Session list is stale. Run /sessions again.',
     'session.load_failed': 'Failed to load sessions.',
+
+    // ── resume context block (last {count} turns shown on resume) ──
+    'resume.context_header': '↩️ Resumed — last {count} messages:',
+    'resume.context_user_label': '👤',
+    'resume.context_assistant_label': '🤖',
   },
 };
 

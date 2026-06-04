@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { promisify } from 'util';
 import { sleep } from '../utils';
-import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
+import type { AgentAdapter, AgentSession, RecentTurn, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
@@ -14,6 +14,7 @@ import { resolveDataDir } from '../state';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
 import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
 import { t } from '../i18n';
+import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 
 /**
@@ -72,9 +73,34 @@ interface ClaudeSession {
    * {@link fenceToolResultBodies}.
    */
   openToolKind: ToolResultKind | null;
+  /**
+   * Resume flood-suppression mode. On `--resume`, Claude repaints the ENTIRE
+   * restored transcript into the pane over several polls; relaying that diff
+   * would dump hours of old conversation into the topic. While seeding we
+   * advance the baseline (`lastContent`) every poll but emit NOTHING, so once
+   * the pane stops growing the baseline equals the full restored transcript
+   * and later diffs are genuine new output. The short last-3-turn context block
+   * is posted separately (read from the `.jsonl`). The auto-Enter / auto-Accept
+   * machinery KEEPS running during seeding — we suppress conversation text, not
+   * lifecycle. See {@link getResumeSeedDecision}.
+   */
+  resumeSeeding: boolean;
+  /** Polls elapsed in {@link resumeSeeding} mode — drives the stable/cap exit. */
+  resumeSeedPolls: number;
+  /** Pane content seen on the previous seeding poll, for the "unchanged across 2 polls" exit. */
+  resumeSeedPrevContent: string;
 }
 
 const pollInterval = 300;
+
+/**
+ * @description Hard cap on resume flood-suppression polls. The normal exit is
+ * "pane non-empty and unchanged across 2 consecutive polls" (the restored
+ * transcript finished painting), but if the paint stutters indefinitely we
+ * force-exit after this many polls (≈ {@link pollInterval} × this) so seeding
+ * can never wedge a session into permanent silence. See {@link getResumeSeedDecision}.
+ */
+const resumeSeedMaxPolls = 40;
 
 const claudePath = resolveClaudeBinary();
 
@@ -1155,6 +1181,77 @@ function extractUserText(message: unknown): string | null {
 }
 
 /**
+ * @description Best-effort extraction of plain text from a transcript's
+ * `assistant` message. Unlike a user message, an assistant `message.content`
+ * is always the block array; we concatenate every `{ type: 'text' }` block
+ * (one assistant turn can interleave several) and IGNORE `tool_use` /
+ * `thinking` / other block kinds so the resume context shows prose, not a
+ * tool-call dump. Returns the joined text, or `null` if no renderable text.
+ */
+function extractAssistantText(message: unknown): string | null {
+  if (!checkIsRecord(message)) return null;
+  const content = message.content;
+  // Some assistant entries store a bare string (rare); accept it too.
+  if (typeof content === 'string') return content.trim() || null;
+  if (!Array.isArray(content)) return null;
+  const textBlocks: string[] = [];
+  for (const block of content) {
+    if (checkIsRecord(block) && block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+      textBlocks.push(block.text.trim());
+    }
+  }
+  if (textBlocks.length === 0) return null;
+  return textBlocks.join('\n\n');
+}
+
+/**
+ * @description Read the last `limit` conversational turns (user/assistant
+ * messages with renderable text, oldest→newest) from a Claude `.jsonl`
+ * transcript, for the resume context block.
+ *
+ * Exported and pure (filesystem-only) so it is unit-testable against a temp
+ * `.jsonl`. Streams the whole file, collecting each `type:'user'` /
+ * `type:'assistant'` entry whose message yields non-empty text (via
+ * {@link extractUserText} / {@link extractAssistantText}); `summary` and other
+ * meta lines, and assistant entries that are tool_use-only, are skipped. Keeps
+ * only the last `limit` in a rolling window so a huge transcript stays cheap.
+ * Tolerates a half-written trailing line; a missing/unreadable file → `[]`.
+ */
+export function readRecentClaudeTurns(filePath: string, limit: number): RecentTurn[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return []; // transcript not on disk (unknown UUID / pruned) → no context
+  }
+
+  const turns: RecentTurn[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue; // tolerate a half-written trailing line
+    }
+    if (!checkIsRecord(entry)) continue;
+
+    if (entry.type === 'user') {
+      const text = extractUserText(entry.message);
+      if (text) turns.push({ role: 'user', text });
+    } else if (entry.type === 'assistant') {
+      const text = extractAssistantText(entry.message);
+      if (text) turns.push({ role: 'assistant', text });
+    }
+    // Bound the window: drop the oldest once we exceed `limit` so a long
+    // transcript never accumulates more than `limit` turns in memory.
+    if (turns.length > limit) turns.shift();
+  }
+  return turns;
+}
+
+/**
  * @description List resumable Claude sessions for a workDir by reading the
  * real `~/.claude/projects/<slug>/*.jsonl` transcripts.
  *
@@ -1523,6 +1620,41 @@ export function getNewPaneContent(oldContent: string, newContent: string): strin
   return newParts.join('\n').trim();
 }
 
+/**
+ * @description Input snapshot of one resume-seeding poll, fed to
+ * {@link getResumeSeedDecision}.
+ */
+export interface ResumeSeedState {
+  /** Cleaned pane content captured on THIS poll. */
+  content: string;
+  /** Cleaned pane content captured on the PREVIOUS poll (empty before the first). */
+  prevContent: string;
+  /** Number of polls already spent in seeding mode (0 on the first seeding poll). */
+  polls: number;
+}
+
+/**
+ * @description Decide whether to stay in resume flood-suppression mode or exit.
+ *
+ * While `keepSeeding` is true, `pollOutput` advances the baseline but emits no
+ * conversation text, so the entire restored transcript Claude repaints on
+ * `--resume` is swallowed instead of dumped into the topic. We exit (and let
+ * the NEXT poll's diff be genuine new output) when either:
+ *
+ *   - the pane is non-empty AND unchanged across two consecutive polls (the
+ *     restored transcript finished painting — the common case), or
+ *   - the hard cap {@link resumeSeedMaxPolls} is hit (paint stuttered forever;
+ *     force-exit so a session can never be wedged into permanent silence).
+ *
+ * Pure + exported so the swallow → exit-on-stable → emit-new transition is
+ * unit-testable without a live tmux pane.
+ */
+export function getResumeSeedDecision(state: ResumeSeedState): { keepSeeding: boolean } {
+  const reachedCap = state.polls + 1 >= resumeSeedMaxPolls;
+  const stableNonEmpty = state.content !== '' && state.content === state.prevContent;
+  return { keepSeeding: !reachedCap && !stableNonEmpty };
+}
+
 export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
@@ -1548,6 +1680,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'autoAcceptInnerTimer'
       | 'isPolling'
       | 'openToolKind'
+      | 'resumeSeeding'
+      | 'resumeSeedPolls'
+      | 'resumeSeedPrevContent'
     >,
   ): ClaudeSession {
     return {
@@ -1562,6 +1697,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       autoAcceptInnerTimer: null,
       isPolling: false,
       openToolKind: null,
+      // Seeding is armed explicitly by `resumeSession` after createSession;
+      // a fresh `startSession` / reattach never floods, so it stays off here.
+      resumeSeeding: false,
+      resumeSeedPolls: 0,
+      resumeSeedPrevContent: '',
     };
   }
 
@@ -2064,6 +2204,20 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description Read the last `limit` conversational turns of a resumable
+   * Claude session for the resume context block. Resolves the same
+   * `~/.claude/projects/<slug>/<sessionId>.jsonl` path the session listing uses
+   * (`key` is unused — Claude scopes transcripts by folder, not by thread) and
+   * delegates to the pure {@link readRecentClaudeTurns}. A missing transcript
+   * (unknown / pruned UUID) yields `[]`, so the caller posts no context block.
+   */
+  async getRecentTurns(_key: ThreadKey, workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]> {
+    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+    const filePath = path.join(projectsRoot, getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    return readRecentClaudeTurns(filePath, limit);
+  }
+
+  /**
    * @description Resume a Claude session by UUID.
    *
    * Two fixes vs. the legacy implementation:
@@ -2137,9 +2291,27 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledAutoAccept: false,
     });
 
+    // Arm flood-suppression BEFORE the first poll: Claude repaints the whole
+    // restored transcript into the pane over the next polls, which would
+    // otherwise be relayed as one giant dump. Seeding swallows that text while
+    // still advancing the baseline (see `pollOutput` + `getResumeSeedDecision`).
+    claudeSession.resumeSeeding = true;
+
     this.sessions.set(keyToString(key), claudeSession);
     this.schedulePoll(key, claudeSession);
     this.emit('started', key);
+
+    // Post the short last-N-turn context block in place of the flood. The
+    // `.jsonl` is independent of the pane, so this can run immediately (it does
+    // not wait for seeding to finish). Best-effort: a read failure or empty
+    // history simply posts no extra block — the normal "resumed" reply stands.
+    try {
+      const turns = await this.getRecentTurns(key, workDir, sessionId, resumeContextTurnLimit);
+      const rendered = formatResumeContext(turns);
+      if (rendered) this.emit('output', key, rendered);
+    } catch (e) {
+      console.warn(`[Claude] resume context block failed:`, e instanceof Error ? e.message : e);
+    }
   }
 
   /**
@@ -2332,6 +2504,31 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     const content = cleanOutput(raw);
 
+    // Resume flood-suppression: while seeding, Claude is repainting the whole
+    // restored transcript into the pane. We advance the baseline every poll but
+    // emit NO conversation text, so once the pane stops growing the baseline
+    // equals the full restored transcript and later diffs are genuine new
+    // output. This runs on EVERY poll (even when `content === lastContent`),
+    // because "unchanged across 2 polls" — the exit signal — is exactly the
+    // no-change case. Lifecycle auto-handling KEEPS running (suppress text, not
+    // the "Press Enter" / bypass-permissions prompts a resume may re-show).
+    if (session.resumeSeeding) {
+      const decision = getResumeSeedDecision({
+        content,
+        prevContent: session.resumeSeedPrevContent,
+        polls: session.resumeSeedPolls,
+      });
+      session.lastContent = content;
+      session.resumeSeedPrevContent = content;
+      session.resumeSeedPolls += 1;
+      this.handleAutoLifecycle(session, content, getNewPaneContent('', content));
+      if (!decision.keepSeeding) {
+        session.resumeSeeding = false;
+        console.log(`[Claude] resume seeding done after ${session.resumeSeedPolls} polls`);
+      }
+      return;
+    }
+
     if (content !== session.lastContent) {
       const previousPane = session.lastContent;
       const newPart = getNewPaneContent(previousPane, content);
@@ -2392,44 +2589,58 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         }
       }
 
-      if (newPart.length > 50) {
-        session.handledAutoEnter = false;
-        session.handledAutoAccept = false;
-      }
+      this.handleAutoLifecycle(session, content, newPart);
+    }
+  }
 
-      if (!session.handledAutoEnter && this.checkNeedsAutoEnter(content)) {
-        session.handledAutoEnter = true;
-        console.log(`[Claude] Auto-pressing Enter`);
-        session.autoEnterTimer = setTimeout(() => {
-          session.autoEnterTimer = null;
+  /**
+   * @description Auto-handle the two lifecycle prompts Claude can show — the
+   * "Press Enter to continue" gate and the bypass-permissions warning — by
+   * issuing the matching keystrokes. Extracted from {@link pollOutput} so the
+   * resume-seeding path (which suppresses conversation TEXT) can still drive
+   * these prompts; suppression must hide chatter, not the lifecycle.
+   *
+   * A large new chunk (`newPart.length > 50`) means real conversation moved on,
+   * so the one-shot `handled*` guards are reset to re-arm for a later prompt.
+   */
+  private handleAutoLifecycle(session: ClaudeSession, content: string, newPart: string): void {
+    if (newPart.length > 50) {
+      session.handledAutoEnter = false;
+      session.handledAutoAccept = false;
+    }
+
+    if (!session.handledAutoEnter && this.checkNeedsAutoEnter(content)) {
+      session.handledAutoEnter = true;
+      console.log(`[Claude] Auto-pressing Enter`);
+      session.autoEnterTimer = setTimeout(() => {
+        session.autoEnterTimer = null;
+        if (!session.isActive) return;
+        this.enqueueTmuxBestEffort(session, async () => {
+          if (!session.isActive) return '';
+          return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+        });
+      }, 300);
+    }
+
+    if (!session.handledAutoAccept && this.checkNeedsAutoAccept(content)) {
+      session.handledAutoAccept = true;
+      console.log(`[Claude] Auto-accepting bypass permissions`);
+      session.autoAcceptOuterTimer = setTimeout(() => {
+        session.autoAcceptOuterTimer = null;
+        if (!session.isActive) return;
+        this.enqueueTmuxBestEffort(session, async () => {
+          if (!session.isActive) return '';
+          return tmuxAsync('send-keys', '-t', session.sessionName, 'Down');
+        });
+        session.autoAcceptInnerTimer = setTimeout(() => {
+          session.autoAcceptInnerTimer = null;
           if (!session.isActive) return;
           this.enqueueTmuxBestEffort(session, async () => {
             if (!session.isActive) return '';
             return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
           });
-        }, 300);
-      }
-
-      if (!session.handledAutoAccept && this.checkNeedsAutoAccept(content)) {
-        session.handledAutoAccept = true;
-        console.log(`[Claude] Auto-accepting bypass permissions`);
-        session.autoAcceptOuterTimer = setTimeout(() => {
-          session.autoAcceptOuterTimer = null;
-          if (!session.isActive) return;
-          this.enqueueTmuxBestEffort(session, async () => {
-            if (!session.isActive) return '';
-            return tmuxAsync('send-keys', '-t', session.sessionName, 'Down');
-          });
-          session.autoAcceptInnerTimer = setTimeout(() => {
-            session.autoAcceptInnerTimer = null;
-            if (!session.isActive) return;
-            this.enqueueTmuxBestEffort(session, async () => {
-              if (!session.isActive) return '';
-              return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
-            });
-          }, 100);
-        }, 300);
-      }
+        }, 100);
+      }, 300);
     }
   }
 

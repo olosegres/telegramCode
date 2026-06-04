@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession, ThreadKey } from '../types';
+import type { AgentAdapter, AgentSession, RecentTurn, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
@@ -16,6 +16,7 @@ import {
   type BoundSessionRef,
 } from '../openCodeSessionRouting';
 import { t } from '../i18n';
+import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 
 const execAsync = promisify(exec);
 
@@ -302,6 +303,50 @@ interface OpenCodeMessageInfo {
   error?: unknown;
   modelID?: string;
   providerID?: string;
+}
+
+/**
+ * @description One record from `GET /session/:id/message`: the stored message
+ * `info` (carries `role`) plus its `parts` array (text / tool / step parts).
+ * Same `parts` shape the SSE `message.part.updated` path handles. Fields are
+ * optional — guarded at the parse boundary in {@link mapOpenCodeMessagesToTurns}.
+ */
+interface OpenCodeMessageRecord {
+  info?: OpenCodeMessageInfo;
+  parts?: OpenCodePart[];
+}
+
+/**
+ * @description Map raw `GET /session/:id/message` records to the last `limit`
+ * conversational turns (oldest→newest) for the resume context block.
+ *
+ * Pure + exported (no I/O) so it is unit-testable. For each record it joins the
+ * text of every `{ type: 'text' }` part (skipping tool / step / empty parts),
+ * trims, and emits a {@link RecentTurn} only when the role is user/assistant
+ * AND the joined text is non-empty. Every field is guarded with `typeof` /
+ * `Array.isArray` so a malformed record is skipped, never crashes — no casts.
+ * Keeps only the last `limit` turns.
+ */
+export function mapOpenCodeMessagesToTurns(records: unknown, limit: number): RecentTurn[] {
+  if (!Array.isArray(records)) return [];
+  const turns: RecentTurn[] = [];
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const { info, parts } = record as OpenCodeMessageRecord;
+    const role = info?.role;
+    if (role !== 'user' && role !== 'assistant') continue;
+    if (!Array.isArray(parts)) continue;
+    const textChunks: string[] = [];
+    for (const part of parts) {
+      if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
+        const trimmed = part.text.trim();
+        if (trimmed) textChunks.push(trimmed);
+      }
+    }
+    if (textChunks.length === 0) continue;
+    turns.push({ role, text: textChunks.join('\n\n') });
+  }
+  return turns.slice(-limit);
 }
 
 /**
@@ -1335,6 +1380,23 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
+  /**
+   * @description Read the last `limit` conversational turns of a session for the
+   * resume context block via `GET /session/:id/message`. `key`/`workDir` are
+   * unused — OpenCode scopes messages by session id, server-side. Maps the raw
+   * records with the pure {@link mapOpenCodeMessagesToTurns}; a request failure
+   * yields `[]`, so the caller posts no context block.
+   */
+  async getRecentTurns(_key: ThreadKey, _workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]> {
+    try {
+      const records = await this.apiRequest<unknown>('GET', `/session/${sessionId}/message`);
+      return mapOpenCodeMessagesToTurns(records, limit);
+    } catch (e) {
+      console.error(`[OpenCode] Failed to read recent turns:`, e);
+      return [];
+    }
+  }
+
   async resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
     // `workDir` is now an explicit argument from the bot, sourced from the
     // thread's binding in state.json. The old code defaulted to
@@ -1397,6 +1459,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // for tens of seconds; the topic must not wait on it for the reattach
       // notice. Session + SSE are live here.
       this.emit('started', key);
+
+      // Post the short last-N-turn context block so a resume shows where the
+      // conversation left off (parity with Claude — OpenCode has no flood, but
+      // gets the same block). Best-effort: a read failure or empty history
+      // posts nothing extra. Runs before model resolution for the same
+      // responsiveness reason as `emit('started')` above.
+      try {
+        const turns = await this.getRecentTurns(key, workDir, apiSession.id, resumeContextTurnLimit);
+        const rendered = formatResumeContext(turns);
+        if (rendered) this.emit('output', key, rendered);
+      } catch (e) {
+        console.warn(`[OpenCode] resume context block failed:`, e instanceof Error ? e.message : e);
+      }
       // Re-resolve the model on every resume so a session that took its model
       // from the server default (no saved /model pref) keeps a populated
       // modelOverride/currentModelLabel after a bot restart — otherwise /effort

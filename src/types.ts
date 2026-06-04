@@ -8,6 +8,18 @@ export interface AgentSession {
 }
 
 /**
+ * @description One conversational turn (a single user OR assistant message that
+ * carries renderable text) of a resumable session, used to build the short
+ * "↩️ Resumed — last N messages" context block shown on resume instead of
+ * flooding the topic with the whole restored transcript. Tool-call / step /
+ * meta records are NOT turns. See `src/resumeContext.ts`.
+ */
+export interface RecentTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+/**
  * @description Routing key for the multi-thread bot architecture.
  *
  * Replaces the old `userId: number` everywhere a per-conversation state used to live.
@@ -140,6 +152,18 @@ export interface AgentAdapter extends EventEmitter {
    * fix to openCodeAdapter.ts:599).
    */
   resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void>;
+
+  /**
+   * @description Read the last `limit` conversational turns (user/assistant
+   * messages with renderable text, oldest→newest) of `sessionId` from the
+   * backend's own transcript — Claude reads its `.jsonl`, OpenCode calls
+   * `GET /session/:id/message`. Optional (optional-method pattern, like
+   * {@link setModel}): adapters that can't cheaply read history omit it and
+   * the resume context block is simply skipped. The result is already capped
+   * to `limit`; an empty array means no renderable turns (brand-new / pruned
+   * session). Used by `resumeSession` to post the short resume context block.
+   */
+  getRecentTurns?(key: ThreadKey, workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]>;
 
   // — Model selection —
 

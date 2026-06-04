@@ -10,7 +10,10 @@ import { resolveDataDir } from '../state';
 import { appendDiagLog } from '../diagLog';
 import {
   checkIsEventForSession,
+  checkShouldLogDrop,
+  getEventOwnerKey,
   updateSessionLineage,
+  type BoundSessionRef,
 } from '../openCodeSessionRouting';
 import { t } from '../i18n';
 
@@ -337,6 +340,17 @@ const sseStallTimeoutMs = sseHeartbeatIntervalMs * 4;
 
 /** Cap on tracked child→parent session links (subagent lineage). */
 const maxTrackedSessionLineageEntries = 1000;
+
+/**
+ * Minimum gap between diag-logged "sse drop" lines for the SAME
+ * (eventType, eventSessionId). A truly orphaned session streams hundreds of
+ * deltas; without throttling the diag log floods (B19). One line per
+ * (type, session) per window is enough to spot a lost turn.
+ */
+const sseDropLogThrottleMs = 60_000;
+/** Bound on the drop-throttle map so an unbounded run of distinct orphan
+ * sessions can't grow it without limit (matches the lineage-map discipline). */
+const maxSseDropThrottleEntries = 500;
 
 /** SSE event types whose loss makes a turn silently hang — diag-logged on drop. */
 const criticalSseEventTypes = new Set<string>([
@@ -665,6 +679,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    */
   private sessionLineage: Map<string, string> = new Map();
 
+  /**
+   * Last diag-log timestamp per `"<eventType>|<eventSessionId>"`, so a flood of
+   * dropped events for an orphaned session logs at most once per
+   * `sseDropLogThrottleMs` instead of once per delta per bound thread (B19).
+   */
+  private sseDropLogThrottle: Map<string, number> = new Map();
+
   private baseUrl: string;
   private authHeader: string | null;
 
@@ -815,16 +836,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     options?: { signal?: AbortSignal },
   ): Promise<T> {
     const url = `${this.baseUrl}${urlPath}`;
-    // Audit S7 / #12: every fetch now carries a timeout. Caller may also
-    // pass an external `AbortSignal` (e.g. tied to session lifetime) —
-    // we don't compose those into one signal because `AbortSignal.any` is
-    // Node-22-only and we want to keep the dependency surface tight; the
-    // 30 s timeout is a safety net regardless.
+    // Audit S7 / #12: every fetch carries a timeout so a saturated server can
+    // never park a request forever (B18). An external `AbortSignal` (e.g. tied
+    // to session lifetime) is COMPOSED with the timeout via `AbortSignal.any`
+    // (Node 22+) — the previous `options?.signal ?? timeoutSignal` SILENTLY
+    // dropped the timeout whenever a caller passed its own signal, so such a
+    // request could hang indefinitely.
     const timeoutSignal = AbortSignal.timeout(apiRequestTimeoutMs);
+    const signal = options?.signal
+      ? AbortSignal.any([options.signal, timeoutSignal])
+      : timeoutSignal;
     const requestInit: RequestInit = {
       method,
       headers: this.getHeaders(),
-      signal: options?.signal ?? timeoutSignal,
+      signal,
     };
     if (body !== undefined) {
       requestInit.body = JSON.stringify(body);
@@ -942,18 +967,25 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           sseStallTimer: null,
         };
 
+        this.detachDuplicateSessionOwners(k, session.sessionId);
         this.sessions.set(k, session);
         this.connectSse(key);
+        // Ready BEFORE model resolution (B18): a busy server can stall
+        // GET /config for tens of seconds, and the topic showed no "ready"
+        // reply meanwhile. The session exists and SSE is live the moment we
+        // get here, so announce readiness now and resolve the model after.
+        this.emit('started', key);
 
-        // Fetch default model info from OpenCode server and show to user
+        // Resolve + announce the model after readiness so a slow /config can
+        // never gate the ready reply. fetchModelInfo emits its own `Model:`
+        // line when resolved (B9/B17 semantics unchanged).
         await this.fetchModelInfo(key);
 
-        // If args provided, send as first message
+        // If args provided, send as first message. After fetchModelInfo so the
+        // resolved model override rides the prompt body.
         if (args) {
           this.sendPromptAsync(key, args);
         }
-
-        this.emit('started', key);
       } catch (e) {
         console.error(`[OpenCode] Failed to start session:`, e);
         throw e;
@@ -1346,7 +1378,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         sseStallTimer: null,
       };
 
+      this.detachDuplicateSessionOwners(k, session.sessionId);
       this.sessions.set(k, session);
+      this.connectSse(key);
+      // Ready BEFORE model resolution (B18): a busy server can stall GET /config
+      // for tens of seconds; the topic must not wait on it for the reattach
+      // notice. Session + SSE are live here.
+      this.emit('started', key);
       // Re-resolve the model on every resume so a session that took its model
       // from the server default (no saved /model pref) keeps a populated
       // modelOverride/currentModelLabel after a bot restart — otherwise /effort
@@ -1354,8 +1392,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // Silent (emitOutput=false): the label is unchanged from the previous run
       // and already shown in the topic, so re-emitting on each restart is noise.
       await this.fetchModelInfo(key, false);
-      this.connectSse(key);
-      this.emit('started', key);
     } catch (e) {
       console.error(`[OpenCode] Failed to resume session:`, e);
       throw e;
@@ -1726,9 +1762,22 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         console.warn(`[OpenCode] dropping ${eventType} without sessionID`);
         return;
       }
-      if (!checkIsEventForSession(eventSessionId, session.sessionId, this.sessionLineage)) {
-        if (criticalSseEventTypes.has(eventType)) {
-          appendDiagLog(`sse drop ${eventType} es=${eventSessionId} bound=${session.sessionId}`);
+      // Single-owner delivery (B20): the server multiplexes EVERY session's
+      // events onto each thread's stream, so the same event reaches this
+      // handler once per bound thread. Resolve the ONE thread that owns
+      // `eventSessionId` (direct id match, else nearest lineage ancestor) and
+      // process it here only if THIS key is that owner — otherwise a false
+      // lineage link or a duplicated session id would emit the same answer to
+      // two topics.
+      const ownerKeyStr = this.resolveEventOwnerKey(eventSessionId);
+      if (ownerKeyStr !== keyToString(key)) {
+        // A genuine loss is "no thread owns this event at all". Log it at most
+        // once per (eventType, eventSessionId) window — the same no-owner verdict
+        // reaches every bound thread, so per-thread logging floods the diag file
+        // (B19). When ANOTHER thread owns it, this is the normal multiplex skip:
+        // stay silent (the owner will process it).
+        if (ownerKeyStr === null && criticalSseEventTypes.has(eventType)) {
+          this.logSseDropOncePerWindow(eventType, eventSessionId);
         }
         return;
       }
@@ -1818,6 +1867,94 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     );
     if (recorded) {
       appendDiagLog(`sse lineage child=${info?.id} parent=${info?.parentID}`);
+    }
+  }
+
+  /**
+   * @description Tear down any OTHER active thread already bound to
+   * `sessionId` before `keyStr` adopts it (B20 prevention). One server-side
+   * OpenCode session belongs to exactly one thread; if two threads held the
+   * same id (e.g. resuming a session already live in another topic), the
+   * server's multiplexed events would match BOTH and the same answer would
+   * land in two topics. Detaching the stale owner keeps the single-owner
+   * invariant true at the source, not just in dispatch.
+   */
+  private detachDuplicateSessionOwners(keyStr: string, sessionId: string): void {
+    for (const [otherKeyStr, otherSession] of this.sessions) {
+      if (otherKeyStr === keyStr) continue;
+      if (!otherSession.isActive || otherSession.sessionId !== sessionId) continue;
+      console.warn(
+        `[OpenCode] session ${sessionId} already owned by ${otherKeyStr}; detaching it before ${keyStr} adopts it`,
+      );
+      appendDiagLog(`sse dup-owner-detach session=${sessionId} from=${otherKeyStr} to=${keyStr}`);
+      // SOFT detach: tear down the stale thread's local tracking (SSE, timers,
+      // map entry) and announce `stopped`, but do NOT abort the server session
+      // — the new thread is adopting that exact live session, so aborting it
+      // would kill the generation the new owner wants to keep streaming.
+      this.softDetachSession(otherSession.key);
+    }
+  }
+
+  /**
+   * @description Tear down a thread's local session tracking WITHOUT aborting
+   * the server-side session. Used when another thread is adopting the same
+   * server session (B20 prevention) — a normal `stopSessionInner` would abort
+   * the shared generation. Mirrors `stopSessionInner` minus the abort POST.
+   */
+  private softDetachSession(key: ThreadKey): void {
+    const k = keyToString(key);
+    const session = this.sessions.get(k);
+    if (!session) return;
+
+    session.isActive = false;
+    if (session.outputTimer) {
+      clearTimeout(session.outputTimer);
+      session.outputTimer = null;
+    }
+    if (session.statusDebounceTimer) {
+      clearTimeout(session.statusDebounceTimer);
+      session.statusDebounceTimer = null;
+    }
+    if (session.reconnectTimer) {
+      clearTimeout(session.reconnectTimer);
+      session.reconnectTimer = null;
+    }
+    this.disconnectSse(key);
+    this.sessions.delete(k);
+    this.emit('stopped', key);
+  }
+
+  /**
+   * @description Resolve the SINGLE active thread that owns an SSE event for
+   * `eventSessionId` (single-owner delivery, B20). Direct session-id match wins
+   * over lineage descent; ties resolve deterministically. Returns the owning
+   * thread's serialised key, or `null` if no active thread owns it.
+   */
+  private resolveEventOwnerKey(eventSessionId: string): string | null {
+    const boundSessions: BoundSessionRef[] = [];
+    for (const [keyStr, session] of this.sessions) {
+      if (session.isActive) boundSessions.push({ keyStr, sessionId: session.sessionId });
+    }
+    return getEventOwnerKey(eventSessionId, boundSessions, this.sessionLineage);
+  }
+
+  /**
+   * @description Diag-log one "sse drop" line for an event no thread owns,
+   * throttled to at most once per (eventType, eventSessionId) per
+   * `sseDropLogThrottleMs`. Without throttling an orphaned session's delta
+   * firehose floods the diag log — once per delta per bound thread (B19).
+   */
+  private logSseDropOncePerWindow(eventType: string, eventSessionId: string): void {
+    const shouldLog = checkShouldLogDrop(
+      this.sseDropLogThrottle,
+      eventType,
+      eventSessionId,
+      Date.now(),
+      sseDropLogThrottleMs,
+      maxSseDropThrottleEntries,
+    );
+    if (shouldLog) {
+      appendDiagLog(`sse drop ${eventType} es=${eventSessionId} (no owner)`);
     }
   }
 

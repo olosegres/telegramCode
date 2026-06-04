@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { promisify } from 'util';
 import { sleep } from '../utils';
-import type { AgentAdapter, AgentSession, RecentTurn, ThreadKey } from '../types';
+import type { AgentAdapter, AgentSession, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
@@ -2234,7 +2234,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    *    (history pruned, different machine), it just starts a new session;
    *    we surface that to the user (T8 in plan §16.3).
    */
-  async resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
+  async resumeSession(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {
     await this.stopSessionInternal(key);
 
     if (!checkIsInstalled('claude')) {
@@ -2301,16 +2301,20 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     this.schedulePoll(key, claudeSession);
     this.emit('started', key);
 
-    // Post the short last-N-turn context block in place of the flood. The
-    // `.jsonl` is independent of the pane, so this can run immediately (it does
-    // not wait for seeding to finish). Best-effort: a read failure or empty
-    // history simply posts no extra block — the normal "resumed" reply stands.
-    try {
-      const turns = await this.getRecentTurns(key, workDir, sessionId, resumeContextTurnLimit);
-      const rendered = formatResumeContext(turns);
-      if (rendered) this.emit('output', key, rendered);
-    } catch (e) {
-      console.warn(`[Claude] resume context block failed:`, e instanceof Error ? e.message : e);
+    // Post the short last-N-turn context block in place of the flood. ONLY on
+    // the explicit user resume (`/sessions` pick) — a silent re-attach must
+    // stay quiet (see ResumeSessionOptions). The `.jsonl` is independent of
+    // the pane, so this can run immediately (it does not wait for seeding to
+    // finish). Best-effort: a read failure or empty history simply posts no
+    // extra block — the normal "resumed" reply stands.
+    if (options?.isWithRecentContext) {
+      try {
+        const turns = await this.getRecentTurns(key, workDir, sessionId, resumeContextTurnLimit);
+        const rendered = formatResumeContext(turns);
+        if (rendered) this.emit('output', key, rendered);
+      } catch (e) {
+        console.warn(`[Claude] resume context block failed:`, e instanceof Error ? e.message : e);
+      }
     }
   }
 

@@ -3074,7 +3074,9 @@ async function resumeSessionByIndex(
   const adapter = getThreadAdapter(key);
   markNeedsNewMessage(key);
   try {
-    await adapter.resumeSession(key, getWorkDir(key), sessionId);
+    // The ONLY resume path that posts the "last N messages" context block —
+    // silent re-attach (bot restart) and crash recovery must stay quiet.
+    await adapter.resumeSession(key, getWorkDir(key), sessionId, { isWithRecentContext: true });
     return t('session.resumed');
   } catch (e) {
     return t('session.resume_failed', { error: e instanceof Error ? e.message : String(e) });

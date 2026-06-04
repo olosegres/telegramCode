@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession, RecentTurn, ThreadKey } from '../types';
+import type { AgentAdapter, AgentSession, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
@@ -1397,17 +1397,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
-  async resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
+  async resumeSession(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {
     // `workDir` is now an explicit argument from the bot, sourced from the
     // thread's binding in state.json. The old code defaulted to
     // `process.env.WORK_DIR || '/workspace'`, which silently mis-routed
     // resumes to the wrong folder as soon as the bot started managing
     // multiple bindings (plan §10.3, fix to old openCodeAdapter.ts:599).
     const k = keyToString(key);
-    return this.withLifecycleLock(k, () => this.resumeSessionInner(key, workDir, sessionId));
+    return this.withLifecycleLock(k, () => this.resumeSessionInner(key, workDir, sessionId, options));
   }
 
-  private async resumeSessionInner(key: ThreadKey, workDir: string, sessionId: string): Promise<void> {
+  private async resumeSessionInner(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {
     this.stopSessionInner(key);
 
     const k = keyToString(key);
@@ -1462,15 +1462,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
       // Post the short last-N-turn context block so a resume shows where the
       // conversation left off (parity with Claude — OpenCode has no flood, but
-      // gets the same block). Best-effort: a read failure or empty history
-      // posts nothing extra. Runs before model resolution for the same
+      // gets the same block). ONLY on the explicit user resume: this method
+      // also runs on silent re-attach after every bot restart and on crash
+      // recovery, and posting the block there spammed every active topic on
+      // every hot rebuild. Best-effort: a read failure or empty history posts
+      // nothing extra. Runs before model resolution for the same
       // responsiveness reason as `emit('started')` above.
-      try {
-        const turns = await this.getRecentTurns(key, workDir, apiSession.id, resumeContextTurnLimit);
-        const rendered = formatResumeContext(turns);
-        if (rendered) this.emit('output', key, rendered);
-      } catch (e) {
-        console.warn(`[OpenCode] resume context block failed:`, e instanceof Error ? e.message : e);
+      if (options?.isWithRecentContext) {
+        try {
+          const turns = await this.getRecentTurns(key, workDir, apiSession.id, resumeContextTurnLimit);
+          const rendered = formatResumeContext(turns);
+          if (rendered) this.emit('output', key, rendered);
+        } catch (e) {
+          console.warn(`[OpenCode] resume context block failed:`, e instanceof Error ? e.message : e);
+        }
       }
       // Re-resolve the model on every resume so a session that took its model
       // from the server default (no saved /model pref) keeps a populated

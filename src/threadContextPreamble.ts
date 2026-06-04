@@ -95,3 +95,20 @@ export function checkShouldInjectPreamble(
 ): boolean {
   return builtPreamble !== lastInjectedMarker;
 }
+
+/**
+ * @description Strip a leading preamble block from a stored prompt text.
+ *
+ * Backend transcripts store the prompt AS FORWARDED — preamble included. When
+ * such a turn is shown back to the user (e.g. the "↩️ Resumed — last N
+ * messages" context block), the service header is noise: the user wants to
+ * see what THEY said, not the bot's glue. The preamble is everything from the
+ * marker header up to the first blank line (see
+ * {@link prependThreadContextPreamble}).
+ */
+export function stripThreadContextPreamble(text: string): string {
+  if (!text.startsWith(threadContextPreambleHeader)) return text;
+  const separatorIndex = text.indexOf(preamblePromptSeparator);
+  if (separatorIndex === -1) return text;
+  return text.slice(separatorIndex + preamblePromptSeparator.length);
+}

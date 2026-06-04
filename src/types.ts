@@ -20,6 +20,19 @@ export interface RecentTurn {
 }
 
 /**
+ * @description Options for {@link AgentAdapter.resumeSession}.
+ */
+export interface ResumeSessionOptions {
+  /**
+   * Post the "↩️ Resumed — last N messages" context block to the topic.
+   * Set ONLY on the explicit user resume (`/sessions` pick) — silent
+   * re-attach after a bot restart and crash-recovery resumes must stay
+   * quiet, otherwise every hot rebuild spams every active topic.
+   */
+  isWithRecentContext?: boolean;
+}
+
+/**
  * @description Routing key for the multi-thread bot architecture.
  *
  * Replaces the old `userId: number` everywhere a per-conversation state used to live.
@@ -150,8 +163,14 @@ export interface AgentAdapter extends EventEmitter {
    * a bot restart, and silently falling back to `process.env.WORK_DIR` was a
    * source of mis-routing in the old single-folder architecture (plan §10.3,
    * fix to openCodeAdapter.ts:599).
+   *
+   * `options.isWithRecentContext` posts the short "↩️ Resumed — last N
+   * messages" context block. ONLY the explicit user resume (`/sessions` pick)
+   * sets it: the same method also runs on silent re-attach after every bot
+   * restart (hot reload) and on opencode crash-recovery, and posting the
+   * block there spammed every active topic on every rebuild.
    */
-  resumeSession(key: ThreadKey, workDir: string, sessionId: string): Promise<void>;
+  resumeSession(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void>;
 
   /**
    * @description Read the last `limit` conversational turns (user/assistant

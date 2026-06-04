@@ -73,4 +73,22 @@ describe('formatResumeContext', () => {
     assert.ok(exact);
     assert.ok(!exact.includes('…'), 'a turn exactly at the cap must not be truncated');
   });
+
+  it('strips the forwarded thread-context preamble from user turns (service glue is not user speech)', () => {
+    const storedPrompt =
+      '[Telegram thread context]\ngroup: "ExampleGroup"\nthread: -100123:9085 | folder: someProject\n\nwhat folder are you in?';
+    const turns: RecentTurn[] = [
+      { role: 'user', text: storedPrompt },
+      // An assistant turn that happens to QUOTE the marker must stay intact.
+      { role: 'assistant', text: '[Telegram thread context] is the preamble header' },
+    ];
+    const out = formatResumeContext(turns);
+    assert.ok(out);
+    assert.ok(out.includes('👤 what folder are you in?'), 'user turn must show only the actual prompt');
+    assert.ok(!out.includes('👤 [Telegram thread context]'), 'the glued preamble must be stripped from user turns');
+    assert.ok(
+      out.includes('🤖 [Telegram thread context] is the preamble header'),
+      'assistant text is never stripped',
+    );
+  });
 });

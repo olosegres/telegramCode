@@ -1,4 +1,5 @@
 import { t } from './i18n';
+import { stripThreadContextPreamble } from './threadContextPreamble';
 import type { RecentTurn } from './types';
 
 /**
@@ -52,7 +53,10 @@ export function formatResumeContext(turns: RecentTurn[]): string | null {
 
   const renderedTurns = turns.map((turn) => {
     const label = turn.role === 'user' ? userLabel : assistantLabel;
-    return `${label} ${getTruncatedTurnText(turn.text)}`;
+    // Stored user prompts include the forwarded "[Telegram thread context]"
+    // glue — service noise when shown back to the user, so strip it.
+    const visibleText = turn.role === 'user' ? stripThreadContextPreamble(turn.text) : turn.text;
+    return `${label} ${getTruncatedTurnText(visibleText)}`;
   });
 
   return [header, ...renderedTurns].join('\n\n');

@@ -2807,14 +2807,28 @@ command('effort', async (ctx, key) => {
   );
 });
 
+/**
+ * @description Build the `/agent` picker keyboard.
+ *
+ * One callback button per available adapter (2 per row); the adapter whose
+ * name matches `currentName` carries a `✓` marker. Shared by the `/agent`
+ * command (initial render) and the `agent_<name>` callback (re-render after
+ * a press) so the marker can never drift between the two (B16, mirrors B12).
+ */
+function buildAgentKeyboard(
+  available: ReadonlyArray<{ name: string; label: string }>,
+  currentName: string,
+) {
+  const buttons = available.map(a =>
+    Markup.button.callback(a.name === currentName ? `${a.label} ✓` : a.label, `agent_${a.name}`),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: 2 });
+}
+
 command('agent', async (_ctx, key) => {
   const available = getAvailableAdapters();
   const currentName = getThreadAdapterName(key);
-  const buttons = available.map(a => {
-    const label = a.name === currentName ? `${a.label} ✓` : a.label;
-    return Markup.button.callback(label, `agent_${a.name}`);
-  });
-  await replyToThread(key, 'Choose agent:', Markup.inlineKeyboard(buttons, { columns: 2 }));
+  await replyToThread(key, 'Choose agent:', buildAgentKeyboard(available, currentName));
 });
 
 /** Max chars of a session title rendered on an inline resume button. */
@@ -3816,6 +3830,30 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
     if (state.getBinding(key)) {
       await state.setAgent(key, { name: adapterName }).catch(() => {});
       await updatePinnedStatus(key).catch(() => {});
+    }
+
+    // Re-render the picker so the `✓` marker follows the newly-selected agent
+    // instead of staying stuck on the previous one (B16, mirrors B12). The
+    // switch keeps the picker message visible (a fresh "Agent: …" reply is
+    // sent, the picker is neither edited nor deleted), so the stale marker
+    // would otherwise persist.
+    const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+    if (cbMsg) {
+      const keyboard = buildAgentKeyboard(getAvailableAdapters(), adapterName);
+      try {
+        await enqueueSend(
+          key,
+          () => bot.telegram.editMessageReplyMarkup(
+            key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
+          ),
+          'interactive',
+        );
+      } catch (e) {
+        const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+        if (!/message is not modified/i.test(desc)) {
+          console.warn('[agent_cb] keyboard re-render failed:', desc || e);
+        }
+      }
     }
   } catch {
     await ctx.answerCbQuery(t('cb.unknown_agent'));

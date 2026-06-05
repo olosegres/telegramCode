@@ -234,6 +234,18 @@ test('stripTuiElements: drops sub-minute tick "· Working… (7s · ↓ 222 toke
   assert.equal(stripTuiElements(input), 'Result.');
 });
 
+test('stripTuiElements: drops a MULTI-WORD task-title tick inside a chunk', () => {
+  // Since ~2026-06 the tick shows the active task title instead of a single
+  // verb. Live leak repro: the `● Agent(…)` permanent message carried
+  // `· Collapsing sub-agent line flood… (5m 26s · …)` lines because the old
+  // single-token `\S+…` pattern did not match multi-word activity text.
+  const input =
+    '● Agent(Review fix)\n  ⎿  Backgrounded agent\n· Collapsing sub-agent line flood… (5m 26s · ↓ 78.6k tokens)';
+  const out = stripTuiElements(input);
+  assert.ok(!out.includes('Collapsing sub-agent line flood…'), `tick leaked: ${JSON.stringify(out)}`);
+  assert.ok(/Agent\(Review fix\)/.test(out), `tool header lost: ${JSON.stringify(out)}`);
+});
+
 test('stripTuiElements: keeps tool-call header "● Bash(ls -la)" — no ellipsis, no time pattern', () => {
   // Disambiguator: tool-call headers start with `●` but have NO `…`
   // and NO `(Xs · ...)` shape. They must survive.

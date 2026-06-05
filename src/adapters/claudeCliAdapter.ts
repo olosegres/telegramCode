@@ -498,20 +498,23 @@ export function checkIsStatusOutput(text: string): boolean {
  *   `· Working… (7s · ↓ 222 tokens)`
  *
  * Plan §2026-05-28 tg-output-readability / S4 (N1.b). Why a SECOND
- * regex on top of `PROGRESS_LINE_RE` (in `progressLine.ts`): the
- * canonical regex requires `\d+m\s+\d+s` (a full minute count); short
- * runs under 60s render as just `5s` and slip past it. The relaxed
- * `\d+(?:m\s+\d+)?s` here accepts both shapes. We deliberately do NOT
- * loosen `PROGRESS_LINE_RE` because the bot-side coalescer
- * (`checkIsProgressChunk`) relies on its current strictness as an
- * anti-false-positive guard.
+ * regex on top of `PROGRESS_LINE_RE` (in `progressLine.ts`): different
+ * job — this one strips tick lines that ride INSIDE a chunk that also
+ * carries real output, while `PROGRESS_LINE_RE` classifies whole
+ * pure-progress chunks bot-side. This regex does not require the token
+ * counter (`(5s)` alone matches), `PROGRESS_LINE_RE` does. Both accept
+ * a multi-word activity text since 2026-06-05 — the TUI now shows the
+ * active task title there ("Fixing streaming output overwrite…"), and
+ * the single-token `\S+…` let those ticks leak into permanent messages
+ * (adapter side) / flood the topic (bot side). The trailing
+ * `(<elapsed>[ · …])` parenthesis stays the load-bearing anchor.
  *
- * The required `\S+…` verb-with-ellipsis disambiguates this from a
- * tool-call header (`● Bash(ls -la)`), which starts with the same
- * `●` glyph but has no ellipsis.
+ * The required text-with-ellipsis disambiguates this from a tool-call
+ * header (`● Bash(ls -la)`), which starts with the same `●` glyph but
+ * has no ellipsis.
  */
 const SPINNER_TICK_RE =
-  /^\s*[✻✽✶✢·*●○]\s+\S+…\s*\(\d+(?:m\s+\d+)?s(?:\s*·[^()]*)?\)\s*$/;
+  /^\s*[✻✽✶✢·*●○]\s+\S[^()\n]*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s(?:\s*·[^()]*)?\)\s*$/;
 
 /**
  * @description Post-thinking trailer line that Claude's TUI prints

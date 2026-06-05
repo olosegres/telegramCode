@@ -6,12 +6,13 @@
  * Claude's TUI redraws a spinner roughly every 300 ms while the agent is
  * thinking. The line looks like:
  *
- *     <glyph> <Verb>… (Xm Ys · ↑/↓ X.Xk tokens [ · <thinking-note>])
+ *     <glyph> <Activity>… (Xm Ys · ↑/↓ X.Xk tokens [ · <thinking-note>])
  *
  * where `<glyph>` rotates through `✻ ✽ ✶ ✢ · *` (plus `●/○` for bullet
- * states), `<Verb>` is one of Claude's activity words (Smooshing,
- * Actioning, Coalescing, Newspapering, Booping, …) and the trailing
- * parenthesis updates time / tokens / thinking-mode every tick.
+ * states), `<Activity>` is one of Claude's activity words (Smooshing,
+ * Actioning, …) or the active task title ("Fixing streaming output
+ * overwrite…"), and the trailing parenthesis updates time / tokens /
+ * thinking-mode every tick (seconds-only right after the turn starts).
  *
  * The bot already routes adapter `status` events through a coalescer
  * that edits one message in place; the gap was that long bursts of
@@ -62,12 +63,22 @@
  *
  *   ^\s*                              leading whitespace (TUI indent)
  *   [✻✽✶✢·*●○]                       spinner glyph (full observed set)
- *   \s+\S+…                           one verb token ending in U+2026
- *                                     ellipsis (no hardcoded verb list →
- *                                     new verbs work automatically)
+ *   \s+\S[^()\n]*?…                   the activity text ending in U+2026
+ *                                     ellipsis. Originally a single verb
+ *                                     token ("Smooshing…"), but the TUI now
+ *                                     shows the active task title here too
+ *                                     ("Fixing streaming output overwrite…"),
+ *                                     so multiple words are allowed; `[^()]`
+ *                                     keeps parens out so the stats group
+ *                                     below stays the real anchor
  *   \s*\(                             stats parenthesis opens
- *   \d+m\s+\d+s                       elapsed time, e.g. "3m 14s"
- *   \s*·\s*[↑↓]\s*[\d.]+k?\s*tokens   token counter, e.g. "↑ 4.4k tokens"
+ *   (?:\d+h\s+)?(?:\d+m\s+)?\d+s      elapsed time — "13s", "4m 35s",
+ *                                     "1h 2m 3s" (a fresh tick has no
+ *                                     minutes yet; the old `\d+m \d+s`
+ *                                     requirement made second-only ticks
+ *                                     flood the topic)
+ *   \s*·\s*[↑↓]\s*[\d.]+k?\s*tokens   token counter, e.g. "↑ 4.4k tokens",
+ *                                     "↓ 176 tokens"
  *   (?:\s*·[^()]*)?                   optional thinking-note suffix
  *                                     ("thought for 9s", "thinking with
  *                                     xhigh effort", "still thinking
@@ -78,14 +89,13 @@
  *                                     cannot be mistaken for a tick.
  *   \)\s*$                            stats parenthesis closes; line ends
  *
- * The `\S+…` "any verb followed by ellipsis" pattern is deliberately
- * greedy-free of a whitelist. Claude has shipped at least Smooshing /
- * Actioning / Coalescing / Newspapering / Booping / Flowing /
- * Cogitating / Pondering / Mussing / etc. — any new word will fit so
- * long as it's a single token before the ellipsis.
+ * The activity text deliberately has no verb whitelist — Claude has shipped
+ * Smooshing / Actioning / Coalescing / … and now task titles; the trailing
+ * `(time · tokens)` stats parenthesis is specific enough to carry the match
+ * on its own, so loosening the text to multi-word is safe.
  */
 export const PROGRESS_LINE_RE =
-  /^\s*[✻✽✶✢·*●○]\s+\S+…\s*\(\d+m\s+\d+s\s*·\s*[↑↓]\s*[\d.]+k?\s*tokens(?:\s*·[^()]*)?\)\s*$/;
+  /^\s*[✻✽✶✢·*●○]\s+\S[^()\n]*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s\s*·\s*[↑↓]\s*[\d.]+k?\s*tokens(?:\s*·[^()]*)?\)\s*$/;
 
 /**
  * @description Verb line of Claude's `/compact` (and automatic context
@@ -156,38 +166,30 @@ export const PROGRESS_BAR_LINE_RE = /^\s*[▰▱]{4,}(?:\s*\d{1,3}\s*%?)?\s*$/;
  *   checkIsProgressChunk('✽ Smooshing… (1m 49s · ↑ 3.3k tokens)') // true
  *   checkIsProgressChunk('Sure, here is the answer…')             // false
  */
+/**
+ * @description One line of ANY recognised progress shape — thinking tick,
+ * sub-agent task frame, compaction verb, or compaction bar.
+ *
+ * A single predicate (not per-shape branches) because a scrape diff freely
+ * interleaves shapes: while a Task sub-agent runs, every redraw carries a
+ * `◯ <type> <title> <elapsed>` frame AND a spinner tick — the old
+ * one-shape-per-chunk branches rejected that mix, so the whole burst was
+ * misrouted as substantive output and flooded the topic (live repro
+ * 2026-06-05, thread relay of a review sub-agent).
+ */
+function checkIsProgressLine(line: string): boolean {
+  return (
+    PROGRESS_LINE_RE.test(line) ||
+    SUBAGENT_PROGRESS_LINE_RE.test(line) ||
+    COMPACT_LINE_RE.test(line) ||
+    PROGRESS_BAR_LINE_RE.test(line)
+  );
+}
+
 export function checkIsProgressChunk(text: string): boolean {
   const lines = text.split('\n').filter(l => l.trim().length > 0);
   if (lines.length === 0) return false;
-
-  // Thinking-spinner burst — every line is a full token-stats tick.
-  if (lines.every(line => PROGRESS_LINE_RE.test(line))) return true;
-
-  // Sub-agent task panel redraw — every line is a `◯ <type>  <title> …` frame
-  // (a fan-out interleaves several distinct tasks; each still matches).
-  if (lines.every(line => SUBAGENT_PROGRESS_LINE_RE.test(line))) return true;
-
-  // Compaction progress — `Compacting conversation…` verb lines (phrase-
-  // anchored, so no bar line is needed to admit them), optionally interleaved
-  // with `▰▱` bar lines and thinking ticks (a scrape diff can straddle a
-  // thinking→compaction transition). Require at least one compaction or bar
-  // line so a pure thinking burst is handled by the first branch, not here.
-  const hasCompactOrBar = lines.some(
-    line => COMPACT_LINE_RE.test(line) || PROGRESS_BAR_LINE_RE.test(line),
-  );
-  if (
-    hasCompactOrBar &&
-    lines.every(
-      line =>
-        COMPACT_LINE_RE.test(line) ||
-        PROGRESS_BAR_LINE_RE.test(line) ||
-        PROGRESS_LINE_RE.test(line),
-    )
-  ) {
-    return true;
-  }
-
-  return false;
+  return lines.every(checkIsProgressLine);
 }
 
 /**
@@ -232,47 +234,58 @@ function getSubagentTaskIdentity(line: string): string {
  * the single most-recent frame, so the coalesced status message rolls in
  * place instead of stacking every intermediate tick/percentage.
  *
- * - sub-agent chunk → the latest frame of EACH distinct task (grouped by
- *   {@link getSubagentTaskIdentity}, first-seen order preserved), so a
- *   parallel fan-out shows one rolling line per sub-agent, padding squeezed.
- * - thinking-spinner chunk → the last tick line (time only grows, scrape is
+ * - sub-agent frames (may be interleaved with any other shape) → the latest
+ *   frame of EACH distinct task (grouped by {@link getSubagentTaskIdentity},
+ *   first-seen order preserved), so a parallel fan-out shows one rolling line
+ *   per sub-agent, padding squeezed. Rendered first — mirroring the TUI,
+ *   which draws the task panel above the main spinner.
+ * - thinking-spinner lines → the last tick line (time only grows, scrape is
  *   in order, so "last" is "latest").
- * - compaction chunk with a bar → the highest-percentage bar line (a redraw
+ * - compaction lines with a bar → the highest-percentage bar line (a redraw
  *   scrape can arrive out of order, and `%` only grows, so max is the true
  *   latest) prefixed with the most recent `Compacting conversation…` verb
  *   line for context. The pair mirrors Claude's own two-line frame.
- * - compaction chunk with no bar (verb lines only) → the last verb line.
+ * - compaction lines with no bar (verb lines only) → the last verb line.
  *
  * Must only be called on a chunk that {@link checkIsProgressChunk} accepted.
  */
 export function collapseProgressChunk(text: string): string {
   const lines = text.split('\n').filter(l => l.trim().length > 0);
+  const collapsedParts: string[] = [];
 
   // Sub-agent panel: keep the latest frame of each distinct task. A Map keyed
   // by task identity, last write wins, preserves insertion (first-seen) order.
   // The `❯` selection cursor is dropped from both the key and the rendered
   // line so a task reads identically whether or not it's currently selected.
-  if (lines.every(line => SUBAGENT_PROGRESS_LINE_RE.test(line))) {
+  const subagentLines = lines.filter(line => SUBAGENT_PROGRESS_LINE_RE.test(line));
+  if (subagentLines.length > 0) {
     const latestFrameByTask = new Map<string, string>();
-    for (const line of lines) {
+    for (const line of subagentLines) {
       const frame = squeezeWhitespace(line.replace(/^\s*❯\s+/, ''));
       latestFrameByTask.set(getSubagentTaskIdentity(line), frame);
     }
-    return [...latestFrameByTask.values()].join('\n');
+    collapsedParts.push(...latestFrameByTask.values());
   }
 
-  const barLines = lines.filter(line => PROGRESS_BAR_LINE_RE.test(line));
-  if (barLines.length === 0) {
-    return lines[lines.length - 1].trim();
+  // Remaining (non-sub-agent) lines: spinner ticks and/or compaction frames.
+  const spinnerAndCompactLines = lines.filter(
+    line => !SUBAGENT_PROGRESS_LINE_RE.test(line),
+  );
+  if (spinnerAndCompactLines.length > 0) {
+    const barLines = spinnerAndCompactLines.filter(line => PROGRESS_BAR_LINE_RE.test(line));
+    if (barLines.length === 0) {
+      collapsedParts.push(spinnerAndCompactLines[spinnerAndCompactLines.length - 1].trim());
+    } else {
+      const latestBar = barLines.reduce((best, line) =>
+        getProgressBarPercent(line) >= getProgressBarPercent(best) ? line : best,
+      );
+      const verbLines = spinnerAndCompactLines.filter(
+        line => COMPACT_LINE_RE.test(line) && !PROGRESS_BAR_LINE_RE.test(line),
+      );
+      const latestVerb = verbLines.length > 0 ? verbLines[verbLines.length - 1].trim() : null;
+      collapsedParts.push(latestVerb ? `${latestVerb}\n${latestBar.trim()}` : latestBar.trim());
+    }
   }
 
-  const latestBar = barLines.reduce((best, line) =>
-    getProgressBarPercent(line) >= getProgressBarPercent(best) ? line : best,
-  );
-  const verbLines = lines.filter(
-    line => COMPACT_LINE_RE.test(line) && !PROGRESS_BAR_LINE_RE.test(line),
-  );
-  const latestVerb = verbLines.length > 0 ? verbLines[verbLines.length - 1].trim() : null;
-
-  return latestVerb ? `${latestVerb}\n${latestBar.trim()}` : latestBar.trim();
+  return collapsedParts.join('\n');
 }

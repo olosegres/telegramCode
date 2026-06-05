@@ -81,6 +81,44 @@ test('checkIsProgressChunk: a sub-agent line mixed with real prose is NOT progre
   assert.equal(checkIsProgressChunk(mixed), false);
 });
 
+test('checkIsProgressChunk: a sub-agent line mixed with a real tool call is NOT progress', () => {
+  // The tail of the live flood: the diff that finally carried real content.
+  const mixed = [
+    PADDED,
+    '● Bash(grep -rn "clearThreadOutputQueues\\|outputQueues.delete" src/bot.ts)',
+  ].join('\n');
+  assert.equal(checkIsProgressChunk(mixed), false);
+});
+
+// ─── Mixed sub-agent + spinner redraw (the 2026-06-05 live flood) ──────
+//
+// While a sub-agent runs, EVERY pane redraw interleaves the `◯` task frame
+// with the main spinner tick (whose activity text is the active task title,
+// multi-word). The old per-shape branches rejected the mix, so each redraw
+// landed as its own permanent message — the exact flood the user pasted.
+
+const MIXED_FLOOD = [
+  '◯ general-purpose  Review streaming append + md fix                  1m 26s',
+  '✽ Fixing streaming output overwrite… (4m 35s · ↓ 11.2k tokens)',
+  '  ◯ general-purpose  Review streaming append + md fix                1m 27s',
+  '· Fixing streaming output overwrite… (4m 36s · ↓ 11.2k tokens)',
+  '  ◯ general-purpose  Review streaming append + md fix                1m 28s',
+  '✽ Fixing streaming output overwrite… (4m 37s · ↓ 11.2k tokens)',
+  '  ◯ general-purpose  Review streaming append + md fix                1m 29s',
+].join('\n');
+
+test('checkIsProgressChunk: interleaved sub-agent frames + spinner ticks ARE progress', () => {
+  assert.equal(checkIsProgressChunk(MIXED_FLOOD), true);
+});
+
+test('collapseProgressChunk: mixed flood → latest task frame + latest spinner tick', () => {
+  assert.equal(
+    collapseProgressChunk(MIXED_FLOOD),
+    '◯ general-purpose Review streaming append + md fix 1m 29s\n' +
+      '✽ Fixing streaming output overwrite… (4m 37s · ↓ 11.2k tokens)',
+  );
+});
+
 // ─── collapseProgressChunk ─────────────────────────────────────────────
 
 test('collapseProgressChunk: single sub-agent → latest frame, padding squeezed', () => {

@@ -35,6 +35,15 @@ const POSITIVE_LINES: ReadonlyArray<string> = [
   // Leading whitespace from TUI indentation (the actual repro from the
   // user's bug log — the tick was indented by one space before the glyph).
   ' * Smooshing… (1m 2s · ↓ 1.6k tokens · thinking more with xhigh effort)',
+  // Multi-word activity text: the TUI shows the ACTIVE TASK TITLE instead of
+  // a single verb when a task list is in use (live flood repro 2026-06-05 —
+  // these ticks failed the old single-token `\S+…` verb pattern).
+  '✽ Fixing streaming output overwrite… (4m 35s · ↓ 11.2k tokens)',
+  // Seconds-only elapsed time (fresh turn, no minutes yet) + unsuffixed
+  // token count — both failed the old `\d+m \d+s` / `k`-only patterns.
+  '✶ Fixing streaming output overwrite… (13s · ↓ 176 tokens · thinking with xhigh effort)',
+  // Hours-long session tick.
+  '· Reviewing the adapter contract… (1h 2m 3s · ↑ 49.0k tokens)',
 ];
 
 for (const line of POSITIVE_LINES) {

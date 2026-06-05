@@ -58,6 +58,17 @@ test('file intake keys exist in every locale', () => {
   assert.ok(checkKeyInAllLangs('file.download_failed'), 'file.download_failed missing in some locale');
 });
 
+test('model-selection keys exist in every locale (S5)', () => {
+  assert.ok(checkKeyInAllLangs('model.saved_for_next_start'), 'model.saved_for_next_start missing in some locale');
+  assert.ok(checkKeyInAllLangs('model.start_agent_first'), 'model.start_agent_first missing in some locale');
+});
+
+test('model.saved_for_next_start substitutes the {model} name', () => {
+  const out = t('model.saved_for_next_start', { model: 'anthropic/claude-opus-4-8' });
+  assert.ok(out.includes('anthropic/claude-opus-4-8'), `expected the model name in "${out}"`);
+  assert.ok(!out.includes('{model}'), `placeholder not substituted: "${out}"`);
+});
+
 test('file.too_big substitutes the {cap} size', () => {
   const out = t('file.too_big', { cap: 20 });
   assert.ok(out.includes('20'), `expected "20" in "${out}"`);

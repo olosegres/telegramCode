@@ -232,6 +232,10 @@ const dict: Record<Lang, Record<string, string>> = {
     'effort.unsupported_backend': 'Управление effort не поддерживается для {label}.',
     'effort.no_session': 'Агент не запущен. Сначала /claude или /opencode.',
 
+    // ── /model (model selection) ──
+    'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
+    'model.start_agent_first': 'Нет активной сессии. Сначала запусти агента.',
+
     // ── /stop-all ──
     'stop_all.none_active': 'Нет активных агентов — нечего останавливать.',
     'stop_all.summary': '🛑 Остановлено {stopped} из {total} активных агентов.',
@@ -500,6 +504,10 @@ const dict: Record<Lang, Record<string, string>> = {
     'effort.cleared_on_model_switch': 'ℹ️ Effort `{level}` cleared: the new model `{model}` does not support it.',
     'effort.unsupported_backend': 'Effort control is not supported for {label}.',
     'effort.no_session': 'No agent running. Start one with /claude or /opencode.',
+
+    // ── /model (model selection) ──
+    'model.saved_for_next_start': 'Model saved: {model} — applies on next agent start.',
+    'model.start_agent_first': 'No active session. Start an agent first.',
 
     'stop_all.none_active': 'No agents running — nothing to stop.',
     'stop_all.summary': '🛑 Stopped {stopped} of {total} active agents.',

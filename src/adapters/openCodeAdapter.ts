@@ -1349,35 +1349,56 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @returns Error message if model not found, null on success
    */
   async setModel(key: ThreadKey, modelId: string): Promise<string | null> {
-    const session = this.sessions.get(keyToString(key));
-    if (!session?.isActive) return 'No active session';
-
-    const models = await fetchAvailableModels();
+    // Resolve first — both calls hit the server/CLI, not session state, so a
+    // model can be picked BEFORE a session exists. `getAvailableModels` is the
+    // stubbable wrapper around `fetchAvailableModels`.
+    const models = await this.getAvailableModels();
     const resolved = await resolveModelId(modelId, models);
-
     if (!resolved) {
       return `Model "${modelId}" not found. Use /model to see available models.`;
     }
-
-    session.modelOverride = resolved;
-    session.isModelInfoShown = false;
     const label = `${resolved.providerID}/${resolved.modelID}`;
-    session.currentModelLabel = label;
-    saveModelPref(key, label);
-    console.log(`[OpenCode] Model set to: ${label}`);
 
-    // Plan 2026-05-30-effort-command / S4: a stored effort the NEW model
-    // can't honour (variant absent) is dropped so the next prompt doesn't
-    // POST an invalid variant — and the user is told why their effort reset.
-    if (session.effortLevel) {
-      const stillValid = (await this.getAvailableEffortLevels(key)).includes(session.effortLevel);
+    // Persist the choice unconditionally: a session started later replays the
+    // saved pref via `restoreSavedModel`, so picking a model before `/opencode`
+    // is no longer lost (the "My health" bug).
+    saveModelPref(key, label);
+
+    const session = this.sessions.get(keyToString(key));
+    if (session?.isActive) {
+      session.modelOverride = resolved;
+      session.isModelInfoShown = false;
+      session.currentModelLabel = label;
+      console.log(`[OpenCode] Model set to: ${label}`);
+
+      // Plan 2026-05-30-effort-command / S4: a stored effort the NEW model
+      // can't honour (variant absent) is dropped so the next prompt doesn't
+      // POST an invalid variant — and the user is told why their effort reset.
+      if (session.effortLevel) {
+        const stillValid = (await this.getAvailableEffortLevels(key)).includes(session.effortLevel);
+        if (!stillValid) {
+          const dropped = session.effortLevel;
+          session.effortLevel = null;
+          clearEffortPref(key);
+          this.emit('output', key, t('effort.cleared_on_model_switch', { level: dropped, model: label }));
+        }
+      }
+      return null;
+    }
+
+    // No active session: the pref is saved above. Guard the SAME invariant as
+    // the live branch — a saved effort the new model can't honour would make
+    // the next session POST an invalid `body.variant`, so drop it now and tell
+    // the user, mirroring the live `effort.cleared_on_model_switch` notice.
+    const savedEffort = loadSavedEffort(key);
+    if (savedEffort) {
+      const stillValid = (await this.getModelVariants(resolved)).includes(savedEffort);
       if (!stillValid) {
-        const dropped = session.effortLevel;
-        session.effortLevel = null;
         clearEffortPref(key);
-        this.emit('output', key, t('effort.cleared_on_model_switch', { level: dropped, model: label }));
+        this.emit('output', key, t('effort.cleared_on_model_switch', { level: savedEffort, model: label }));
       }
     }
+    console.log(`[OpenCode] Model pref saved (no active session): ${label}`);
     return null;
   }
 
@@ -1390,8 +1411,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   getCurrentModel(key: ThreadKey): string | null {
     const session = this.sessions.get(keyToString(key));
-    if (!session) return null;
-    return session.currentModelLabel;
+    if (session?.currentModelLabel) return session.currentModelLabel;
+    // No live label (no session, or session not yet resolved) → fall back to
+    // the saved pref so the /model header and success copy stay correct
+    // pre-session. Mirrors getEffort's session-then-disk read order.
+    const saved = loadSavedModel(key);
+    return saved ? `${saved.providerID}/${saved.modelID}` : null;
   }
 
   // ── Reasoning effort (variants) ───────────────────────────────────────────
@@ -1421,16 +1446,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Variant names the thread's CURRENT model exposes, or `[]`
-   * when no model is set or the model declares no variants. Resolves the
-   * provider/model id from the live override (preferred) or the label.
+   * @description Variant names a `{providerID, modelID}` model exposes, or
+   * `[]` when the ref is incomplete or the model declares no variants.
+   *
+   * Takes a model ref (not a session) so the no-session `setModel` path can
+   * validate a freshly-picked model's variants before any session exists —
+   * `getAvailableEffortLevels` resolves the ref from the live session.
    */
-  private async getModelVariants(session: OpenCodeSession): Promise<string[]> {
-    const label = session.currentModelLabel;
-    const providerID = session.modelOverride?.providerID
-      ?? (label && label.includes('/') ? label.slice(0, label.indexOf('/')) : null);
-    const modelID = session.modelOverride?.modelID
-      ?? (label && label.includes('/') ? label.slice(label.indexOf('/') + 1) : null);
+  private async getModelVariants(model: OpenCodeModelOverride | null): Promise<string[]> {
+    const providerID = model?.providerID;
+    const modelID = model?.modelID;
     if (!providerID || !modelID) return [];
     try {
       const config = await this.getProvidersConfig();
@@ -1442,6 +1467,22 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description Resolve the live session's current model into a
+   * `{providerID, modelID}` ref from the override (preferred) or the label.
+   */
+  private getSessionModelRef(session: OpenCodeSession): OpenCodeModelOverride | null {
+    if (session.modelOverride) return session.modelOverride;
+    const label = session.currentModelLabel;
+    if (label && label.includes('/')) {
+      return {
+        providerID: label.slice(0, label.indexOf('/')),
+        modelID: label.slice(label.indexOf('/') + 1),
+      };
+    }
+    return null;
+  }
+
+  /**
    * @description Effort levels the current thread can use: exactly the
    * variants the current model declares. Empty when no session is running
    * or the model has no variants.
@@ -1449,7 +1490,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   async getAvailableEffortLevels(key: ThreadKey): Promise<string[]> {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return [];
-    return this.getModelVariants(session);
+    return this.getModelVariants(this.getSessionModelRef(session));
   }
 
   getEffort(key: ThreadKey): string | null {

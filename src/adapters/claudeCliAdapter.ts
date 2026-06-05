@@ -2100,8 +2100,16 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * Sends "/model <modelId>" as input to the tmux session. Returns `null`
    * on success (best-effort: claude doesn't ack the change synchronously).
    * Audit S10 / #39: unified signature with OpenCode adapter.
+   *
+   * Unlike OpenCode, Claude has NO model-pref persistence — model switching is
+   * a TUI keystroke with no on-disk pref to replay at next start. So with no
+   * active session there is nothing to do but refuse, otherwise `sendInput`
+   * silently no-ops and the caller would report a false "model set" success
+   * (reachable today via the ungated numeric-pick path).
    */
   async setModel(key: ThreadKey, modelId: string): Promise<string | null> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return t('model.start_agent_first');
     this.sendInput(key, `/model ${modelId}`);
     return null;
   }

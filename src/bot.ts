@@ -68,6 +68,7 @@ import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTr
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import { getBindGateDecision } from './utils/bindGateDecision';
+import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
   buildThreadContextPreamble,
   prependThreadContextPreamble,
@@ -1952,6 +1953,37 @@ function formatTimeAgo(date: Date): string {
   return `${Math.floor(diffHours / 24)}d ago`;
 }
 
+/**
+ * @description Single choke point for the four `/model`-set paths (the
+ * `/model <num>` and `/model <name>` commands, the text-handler numeric pick,
+ * and the `model_<id>` button callback). Drives the thread's adapter and turns
+ * the outcome into a ready reply via the pure {@link getModelSetReplyDecision}.
+ *
+ * No session gate here: each adapter decides what "no session" means
+ * (OpenCode persists the pick for the next start and succeeds; Claude refuses
+ * with a notice). On success the pinned banner is refreshed best-effort.
+ */
+async function applyModelSelection(
+  adapter: AgentAdapter,
+  key: ThreadKey,
+  modelId: string,
+): Promise<{ isOk: boolean; message: string; setModelError: string | null; displayLabel: string }> {
+  const setModelError = adapter.setModel ? await adapter.setModel(key, modelId) : null;
+  const displayLabel = adapter.getCurrentModel?.(key) || modelId;
+  const decision = getModelSetReplyDecision(
+    {
+      hasSetModel: Boolean(adapter.setModel),
+      setModelError,
+      isActive: adapter.checkIsActive(key),
+      adapterLabel: adapter.label,
+      displayLabel,
+    },
+    t,
+  );
+  if (decision.isOk) await updatePinnedStatus(key).catch(() => {});
+  return { ...decision, setModelError, displayLabel };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Commands
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2886,37 +2918,16 @@ command('model', async (ctx, key) => {
       await replyToThread(key, 'Invalid number. Run /model to see the list.');
       return;
     }
-    if (!adapter.checkIsActive(key)) {
-      await replyToThread(key, 'No active session. Start an agent first.');
-      return;
-    }
     const selected = modelList[num - 1];
-    if (adapter.setModel) {
-      const err = await adapter.setModel(key, selected);
-      await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
-      if (!err) await updatePinnedStatus(key).catch(() => {});
-    }
+    const { message } = await applyModelSelection(adapter, key, selected);
+    await replyToThread(key, message);
     return;
   }
 
   // direct «/model provider/name»
   if (args) {
-    if (!adapter.checkIsActive(key)) {
-      await replyToThread(key, 'No active session. Start an agent first.');
-      return;
-    }
-    if (adapter.setModel) {
-      const err = await adapter.setModel(key, args);
-      if (err) {
-        await replyToThread(key, `Error: ${err}`);
-      } else {
-        const current = adapter.getCurrentModel?.(key) || args;
-        await replyToThread(key, `Model set to: ${current}`);
-        await updatePinnedStatus(key).catch(() => {});
-      }
-    } else {
-      await replyToThread(key, `Model switching not supported for ${adapter.label}`);
-    }
+    const { message } = await applyModelSelection(adapter, key, args);
+    await replyToThread(key, message);
     return;
   }
 
@@ -3547,15 +3558,11 @@ bot.on(message('text'), async (ctx) => {
       // `adapter.setModel` was truthy; on adapters that don't implement
       // it (legacy void return) execution fell through and the same
       // numeric reply was re-processed as a natural-language start +
-      // forwarded to the agent. Always return after numeric selection
+      // forwarded to the agent. `applyModelSelection` always replies (even
+      // for the unsupported case), so we always return after a numeric pick
       // — the user clearly intended a model pick, not a prompt.
-      if (adapter.setModel) {
-        const err = await adapter.setModel(key, selected);
-        await replyToThread(key, err ? `Error: ${err}` : `Model set to: ${selected}`);
-        if (!err) await updatePinnedStatus(key).catch(() => {});
-      } else {
-        await replyToThread(key, `Model switching is not supported for ${adapter.label}`);
-      }
+      const { message } = await applyModelSelection(adapter, key, selected);
+      await replyToThread(key, message);
     } else {
       await replyToThread(key, 'Invalid number. Run /model to see the list.');
     }
@@ -4327,21 +4334,20 @@ bot.action(/^model_(.+)$/, async (ctx) => {
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const modelId = ctx.match[1];
   const adapter = getThreadAdapter(key);
-  if (!adapter.checkIsActive(key)) {
-    await ctx.answerCbQuery(t('cb.no_active_session'));
+  // No bot-side session gate: the adapter owns the no-session decision
+  // (OpenCode persists the pick for next start and succeeds; Claude refuses
+  // with a notice surfaced as the error toast below).
+  if (!adapter.setModel) {
+    await ctx.answerCbQuery(t('cb.not_supported', { label: adapter.label }));
     return;
   }
-  if (adapter.setModel) {
-    const err = await adapter.setModel(key, modelId);
-    if (err) { await ctx.answerCbQuery(t('cb.model_error', { error: err.slice(0, 50) })); return; }
-    const current = adapter.getCurrentModel?.(key) || modelId;
-    await ctx.answerCbQuery(t('cb.model_set', { model: current.split('/').pop() || current }));
-    await replyToThread(key, `Model switched to: ${current}`);
-    // Reflect the new model in the pinned banner.
-    await updatePinnedStatus(key).catch(() => {});
-  } else {
-    await ctx.answerCbQuery(t('cb.not_supported', { label: adapter.label }));
+  const { isOk, message, setModelError, displayLabel } = await applyModelSelection(adapter, key, modelId);
+  if (!isOk) {
+    await ctx.answerCbQuery(t('cb.model_error', { error: (setModelError ?? message).slice(0, 50) }));
+    return;
   }
+  await ctx.answerCbQuery(t('cb.model_set', { model: displayLabel.split('/').pop() || displayLabel }));
+  await replyToThread(key, message);
 });
 
 bot.action(/^effort_(.+)$/, async (ctx) => {

@@ -73,6 +73,20 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.outside_root': '❌ Путь выходит за пределы `WORK_ROOT`.',
     'bind.not_directory': '❌ `{subdir}` существует, но это не папка.',
 
+    // ── /bind create-new-folder flow ──
+    'bind.create_button': '➕ Создать новую папку',
+    'bind.create_prompt':
+      '✏️ Пришли название новой папки (будет создана в `WORK_ROOT`).\n/cancel — отмена.',
+    'bind.create_cb': 'Создаю новую папку…',
+    'bind.create_empty': '❌ Название пустое. Пришли название папки или /cancel.',
+    'bind.create_separator': '❌ Название не должно содержать `/` или `\\`. Пришли простое имя.',
+    'bind.create_dot_segment': '❌ `.` и `..` нельзя использовать как имя папки.',
+    'bind.create_hidden': '❌ Имя не должно начинаться с точки.',
+    'bind.create_invalid_chars': '❌ В названии папки запрещены управляющие символы.',
+    'bind.create_exists': '📁 Папка `{subdir}` уже существует — привязываю к ней.',
+    'bind.create_failed': '❌ Не удалось создать папку: {error}',
+    'bind.create_cancelled': 'Отменено. Создание папки закрыто.',
+
     // ── /ls /list (General-scoped) ──
     'ls.header': '📁 Подпапки `{workRoot}`:',
     'ls.empty': '📁 В `WORK_ROOT` нет подходящих подпапок.',
@@ -350,6 +364,20 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.not_found': '❌ Folder `{subdir}` not found under `WORK_ROOT` (`{workRoot}`).',
     'bind.outside_root': '❌ Path escapes `WORK_ROOT`.',
     'bind.not_directory': '❌ `{subdir}` exists but is not a directory.',
+
+    // ── /bind create-new-folder flow ──
+    'bind.create_button': '➕ Create new folder',
+    'bind.create_prompt':
+      '✏️ Send the new folder name (it will be created under `WORK_ROOT`).\n/cancel to abort.',
+    'bind.create_cb': 'Creating a new folder…',
+    'bind.create_empty': '❌ Name is empty. Send a folder name or /cancel.',
+    'bind.create_separator': '❌ Name must not contain `/` or `\\`. Send a plain name.',
+    'bind.create_dot_segment': '❌ `.` and `..` cannot be used as a folder name.',
+    'bind.create_hidden': '❌ Name must not start with a dot.',
+    'bind.create_invalid_chars': '❌ Folder name must not contain control characters.',
+    'bind.create_exists': '📁 Folder `{subdir}` already exists — binding to it.',
+    'bind.create_failed': '❌ Failed to create the folder: {error}',
+    'bind.create_cancelled': 'Cancelled. Folder creation closed.',
 
     // ── /ls /list (General-scoped) ──
     'ls.header': '📁 Subfolders of `{workRoot}`:',

@@ -102,6 +102,36 @@ test('file.too_big substitutes the {cap} size', () => {
   assert.ok(!out.includes('{cap}'), `placeholder not substituted: "${out}"`);
 });
 
+test('bind create-folder flow keys exist in every locale', () => {
+  for (const code of [
+    'bind.create_button',
+    'bind.create_prompt',
+    'bind.create_cb',
+    'bind.create_empty',
+    'bind.create_separator',
+    'bind.create_dot_segment',
+    'bind.create_hidden',
+    'bind.create_invalid_chars',
+    'bind.create_exists',
+    'bind.create_failed',
+    'bind.create_cancelled',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('bind.create_exists substitutes the {subdir}', () => {
+  const out = t('bind.create_exists', { subdir: 'overview' });
+  assert.ok(out.includes('overview'), `expected the subdir in "${out}"`);
+  assert.ok(!out.includes('{subdir}'), `placeholder not substituted: "${out}"`);
+});
+
+test('bind.create_failed substitutes the {error}', () => {
+  const out = t('bind.create_failed', { error: 'EACCES' });
+  assert.ok(out.includes('EACCES'), `expected the error in "${out}"`);
+  assert.ok(!out.includes('{error}'), `placeholder not substituted: "${out}"`);
+});
+
 test('t falls back to last code segment for unknown key', () => {
   const out = t('nonexistent.key.path');
   assert.equal(out, 'path');

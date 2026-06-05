@@ -114,7 +114,8 @@ config/variants, not a per-message API field).
 | `state.ts` | Persistence (`state.json`): bindings, sessions, pairing; `resolveDataDir()` |
 | `mcpConfig.ts` | Merge MCP server config across the user/group/project/thread hierarchy |
 | `i18n.ts` | `t(key, vars)` translations for all user-facing strings |
-| `validation.ts` | Input validation |
+| `validation.ts` | Input validation for existing-folder `/bind` args (`validateSubdir`, path-traversal/symlink-safe) |
+| `folderName.ts` | Pure validation of a typed NEW folder name for the `/bind` create-folder flow (`validateNewFolderName`) — pre-`mkdir` gate (no slashes/traversal/dots/control chars), distinct from `validateSubdir` which requires the folder to exist |
 | `rateLimiter.ts` | Per-user / per-action rate limiting |
 | `progressLine.ts` | Render the live progress / spinner line |
 | `pinnedStatus.ts` | Per-thread pinned status banner (shows model, etc.) |
@@ -198,6 +199,15 @@ as a command in `bot.ts`.
     first".
 - **Binding & navigation:** `/bind`, `/unbind`, `/where`, `/ls`, `/list`,
   `/pair`
+  - `/bind` with no arg shows the folder picker; its FIRST inline button is
+    «create new folder» (`bindCreateFolder` callback). Tapping it arms a
+    per-thread await-folder-name mode (`awaitingFolderName`): the next text
+    message is validated (`validateNewFolderName` in `folderName.ts` — no
+    slashes/traversal/dots/control chars), `mkdir`'d under `WORK_ROOT`
+    (already-exists → just bind to it), then bound via `applyBinding` with the
+    normal welcome stack. Invalid name → error, mode stays armed for retry.
+    `/cancel` or any other command exits the mode. `/bind <subdir>` direct form
+    is unchanged.
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw
   TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
   - While a Claude TUI selector is on screen (`isQuestionPending`), a bare

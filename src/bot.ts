@@ -48,6 +48,7 @@ import { gracefulShutdown } from './shutdown';
 import { classifyBoot } from './bootClassifier';
 import { t } from './i18n';
 import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
+import { validateNewFolderName, NewFolderNameError } from './folderName';
 import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
 import { AdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
 import { downloadFile } from './utils/download';
@@ -433,6 +434,16 @@ const threadSessionLists = new Map<string, string[]>();
  */
 const awaitingSessionSelection = new Set<string>();
 
+/**
+ * @description Per-thread "create-new-folder" arming flag. Added when the
+ * user taps the «create new folder» option in the `/bind` picker; removed
+ * when the user sends the name, cancels, or runs any other command. While a
+ * key is in this set the next text message is treated as the folder name to
+ * create + bind. Mirrors the `awaitingSessionSelection` pattern. Stays armed
+ * on an invalid name so the user can retry.
+ */
+const awaitingFolderName = new Set<string>();
+
 /** Max sessions shown in a `/sessions` list (Telegram-friendly, plan S3). */
 const sessionsDisplayLimit = 10;
 
@@ -735,6 +746,7 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   awaitingModelSelection.delete(k);
   threadSessionLists.delete(k);
   awaitingSessionSelection.delete(k);
+  awaitingFolderName.delete(k);
   pinnedStatusTextCache.delete(k);
   statusCoalescers.delete(k);
 }
@@ -1673,7 +1685,15 @@ function listAvailableSubdirs(workRoot: string, limit = 200): string[] {
  * in `listAvailableSubdirs`. `page` is clamped to a valid index so a stale
  * callback (folders disappeared since the keyboard was sent) just lands
  * on the last available page.
+ *
+ * The FIRST row is always a full-width «create new folder» button
+ * (`bindCreateFolderCallback`) — its callback deliberately does NOT start
+ * with `bind_`, so it can't be mistaken for a folder pick by the
+ * `bind_<subdir>` action regex. It rides on every page so it's reachable
+ * regardless of pagination.
  */
+const bindCreateFolderCallback = 'bindCreateFolder';
+
 function buildBindKeyboard(
   subdirs: readonly string[],
   page: number = 0,
@@ -1681,7 +1701,9 @@ function buildBindKeyboard(
 ) {
   const { slice, currentPage, totalPages } = paginateBindList(subdirs, page, pageSize);
 
-  const rows = [];
+  const rows = [
+    [Markup.button.callback(t('bind.create_button'), bindCreateFolderCallback)],
+  ];
   for (let i = 0; i < slice.length; i += 2) {
     const row = [Markup.button.callback(`📁 ${slice[i]}`, `bind_${slice[i]}`)];
     if (slice[i + 1]) {
@@ -2021,9 +2043,18 @@ function command(
   name: string | string[],
   handler: (ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>, key: ThreadKey) => Promise<void> | void,
 ): void {
+  const names = Array.isArray(name) ? name : [name];
+  // `/cancel` owns its own exit + acknowledgement for the create-folder mode,
+  // so the wrapper must NOT clear the flag before it runs (it would otherwise
+  // see "nothing armed" and reply the no-op notice).
+  const ownsFolderModeExit = names.includes('cancel');
   bot.command(name, async (ctx) => {
     const key = await authoriseContext(ctx);
     if (!key) return;
+    // Running any other command exits the /bind create-folder await-name mode —
+    // the create flow only expects a plain folder-name message, never a command.
+    // (The picker's create button re-arms it afterwards via its own callback.)
+    if (!ownsFolderModeExit) awaitingFolderName.delete(keyToString(key));
     await handler(ctx, key);
   });
 }
@@ -2139,6 +2170,76 @@ async function applyBinding(
   return { ok: true, message, subdir };
 }
 
+/**
+ * @description Arm a thread's await-folder-name mode for the `/bind`
+ * create-folder flow. Clears any other in-flight pick mode first so the
+ * armed-mode branches in the text handler never overlap (only one armed
+ * mode is active per thread at a time).
+ */
+function armFolderCreation(key: ThreadKey): void {
+  const kStr = keyToString(key);
+  awaitingModelSelection.delete(kStr);
+  awaitingSessionSelection.delete(kStr);
+  // A stale pending question would otherwise consume the message AFTER the
+  // folder name as an answer to the old (pre-rebind) agent question.
+  pendingQuestions.delete(kStr);
+  awaitingFolderName.add(kStr);
+}
+
+/** Map a `validateNewFolderName` rejection to its localised reply. */
+function mapNewFolderError(reason: NewFolderNameError): string {
+  switch (reason) {
+    case 'empty':         return t('bind.create_empty');
+    case 'separator':     return t('bind.create_separator');
+    case 'dot_segment':   return t('bind.create_dot_segment');
+    case 'hidden':        return t('bind.create_hidden');
+    case 'invalid_chars': return t('bind.create_invalid_chars');
+    default:              return t('bind.create_empty');
+  }
+}
+
+/**
+ * @description Create a new folder under WORK_ROOT from a user-typed name and
+ * bind the thread to it. Validates the name first (no traversal/slashes/dots),
+ * then `mkdir` (recursive: an already-existing folder is fine — we just bind
+ * to it and tell the user), then routes through `applyBinding` for the same
+ * containment/symlink defence + welcome stack the picker uses.
+ *
+ * Returns `{ ok }` so the caller knows whether to disarm the await-name mode:
+ * an invalid name keeps the thread armed for a retry; success or a real
+ * filesystem failure disarms it.
+ */
+async function createAndBindFolder(key: ThreadKey, rawName: string): Promise<{ ok: boolean }> {
+  const validated = validateNewFolderName(rawName);
+  if (!validated.ok) {
+    await replyToThread(key, mapNewFolderError(validated.reason));
+    return { ok: false };
+  }
+
+  const targetPath = path.join(ENV.workRoot, validated.name);
+  const alreadyExisted = fs.existsSync(targetPath);
+  try {
+    fs.mkdirSync(targetPath, { recursive: true });
+  } catch (e) {
+    await replyToThread(key, t('bind.create_failed', {
+      error: e instanceof Error ? e.message : String(e),
+    }));
+    return { ok: true };
+  }
+
+  // Folder freshly on disk → the cached subdir list is stale; drop it so the
+  // next picker render includes the new folder.
+  subdirCache.clear();
+
+  if (alreadyExisted) {
+    await replyToThread(key, t('bind.create_exists', { subdir: validated.name }));
+  }
+  const result = await applyBinding(key, validated.name);
+  await replyToThread(key, result.message);
+  if (result.ok) await sendBindingWelcome(key, result.subdir);
+  return { ok: true };
+}
+
 command('bind', async (ctx, key) => {
   if (checkIsGeneral(key)) {
     await replyToThread(key, t('bind.in_general'));
@@ -2158,10 +2259,9 @@ command('bind', async (ctx, key) => {
       : t('bind.current_none');
     const usage = `${currentLine}\n\n${t('bind.usage')}`;
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    if (subdirs.length === 0) {
-      await replyToThread(key, usage);
-      return;
-    }
+    // Always show the keyboard — even with zero subdirs it carries the
+    // «create new folder» button, which is the only way to bootstrap a folder
+    // from an empty WORK_ROOT without the slash form.
     await replyToThread(key, usage, buildBindKeyboard(subdirs));
     return;
   }
@@ -2488,7 +2588,7 @@ command('help', async (_ctx, key) => {
   const binding = state.getBinding(key);
   if (!binding) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    const extra = buildBindKeyboard(subdirs);
     await replyToThread(key, t('help.thread_unbound'), {
       parse_mode: 'Markdown',
       ...(extra ?? {}),
@@ -2861,7 +2961,7 @@ async function handleStartCommand(
   // natural-language path in the text handler (plan §11 Этап 4).
   if (!state.getBinding(key)) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    const extra = buildBindKeyboard(subdirs);
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
@@ -3074,7 +3174,7 @@ async function handleSessionsList(key: ThreadKey): Promise<void> {
   }
   if (!state.getBinding(key)) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    const extra = buildBindKeyboard(subdirs);
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
@@ -3165,6 +3265,11 @@ command(['sessions', 'resume'], (_ctx, key) => handleSessionsList(key));
 // thread wasn't armed, so a stray /cancel never looks broken.
 command('cancel', async (_ctx, key) => {
   const kStr = keyToString(key);
+  if (awaitingFolderName.has(kStr)) {
+    awaitingFolderName.delete(kStr);
+    await replyToThread(key, t('bind.create_cancelled'));
+    return;
+  }
   if (awaitingSessionSelection.has(kStr)) {
     awaitingSessionSelection.delete(kStr);
     await replyToThread(key, t('session.cancelled'));
@@ -3520,7 +3625,10 @@ bot.on(message('text'), async (ctx) => {
   // binding. Now that an allowed user is engaging this thread, retry the
   // fuzzy auto-bind once. Failure leaves the binding empty — text below
   // will route to the picker UX, same as on a topic without a cache hit.
-  if (!checkIsGeneral(key) && !state.getBinding(key)) {
+  // Skip entirely when the thread is armed for create-folder: the user
+  // explicitly chose to create a new folder, so this message is the name —
+  // don't let a stale topic-name cache hijack it into a different bind.
+  if (!checkIsGeneral(key) && !state.getBinding(key) && !awaitingFolderName.has(kStr)) {
     const pending = pendingTopicNames.get(kStr);
     if (pending && Date.now() - pending.ts < PENDING_TOPIC_NAME_TTL_MS) {
       const match = findAutobindSubdir(pending.name, listAvailableSubdirs(ENV.workRoot));
@@ -3547,6 +3655,18 @@ bot.on(message('text'), async (ctx) => {
   }
 
   const adapter = getThreadAdapter(key);
+
+  // Create-folder mode (armed by the «create new folder» button in the /bind
+  // picker). The whole next message is the folder name — checked BEFORE the
+  // numeric model / session branches so a numeric folder name (e.g. "2025")
+  // isn't mistaken for a pick. /cancel and other commands already exited above
+  // (slash commands return early), so reaching here means real name text. An
+  // invalid name keeps the thread armed for a retry; success disarms it.
+  if (awaitingFolderName.has(kStr)) {
+    const { ok } = await createAndBindFolder(key, text);
+    if (ok) awaitingFolderName.delete(kStr);
+    return;
+  }
 
   // Numeric model selection after `/model`.
   if (/^\d+$/.test(text) && awaitingModelSelection.has(kStr)) {
@@ -3611,7 +3731,7 @@ bot.on(message('text'), async (ctx) => {
       // user wants, so refuse and offer the picker instead.
       if (!state.getBinding(key)) {
         const subdirs = listAvailableSubdirs(ENV.workRoot);
-        const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+        const extra = buildBindKeyboard(subdirs);
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
@@ -3686,7 +3806,7 @@ bot.on(message('text'), async (ctx) => {
   const binding = state.getBinding(key);
   if (!binding) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    const extra = buildBindKeyboard(subdirs);
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
@@ -3768,7 +3888,7 @@ bot.on(message('voice'), async (ctx) => {
         }
         if (!state.getBinding(key)) {
           const subdirs = listAvailableSubdirs(ENV.workRoot);
-          const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+          const extra = buildBindKeyboard(subdirs);
           await replyToThread(key, t('thread.no_binding'), extra);
           return;
         }
@@ -3786,7 +3906,7 @@ bot.on(message('voice'), async (ctx) => {
       const binding = state.getBinding(key);
       if (!binding) {
         const subdirs = listAvailableSubdirs(ENV.workRoot);
-        const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+        const extra = buildBindKeyboard(subdirs);
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
@@ -3852,7 +3972,7 @@ async function checkFileIntakeGatePassed(
   const binding = state.getBinding(key);
   if (!binding) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    const extra = buildBindKeyboard(subdirs);
     await sendHint(t('thread.no_binding'), extra);
     return false;
   }
@@ -4201,7 +4321,7 @@ bot.on(message('forum_topic_created'), async (ctx) => {
     }
   }
 
-  const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+  const extra = buildBindKeyboard(subdirs);
   await replyToThread(key, t('thread.welcome_pick'), extra);
 });
 
@@ -4328,6 +4448,22 @@ bot.action(/^bind_page_(\d+)$/, async (ctx) => {
 // Middle "N/M" pill in the nav row — pure UI, no state change.
 bot.action('bind_page_noop', async (ctx) => {
   await ctx.answerCbQuery();
+});
+
+// «Create new folder» — first option in the /bind picker. Arms the thread's
+// await-folder-name mode; the next text message is the name (see the text
+// handler). Callback id deliberately avoids the `bind_` prefix so it can't be
+// matched by the `bind_<subdir>` regex below.
+bot.action(bindCreateFolderCallback, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  if (checkIsGeneral(key)) {
+    await ctx.answerCbQuery(t('cb.bind_only_topical'));
+    return;
+  }
+  await ctx.answerCbQuery(t('bind.create_cb'));
+  armFolderCreation(key);
+  await replyToThread(key, t('bind.create_prompt'));
 });
 
 bot.action(/^bind_(.+)$/, async (ctx) => {
@@ -5130,6 +5266,11 @@ export async function startBot(): Promise<void> {
       for (const k of awaitingSessionSelection) {
         if (!live.has(k)) { awaitingSessionSelection.delete(k); removed += 1; }
       }
+      // NOTE: `awaitingFolderName` is intentionally NOT swept here. It arms an
+      // UNBOUND thread (folder doesn't exist yet), so its key is never in
+      // `live` — sweeping would clear a user who tapped "create folder" but is
+      // still typing the name. The flag self-clears on the next message or any
+      // command; an abandoned attempt costs one stray Set entry.
       // Per-topic-name cache also benefits from the same sweep — entries
       // for live keys are valid until TTL; for dead keys, drop now.
       for (const k of pendingTopicNames.keys()) {

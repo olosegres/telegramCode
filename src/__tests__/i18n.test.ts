@@ -63,6 +63,20 @@ test('model-selection keys exist in every locale (S5)', () => {
   assert.ok(checkKeyInAllLangs('model.start_agent_first'), 'model.start_agent_first missing in some locale');
 });
 
+test('rename-session keys exist in every locale', () => {
+  assert.ok(checkKeyInAllLangs('rename_session.usage'), 'rename_session.usage missing in some locale');
+  assert.ok(checkKeyInAllLangs('rename_session.start_agent_first'), 'rename_session.start_agent_first missing in some locale');
+  assert.ok(checkKeyInAllLangs('rename_session.unsupported_backend'), 'rename_session.unsupported_backend missing in some locale');
+  assert.ok(checkKeyInAllLangs('rename_session.success'), 'rename_session.success missing in some locale');
+  assert.ok(checkKeyInAllLangs('rename_session.failed'), 'rename_session.failed missing in some locale');
+});
+
+test('rename_session.success substitutes the {title}', () => {
+  const out = t('rename_session.success', { title: 'Refactor auth' });
+  assert.ok(out.includes('Refactor auth'), `expected the title in "${out}"`);
+  assert.ok(!out.includes('{title}'), `placeholder not substituted: "${out}"`);
+});
+
 test('model.saved_for_next_start substitutes the {model} name', () => {
   const out = t('model.saved_for_next_start', { model: 'anthropic/claude-opus-4-8' });
   assert.ok(out.includes('anthropic/claude-opus-4-8'), `expected the model name in "${out}"`);

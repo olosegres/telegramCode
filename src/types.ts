@@ -171,6 +171,21 @@ export interface AgentAdapter extends EventEmitter {
    */
   getSessions(key: ThreadKey, workDir: string): Promise<AgentSession[]>;
   /**
+   * Rename the CURRENT live session bound to `key` to `title`. Same
+   * convention as {@link setModel}: resolves to `null` on success, or a
+   * short user-facing error string on failure.
+   *
+   * Optional (optional-method pattern, like {@link setModel}): only backends
+   * with a real session-title concept implement it. OpenCode does
+   * (`PATCH /session/:id { title }`); Claude does NOT — its transcripts have
+   * no title — so the bot replies "not supported" for adapters lacking it.
+   *
+   * A manual rename is final: it must suppress any later automatic title
+   * overwrite (OpenCode's bot-side auto-name fallback).
+   */
+  renameSession?(key: ThreadKey, title: string): Promise<string | null>;
+
+  /**
    * Resume an existing backend session under this `key` and `workDir`.
    *
    * `workDir` is now a required argument: the adapter cannot infer it after

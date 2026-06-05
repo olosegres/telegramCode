@@ -149,8 +149,8 @@ as a command in `bot.ts`.
 ## Commands (all registered in `bot.ts`)
 
 - **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/stop`, `/stop-all`,
-  `/quit` (`/q`), `/sessions` (`/resume`), `/cancel`, `/clear_messages`,
-  `/compact`
+  `/quit` (`/q`), `/sessions` (`/resume`), `/rename_session`, `/cancel`,
+  `/clear_messages`, `/compact`
   - `/clear_messages` (formerly `/clear`) deletes this thread's Telegram
     messages (up to 48h, Telegram limit). The bare `/clear` is **no longer
     bot-owned** — it's forwarded verbatim to the agent like `/compact` (Claude
@@ -178,6 +178,15 @@ as a command in `bot.ts`.
       adapter falls back to a ~60-char snippet of the first meaningful (non
       slash, ≥10-char) raw prompt via `PATCH /session/:id`. See plan
       `agent/tasks/completed/2026-06-04-opencode-session-autonaming.md`.
+  - `/rename_session <new title>` manually renames the CURRENT thread's live
+    session (per-backend, adapter-owned optional method like `/model`).
+    **OpenCode** renames via instance-scoped `PATCH /session/:id { title }`
+    (reusing the auto-naming PATCH helper) and clears `isAutoNamePending` so a
+    manual title can never be overwritten by the auto-name fallback; the title
+    is trimmed and capped at `sessionTitleSnippetMaxLength` (60). **Claude**
+    has no title concept and does not implement the method → the bot replies
+    "not supported". No args → usage hint; no active session → "start an agent
+    first".
 - **Binding & navigation:** `/bind`, `/unbind`, `/where`, `/ls`, `/list`,
   `/new`, `/pair`
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw

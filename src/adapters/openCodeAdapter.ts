@@ -1523,6 +1523,41 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return null;
   }
 
+  /**
+   * @description Manually rename the live session via `PATCH /session/:id
+   * { title }`, scoped to the session's owning project instance
+   * (`?directory=<workDir>`) so it hits the same instance the session was
+   * created in. Reuses {@link apiRequest} — no duplicate HTTP code.
+   *
+   * A manual rename is final: it clears `isAutoNamePending` so the bot-side
+   * auto-name fallback can never overwrite the user's title later (the
+   * fallback only fires while that flag is set — see
+   * {@link maybeScheduleFallbackRename}).
+   */
+  async renameSession(key: ThreadKey, title: string): Promise<string | null> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return t('rename_session.start_agent_first');
+
+    // The user explicitly named it — auto-title must never win over a manual
+    // rename, so retire the fallback for this session regardless of the PATCH
+    // outcome.
+    session.isAutoNamePending = false;
+
+    try {
+      await this.apiRequest(
+        'PATCH',
+        buildDirectoryScopedPath(`/session/${session.sessionId}`, session.workDir),
+        { title },
+      );
+      console.log(`[OpenCode] Renamed session ${session.sessionId} to "${title}"`);
+      return null;
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      console.warn(`[OpenCode] manual session rename failed:`, reason);
+      return t('rename_session.failed', { reason });
+    }
+  }
+
   getOpenCodeSessionId(key: ThreadKey): string | null {
     return this.sessions.get(keyToString(key))?.sessionId ?? null;
   }

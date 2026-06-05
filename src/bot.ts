@@ -89,6 +89,7 @@ import {
 } from './telegramFileIntake';
 import type { TelegramFileMeta, AlbumFile } from './telegramFileIntake';
 import { createMediaGroupCollector } from './utils/mediaGroupCollector';
+import { sessionTitleSnippetMaxLength } from './openCodeSessionTitle';
 import {
   ensureThreadFilesDir,
   purgeThreadFiles,
@@ -3035,6 +3036,35 @@ command('effort', async (ctx, key) => {
   );
 });
 
+// Manually rename the CURRENT thread's session. Adapter-owned capability
+// (optional method, like /model): OpenCode renames via `PATCH /session/:id`;
+// Claude has no title concept and is told "not supported". Requires a live
+// session — without one the user is told to start an agent first.
+command('rename_session', async (ctx, key) => {
+  const adapter = getThreadAdapter(key);
+
+  if (!adapter.renameSession) {
+    await replyToThread(key, t('rename_session.unsupported_backend', { label: adapter.label }));
+    return;
+  }
+
+  // Title is the whole text after the command, trimmed and capped to the same
+  // length the auto-name snippet uses (single source of truth).
+  const title = ctx.message.text.split(' ').slice(1).join(' ').trim().slice(0, sessionTitleSnippetMaxLength);
+  if (!title) {
+    await replyToThread(key, t('rename_session.usage'));
+    return;
+  }
+
+  const err = await adapter.renameSession(key, title);
+  if (err) {
+    await replyToThread(key, err);
+    return;
+  }
+  await replyToThread(key, t('rename_session.success', { title }));
+  await updatePinnedStatus(key).catch(() => {});
+});
+
 /**
  * @description Build the `/agent` picker keyboard.
  *
@@ -3477,7 +3507,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'whoami', 'version', 'help',
-  'doctor', 'mcp',
+  'doctor', 'mcp', 'rename_session',
 ]);
 
 /**
@@ -4843,6 +4873,7 @@ const COMMANDS_MENU = [
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
+  { command: 'rename_session', description: '✏️ Rename the current session (OpenCode)' },
   { command: 'cancel', description: '🚫 Cancel the session picker' },
   { command: 'stop', description: '⏹ Stop agent (hard kill)' },
   { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },

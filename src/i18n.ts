@@ -236,6 +236,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
     'model.start_agent_first': 'Нет активной сессии. Сначала запусти агента.',
 
+    // ── /rename_session (manual session rename) ──
+    'rename_session.usage': 'Использование: /rename_session <новое название>',
+    'rename_session.start_agent_first': 'Нет активной сессии. Сначала запусти агента (/claude или /opencode).',
+    'rename_session.unsupported_backend': 'Переименование сессии не поддерживается для {label}.',
+    'rename_session.success': '✅ Сессия переименована: {title}',
+    'rename_session.failed': '⚠️ Не удалось переименовать сессию: {reason}',
+
     // ── /stop-all ──
     'stop_all.none_active': 'Нет активных агентов — нечего останавливать.',
     'stop_all.summary': '🛑 Остановлено {stopped} из {total} активных агентов.',
@@ -508,6 +515,13 @@ const dict: Record<Lang, Record<string, string>> = {
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Model saved: {model} — applies on next agent start.',
     'model.start_agent_first': 'No active session. Start an agent first.',
+
+    // ── /rename_session (manual session rename) ──
+    'rename_session.usage': 'Usage: /rename_session <new title>',
+    'rename_session.start_agent_first': 'No active session. Start an agent first (/claude or /opencode).',
+    'rename_session.unsupported_backend': 'Session rename is not supported for {label}.',
+    'rename_session.success': '✅ Session renamed: {title}',
+    'rename_session.failed': '⚠️ Failed to rename the session: {reason}',
 
     'stop_all.none_active': 'No agents running — nothing to stop.',
     'stop_all.summary': '🛑 Stopped {stopped} of {total} active agents.',

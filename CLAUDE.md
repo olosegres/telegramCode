@@ -70,6 +70,17 @@ config/variants, not a per-message API field).
   forwarding a bare `/clear`. Topic name comes from `forum_topic_created` /
   `_edited` / `/new` (persisted on the binding); the group title from an
   in-memory cache fed by authorised updates. Slash commands skip the preamble.
+- **File intake.** A file sent to a bound, agent-active topic (photo,
+  document incl. PDF, video, video_note, audio, animation) is downloaded into
+  `DATA_DIR/files/<chatId>_<threadId>/` (bot-owned, never inside the bound
+  project folder) and announced to the agent through `forwardPromptToAgent` as
+  `[Telegram file] <kind> saved to: <path> (<size>)` + caption. Idle/unbound
+  thread → same friendly hint as plain text, nothing downloaded; file over the
+  20 MB Bot API cap → `file.too_big` reply. **Voice is NOT intake** — it stays
+  on the transcription path. Two cleanup mechanisms: a forwarded bare `/clear`
+  purges the thread's files dir (agent context gone → files useless), and a
+  daily + at-boot age sweep deletes files older than `fileRetentionDays` (30).
+  Pure helpers in `telegramFileIntake.ts`; storage/janitor in `botFileStorage.ts`.
 
 ## Module map (`src/`)
 
@@ -90,6 +101,8 @@ config/variants, not a per-message API field).
 | `pinnedStatus.ts` | Per-thread pinned status banner (shows model, etc.) |
 | `agentTrigger.ts` | Detect agent-ready / prompt triggers in output |
 | `threadContextPreamble.ts` | Pure helpers: build the `[Telegram thread context]` preamble (`buildThreadContextPreamble`), decide whether to inject it (`checkShouldInjectPreamble`, `checkShouldSkipPreambleForText`), and glue it ahead of the prompt (`prependThreadContextPreamble`) |
+| `telegramFileIntake.ts` | Pure file-intake helpers: normalise the six media kinds (`getTelegramFileMeta`, photo = largest size), build the safe saved filename (`buildSavedFileName`, sanitised), the agent-facing announcement (`buildFilePromptText`), and the size cap check (`checkIsFileTooBig`) |
+| `botFileStorage.ts` | Per-thread intake dir layout + janitor: `resolveThreadFilesDir`, `ensureThreadFilesDir`, `purgeThreadFiles` (on `/clear`), `sweepExpiredThreadFiles` (boot + daily age sweep, `fileRetentionDays = 30`) |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
@@ -123,7 +136,8 @@ as a command in `bot.ts`.
     bot-owned** — it's forwarded verbatim to the agent like `/compact` (Claude
     TUI wipes its context; OpenCode treats it as plain text), and forwarding it
     resets the thread-context preamble marker so the next prompt re-informs the
-    agent of its topic.
+    agent of its topic. It also **purges the thread's file-intake dir** (the
+    agent's context is gone, so any downloaded files it referenced are useless).
   - `/sessions` and its synonym `/resume` list resumable sessions for the
     thread's bound folder as numbered text **and** tappable inline buttons,
     then arm a per-thread pick mode: reply with a bare digit to resume that

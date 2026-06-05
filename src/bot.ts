@@ -75,6 +75,22 @@ import {
   checkShouldSkipPreambleForText,
 } from './threadContextPreamble';
 import { getPinnedBannerSkipDecision } from './utils/pinnedBannerSkipDecision';
+import {
+  getTelegramFileMeta,
+  buildSavedFileName,
+  buildFilePromptText,
+  checkIsFileTooBig,
+  telegramFileDownloadCapBytes,
+  incomingFileMessageFilter,
+} from './telegramFileIntake';
+import {
+  ensureThreadFilesDir,
+  purgeThreadFiles,
+  resolveFilesRoot,
+  sweepExpiredThreadFiles,
+  fileRetentionMs,
+  fileSweepIntervalMs,
+} from './botFileStorage';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -278,6 +294,15 @@ const COOLDOWN_RETRY_SLACK_MS = 250;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let state!: StateStore;
+
+/**
+ * @description Resolve the live `DATA_DIR` from the state store. The store
+ * owns `state.json` in that directory, so its parent is the single source of
+ * truth for where bot-owned data (including intake files) lands.
+ */
+function getDataDir(): string {
+  return path.dirname(state.stateFilePath);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Per-thread in-memory state
@@ -1421,6 +1446,13 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
 // redirects, warm-agent reuse) lives in `./utils/download` so it stays
 // side-effect-free and unit-testable.
 const DOWNLOAD_TIMEOUT_MS = 20_000;
+
+/**
+ * Bot API download cap in MB, surfaced in the `file.too_big` reply. Derived
+ * from `telegramFileDownloadCapBytes` so the user-facing number and the
+ * pre-download size check can never drift apart.
+ */
+const FILE_DOWNLOAD_CAP_MB = Math.floor(telegramFileDownloadCapBytes / (1024 * 1024));
 
 type TranscribeResult =
   | { ok: true; text: string }
@@ -3597,7 +3629,14 @@ bot.on(message('text'), async (ctx) => {
     // A bare `/clear` forwarded to the agent wipes its context (Claude TUI),
     // so the next prompt must re-carry the thread-context preamble. Reset the
     // marker before forwarding — the slash text itself never gets a preamble.
-    if (text === forwardedClearCommand) clearThreadContextMarker(key);
+    // The agent's context is gone, so any intake files it might reference are
+    // now useless — purge the thread's files dir in the same breath.
+    if (text === forwardedClearCommand) {
+      clearThreadContextMarker(key);
+      await purgeThreadFiles(getDataDir(), key).catch((e) =>
+        console.warn(`[file] purge on /clear failed for ${keyToString(key)}:`, e),
+      );
+    }
     await forwardPromptToAgent(key, adapter, text);
     return;
   }
@@ -3727,6 +3766,137 @@ bot.on(message('voice'), async (ctx) => {
     await replyToThread(key, 'Error processing voice message');
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  File intake handler — photo / document / video / video_note / audio / animation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description Detect Telegram's "file is too big" rejection from `getFile` /
+ * `getFileLink` (400 with that description) so we can map it to the friendly
+ * `file.too_big` reply instead of a generic failure. Bot API refuses to serve
+ * a download link for files over the 20 MB cap.
+ */
+function checkIsFileTooBigApiError(err: unknown): boolean {
+  if (!checkIsApiError(err)) return false;
+  return /file is too big/i.test(getErrorDescription(err));
+}
+
+/**
+ * @description Handle an inbound media message: gate exactly like the text
+ * path, download the file into the bot-owned per-thread dir, then announce it
+ * to the agent through the same `forwardPromptToAgent` choke point so the
+ * preamble / buffering / `/clear` marker all apply uniformly.
+ *
+ * Gating mirrors the text handler: group gate (`authoriseContext`), inbound
+ * id tracking, startup-buffer replay, then the active-session check with the
+ * same no-agent / no-binding hints. The file is downloaded ONLY once we know
+ * an agent is active (or mid-startup) — an idle/unbound thread gets the hint
+ * and nothing hits disk, per the locked decision.
+ */
+async function handleIncomingFile(
+  ctx: NarrowedContext<Context, Update.MessageUpdate>,
+  key: ThreadKey,
+): Promise<void> {
+  const meta = getTelegramFileMeta(ctx.message);
+  if (!meta) return; // Not one of the six kinds (e.g. sticker) — ignore.
+
+  // Always track inbound ids so /clear_messages can delete user uploads too.
+  await state.pushMessageId(key, ctx.message.message_id);
+
+  const kStr = keyToString(key);
+  const adapter = getThreadAdapter(key);
+  const isStarting = startupPromptBuffer.checkIsStarting(kStr);
+
+  // Idle thread (no active agent and not mid-startup) → friendly guidance,
+  // identical to the text path. Do NOT download anything.
+  if (!isStarting && !adapter.checkIsActive(key)) {
+    if (checkIsGeneral(key)) {
+      await replyToThread(key, t('thread.general_no_agent'));
+      return;
+    }
+    const binding = state.getBinding(key);
+    if (!binding) {
+      const subdirs = listAvailableSubdirs(ENV.workRoot);
+      const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+      await replyToThread(key, t('thread.no_binding'), extra);
+      return;
+    }
+    await replyToThread(key, t('thread.no_agent_with_binding', { subdir: binding.subdir }));
+    return;
+  }
+
+  // Reject over-cap files we can already size before bothering the Bot API.
+  if (checkIsFileTooBig(meta.fileSize)) {
+    await replyToThread(key, t('file.too_big', { cap: FILE_DOWNLOAD_CAP_MB }));
+    return;
+  }
+
+  let fileUrl: string;
+  try {
+    fileUrl = (await ctx.telegram.getFileLink(meta.fileId)).toString();
+  } catch (err) {
+    if (checkIsFileTooBigApiError(err)) {
+      await replyToThread(key, t('file.too_big', { cap: FILE_DOWNLOAD_CAP_MB }));
+    } else {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[Bot] getFileLink failed for ${meta.kind}: ${msg}`);
+      await replyToThread(key, t('file.download_failed'));
+    }
+    return;
+  }
+
+  let savedPath: string;
+  try {
+    const dir = await ensureThreadFilesDir(getDataDir(), key);
+    const unixSeconds = Math.floor(Date.now() / 1000);
+    const fileName = buildSavedFileName(unixSeconds, meta.fileUniqueId, meta.kind, meta.fileName);
+    savedPath = path.join(dir, fileName);
+    await downloadFile(fileUrl, savedPath, {
+      agent: telegramAgent,
+      timeoutMs: DOWNLOAD_TIMEOUT_MS,
+      onRetry: (attempt, err, delayMs) => {
+        console.warn(`[Bot] file download attempt ${attempt} failed (${err.message}); retrying in ${delayMs}ms`);
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Bot] file download failed after retries: ${msg}`);
+    await replyToThread(key, t('file.download_failed'));
+    return;
+  }
+
+  const promptText = buildFilePromptText(meta.kind, savedPath, meta.fileSize, meta.caption);
+
+  // Mid-startup → buffer the announcement so it replays in order when ready,
+  // exactly like a text prompt or voice transcript typed during boot.
+  if (isStarting) {
+    const isFirstBuffered = startupPromptBuffer.addPrompt(kStr, promptText);
+    if (isFirstBuffered) {
+      await replyToThread(key, t('agent.queued_starting', { label: getThreadAdapter(key).label }));
+    }
+    return;
+  }
+
+  await forwardPromptToAgent(key, adapter, promptText);
+}
+
+bot.on(
+  // anyOf-composed per-kind filter — `message('photo', 'document', …)` would
+  // be an AND over the fields and never match a real media message (see
+  // incomingFileMessageFilter).
+  incomingFileMessageFilter,
+  async (ctx) => {
+    const key = await authoriseContext(ctx);
+    if (!key) return;
+    try {
+      await handleIncomingFile(ctx, key);
+    } catch (err) {
+      console.error('[Bot] File handling error:', err);
+      await replyToThread(key, t('file.download_failed'));
+    }
+  },
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Edited message — explicit UX hint instead of silent ignore
@@ -4802,6 +4972,25 @@ export async function startBot(): Promise<void> {
   // a marker for the next start to read.
   state.touchHeartbeat();
 
+  // 5d. File-intake age sweep. Logrotate-style: delete intake files older
+  //     than the retention window and prune now-empty thread dirs. Runs once
+  //     at boot (catches files orphaned while the bot was down) and then once
+  //     a day. The interval is `unref`'d so it never keeps the process alive.
+  const runFileSweep = (): void => {
+    void sweepExpiredThreadFiles(resolveFilesRoot(getDataDir()), fileRetentionMs, Date.now())
+      .then((result) => {
+        if (result.removedFiles > 0 || result.removedDirs > 0) {
+          console.log(
+            `[fileSweep] removed ${result.removedFiles} expired files, ${result.removedDirs} empty dirs`,
+          );
+        }
+      })
+      .catch((e) => console.warn('[fileSweep] sweep failed:', e));
+  };
+  runFileSweep();
+  const fileSweepInterval = setInterval(runFileSweep, fileSweepIntervalMs);
+  fileSweepInterval.unref();
+
   // 6. Global catch — Telegraf swallows handler errors otherwise.
   bot.catch((err, ctx) => {
     if (checkIsStaleAnswerCallbackQueryError(err)) {
@@ -4830,6 +5019,7 @@ export async function startBot(): Promise<void> {
       cleanupTimers: () => {
         clearInterval(inMemoryGcInterval);
         clearInterval(heartbeatInterval);
+        clearInterval(fileSweepInterval);
       },
     });
   };

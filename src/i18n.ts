@@ -253,6 +253,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'voice.failed': 'Не удалось распознать голосовое.',
     'voice.transcribed': '🎤 {text}',
 
+    // ── file intake ──
+    'file.too_big':
+      '📎 Файл больше лимита Bot API ({cap} МБ) — скачать его я не могу. Пришли файл поменьше.',
+    'file.download_failed': '📎 Не удалось скачать файл. Попробуй ещё раз.',
+
     // ── error codes ──
     'error.workdir.gone':
       '📁 Папка `{subdir}` исчезла с диска. Сделай /unbind или /bind <newdir>.',
@@ -512,6 +517,11 @@ const dict: Record<Lang, Record<string, string>> = {
       'Voice requires `GROQ_API_KEY` (free) or `OPENAI_API_KEY`.',
     'voice.failed': 'Failed to transcribe voice message.',
     'voice.transcribed': '🎤 {text}',
+
+    // ── file intake ──
+    'file.too_big':
+      '📎 File exceeds the Bot API limit ({cap} MB) — I can\'t download it. Send a smaller file.',
+    'file.download_failed': '📎 Failed to download the file. Please try again.',
 
     'error.workdir.gone':
       '📁 Folder `{subdir}` is gone from disk. Run /unbind or /bind <newdir>.',

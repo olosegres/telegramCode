@@ -13,7 +13,7 @@ import * as assert from 'node:assert/strict';
 // is, in practice, because tests are run fresh per file.
 process.env.BOT_LANG = 'ru';
 
-import { t } from '../i18n';
+import { t, checkKeyInAllLangs } from '../i18n';
 
 test('t substitutes single {name} placeholder', () => {
   // Use any known key that takes a placeholder. `cb.binding_to` was
@@ -51,6 +51,17 @@ test('thread.bind_required resolves in ru (not the bare-code fallback) and names
   const out = t('thread.bind_required');
   assert.notEqual(out, 'bind_required', 'ru catalog is missing thread.bind_required');
   assert.ok(out.includes('/bind'), `expected "/bind" in "${out}"`);
+});
+
+test('file intake keys exist in every locale', () => {
+  assert.ok(checkKeyInAllLangs('file.too_big'), 'file.too_big missing in some locale');
+  assert.ok(checkKeyInAllLangs('file.download_failed'), 'file.download_failed missing in some locale');
+});
+
+test('file.too_big substitutes the {cap} size', () => {
+  const out = t('file.too_big', { cap: 20 });
+  assert.ok(out.includes('20'), `expected "20" in "${out}"`);
+  assert.ok(!out.includes('{cap}'), `placeholder not substituted: "${out}"`);
 });
 
 test('t falls back to last code segment for unknown key', () => {

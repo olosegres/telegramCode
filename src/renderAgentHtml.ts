@@ -1,7 +1,7 @@
 /**
  * @description Render the agent adapters' "markdown-ish" output
- * (`*bold*`, `` `inline` ``, ```` ```fenced``` ````, `[text](url)`) into
- * Telegram **HTML**.
+ * (`*bold*`, `**bold**`, `# headings`, `` `inline` ``, ```` ```fenced``` ````,
+ * `[text](url)`) into Telegram **HTML**.
  *
  * Why HTML instead of the legacy Markdown path: Telegram's classic Markdown
  * drops the WHOLE message to unformatted plain text on a single stray `*` or
@@ -25,8 +25,17 @@ export function escapeHtmlText(text: string): string {
 // goes through `String.replace` (which resets `lastIndex`), never `.exec`.
 const FENCE_REGEX = /```([^\n`]*)\n?([\s\S]*?)```/g;
 const INLINE_CODE_REGEX = /`([^`\n]+)`/g;
+// `**bold**` must run BEFORE the single-star `*bold*` matcher: otherwise the
+// single-star regex matches from the 2nd asterisk of `**` and leaves a stray
+// leading `*` (live OpenCode trace: `*<b>bold</b>*`). Non-greedy so adjacent
+// pairs `**a** **b**` don't merge into one span.
+const DOUBLE_BOLD_REGEX = /\*\*([^\n]+?)\*\*/g;
 const BOLD_REGEX = /\*([^*\n]+)\*/g;
 const LINK_REGEX = /\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+// Markdown ATX headings (`#`…`######` + text). Telegram has no heading
+// element, so render the line as bold — the established convention. Anchored
+// to line start with the `m` flag, so a `#` mid-line stays literal.
+const HEADING_REGEX = /^#{1,6}\s+(.+)$/gm;
 const PLACEHOLDER_REGEX = /\x00(\d+)\x00/g;
 /**
  * C0 control chars except `\n` and `\t`. They never belong in a Telegram
@@ -73,12 +82,17 @@ export function renderAgentHtml(text: string): string {
   // 3. Escape the remaining prose.
   work = escapeHtmlText(work);
 
-  // 4. Bold + links on the escaped prose. Label/URL are already escaped by
-  //    step 3, so we only additionally guard `"` in the href attribute.
+  // 4. Bold + links + headings on the escaped prose. Label/URL are already
+  //    escaped by step 3, so we only additionally guard `"` in the href
+  //    attribute. `**bold**` runs before `*bold*` (see DOUBLE_BOLD_REGEX).
+  work = work.replace(DOUBLE_BOLD_REGEX, '<b>$1</b>');
   work = work.replace(BOLD_REGEX, '<b>$1</b>');
   work = work.replace(LINK_REGEX, (_match, label: string, url: string) =>
     `<a href="${url.replace(/"/g, '&quot;')}">${label}</a>`,
   );
+  // Headings after bold/links: a heading line may already carry `<b>` from the
+  // bold pass; Telegram accepts nested `<b>`, so no special-casing needed.
+  work = work.replace(HEADING_REGEX, '<b>$1</b>');
 
   // 5. Restore the stashed code spans (already valid HTML — do not re-escape).
   return work.replace(PLACEHOLDER_REGEX, (match, idx: string) => placeholders[Number(idx)] ?? match);

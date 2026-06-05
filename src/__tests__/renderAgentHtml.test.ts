@@ -1,10 +1,12 @@
 /**
  * @description Plan §2026-05-30 tg-html-output / S1. Agent output must reach
  * Telegram as real HTML: fenced code → `<pre><code>`, inline → `<code>`,
- * `*bold*` → `<b>`, links → `<a>`, and `& < >` escaped. The load-bearing
- * promise is that a ```` ```diff ```` chunk renders as a monospaced block
- * (NOT literal backticks in the message) and that a lone `*` / unpaired
- * backtick no longer forces the whole message to plain text.
+ * `*bold*` / `**bold**` → `<b>`, `# headings` → `<b>`, links → `<a>`, and
+ * `& < >` escaped. The load-bearing promise is that a ```` ```diff ```` chunk
+ * renders as a monospaced block (NOT literal backticks in the message), that a
+ * lone `*` / unpaired backtick no longer forces the whole message to plain
+ * text, and that OpenCode's `**bold**` / `## heading` no longer leak raw
+ * markdown (`*<b>bold</b>*`, literal `##`) into Telegram.
  */
 
 import { test } from 'node:test';
@@ -33,6 +35,50 @@ test('inline code → <code>', () => {
 
 test('*bold* → <b>', () => {
   assert.equal(renderAgentHtml('this is *important* ok'), 'this is <b>important</b> ok');
+});
+
+test('**bold** → <b> with NO stray leading/trailing asterisk', () => {
+  // Live OpenCode bug: the single-star matcher started at the 2nd `*` and left
+  // `*<b>bold</b>*`. The double-star pass must consume BOTH asterisks.
+  const out = renderAgentHtml('this is **important** ok');
+  assert.equal(out, 'this is <b>important</b> ok');
+  assert.ok(!out.includes('*'));
+});
+
+test('**a** and **b** → two separate <b> spans (non-greedy)', () => {
+  // Greedy matching would swallow the gap and produce one span across both.
+  assert.equal(renderAgentHtml('**a** and **b**'), '<b>a</b> and <b>b</b>');
+});
+
+test('## heading → <b>, no literal #', () => {
+  const out = renderAgentHtml('## Section Title');
+  assert.equal(out, '<b>Section Title</b>');
+  assert.ok(!out.includes('#'));
+});
+
+test('# H1 and ###### H6 both → <b>', () => {
+  assert.equal(renderAgentHtml('# H1'), '<b>H1</b>');
+  assert.equal(renderAgentHtml('###### H6'), '<b>H6</b>');
+});
+
+test('non-ASCII heading → <b> (Cyrillic)', () => {
+  assert.equal(renderAgentHtml('## Заголовок'), '<b>Заголовок</b>');
+});
+
+test('a # mid-line is NOT converted to a heading', () => {
+  assert.equal(renderAgentHtml('issue #42 is open'), 'issue #42 is open');
+});
+
+test('heading inside a fenced code block stays literal (not converted)', () => {
+  const out = renderAgentHtml('```\n## not a heading\n```');
+  assert.equal(out, '<pre><code>## not a heading</code></pre>');
+  assert.ok(out.includes('## not a heading'));
+});
+
+test('** inside inline code is NOT turned into <b>', () => {
+  const out = renderAgentHtml('use `a ** b` here');
+  assert.equal(out, 'use <code>a ** b</code> here');
+  assert.ok(!out.includes('<b>'));
 });
 
 test('[text](url) → <a href>', () => {

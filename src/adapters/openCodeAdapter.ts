@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
+import type { AgentAdapter, AgentSession, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
@@ -2310,15 +2310,23 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Emit only the part of `currentResponseText` not yet sent as
    * an `output` event, then advance `lastEmittedLength`. The bot does not
    * delta-render OpenCode output (`outputsDeltas` is unset), so each emit is a
-   * standalone message/chunk; `queueOutput` joins pending chunks with `\n`, so
-   * successive tails reconstruct the full response exactly once. Without this,
-   * the debounce timer and `flushOutput` both emitted the whole accumulated
-   * text, duplicating the response in Telegram.
+   * raw tail of the in-flight response — possibly cut mid-word.
+   *
+   * Every tail except the FIRST of a response carries `isContinuation: true`
+   * (a {@link OutputEventMeta}). The bot appends a continuation tail to the
+   * same growing Telegram message instead of starting a new one, so the long
+   * reply reads as one message rather than each edit replacing the previous
+   * text. `lastEmittedLength === 0` means this is the first tail of a fresh
+   * response (nothing emitted yet), so it is NOT a continuation. `flushOutput`
+   * resets `lastEmittedLength` to 0 after the final tail, so the next response
+   * again starts with a non-continuation first tail.
    */
   private emitResponseTail(key: ThreadKey, session: OpenCodeSession): void {
     const tail = session.currentResponseText.slice(session.lastEmittedLength);
     if (!tail.trim()) return;
-    this.emit('output', key, tail);
+    const isContinuation = session.lastEmittedLength > 0;
+    const meta: OutputEventMeta = { isContinuation };
+    this.emit('output', key, tail, meta);
     session.lastEmittedLength = session.currentResponseText.length;
   }
 

@@ -1,4 +1,4 @@
-import type { AgentAdapter, ThreadKey } from '../types';
+import type { AgentAdapter, OutputEventMeta, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -23,7 +23,7 @@ const adapterInstances = new Map<string, AgentAdapter>();
 const threadAdapterNames = new Map<string, string>();
 
 /** Event listener forwarder — wired up per adapter instance. */
-type OutputHandler = (key: ThreadKey, output: string) => void;
+type OutputHandler = (key: ThreadKey, output: string, meta?: OutputEventMeta) => void;
 type StatusHandler = (key: ThreadKey, status: string) => void;
 type QuestionHandler = (key: ThreadKey, question: OpenCodePendingQuestion) => void;
 type ThreadKeyHandler = (key: ThreadKey) => void;

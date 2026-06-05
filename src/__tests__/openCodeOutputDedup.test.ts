@@ -11,25 +11,32 @@
  *
  * These tests drive the REAL adapter event path: synthesized SSE JSON is fed
  * through `handleSseData` (the same entry the live `/global/event` reader
- * uses), `output` events are captured off the adapter EventEmitter, and the
- * 500ms debounce is advanced with `node:test` mock timers.
+ * uses), `output` events (text + `meta`) are captured off the adapter
+ * EventEmitter, and the 500ms debounce is advanced with `node:test` mock timers.
  *
- * Bot merge semantics (see `bot.ts` `queueOutput`): successive `output` emits
- * within one debounce window are joined with `\n`, so emitted tails must
- * reconstruct the full response exactly once.
+ * Bot merge semantics (see `bot.ts` `queueOutput` / `appendPendingOutput`):
+ * the FIRST tail of a response is a standalone `output`; every later tail
+ * carries `meta.isContinuation === true` and the bot CONCATENATES it raw (no
+ * separator) onto the message it is already rendering — so the tails
+ * reconstruct the full response exactly once, with no inserted whitespace that
+ * would corrupt a mid-word cut.
  */
 
 import { describe, it, mock, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenCodeAdapter } from '../adapters/openCodeAdapter';
-import { keyToString, type ThreadKey } from '../types';
+import { keyToString, type OutputEventMeta, type ThreadKey } from '../types';
 
 const sseOutputBatchMs = 500;
 const ownSessionId = 'ses_own';
 const key: ThreadKey = { chatId: -100123, threadId: 42 };
 
 /** Build a minimal-but-complete live session and inject it into the adapter. */
-function createAdapterWithSession(): { adapter: OpenCodeAdapter; outputs: string[] } {
+function createAdapterWithSession(): {
+  adapter: OpenCodeAdapter;
+  outputs: string[];
+  metas: (OutputEventMeta | undefined)[];
+} {
   const adapter = new OpenCodeAdapter();
   const session = {
     key,
@@ -60,10 +67,12 @@ function createAdapterWithSession(): { adapter: OpenCodeAdapter; outputs: string
   adapter['sessions'].set(keyToString(key), session);
 
   const outputs: string[] = [];
-  adapter.on('output', (_key: ThreadKey, text: string) => {
+  const metas: (OutputEventMeta | undefined)[] = [];
+  adapter.on('output', (_key: ThreadKey, text: string, meta?: OutputEventMeta) => {
     outputs.push(text);
+    metas.push(meta);
   });
-  return { adapter, outputs };
+  return { adapter, outputs, metas };
 }
 
 /** Feed one `message.part.delta` text event through the real SSE dispatcher. */
@@ -109,13 +118,14 @@ describe('OpenCode output dedup (B4)', () => {
     assert.deepEqual(outputs, ['Hello world']);
   });
 
-  it('debounce fires (emit #1), MORE deltas, idle → emit #2 is ONLY the new tail; merged == full text once', () => {
-    const { adapter, outputs } = createAdapterWithSession();
+  it('debounce fires (emit #1), MORE deltas, idle → emit #2 is ONLY the new tail with isContinuation; raw concat == full text once', () => {
+    const { adapter, outputs, metas } = createAdapterWithSession();
 
     feedTextDelta(adapter, 'First paragraph. ');
-    // Debounce fires → emit #1 carries the text so far.
+    // Debounce fires → emit #1 carries the text so far (first tail, not a continuation).
     mock.timers.tick(sseOutputBatchMs + 1);
     assert.deepEqual(outputs, ['First paragraph. ']);
+    assert.equal(metas[0]?.isContinuation, false, 'first tail of a response is NOT a continuation');
 
     feedTextDelta(adapter, 'Second paragraph.');
     feedSessionIdle(adapter);
@@ -126,8 +136,11 @@ describe('OpenCode output dedup (B4)', () => {
     assert.equal(outputs[0], 'First paragraph. ');
     assert.equal(outputs[1], 'Second paragraph.');
 
-    // Bot joins pending chunks with '\n' (queueOutput). The tails simply
-    // concatenate back to the full accumulated response — each paragraph once.
+    // emit #2 is a continuation → the bot appends it RAW (no separator).
+    assert.equal(metas[1]?.isContinuation, true, 'a later tail of the same response IS a continuation');
+
+    // Raw concat (bot's append semantics) reconstructs the full response —
+    // each paragraph exactly once, with no inserted separator.
     assert.equal(outputs.join(''), 'First paragraph. Second paragraph.');
     assert.equal(outputs.filter(chunk => chunk.includes('First paragraph')).length, 1);
     assert.equal(outputs.filter(chunk => chunk.includes('Second paragraph')).length, 1);

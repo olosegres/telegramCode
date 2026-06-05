@@ -57,6 +57,17 @@ config/variants, not a per-message API field).
 - **Startup-safe input.** A session has an async boot window (Claude tmux/pty,
   OpenCode server + `POST /session`). Prompts typed during it are buffered
   (`startupPromptBuffer.ts`) and replayed in order when ready — never dropped.
+- **Streaming output appends, never overwrites.** OpenCode streams a reply as
+  incremental tails; every `output` emit after the first of a response carries
+  `isContinuation: true` (`OutputEventMeta` in `types.ts`). The bot appends a
+  continuation to the message it is already rendering — re-rendering the FULL
+  accumulated text (so `**`/`` ` `` pairs split across flushes re-pair) and
+  editing in place; when the combined text outgrows the Telegram cap it spills
+  into a new message and keeps growing there (pure planner:
+  `utils/outputFlushPlan.ts`). Non-continuation outputs ALWAYS send a new
+  message — the old edit-in-place for fresh outputs silently replaced interim
+  texts (live bug 2026-06-05). Claude's adapter never marks continuations, so
+  its flushes stay one-message-each.
 - **Two-instance ready.** A "pet" and a "work" instance can run on one host with
   isolated `DATA_DIR`, group, and OpenCode port.
 - **MCP hierarchy.** MCP servers merge across user / group / project / thread

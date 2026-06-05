@@ -88,11 +88,25 @@ export function keysEqual(a: ThreadKey, b: ThreadKey): boolean {
 }
 
 /**
+ * @description Metadata riding an `output` event alongside the text.
+ */
+export interface OutputEventMeta {
+  /**
+   * True when this text directly continues the previous `output` emit of the
+   * same in-flight response (a streaming tail cut mid-sentence, possibly
+   * mid-word). The bot appends it to the message it is already rendering —
+   * concatenated as-is, no separator — instead of starting a new message.
+   * Absent/false = a standalone output (new logical message).
+   */
+  isContinuation?: boolean;
+}
+
+/**
  * @description Unified interface for AI agent backends (Claude CLI, OpenCode, etc.).
  * Each adapter manages sessions keyed by `ThreadKey` and communicates via EventEmitter.
  *
  * Events emitted (all carry the `ThreadKey` as the first argument):
- * - 'output'   (key: ThreadKey, text: string)   — permanent text response
+ * - 'output'   (key: ThreadKey, text: string, meta?: OutputEventMeta) — permanent text response
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
  * - 'started'  (key: ThreadKey)                  — session is up and ready

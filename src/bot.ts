@@ -22,7 +22,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, OutputEventMeta } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -63,6 +63,7 @@ import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage } from './messageSplit';
+import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
@@ -324,6 +325,8 @@ function getDataDir(): string {
 interface ThreadMessageState {
   /** Most recent assistant-message id we can edit in place. */
   lastMessageId: number | null;
+  /** Source (pre-render) text currently shown in `lastMessageId` — the append base for streaming continuations. */
+  lastMessageText: string | null;
   /** True when next output should send a new message instead of editing. */
   needsNewMessage: boolean;
   /** Loader (⏳) message id — deleted when the first real output arrives. */
@@ -341,6 +344,8 @@ interface ThreadMessageState {
 
 interface OutputQueueState {
   pendingOutput: string | null;
+  /** Whether the FIRST batch in `pendingOutput` continues the last sent message. */
+  pendingIsContinuation: boolean;
   isProcessing: boolean;
   debounceTimer: NodeJS.Timeout | null;
 }
@@ -481,7 +486,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -491,7 +496,7 @@ function getOutputQueueState(key: ThreadKey): OutputQueueState {
   const k = keyToString(key);
   let s = outputQueues.get(k);
   if (!s) {
-    s = { pendingOutput: null, isProcessing: false, debounceTimer: null };
+    s = { pendingOutput: null, pendingIsContinuation: false, isProcessing: false, debounceTimer: null };
     outputQueues.set(k, s);
   }
   return s;
@@ -1293,9 +1298,13 @@ function escapeMarkdown(text: string): string {
 /**
  * @description Queue an output text for a thread with debounce.
  *
- * Multiple `output` events from the adapter are accumulated (newline-joined),
- * not overwritten — every emitted chunk reaches Telegram. During a 429
- * cooldown the delay stretches so we don't keep hammering the API.
+ * Multiple `output` events from the adapter are coalesced into one pending
+ * buffer (see {@link appendPendingOutput}), not overwritten — every emitted
+ * chunk reaches Telegram. A continuation tail concatenates as-is (it may be
+ * cut mid-word); a standalone output joins the buffer with `\n`. The first
+ * batch's `isContinuation` is recorded so the flush knows whether the buffer
+ * extends the last sent message or starts a new one. During a 429 cooldown
+ * the delay stretches so we don't keep hammering the API.
  */
 /**
  * Audit S13 / #30: extracted from two near-identical ternaries; lengthens
@@ -1308,11 +1317,12 @@ function getOutputDelay(chatId: number): number {
     : OUTPUT_DEBOUNCE_MS;
 }
 
-function queueOutput(key: ThreadKey, output: string): void {
+function queueOutput(key: ThreadKey, output: string, isContinuation = false): void {
   const q = getOutputQueueState(key);
-  q.pendingOutput = q.pendingOutput
-    ? `${q.pendingOutput}\n${output}`
-    : output;
+  // The continuation flag of the FIRST batch in a fresh buffer decides whether
+  // the whole flush extends the last sent message; later batches only append.
+  if (q.pendingOutput === null) q.pendingIsContinuation = isContinuation;
+  q.pendingOutput = appendPendingOutput(q.pendingOutput, output, isContinuation);
   if (q.debounceTimer) clearTimeout(q.debounceTimer);
   q.debounceTimer = setTimeout(() => {
     q.debounceTimer = null;
@@ -1326,8 +1336,9 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
   q.isProcessing = true;
   try {
     const out = q.pendingOutput;
+    const isContinuation = q.pendingIsContinuation;
     q.pendingOutput = null;
-    await sendOutputImmediate(key, out);
+    await sendOutputImmediate(key, out, isContinuation);
   } finally {
     q.isProcessing = false;
     if (q.pendingOutput) {
@@ -1347,58 +1358,55 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
 }
 
 /**
- * @description Render `output` as the agent's permanent message in a
- * thread. Uses edit-in-place for the first chunk if we have a recent
- * editable message, otherwise sends new. Subsequent chunks always send new.
+ * @description Render `output` as the agent's permanent message in a thread.
+ *
+ * Append semantics for continuations: when `isContinuation` is true and the
+ * last message is still editable, the flush re-renders `lastMessageText +
+ * output` and edits that message in place — the one message GROWS as the
+ * streamed reply arrives, spilling into fresh messages once it outgrows the
+ * Telegram cap. The pre-render append base lives in `msgState.lastMessageText`.
+ *
+ * Fresh outputs ALWAYS send a new message — never edit. The old edit-in-place
+ * for fresh outputs was the data-loss bug: each interim tail replaced the whole
+ * previous text on the same message id, so the user could read only the last
+ * tail. Editing is now reserved for explicit continuations of the SAME reply.
  *
  * On Markdown rejection by Telegram we fall back to plain text (`parse_mode`
- * unset) — the message lands either way.
+ * unset) — the message lands either way. If the in-place edit fails (message
+ * deleted / API hiccup) we send every chunk fresh so the full combined text
+ * still reaches the user.
  */
-async function sendOutputImmediate(key: ThreadKey, output: string): Promise<void> {
+async function sendOutputImmediate(key: ThreadKey, output: string, isContinuation = false): Promise<void> {
   await deleteLoaderMessage(key);
   await deleteStatusMessage(key);
 
-  const chunks = splitMessage(output);
   const msgState = getThreadMessageState(key);
-  const adapter = getThreadAdapter(key);
-  // Claude's adapter polls tmux and emits deltas (`outputsDeltas = true`).
-  // Editing in place would overwrite a previous delta and silently lose
-  // earlier lines (live ExampleGroup repro: `git status` only showing the tail).
-  // For delta adapters every flush must land as a new message; OpenCode
-  // (which already accumulates server-side) keeps the edit-in-place path.
-  const forceNew = adapter.outputsDeltas === true;
+  const { chunks, shouldEditFirstChunk } = getOutputFlushPlan({
+    output,
+    isContinuation,
+    needsNewMessage: msgState.needsNewMessage,
+    lastMessageId: msgState.lastMessageId,
+    lastMessageText: msgState.lastMessageText,
+  });
 
-  const sendOrEditFirst = async (text: string): Promise<number | null> => {
-    const rendered = renderAgentHtml(text);
-    const shouldSendNew = forceNew || msgState.needsNewMessage || !msgState.lastMessageId;
-    if (shouldSendNew) {
-      const id = await replyChunkWithFallback(key, rendered, text, 'output');
-      if (id) {
-        msgState.lastMessageId = id;
-        msgState.needsNewMessage = false;
-      }
-      return id;
+  let startIndex = 0;
+  if (shouldEditFirstChunk) {
+    const editedOk =
+      chunks[0] === msgState.lastMessageText ||
+      (await editThreadMessage(key, msgState.lastMessageId!, renderAgentHtml(chunks[0]), { parse_mode: 'HTML' }, 'output'));
+    if (editedOk) {
+      msgState.lastMessageText = chunks[0];
+      startIndex = 1;
     }
-    // Try edit; on failure send new.
-    const editedOk = await editThreadMessage(key, msgState.lastMessageId!, rendered, {
-      parse_mode: 'HTML',
-    }, 'output');
-    if (editedOk) return msgState.lastMessageId;
-    const id = await replyChunkWithFallback(key, rendered, text, 'output');
+    // Edit failed (message deleted / API hiccup): fall through and send every
+    // chunk fresh — the full combined text still reaches the user.
+  }
+
+  for (let i = startIndex; i < chunks.length; i++) {
+    const id = await replyChunkWithFallback(key, renderAgentHtml(chunks[i]), chunks[i], 'output');
     if (id) {
       msgState.lastMessageId = id;
-      msgState.needsNewMessage = false;
-    }
-    return id;
-  };
-
-  await sendOrEditFirst(chunks[0]);
-
-  for (let i = 1; i < chunks.length; i++) {
-    const rendered = renderAgentHtml(chunks[i]);
-    const id = await replyChunkWithFallback(key, rendered, chunks[i], 'output');
-    if (id) {
-      msgState.lastMessageId = id;
+      msgState.lastMessageText = chunks[i];
       msgState.needsNewMessage = false;
     }
   }
@@ -3454,6 +3462,7 @@ command('clear_messages', async (ctx, key) => {
 
   const ms = getThreadMessageState(key);
   ms.lastMessageId = null;
+  ms.lastMessageText = null;
   ms.needsNewMessage = true;
 
   console.log(`[clear_messages] ${keyToString(key)}: deleted ${deleted}/${all.length}`);
@@ -4529,7 +4538,7 @@ bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
 //  Adapter event handlers (output / status / question / closed / error)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function handleAgentOutput(key: ThreadKey, output: string): void {
+function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMeta): void {
   console.log(`[Bot] output ${keyToString(key)} (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
   traceAgentEmit('output', key, output);
@@ -4569,7 +4578,7 @@ function handleAgentOutput(key: ThreadKey, output: string): void {
     if (adapter.outputsDeltas) msgState.needsNewMessage = true;
     void deleteStatusMessage(key).catch(() => {});
   }
-  queueOutput(key, output);
+  queueOutput(key, output, meta?.isContinuation === true);
 }
 
 /**

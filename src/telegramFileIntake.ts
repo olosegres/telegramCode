@@ -190,6 +190,21 @@ export function getTelegramFileMeta(message: Message): TelegramFileMeta | null {
 }
 
 /**
+ * @description Extract the `media_group_id` from an inbound message, or
+ * `undefined` when the message is not part of an album. Telegram sets this same
+ * id on every message of a multi-file album (photos/documents sent together);
+ * the bot uses it to batch the burst into one combined prompt. Kept here (next
+ * to {@link getTelegramFileMeta}) so the message-shape narrowing stays in one
+ * pure, testable place.
+ */
+export function getMediaGroupId(message: Message): string | undefined {
+  if ('media_group_id' in message && typeof message.media_group_id === 'string') {
+    return message.media_group_id;
+  }
+  return undefined;
+}
+
+/**
  * @description Sanitise a Telegram-provided original filename into a safe
  * single path segment: basename only (drop any directory parts), control
  * chars and path separators stripped, collapsed to a bounded ASCII-ish slug.
@@ -237,8 +252,16 @@ export function buildSavedFileName(
   return `${unixSeconds}-${fileUniqueId}-${nameSegment}`;
 }
 
-/** Marker line the agent recognises as a bot-injected file announcement. */
+/** Marker line the agent recognises as a bot-injected single-file announcement. */
 export const filePromptHeader = '[Telegram file]';
+
+/**
+ * Marker line for a bot-injected media-album announcement — sibling of
+ * {@link filePromptHeader}. A Telegram album (multiple files in one visual
+ * message) is batched into ONE combined prompt under this header instead of N
+ * separate single-file prompts (see {@link buildAlbumPromptText}).
+ */
+export const albumPromptHeader = '[Telegram album]';
 
 /** Threshold below which a byte size renders in KB rather than MB. */
 const bytesPerMegabyte = 1024 * 1024;
@@ -278,6 +301,44 @@ export function buildFilePromptText(
   const announcement = `${filePromptHeader} ${kind} saved to: ${savedPath}${sizeSuffix}`;
   const trimmedCaption = caption?.trim();
   return trimmedCaption ? `${announcement}\n${trimmedCaption}` : announcement;
+}
+
+/**
+ * @description One successfully-saved member of a media album, as fed to
+ * {@link buildAlbumPromptText}. Mirrors the single-file announcement inputs
+ * (kind / saved path / size); the caption is handled once for the whole album,
+ * not per file, so it is not part of this shape.
+ */
+export interface AlbumFile {
+  kind: TelegramFileKind;
+  savedPath: string;
+  fileSize?: number;
+}
+
+/**
+ * @description Render the agent-facing prompt for a settled media album: one
+ * header line with the file count, then one bullet per saved file (kind + path
+ * + size), then the album caption (whichever album item carried it) on its own
+ * line. Reuses {@link formatFileSize} — the KB/MB formatting is NOT duplicated.
+ *
+ * Example:
+ *   [Telegram album] 3 files saved:
+ *   - photo: /…/a.jpg (1.2 MB)
+ *   - photo: /…/b.jpg (900 KB)
+ *   - document: /…/c.pdf (40 KB)
+ *   <caption>
+ */
+export function buildAlbumPromptText(files: AlbumFile[], caption?: string): string {
+  const headerLine = `${albumPromptHeader} ${files.length} ${files.length === 1 ? 'file' : 'files'} saved:`;
+  const bulletLines = files.map((file) => {
+    const sizeText = formatFileSize(file.fileSize);
+    const sizeSuffix = sizeText ? ` (${sizeText})` : '';
+    return `- ${file.kind}: ${file.savedPath}${sizeSuffix}`;
+  });
+  const lines = [headerLine, ...bulletLines];
+  const trimmedCaption = caption?.trim();
+  if (trimmedCaption) lines.push(trimmedCaption);
+  return lines.join('\n');
 }
 
 /**

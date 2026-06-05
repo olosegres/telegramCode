@@ -76,11 +76,19 @@ config/variants, not a per-message API field).
   project folder) and announced to the agent through `forwardPromptToAgent` as
   `[Telegram file] <kind> saved to: <path> (<size>)` + caption. Idle/unbound
   thread → same friendly hint as plain text, nothing downloaded; file over the
-  20 MB Bot API cap → `file.too_big` reply. **Voice is NOT intake** — it stays
-  on the transcription path. Two cleanup mechanisms: a forwarded bare `/clear`
-  purges the thread's files dir (agent context gone → files useless), and a
-  daily + at-boot age sweep deletes files older than `fileRetentionDays` (30).
-  Pure helpers in `telegramFileIntake.ts`; storage/janitor in `botFileStorage.ts`.
+  20 MB Bot API cap → `file.too_big` reply. A **media album** (multiple files
+  sent as one visual message; arrives as N messages sharing `media_group_id`)
+  is batched by `(thread, media_group_id)` with a ~2 s debounce after the last
+  item into ONE combined `[Telegram album]` prompt (one bullet per saved file +
+  the album's caption), so the N items no longer abort each other and gating /
+  error hints fire once per album, not N times. The batcher lives in
+  `utils/mediaGroupCollector.ts` (pure, debounce + per-group one-shot hint
+  guard); prompt text in `buildAlbumPromptText`. **Voice is NOT intake** — it
+  stays on the transcription path. Two cleanup mechanisms: a forwarded bare
+  `/clear` purges the thread's files dir (agent context gone → files useless),
+  and a daily + at-boot age sweep deletes files older than `fileRetentionDays`
+  (30). Pure helpers in `telegramFileIntake.ts`; storage/janitor in
+  `botFileStorage.ts`.
 
 ## Module map (`src/`)
 
@@ -101,7 +109,8 @@ config/variants, not a per-message API field).
 | `pinnedStatus.ts` | Per-thread pinned status banner (shows model, etc.) |
 | `agentTrigger.ts` | Detect agent-ready / prompt triggers in output |
 | `threadContextPreamble.ts` | Pure helpers: build the `[Telegram thread context]` preamble (`buildThreadContextPreamble`), decide whether to inject it (`checkShouldInjectPreamble`, `checkShouldSkipPreambleForText`), and glue it ahead of the prompt (`prependThreadContextPreamble`) |
-| `telegramFileIntake.ts` | Pure file-intake helpers: normalise the six media kinds (`getTelegramFileMeta`, photo = largest size), build the safe saved filename (`buildSavedFileName`, sanitised), the agent-facing announcement (`buildFilePromptText`), and the size cap check (`checkIsFileTooBig`) |
+| `telegramFileIntake.ts` | Pure file-intake helpers: normalise the six media kinds (`getTelegramFileMeta`, photo = largest size), read the album id (`getMediaGroupId`), build the safe saved filename (`buildSavedFileName`, sanitised), the agent-facing announcements (`buildFilePromptText` single, `buildAlbumPromptText` album), and the size cap check (`checkIsFileTooBig`) |
+| `utils/mediaGroupCollector.ts` | Pure debounced batcher for media albums: `collect(groupKey, item)` re-arms a per-group timer, `onFlush` fires once with items in arrival order; also owns the per-group one-shot hint guard (`checkShouldAnnounceOnce`) so gating/error replies fire once per album |
 | `botFileStorage.ts` | Per-thread intake dir layout + janitor: `resolveThreadFilesDir`, `ensureThreadFilesDir`, `purgeThreadFiles` (on `/clear`), `sweepExpiredThreadFiles` (boot + daily age sweep, `fileRetentionDays = 30`) |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |

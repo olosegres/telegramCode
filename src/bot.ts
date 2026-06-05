@@ -23,7 +23,7 @@ import {
   getKnownAdapterNames,
 } from './adapters/createAdapter';
 import type { ThreadKey, AgentAdapter, AgentSession } from './types';
-import { keyToString } from './types';
+import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
 import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
@@ -77,12 +77,16 @@ import {
 import { getPinnedBannerSkipDecision } from './utils/pinnedBannerSkipDecision';
 import {
   getTelegramFileMeta,
+  getMediaGroupId,
   buildSavedFileName,
   buildFilePromptText,
+  buildAlbumPromptText,
   checkIsFileTooBig,
   telegramFileDownloadCapBytes,
   incomingFileMessageFilter,
 } from './telegramFileIntake';
+import type { TelegramFileMeta, AlbumFile } from './telegramFileIntake';
+import { createMediaGroupCollector } from './utils/mediaGroupCollector';
 import {
   ensureThreadFilesDir,
   purgeThreadFiles,
@@ -1453,6 +1457,14 @@ const DOWNLOAD_TIMEOUT_MS = 20_000;
  * pre-download size check can never drift apart.
  */
 const FILE_DOWNLOAD_CAP_MB = Math.floor(telegramFileDownloadCapBytes / (1024 * 1024));
+
+/**
+ * Quiet period after the LAST album item before the batched album prompt is
+ * forwarded. Telegram delivers an album's messages in a sub-second burst, so a
+ * couple of seconds comfortably catches every item (album max is 10) without a
+ * user-perceptible lag before the agent starts.
+ */
+const ALBUM_DEBOUNCE_MS = 2_000;
 
 type TranscribeResult =
   | { ok: true; text: string }
@@ -3794,6 +3806,216 @@ function checkIsFileTooBigApiError(err: unknown): boolean {
  * an agent is active (or mid-startup) — an idle/unbound thread gets the hint
  * and nothing hits disk, per the locked decision.
  */
+/**
+ * @description Evaluate the file-intake gate for a thread: an idle thread (no
+ * active agent and not mid-startup) gets the same friendly guidance as the text
+ * path and nothing hits disk. Returns `true` when intake may proceed.
+ *
+ * The hint reply is routed through `sendHint` rather than sent directly so the
+ * album path can dedupe it to once-per-album; the single-file path passes
+ * `replyToThread` verbatim.
+ */
+async function checkFileIntakeGatePassed(
+  key: ThreadKey,
+  isStarting: boolean,
+  sendHint: (text: string, extra?: SendExtra) => Promise<unknown>,
+): Promise<boolean> {
+  const adapter = getThreadAdapter(key);
+  if (isStarting || adapter.checkIsActive(key)) return true;
+
+  if (checkIsGeneral(key)) {
+    await sendHint(t('thread.general_no_agent'));
+    return false;
+  }
+  const binding = state.getBinding(key);
+  if (!binding) {
+    const subdirs = listAvailableSubdirs(ENV.workRoot);
+    const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
+    await sendHint(t('thread.no_binding'), extra);
+    return false;
+  }
+  await sendHint(t('thread.no_agent_with_binding', { subdir: binding.subdir }));
+  return false;
+}
+
+/**
+ * @description Download one inbound media file into the bot-owned per-thread
+ * dir, returning its absolute saved path, or `null` if it could not be fetched.
+ *
+ * On a known-too-big file, an over-cap API error, or a download failure it
+ * sends the matching error reply through `onError` (so the album path can
+ * dedupe it) and returns `null`. The size pre-check is the caller's job for the
+ * single-file fast path; for albums it is folded in here so each item is sized.
+ */
+async function downloadIncomingFile(
+  ctx: NarrowedContext<Context, Update.MessageUpdate>,
+  key: ThreadKey,
+  meta: TelegramFileMeta,
+  onError: (text: string) => Promise<unknown>,
+): Promise<string | null> {
+  if (checkIsFileTooBig(meta.fileSize)) {
+    await onError(t('file.too_big', { cap: FILE_DOWNLOAD_CAP_MB }));
+    return null;
+  }
+
+  let fileUrl: string;
+  try {
+    fileUrl = (await ctx.telegram.getFileLink(meta.fileId)).toString();
+  } catch (err) {
+    if (checkIsFileTooBigApiError(err)) {
+      await onError(t('file.too_big', { cap: FILE_DOWNLOAD_CAP_MB }));
+    } else {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[Bot] getFileLink failed for ${meta.kind}: ${msg}`);
+      await onError(t('file.download_failed'));
+    }
+    return null;
+  }
+
+  try {
+    const dir = await ensureThreadFilesDir(getDataDir(), key);
+    const unixSeconds = Math.floor(Date.now() / 1000);
+    const fileName = buildSavedFileName(unixSeconds, meta.fileUniqueId, meta.kind, meta.fileName);
+    const savedPath = path.join(dir, fileName);
+    await downloadFile(fileUrl, savedPath, {
+      agent: telegramAgent,
+      timeoutMs: DOWNLOAD_TIMEOUT_MS,
+      onRetry: (attempt, err, delayMs) => {
+        console.warn(`[Bot] file download attempt ${attempt} failed (${err.message}); retrying in ${delayMs}ms`);
+      },
+    });
+    return savedPath;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Bot] file download failed after retries: ${msg}`);
+    await onError(t('file.download_failed'));
+    return null;
+  }
+}
+
+/**
+ * @description Send one already-built file/album announcement to the agent,
+ * honouring the startup window: mid-startup the prompt is buffered (replays in
+ * order when ready, exactly like a text prompt typed during boot); otherwise it
+ * is forwarded immediately through the normal choke point.
+ */
+async function announceFilePrompt(
+  key: ThreadKey,
+  promptText: string,
+  isStarting: boolean,
+): Promise<void> {
+  const kStr = keyToString(key);
+  if (isStarting) {
+    const isFirstBuffered = startupPromptBuffer.addPrompt(kStr, promptText);
+    if (isFirstBuffered) {
+      await replyToThread(key, t('agent.queued_starting', { label: getThreadAdapter(key).label }));
+    }
+    return;
+  }
+  await forwardPromptToAgent(key, getThreadAdapter(key), promptText);
+}
+
+/**
+ * @description One member of an in-flight album, buffered in the collector
+ * between the per-item download and the debounced flush. `caption` is the
+ * caption that rode THIS item (Telegram puts it on a single, arbitrary album
+ * member); the flush picks the first non-empty one.
+ */
+interface AlbumCollectorItem {
+  /**
+   * The originating message id. Album members arrive with monotonically
+   * increasing ids, so sorting by it at flush time restores the user's visual
+   * order even though Telegraf dispatches the burst concurrently (per-item
+   * downloads can finish out of order).
+   */
+  messageId: number;
+  albumFile: AlbumFile;
+  caption?: string;
+}
+
+/**
+ * @description Per-(thread, media_group) album batcher. Telegram delivers an
+ * album as N messages sharing `media_group_id` in a quick burst; this coalesces
+ * them so the agent gets ONE combined prompt after the burst settles, and gating
+ * / error hints fire once per album. The flush forwards the combined prompt
+ * through {@link announceFilePrompt}, re-reading the startup state AT FLUSH TIME
+ * so a session that finished booting mid-burst forwards instead of buffers.
+ */
+const albumCollector = createMediaGroupCollector<AlbumCollectorItem>({
+  debounceMs: ALBUM_DEBOUNCE_MS,
+  onFlush: (groupKey, items) => {
+    void (async () => {
+      const { key } = parseAlbumGroupKey(groupKey);
+      if (items.length === 0) return; // Group existed only to hold a claimed hint.
+      // Restore the user's visual order — downloads may have completed (and
+      // thus collected) out of order under Telegraf's concurrent dispatch.
+      const orderedItems = [...items].sort((a, b) => a.messageId - b.messageId);
+      const files = orderedItems.map((item) => item.albumFile);
+      const caption = orderedItems.find((item) => item.caption && item.caption.trim())?.caption;
+      const promptText = buildAlbumPromptText(files, caption);
+      const isStarting = startupPromptBuffer.checkIsStarting(keyToString(key));
+      try {
+        await announceFilePrompt(key, promptText, isStarting);
+      } catch (err) {
+        console.error('[Bot] album flush failed:', err);
+        await replyToThread(key, t('file.download_failed')).catch(() => {});
+      }
+    })();
+  },
+});
+
+/** Join a thread key and a media_group_id into the collector's group key. */
+function buildAlbumGroupKey(key: ThreadKey, mediaGroupId: string): string {
+  return `${keyToString(key)}|${mediaGroupId}`;
+}
+
+/** Inverse of {@link buildAlbumGroupKey} — recover the owning thread key. */
+function parseAlbumGroupKey(groupKey: string): { key: ThreadKey } {
+  const separatorIndex = groupKey.indexOf('|');
+  const threadKeyString = separatorIndex === -1 ? groupKey : groupKey.slice(0, separatorIndex);
+  return { key: keyFromString(threadKeyString) };
+}
+
+/**
+ * @description Handle one media message that is part of an album (carries a
+ * `media_group_id`). Gating and download happen per item — but the gating hint
+ * and the download-error reply are deduped to once per album via the collector's
+ * one-shot guard, and only the COMBINED prompt is debounced (the flush in
+ * {@link albumCollector}). A successful download is buffered into the collector;
+ * a failed one still lets the album flush announce the rest.
+ */
+async function handleAlbumFile(
+  ctx: NarrowedContext<Context, Update.MessageUpdate>,
+  key: ThreadKey,
+  meta: TelegramFileMeta,
+  mediaGroupId: string,
+): Promise<void> {
+  const groupKey = buildAlbumGroupKey(key, mediaGroupId);
+  const isStarting = startupPromptBuffer.checkIsStarting(keyToString(key));
+
+  // Gate per item, but reply at most once per album. The guard is claimed
+  // lazily so a passing gate never burns the one-shot slot.
+  const gatePassed = await checkFileIntakeGatePassed(key, isStarting, async (text, extra) => {
+    if (albumCollector.checkShouldAnnounceOnce(groupKey)) {
+      await replyToThread(key, text, extra);
+    }
+  });
+  if (!gatePassed) return;
+
+  const savedPath = await downloadIncomingFile(ctx, key, meta, async (text) => {
+    if (albumCollector.checkShouldAnnounceOnce(groupKey)) {
+      await replyToThread(key, text);
+    }
+  });
+  if (savedPath === null) return; // Error already deduped; let the rest flush.
+
+  albumCollector.collect(groupKey, {
+    messageId: ctx.message.message_id,
+    albumFile: { kind: meta.kind, savedPath, fileSize: meta.fileSize },
+    caption: meta.caption,
+  });
+}
+
 async function handleIncomingFile(
   ctx: NarrowedContext<Context, Update.MessageUpdate>,
   key: ThreadKey,
@@ -3804,81 +4026,26 @@ async function handleIncomingFile(
   // Always track inbound ids so /clear_messages can delete user uploads too.
   await state.pushMessageId(key, ctx.message.message_id);
 
-  const kStr = keyToString(key);
-  const adapter = getThreadAdapter(key);
-  const isStarting = startupPromptBuffer.checkIsStarting(kStr);
-
-  // Idle thread (no active agent and not mid-startup) → friendly guidance,
-  // identical to the text path. Do NOT download anything.
-  if (!isStarting && !adapter.checkIsActive(key)) {
-    if (checkIsGeneral(key)) {
-      await replyToThread(key, t('thread.general_no_agent'));
-      return;
-    }
-    const binding = state.getBinding(key);
-    if (!binding) {
-      const subdirs = listAvailableSubdirs(ENV.workRoot);
-      const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
-      await replyToThread(key, t('thread.no_binding'), extra);
-      return;
-    }
-    await replyToThread(key, t('thread.no_agent_with_binding', { subdir: binding.subdir }));
+  // Album item (shares media_group_id with siblings) → batch them into one
+  // combined prompt instead of N prompts that abort each other.
+  const mediaGroupId = getMediaGroupId(ctx.message);
+  if (mediaGroupId) {
+    await handleAlbumFile(ctx, key, meta, mediaGroupId);
     return;
   }
 
-  // Reject over-cap files we can already size before bothering the Bot API.
-  if (checkIsFileTooBig(meta.fileSize)) {
-    await replyToThread(key, t('file.too_big', { cap: FILE_DOWNLOAD_CAP_MB }));
-    return;
-  }
+  const isStarting = startupPromptBuffer.checkIsStarting(keyToString(key));
 
-  let fileUrl: string;
-  try {
-    fileUrl = (await ctx.telegram.getFileLink(meta.fileId)).toString();
-  } catch (err) {
-    if (checkIsFileTooBigApiError(err)) {
-      await replyToThread(key, t('file.too_big', { cap: FILE_DOWNLOAD_CAP_MB }));
-    } else {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[Bot] getFileLink failed for ${meta.kind}: ${msg}`);
-      await replyToThread(key, t('file.download_failed'));
-    }
-    return;
-  }
+  const gatePassed = await checkFileIntakeGatePassed(key, isStarting, (text, extra) =>
+    replyToThread(key, text, extra),
+  );
+  if (!gatePassed) return;
 
-  let savedPath: string;
-  try {
-    const dir = await ensureThreadFilesDir(getDataDir(), key);
-    const unixSeconds = Math.floor(Date.now() / 1000);
-    const fileName = buildSavedFileName(unixSeconds, meta.fileUniqueId, meta.kind, meta.fileName);
-    savedPath = path.join(dir, fileName);
-    await downloadFile(fileUrl, savedPath, {
-      agent: telegramAgent,
-      timeoutMs: DOWNLOAD_TIMEOUT_MS,
-      onRetry: (attempt, err, delayMs) => {
-        console.warn(`[Bot] file download attempt ${attempt} failed (${err.message}); retrying in ${delayMs}ms`);
-      },
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[Bot] file download failed after retries: ${msg}`);
-    await replyToThread(key, t('file.download_failed'));
-    return;
-  }
+  const savedPath = await downloadIncomingFile(ctx, key, meta, (text) => replyToThread(key, text));
+  if (savedPath === null) return;
 
   const promptText = buildFilePromptText(meta.kind, savedPath, meta.fileSize, meta.caption);
-
-  // Mid-startup → buffer the announcement so it replays in order when ready,
-  // exactly like a text prompt or voice transcript typed during boot.
-  if (isStarting) {
-    const isFirstBuffered = startupPromptBuffer.addPrompt(kStr, promptText);
-    if (isFirstBuffered) {
-      await replyToThread(key, t('agent.queued_starting', { label: getThreadAdapter(key).label }));
-    }
-    return;
-  }
-
-  await forwardPromptToAgent(key, adapter, promptText);
+  await announceFilePrompt(key, promptText, isStarting);
 }
 
 bot.on(

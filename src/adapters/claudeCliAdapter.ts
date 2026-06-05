@@ -17,6 +17,7 @@ import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
+import { getEffortStartupKeystroke } from '../utils/effortStartupKeystroke';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -106,6 +107,17 @@ interface ClaudeSession {
   currentPollDelayMs: number;
   /** Consecutive unchanged polls — drives {@link getNextPollDelay}'s backoff. */
   unchangedPollStreak: number;
+  /**
+   * S7 one-shot: the stored `/effort` level to re-type ONCE the TUI input box
+   * first appears, so a fresh spawn doesn't inherit claude's GLOBAL effort
+   * state (possibly set in another topic). Set at spawn from the per-thread
+   * pref ({@link applyStoredEffortOnSpawn}); `null` when no pref or already
+   * applied. Consumed by the first poll that sees a ready prompt
+   * ({@link checkIsClaudePromptReady}), BEFORE the bot replays buffered prompts
+   * onto the same serial tmux queue. NOT set on adopt/reattach (that claude
+   * process kept its in-TUI effort and may be mid-turn).
+   */
+  pendingEffortReapply: string | null;
 }
 
 /**
@@ -1518,6 +1530,51 @@ export function checkLooksUnsubmitted(paneText: string, typedText: string): bool
 }
 
 /**
+ * @description Boot-time lifecycle gates Claude can paint before the real input
+ * box is usable: the "Press Enter to continue" / login-success gate, and the
+ * bypass-permissions warning. `handleAutoLifecycle` dismisses both; the S7
+ * readiness predicate treats them as "not ready yet". Module-level so both the
+ * auto-lifecycle handlers and {@link checkIsClaudePromptReady} share one source
+ * of truth (no duplicated regexes).
+ */
+const CLAUDE_AUTO_ENTER_PATTERNS = [
+  /Press Enter to continue/i,
+  /Login successful\. Press Enter/i,
+];
+const CLAUDE_BYPASS_WARNING_RE = /WARNING.*Bypass|Bypass.*Permissions/i;
+const CLAUDE_BYPASS_ACCEPT_RE = /Yes,?\s*I\s*accept/i;
+
+/**
+ * @description Matches the TUI's live input box prompt row (`❯` led, optional
+ * draft text after it). Its presence in a captured pane is our signal that the
+ * Claude TUI has finished booting its banner and is ready to receive typed
+ * input — before that, the pane shows only the boot banner with no `❯` row.
+ */
+const CLAUDE_INPUT_BOX_RE = /^\s*❯/m;
+
+/**
+ * @description Whether a captured pane shows the Claude TUI has finished
+ * booting and is ready to accept a typed slash command (S7 readiness signal).
+ *
+ * Ready means: the live input box `❯` is on screen AND no boot-time lifecycle
+ * gate is still up — neither the "Press Enter to continue" / login gate nor the
+ * bypass-permissions warning, both of which `handleAutoLifecycle` dismisses
+ * over the next polls. We do NOT require idle: a fresh spawn is idle, and
+ * gating on "not busy" would only delay the re-apply past the box first
+ * appearing. Keeping the predicate to "input box up, no lifecycle gate" matches
+ * the single observable moment the box first accepts keys. Exported for unit
+ * testing without a live tmux pane.
+ */
+export function checkIsClaudePromptReady(paneText: string): boolean {
+  if (!CLAUDE_INPUT_BOX_RE.test(paneText)) return false;
+  if (CLAUDE_AUTO_ENTER_PATTERNS.some((pattern) => pattern.test(paneText))) return false;
+  const hasBypassWarning = CLAUDE_BYPASS_WARNING_RE.test(paneText);
+  const hasBypassAccept = CLAUDE_BYPASS_ACCEPT_RE.test(paneText);
+  if (hasBypassWarning && hasBypassAccept) return false;
+  return true;
+}
+
+/**
  * @description Markers of a live sub-agent (Task tool) on the pane. While a
  * sub-agent runs the TUI shows a task line led by `◯` (U+25EF LARGE CIRCLE —
  * NOT the spinner glyph `○` U+25CB used elsewhere in this file), e.g.
@@ -1714,6 +1771,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'lastRawCapture'
       | 'currentPollDelayMs'
       | 'unchangedPollStreak'
+      | 'pendingEffortReapply'
     >,
   ): ClaudeSession {
     return {
@@ -1739,6 +1797,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // No timer is armed yet, so an explicit resetPollCadence would be a no-op.
       currentPollDelayMs: basePollIntervalMs,
       unchangedPollStreak: 0,
+      // S7: armed explicitly by `applyStoredEffortOnSpawn` after a fresh
+      // start/resume spawn; adopt/reattach leaves it null (no re-apply).
+      pendingEffortReapply: null,
     };
   }
 
@@ -1940,6 +2001,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     this.sessions.set(keyToString(key), session);
     this.schedulePoll(key, session);
+    // S7: ARM the thread's stored /effort for re-apply once the TUI input box
+    // is actually ready (consumed in the poll loop) — NOT typed now, while the
+    // pane is still painting its boot banner. Fresh spawn only — see
+    // applyStoredEffortOnSpawn.
+    this.applyStoredEffortOnSpawn(key);
     this.emit('started', key);
   }
 
@@ -2242,6 +2308,58 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description ARM the thread's stored `/effort` choice for re-apply on a
+   * FRESH TUI spawn (S7) — deferred, not typed immediately. claude persists
+   * effort GLOBALLY in its own settings.json, so a fresh `startSession` /
+   * `resumeSession` would otherwise inherit the last globally-set level —
+   * possibly chosen in another topic.
+   *
+   * Timing is the whole point: a fresh tmux session returns the instant
+   * `new-session` succeeds, while the claude TUI is still painting its boot
+   * banner — typing into it then interleaves keystrokes with the paint and the
+   * command sits unsubmitted (live bug 2026-06-05). So we do NOT type here; we
+   * stash the level on `session.pendingEffortReapply` and let the poll loop
+   * consume it the FIRST time the pane shows a ready input box
+   * ({@link checkIsClaudePromptReady}). That readiness moment is strictly after
+   * the banner paints and strictly before the box can echo a buffered prompt,
+   * giving the required ordering (effort BEFORE buffered prompts) via the same
+   * serial tmux queue.
+   *
+   * Called at the END of `startSession` / `resumeSession`. NOT called from
+   * `adoptExistingTmuxSession` — that claude process survived the restart with
+   * its in-TUI effort intact and may be mid-turn, so re-applying would be both
+   * unnecessary and risk interleaving with a running stream.
+   *
+   * No stored pref → nothing armed (claude's own default stands). A level
+   * claude can't honour is armed as-is — claude clamps per model (D2), same as
+   * a manual `/effort`.
+   */
+  private applyStoredEffortOnSpawn(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
+    if (!session) return;
+    const level = this.getEffort(key);
+    if (!getEffortStartupKeystroke(level)) return;
+    session.pendingEffortReapply = level;
+  }
+
+  /**
+   * @description S7 consumption point: once the poll loop sees the TUI input
+   * box is up and no boot gate is left, type the armed `/effort <level>` ONCE
+   * and clear the pending flag (one-shot, can't fire twice). Reuses the exact
+   * keystroke path a manual `/effort` uses ({@link sendInput} with its
+   * bare-slash deferred-Enter handling) so there is no duplicate keystroke
+   * logic. Enqueuing onto the session's serial tmux queue at this ready moment
+   * guarantees the keystroke lands in a usable input box (not the boot paint)
+   * and ahead of any buffered prompt the bot replays onto the same queue.
+   */
+  private consumePendingEffortReapply(session: ClaudeSession): void {
+    const keystroke = getEffortStartupKeystroke(session.pendingEffortReapply);
+    if (!keystroke) return;
+    session.pendingEffortReapply = null;
+    this.sendInput(session.key, keystroke);
+  }
+
+  /**
    * @description Effort levels offered by the `/effort` picker for Claude.
    *
    * Returns the canonical set unconditionally (plan D2). The `key` argument
@@ -2373,6 +2491,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     this.sessions.set(keyToString(key), claudeSession);
     this.schedulePoll(key, claudeSession);
+    // S7: ARM the stored /effort for re-apply on this fresh resume spawn too
+    // (claude's global effort state could be from another topic). Deferred to
+    // the poll-loop readiness point — same as startSession; the resume seeding
+    // repaint must finish before the input box is ready, which the readiness
+    // predicate already requires. See applyStoredEffortOnSpawn.
+    this.applyStoredEffortOnSpawn(key);
     this.emit('started', key);
 
     // Post the short last-N-turn context block in place of the flood. ONLY on
@@ -2635,6 +2759,17 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       return;
     }
 
+    // S7: re-apply the thread's stored /effort the FIRST poll the TUI input box
+    // is up (and no boot gate left). Runs every non-seeding poll, incl. unchanged
+    // ones — the box can appear on a poll whose content didn't otherwise change.
+    // Cheap early-out below when nothing is armed; `consumePendingEffortReapply`
+    // clears the flag so it fires exactly once. Must precede any buffered-prompt
+    // replay, which the bot only starts after the input box exists — they share
+    // the serial tmux queue, and this enqueues first.
+    if (session.pendingEffortReapply && checkIsClaudePromptReady(content)) {
+      this.consumePendingEffortReapply(session);
+    }
+
     if (content !== session.lastContent) {
       const previousPane = session.lastContent;
       const newPart = getNewPaneContent(previousPane, content);
@@ -2763,16 +2898,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   private checkNeedsAutoEnter(content: string): boolean {
-    const autoEnterPatterns = [
-      /Press Enter to continue/i,
-      /Login successful\. Press Enter/i,
-    ];
-    return autoEnterPatterns.some(pattern => pattern.test(content));
+    return CLAUDE_AUTO_ENTER_PATTERNS.some(pattern => pattern.test(content));
   }
 
   private checkNeedsAutoAccept(content: string): boolean {
-    const hasWarning = /WARNING.*Bypass/i.test(content) || /Bypass.*Permissions/i.test(content);
-    const hasAccept = /Yes,?\s*I\s*accept/i.test(content);
+    const hasWarning = CLAUDE_BYPASS_WARNING_RE.test(content);
+    const hasAccept = CLAUDE_BYPASS_ACCEPT_RE.test(content);
     if (hasWarning || hasAccept) {
       console.log(`[Claude] checkNeedsAutoAccept: warning=${hasWarning}, accept=${hasAccept}`);
     }

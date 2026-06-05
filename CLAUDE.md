@@ -231,6 +231,18 @@ as a command in `bot.ts`.
     `GET /config/providers` and applied per-prompt as `body.variant` on the
     prompt request (no env configuration). See plan
     `agent/tasks/completed/2026-05-31-effort-buttons-both-backends.md`.
+    - **Effort survives the session lifecycle (per-thread, permanent).** claude
+      persists effort GLOBALLY in its own settings.json, so a fresh TUI (start /
+      `/new` / resume) would otherwise inherit the last globally-set level
+      (maybe another topic's). On every fresh spawn the Claude adapter ARMS the
+      thread's stored level on the session (`pendingEffortReapply`); the poll
+      loop types `/effort <level>` the FIRST time the TUI input box is actually
+      ready (`checkIsClaudePromptReady`) — NOT at the spawn instant, when the
+      banner is still painting (typing then leaves the command unsubmitted; live
+      bug 2026-06-05). One-shot, and strictly before any buffered prompt (same
+      serial tmux queue). NOT done on adopt/reattach (the surviving process
+      keeps its in-TUI state). OpenCode seeds `effortLevel` from the same
+      per-thread pref at session creation.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
   `/doctor`, `/mcp`, `/trace`
   - `/trace on|off` toggles the output-trace recorder for THIS topic; `/trace

@@ -44,6 +44,15 @@ test('bind.current_none resolves to a non-empty message', () => {
   assert.ok(!out.includes('{'));
 });
 
+test('thread.bind_required resolves in ru (not the bare-code fallback) and names /bind', () => {
+  // Active lang here is ru. A real translation must come back — never the
+  // last-code-segment fallback `bind_required` that `t` returns for a key
+  // missing in BOTH catalogs — and it must point the user at /bind.
+  const out = t('thread.bind_required');
+  assert.notEqual(out, 'bind_required', 'ru catalog is missing thread.bind_required');
+  assert.ok(out.includes('/bind'), `expected "/bind" in "${out}"`);
+});
+
 test('t falls back to last code segment for unknown key', () => {
   const out = t('nonexistent.key.path');
   assert.equal(out, 'path');

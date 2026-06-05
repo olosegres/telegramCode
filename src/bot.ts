@@ -67,6 +67,7 @@ import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import { getBindGateDecision } from './utils/bindGateDecision';
 import {
   buildThreadContextPreamble,
   prependThreadContextPreamble,
@@ -1525,17 +1526,17 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<Transc
 
 /**
  * @description Resolve the working directory for an adapter session in
- * this thread.
+ * this thread, or `null` when the thread has no binding.
  *
- * Этап 3 fallback: if the thread has a binding, use it; otherwise use
- * `WORK_ROOT` itself so a fresh install can smoke-test agents before any
- * `/bind` lands. Этап 4 adds `/bind` proper and may make the «no binding»
- * case error out depending on UX choices.
+ * The bind IS the agent's working folder — an agent must never run outside it,
+ * so there is deliberately NO fallback to `WORK_ROOT` itself. The old Этап-3
+ * "smoke-test against WORK_ROOT before any /bind" behavior is retired: every
+ * agent-facing entry point (start / list / resume) refuses with
+ * `thread.bind_required` when this returns `null`.
  */
-function getWorkDir(key: ThreadKey): string {
-  const binding = state.getBinding(key);
-  if (binding) return path.join(ENV.workRoot, binding.subdir);
-  return ENV.workRoot;
+function getWorkDir(key: ThreadKey): string | null {
+  const decision = getBindGateDecision(state.getBinding(key), ENV.workRoot);
+  return decision.kind === 'proceed' ? decision.workDir : null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1714,6 +1715,12 @@ async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<voi
 
 async function startAgentSession(key: ThreadKey, args?: string): Promise<string> {
   const kStr = keyToString(key);
+  // The bound folder IS the agent's cwd — refuse to start without one. The
+  // command/natural-language callers gate on the binding too, but a binding
+  // can vanish (/unbind) between their check and here, so re-check before any
+  // side effect (startup window / markers) opens.
+  const workDir = getWorkDir(key);
+  if (!workDir) return t('thread.bind_required');
   // Open the startup window synchronously (before the first await) so text
   // typed right after `/claude` / `/opencode` is buffered, not dropped.
   startupPromptBuffer.markStarting(kStr);
@@ -1722,7 +1729,6 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
   // re-carry the thread-context preamble. Forget the last-injected marker.
   clearThreadContextMarker(key);
   const adapter = getThreadAdapter(key);
-  const workDir = getWorkDir(key);
 
   // U1 from plan §10.2 / §16.3: typing indicator while the agent boots so
   // the user doesn't think the bot is asleep.
@@ -3015,10 +3021,17 @@ async function handleSessionsList(key: ThreadKey): Promise<void> {
     return;
   }
 
+  // Guarded by the `!state.getBinding` early-return above, so workDir is
+  // non-null here; the explicit check keeps the no-fallback contract honest.
+  const workDir = getWorkDir(key);
+  if (!workDir) {
+    await replyToThread(key, t('thread.bind_required'));
+    return;
+  }
   const adapter = getThreadAdapter(key);
   let sessions: AgentSession[];
   try {
-    sessions = await adapter.getSessions(key, getWorkDir(key));
+    sessions = await adapter.getSessions(key, workDir);
   } catch (e) {
     console.error('[Bot] getSessions:', e);
     await replyToThread(key, t('session.load_failed'));
@@ -3071,12 +3084,17 @@ async function resumeSessionByIndex(
     return null;
   }
   const sessionId = list[idx];
+  // Pick-mode is armed only by `handleSessionsList` (binding-gated), but a
+  // binding can vanish (/unbind) between listing and picking — resume must
+  // never run against an unbound thread (no WORK_ROOT fallback).
+  const workDir = getWorkDir(key);
+  if (!workDir) return t('thread.bind_required');
   const adapter = getThreadAdapter(key);
   markNeedsNewMessage(key);
   try {
     // The ONLY resume path that posts the "last N messages" context block —
     // silent re-attach (bot restart) and crash recovery must stay quiet.
-    await adapter.resumeSession(key, getWorkDir(key), sessionId, { isWithRecentContext: true });
+    await adapter.resumeSession(key, workDir, sessionId, { isWithRecentContext: true });
     return t('session.resumed');
   } catch (e) {
     return t('session.resume_failed', { error: e instanceof Error ? e.message : String(e) });

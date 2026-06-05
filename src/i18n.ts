@@ -42,6 +42,8 @@ const dict: Record<Lang, Record<string, string>> = {
     // ── bindings / threads ──
     'thread.no_binding':
       '📁 Этот тред не привязан к папке. Используй /bind <subdir> или выбери из списка.',
+    'thread.bind_required':
+      '📁 Сначала привяжи папку: /bind <subdir>. Агент запускается только в привязанной папке.',
     'thread.bound': '📁 Привязано к `{subdir}`.\nЗапусти /claude или /opencode.',
     'thread.unbound': '📁 Привязка снята.',
     'thread.unbind_unbound': 'Тред и так не был привязан.',
@@ -310,6 +312,8 @@ const dict: Record<Lang, Record<string, string>> = {
 
     'thread.no_binding':
       '📁 This thread is not bound to a folder. Use /bind <subdir> or pick from the list.',
+    'thread.bind_required':
+      '📁 Bind a folder first: /bind <subdir>. The agent only ever runs inside the bound folder.',
     'thread.bound': '📁 Bound to `{subdir}`.\nRun /claude or /opencode.',
     'thread.unbound': '📁 Binding cleared.',
     'thread.unbind_unbound': 'Thread had no binding to clear.',
@@ -620,4 +624,15 @@ export function errorMessage(code: string, opts?: Record<string, string | number
 /** Exposed for tests + `/doctor` output ("language: ru"). */
 export function getActiveLang(): Lang {
   return lang;
+}
+
+/**
+ * @description Integrity check (tests): is `code` present in EVERY language
+ * catalog? Independent of the import-time `lang`, so a single test process can
+ * prove a key resolves in both `ru` and `en` without the bare-code fallback —
+ * which `t` alone can't show, since it only ever reaches the active locale plus
+ * the en fallback.
+ */
+export function checkKeyInAllLangs(code: string): boolean {
+  return (Object.keys(dict) as Lang[]).every((l) => dict[l][code] !== undefined);
 }

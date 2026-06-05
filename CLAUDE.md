@@ -34,9 +34,15 @@ config/variants, not a per-message API field).
 
 ## Key concepts
 
-- **One topic ↔ one project folder ↔ one agent session.** Each forum topic is
-  bound to a subfolder under `WORK_ROOT` and runs its own isolated `claude` or
-  `opencode` session. Two topics can point at the same folder for parallel work.
+- **One topic ↔ one project folder ↔ one agent session — the bind is mandatory.**
+  Each forum topic binds to a subfolder under `WORK_ROOT` and runs its own
+  isolated `claude` or `opencode` session **in that folder**. Two topics can
+  point at the same folder for parallel work. **No bind → no agent:** an unbound
+  topic refuses every agent-facing action (start, `/sessions`, resume) with a
+  "bind a folder first" reply — the agent never runs against `WORK_ROOT` itself
+  (the old smoke-test fallback is retired). For OpenCode the bind is the
+  server-instance selector: sessions are created and listed in that folder's
+  project instance via `?directory=<workDir>`.
 - **Per-thread isolation.** Routing, sessions, MCP config, model/effort prefs,
   and history are keyed per topic (`ThreadKey` = `"<chatId>:<threadId>"`).
 - **Restart-safe.** State is persisted to `state.json`; on restart the bot
@@ -122,11 +128,14 @@ as a command in `bot.ts`.
     thread's bound folder as numbered text **and** tappable inline buttons,
     then arm a per-thread pick mode: reply with a bare digit to resume that
     session, `0` or `/cancel` to exit, out-of-range stays armed, any other
-    text exits and is handled normally. **Two backends differ:** Claude lists
-    real `~/.claude/projects/<cwd-slug>/*.jsonl` transcripts filtered by
+    text exits and is handled normally. **Both backends are folder-scoped now**
+    (a binding is required to even reach the list): Claude lists real
+    `~/.claude/projects/<cwd-slug>/*.jsonl` transcripts filtered by
     `recordedCwd === workDir` (so sessions started by hand on the laptop in
-    that folder are resumable too); OpenCode lists server sessions via
-    `GET /session` (not folder-filtered).
+    that folder are resumable too); OpenCode lists the bound folder's project
+    instance via `GET /session?directory=<workDir>`. Sessions created in other
+    instances (by-hand serve-cwd scatter) no longer appear — accepted tradeoff;
+    already-attached ones keep working (by-id calls are cross-instance).
     - **OpenCode session naming:** bot-created OpenCode sessions are created
       WITHOUT a title, so opencode's own LLM auto-titles them from the first
       prompt (e.g. "Debug broken login flow") instead of the old identical

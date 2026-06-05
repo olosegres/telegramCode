@@ -40,7 +40,10 @@ function createStubbedAdapter(configHandler: () => Promise<unknown>): {
   const adapter = new OpenCodeAdapter();
 
   adapter['apiRequest'] = async (method: string, urlPath: string) => {
-    if (method === 'POST' && urlPath === '/session') {
+    // Session create is now folder-scoped: `/session?directory=<workDir>`
+    // (S1). Match the create regardless of the query so this harness keeps
+    // resolving the new id; `/session/<id>/abort` etc. keep the path segment.
+    if (method === 'POST' && (urlPath === '/session' || urlPath.startsWith('/session?'))) {
       return { id: newSessionId };
     }
     if (method === 'GET' && urlPath === '/config') {

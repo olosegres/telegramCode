@@ -1070,7 +1070,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         // explicit `/opencode <args>` case (explicit title, no auto-rename).
         const createBody: Record<string, unknown> = {};
         if (args) createBody.title = args;
-        const apiSession = await this.apiRequest<OpenCodeApiSession>('POST', '/session', createBody);
+        // The bound folder IS the agent's working directory: create the session
+        // in that folder's project instance (`?directory=`) so its cwd/tools are
+        // scoped there. Without it the server falls back to its serve-cwd default
+        // instance and the agent runs outside the topic's folder.
+        const apiSession = await this.apiRequest<OpenCodeApiSession>(
+          'POST',
+          buildDirectoryScopedPath('/session', workDir),
+          createBody,
+        );
 
         const session: OpenCodeSession = {
           key,
@@ -1478,12 +1486,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return this.sessions.get(keyToString(key))?.sessionId ?? null;
   }
 
-  // `_workDir` is part of the shared `getSessions` contract but unused
-  // here: OpenCode's `GET /session` returns a server-wide list with no
-  // directory field to filter on, so the list is not folder-scoped.
-  async getSessions(_key: ThreadKey, _workDir: string): Promise<AgentSession[]> {
+  // Folder-scoped listing: `GET /session?directory=<workDir>` returns only the
+  // sessions of the bound folder's project instance. The topic is always bound
+  // before this is reached (the bot gates `/sessions` on a binding), so workDir
+  // is the real working folder, never a serve-cwd fallback. Sessions created in
+  // other instances (e.g. by-hand serve-cwd scatter) are intentionally absent.
+  async getSessions(_key: ThreadKey, workDir: string): Promise<AgentSession[]> {
     try {
-      const apiSessions = await this.apiRequest<OpenCodeApiSession[]>('GET', '/session');
+      const apiSessions = await this.apiRequest<OpenCodeApiSession[]>(
+        'GET',
+        buildDirectoryScopedPath('/session', workDir),
+      );
 
       if (!Array.isArray(apiSessions)) return [];
 

@@ -52,12 +52,12 @@ export interface BoundSessionRef {
  * @description Resolve the SINGLE bound thread that owns an incoming SSE event,
  * so an event is delivered to at most one topic (single-owner delivery).
  *
- * The OpenCode server multiplexes every session's events onto each thread's
- * `/global/event` stream, so the same event is offered once per bound thread.
- * Without a single-owner rule, a false lineage link OR a duplicated session id
- * (two threads accidentally bound to the same server session) would make the
- * event match — and emit to — more than one topic (bug B20: the same answer
- * appeared in two threads).
+ * Even with one stream per bound folder (threads sharing a folder share it),
+ * the same event reaches the dispatcher once and may match more than one bound
+ * thread: a false lineage link OR a duplicated session id (two threads
+ * accidentally bound to the same server session) would make the event match —
+ * and emit to — more than one topic (bug B20: the same answer appeared in two
+ * threads). The single-owner rule picks exactly one.
  *
  * Ownership priority:
  *   1. A thread whose own `sessionId` directly equals `eventSessionId` is the

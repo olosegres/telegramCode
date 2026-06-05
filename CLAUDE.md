@@ -25,8 +25,13 @@ to the agent rather than handled locally:
   one-line size summaries).
 - **OpenCode** runs as a local HTTP server. The bot talks to it over
   **HTTP + SSE**: it POSTs prompts to `/session/:id/prompt_async` (with a
-  `model: {providerID, modelID}` override) and consumes the `/global/event`
-  stream.
+  `model: {providerID, modelID}` override) and consumes one
+  `/event?directory=<workDir>` stream **per unique bound folder** (not per
+  thread). Each directory instance delivers only its own events, so threads
+  sharing a folder share one stream and every event is JSON-parsed once and
+  routed to the owning session (plan `agent/tasks/completed/2026-06-05-event-loop-saturation-phase1.md`,
+  S5). The stream opens with the first active session in a folder and closes
+  with the last.
 
 When adding a feature, first decide: *is this a bot-local concern, or something
 that must be proxied to the agent?* If it changes agent behavior (model,
@@ -130,6 +135,7 @@ config/variants, not a per-message API field).
 | `botFileStorage.ts` | Per-thread intake dir layout + janitor: `resolveThreadFilesDir`, `ensureThreadFilesDir`, `purgeThreadFiles` (on `/clear`), `sweepExpiredThreadFiles` (boot + daily age sweep, `fileRetentionDays = 30`) |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
+| `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
 | `outputTrace.ts` | Output-trace mode, toggled at runtime via `/trace` (no env var): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram. The toggle (`tracedThreads` set + `traceAllThreads` flag) is persisted in `state.json` and re-seeded at boot; an async-buffered, single-flight writer flushes on a 500ms timer / 200-entry threshold (sync flush on process exit). OFF by default → one boolean check per hook. Filtering: `recv`/`emit`/send-with-thread-id record iff the thread is traced (all-flag or in the set); send records with NO derivable thread id (e.g. `editMessageText`) record whenever ANY tracing is active |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
@@ -143,7 +149,7 @@ config/variants, not a per-message API field).
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
 | `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping) |
-| `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts, stream `/global/event`) |
+| `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; one `/event?directory=` stream per bound folder, shared by threads in that folder, parsed once + owner-routed) |
 
 The `AgentAdapter` interface (in `types.ts`) is the seam. Per-backend agent
 controls (`setModel`, `getCurrentModel`, `sendInput`, `sendSignal`,

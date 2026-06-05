@@ -23,6 +23,11 @@ import {
   checkIsMeaningfulPrompt,
   checkIsPlaceholderTitle,
 } from '../openCodeSessionTitle';
+import {
+  countActiveSessionsForDirectory,
+  getSseStreamTransition,
+  type DirectoryBoundSession,
+} from '../utils/sseStreamLifecycle';
 
 const execAsync = promisify(exec);
 
@@ -200,27 +205,6 @@ interface OpenCodeSession {
    */
   busyChildSessionIds: Set<string>;
   /**
-   * Abort controller for the live SSE `fetch` + reader. Set by
-   * `pollSse`, cleared on natural exit. `disconnectSse` / `stopSession`
-   * call `.abort()` so the reader unblocks immediately instead of
-   * waiting for the server to deliver the next byte (audit S7 / #12).
-   */
-  sseController: AbortController | null;
-  /**
-   * Handle for the SSE reconnect `setTimeout`. Cleared by `stopSession`
-   * / `disconnectSse` so the callback doesn't re-enter `pollSse` for a
-   * tornDown session (audit S8 / #14).
-   */
-  reconnectTimer: NodeJS.Timeout | null;
-  /**
-   * Handle for the SSE stall watchdog `setTimeout`. OpenCode emits a
-   * `server.heartbeat` every ~10 s, so a live stream always delivers bytes
-   * within that window; if none arrive for `sseStallTimeoutMs` the socket is
-   * silently dead (open TCP, no FIN/RST) and `reader.read()` would park
-   * forever. The watchdog aborts the controller so `pollSse` reconnects.
-   */
-  sseStallTimer: NodeJS.Timeout | null;
-  /**
    * Whether this session may still be renamed by the bot-side fallback. Set
    * `true` only for sessions the bot created WITHOUT explicit `/opencode args`
    * (those rely on opencode's native auto-title — R1). Cleared on the first
@@ -259,6 +243,46 @@ interface OpenCodeSseEvent {
    * `/event` shape, which is instance-local by construction.
    */
   directory?: string;
+}
+
+/**
+ * @description Live SSE stream owned by the adapter for ONE bound directory
+ * (plan 2026-06-05 S5). Threads bound to the same folder share this single
+ * stream — the server delivers only that directory instance's events on
+ * `/event?directory=<workDir>`, so each event is parsed once and routed to the
+ * owning session. Opened when the first active session for the directory
+ * appears, closed when the last one goes away.
+ */
+interface SseStreamState {
+  /** The bound directory this stream is scoped to (the `?directory=` value). */
+  directory: string;
+  /**
+   * Abort controller for the live `fetch` + reader. `.abort()` unblocks the
+   * parked `reader.read()` immediately on teardown or stall, instead of waiting
+   * for the server to deliver the next byte (audit S7 / #12).
+   */
+  controller: AbortController | null;
+  /**
+   * Stall watchdog `setTimeout`. OpenCode emits a `server.heartbeat` every
+   * ~10 s, so a live stream always delivers bytes within `sseStallTimeoutMs`;
+   * if none arrive the socket is silently dead (open TCP, no FIN/RST) and
+   * `reader.read()` would park forever. Firing aborts the controller so the
+   * reader reconnects.
+   */
+  stallTimer: NodeJS.Timeout | null;
+  /**
+   * Reconnect `setTimeout`. Cleared on teardown so a fired callback can't
+   * re-enter the reader loop for a stream whose last session is already gone
+   * (audit S8 / #14).
+   */
+  reconnectTimer: NodeJS.Timeout | null;
+  /**
+   * Latch flipped to `true` by teardown so an in-flight reconnect/await that
+   * resumes after the stream is closed exits instead of reopening it. A closed
+   * directory entry is also deleted from the stream map, but a reconnect
+   * promise may already hold a stale reference.
+   */
+  isClosed: boolean;
 }
 
 /**
@@ -774,6 +798,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   private sessions: Map<string, OpenCodeSession> = new Map();
 
   /**
+   * One SSE stream per unique bound directory (plan 2026-06-05 S5), keyed by
+   * the directory path. The server delivers only that directory instance's
+   * events on `/event?directory=<dir>`, so threads sharing a folder share one
+   * stream and each event is JSON-parsed once. Opened when the first active
+   * session for a directory appears, closed when the last one goes away.
+   */
+  private sseStreams: Map<string, SseStreamState> = new Map();
+
+  /**
    * child sessionID → parent sessionID, learned from `session.updated` events.
    * OpenCode runs subagents (e.g. `@explore`) in child sessions whose SSE
    * events carry the child id; this map routes them back to the topic bound to
@@ -886,6 +919,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.log(`[OpenCode] Attempting server restart...`);
       await ensureOpenCodeServer();
       console.log(`[OpenCode] Server restarted successfully`);
+
+      // Close every directory stream up front: their readers point at the
+      // crashed server's connection. The resume loop below re-opens a fresh
+      // stream per still-active directory (plan 2026-06-05 S5: re-open the
+      // directory streams, then restore sessions). Without this, a stream
+      // shared by two threads would keep its stale reader (it only self-heals
+      // later via the stall watchdog) — re-opening here makes recovery
+      // deterministic and tied to the restart.
+      this.closeAllStreams();
 
       // OpenCode persists sessions to disk, so the restarted server still
       // knows the previous session ids — that's the basis of this recovery.
@@ -1099,9 +1141,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           isBusy: false,
           isCompacting: false,
           busyChildSessionIds: new Set(),
-          sseController: null,
-          reconnectTimer: null,
-          sseStallTimer: null,
           // Only untitled (no-args) sessions are eligible for the bot-side
           // fallback rename; an explicit `args` title is user-set and final.
           isAutoNamePending: !args,
@@ -1162,11 +1201,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.statusDebounceTimer);
       session.statusDebounceTimer = null;
     }
-    if (session.reconnectTimer) {
-      clearTimeout(session.reconnectTimer);
-      session.reconnectTimer = null;
-    }
 
+    // Tear down the directory's SSE stream if this was its last active session
+    // (also clears that stream's reconnect + stall timers).
     this.disconnectSse(key);
 
     // Abort any running generation. Audit S15: log failures instead
@@ -1659,9 +1696,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         isBusy: false,
         isCompacting: false,
         busyChildSessionIds: new Set(),
-        sseController: null,
-        reconnectTimer: null,
-        sseStallTimer: null,
         // A resumed session already has a name and history — never auto-rename.
         isAutoNamePending: false,
       };
@@ -1705,47 +1739,142 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Connect to OpenCode SSE event stream.
-   * OpenCode SSE uses only `data:` lines (no `event:` field).
-   * Each data line contains JSON: { type: "event.name", properties: {...} }
+   * @description Ensure the SSE stream for this session's bound directory is
+   * open (plan 2026-06-05 S5). Called after a session is inserted active into
+   * `this.sessions` (start / resume / restart). Threads sharing a folder share
+   * one stream: the stream opens only for the FIRST active session in a
+   * directory; later sessions reuse it. Keeps the `(key)` signature so the
+   * lifecycle paths and tests (which stub `connectSse` to a no-op) are
+   * unchanged.
    */
   private connectSse(key: ThreadKey): void {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
-
-    // OpenCode 1.14.48 closes `/event` after `server.connected`; the global
-    // stream stays open and is safe because `handleSseData` filters session ids.
-    const sseUrl = `${this.baseUrl}/global/event`;
-    console.log(`[OpenCode] Connecting SSE: ${sseUrl}`);
-
-    this.pollSse(key, sseUrl).catch((e) => {
-      console.error(`[OpenCode] SSE connection error:`, e);
-      // Audit S10 / #43: surface SSE start failures so the bot can
-      // notify the user — previously they vanished into console logs
-      // and the user saw a silently-dead session.
-      this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
-    });
+    this.ensureDirectoryStream(session.workDir);
   }
 
+  /**
+   * @description Mark a session inactive and tear down its directory's SSE
+   * stream IFF it was the last active session sharing that folder. The stream
+   * is reference-counted by directory (recomputed from `this.sessions` so it
+   * can never drift): a sibling session in the same folder keeps it open.
+   *
+   * Order-independent: callers vary in whether they pre-set `isActive = false`
+   * (`stopSessionInner` does, before calling here), so the decision counts
+   * OTHER active sessions for the directory and treats this one as departing.
+   * `before = other + 1`, `after = other` → `close` exactly when no sibling
+   * keeps the stream alive.
+   */
   private disconnectSse(key: ThreadKey): void {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
+    const { workDir } = session;
     session.isActive = false;
-    // Audit S7 / #12: unblock the SSE reader immediately. Without this,
-    // the in-flight `reader.read()` would only return when the server
-    // happened to send the next byte — could be minutes for a silent
-    // session.
-    if (session.sseController) {
-      session.sseController.abort();
-      session.sseController = null;
+    const otherActive = this.countOtherActiveSessionsForDir(workDir, key);
+    if (getSseStreamTransition(otherActive + 1, otherActive) === 'close') {
+      this.closeDirectoryStream(workDir);
     }
-    // Audit S8 / #14: also kill any pending reconnect timer.
-    if (session.reconnectTimer) {
-      clearTimeout(session.reconnectTimer);
-      session.reconnectTimer = null;
+  }
+
+  /**
+   * @description All sessions reduced to the directory-routing shape for the
+   * pure helpers, optionally excluding one key (the departing session in a
+   * teardown decision).
+   */
+  private getDirectoryBoundSessions(excludeKey?: ThreadKey): DirectoryBoundSession[] {
+    const excludeKeyStr = excludeKey ? keyToString(excludeKey) : null;
+    const bound: DirectoryBoundSession[] = [];
+    for (const [keyStr, session] of this.sessions) {
+      if (keyStr === excludeKeyStr) continue;
+      bound.push({ workDir: session.workDir, isActive: session.isActive });
     }
-    // Also disarm the stall watchdog so it can't fire after teardown.
-    this.clearSseStallTimer(session);
+    return bound;
+  }
+
+  /**
+   * @description Active sessions bound to `directory` EXCLUDING `key` — the
+   * sibling count that decides whether a departing session's stream stays up.
+   */
+  private countOtherActiveSessionsForDir(directory: string, key: ThreadKey): number {
+    return countActiveSessionsForDirectory(this.getDirectoryBoundSessions(key), directory);
+  }
+
+  /**
+   * @description Open the SSE stream for `directory` if it is not already open.
+   * Idempotent — a second active session in the same folder finds the stream
+   * present and no-ops. The reader runs detached; a fatal start error surfaces
+   * to every session bound to the directory so the user isn't left with a
+   * silently-dead session (audit S10 / #43).
+   */
+  private ensureDirectoryStream(directory: string): void {
+    if (this.sseStreams.has(directory)) return;
+
+    const stream: SseStreamState = {
+      directory,
+      controller: null,
+      stallTimer: null,
+      reconnectTimer: null,
+      isClosed: false,
+    };
+    this.sseStreams.set(directory, stream);
+
+    // `/event?directory=<dir>` delivers ONLY this directory instance's events
+    // (verified live, opencode 1.16.0) — no `/global/event` multiplex, so each
+    // event is parsed once here and routed to its owning session.
+    const sseUrl = `${this.baseUrl}${buildDirectoryScopedPath('/event', directory)}`;
+    console.log(`[OpenCode] Connecting SSE for ${directory}: ${sseUrl}`);
+    appendDiagLog(`sse open dir=${directory}`);
+
+    this.pollSseStream(stream, sseUrl).catch((e) => {
+      console.error(`[OpenCode] SSE connection error for ${directory}:`, e);
+      this.emitToDirectorySessions(directory, 'error', e instanceof Error ? e : new Error(String(e)));
+    });
+  }
+
+  /**
+   * @description Tear down the SSE stream for `directory`: latch it closed,
+   * abort the in-flight reader (unblocks `reader.read()` immediately — audit
+   * S7 / #12), cancel its stall + reconnect timers, and drop it from the map.
+   */
+  private closeDirectoryStream(directory: string): void {
+    const stream = this.sseStreams.get(directory);
+    if (!stream) return;
+    stream.isClosed = true;
+    if (stream.controller) {
+      stream.controller.abort();
+      stream.controller = null;
+    }
+    this.clearStreamStallTimer(stream);
+    if (stream.reconnectTimer) {
+      clearTimeout(stream.reconnectTimer);
+      stream.reconnectTimer = null;
+    }
+    this.sseStreams.delete(directory);
+    appendDiagLog(`sse close dir=${directory}`);
+  }
+
+  /**
+   * @description Close every open directory stream (used on server restart
+   * before re-opening fresh ones). Iterates a snapshot of directories so
+   * deletion during the loop is safe.
+   */
+  private closeAllStreams(): void {
+    for (const directory of Array.from(this.sseStreams.keys())) {
+      this.closeDirectoryStream(directory);
+    }
+  }
+
+  /** Emit an event to every active session bound to `directory`. */
+  private emitToDirectorySessions(
+    directory: string,
+    eventName: 'error',
+    error: Error,
+  ): void {
+    for (const session of this.sessions.values()) {
+      if (session.isActive && session.workDir === directory) {
+        this.emit(eventName, session.key, error);
+      }
+    }
   }
 
   /**
@@ -1820,15 +1949,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Fetch-based SSE reader. OpenCode sends all events as `data:` lines
-   * with JSON payload { type, properties }. No `event:` field is used.
+   * @description Fetch-based SSE reader for ONE directory's `/event?directory=`
+   * stream (plan 2026-06-05 S5). OpenCode sends every event as a `data:` line
+   * with JSON payload { type, properties }; this stream carries only the
+   * directory instance's own events, so each line is parsed once here and
+   * routed to its owning session.
    *
-   * On connection failure: checks if server is alive, attempts restart if dead,
-   * retries forever with capped exponential backoff until reconnect succeeds.
+   * On connection failure: checks if the server is alive, attempts a restart if
+   * dead, and retries forever with capped exponential backoff until reconnect
+   * succeeds — as long as the stream is still wanted (not closed).
    */
-  private async pollSse(key: ThreadKey, sseUrl: string, reconnectAttempt = 0, reconnectStartTs = Date.now()): Promise<void> {
-    const session = this.sessions.get(keyToString(key));
-    if (!session?.isActive) return;
+  private async pollSseStream(stream: SseStreamState, sseUrl: string, reconnectAttempt = 0, reconnectStartTs = Date.now()): Promise<void> {
+    if (stream.isClosed) return;
+    const { directory } = stream;
 
     const headers: Record<string, string> = {
       'Accept': 'text/event-stream',
@@ -1838,12 +1971,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
 
     // Audit S7 / #12: SSE was previously read with no abort path —
-    // `await reader.read()` blocks until bytes arrive, so a `stopSession`
-    // during a silent server couldn't actually free the connection. The
-    // session-scoped controller is stored so `disconnectSse` / `stopSession`
-    // can abort the in-flight `fetch` and `reader.read` immediately.
+    // `await reader.read()` blocks until bytes arrive, so a teardown during a
+    // silent server couldn't actually free the connection. The stream-scoped
+    // controller is stored so `closeDirectoryStream` can abort the in-flight
+    // `fetch` and `reader.read` immediately.
     const controller = new AbortController();
-    session.sseController = controller;
+    stream.controller = controller;
 
     let sawData = false;
 
@@ -1851,14 +1984,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       const response = await fetch(sseUrl, { headers, signal: controller.signal });
 
       if (!response.ok || !response.body) {
-        console.error(`[OpenCode] SSE connection failed: ${response.status}`);
+        console.error(`[OpenCode] SSE connection failed for ${directory}: ${response.status}`);
         await response.body?.cancel().catch(() => {});
-        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, `HTTP ${response.status}`);
+        await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, `HTTP ${response.status}`);
         return;
       }
 
-      console.log(`[OpenCode] SSE connected successfully`);
-      appendDiagLog(`sse connected key=${keyToString(key)} attempt=${reconnectAttempt}`);
+      console.log(`[OpenCode] SSE connected for ${directory}`);
+      appendDiagLog(`sse connected dir=${directory} attempt=${reconnectAttempt}`);
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -1867,12 +2000,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // Arm the stall watchdog before the first read and re-arm on every chunk;
       // a silently dead stream (no bytes, not even a heartbeat) would otherwise
       // park `reader.read()` forever with no reconnect.
-      this.armSseStallWatchdog(session, key, controller);
+      this.armSseStallWatchdog(stream, controller);
 
-      while (session.isActive) {
+      while (!stream.isClosed) {
         const { done, value } = await reader.read();
         if (done) break;
-        this.armSseStallWatchdog(session, key, controller);
+        this.armSseStallWatchdog(stream, controller);
 
         // Audit S7 / #12: a flapping server used to reset `reconnectAttempt`
         // on a *successful TCP connect*, so the 5-attempts ceiling never
@@ -1883,7 +2016,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           sawData = true;
           reconnectAttempt = 0;
           reconnectStartTs = Date.now();
-          appendDiagLog(`sse first-data key=${keyToString(key)}`);
+          appendDiagLog(`sse first-data dir=${directory}`);
         }
 
         buffer += decoder.decode(value, { stream: true });
@@ -1894,84 +2027,84 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           if (!line.startsWith('data: ')) continue;
 
           const dataStr = line.slice(6);
-          this.handleSseData(key, dataStr);
+          this.routeSseData(directory, dataStr);
         }
       }
 
       // Leaving the read loop: disarm before any reconnect await so the
       // watchdog can't fire against this (now-finished) controller.
-      this.clearSseStallTimer(session);
+      this.clearStreamStallTimer(stream);
       reader.cancel().catch(() => {});
 
-      // If session is still active but stream ended (server-side close), try to reconnect
-      if (session.isActive) {
-        console.log(`[OpenCode] SSE stream ended while session active, reconnecting...`);
-        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, 'stream ended');
+      // If the stream is still wanted but the server closed it, reconnect.
+      if (!stream.isClosed) {
+        console.log(`[OpenCode] SSE stream for ${directory} ended while wanted, reconnecting...`);
+        await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, 'stream ended');
       }
     } catch (e) {
-      this.clearSseStallTimer(session);
-      // An aborted controller means either `stopSession`/`disconnectSse`
-      // (session no longer active → just exit) or the stall watchdog firing
-      // on a silently dead stream (session still active → reconnect).
+      this.clearStreamStallTimer(stream);
+      // An aborted controller means either `closeDirectoryStream` (stream no
+      // longer wanted → just exit) or the stall watchdog firing on a silently
+      // dead stream (stream still wanted → reconnect).
       if (controller.signal.aborted) {
-        if (session.isActive) {
-          await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, 'stall');
+        if (!stream.isClosed) {
+          await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, 'stall');
         }
         return;
       }
-      if (session.isActive) {
+      if (!stream.isClosed) {
         const errorMessage = e instanceof Error ? e.message : String(e);
-        console.error(`[OpenCode] SSE error:`, errorMessage);
-        await this.handleSseReconnect(key, sseUrl, reconnectAttempt, reconnectStartTs, errorMessage);
+        console.error(`[OpenCode] SSE error for ${directory}:`, errorMessage);
+        await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, errorMessage);
       }
     } finally {
-      this.clearSseStallTimer(session);
-      if (session.sseController === controller) session.sseController = null;
+      this.clearStreamStallTimer(stream);
+      if (stream.controller === controller) stream.controller = null;
     }
   }
 
   /**
-   * @description (Re)arm the SSE stall watchdog. OpenCode emits a
+   * @description (Re)arm a stream's stall watchdog. OpenCode emits a
    * `server.heartbeat` every ~10 s, so a live stream always delivers bytes
    * within `sseStallTimeoutMs`; if none arrive the socket is silently dead
-   * (open TCP, no FIN/RST) and `reader.read()` would park forever. Aborting
-   * the controller unblocks the reader so `pollSse`'s catch path reconnects.
+   * (open TCP, no FIN/RST) and `reader.read()` would park forever. Aborting the
+   * controller unblocks the reader so `pollSseStream`'s catch path reconnects.
    * Re-armed on every chunk, so heartbeats keep a healthy stream alive.
    */
-  private armSseStallWatchdog(session: OpenCodeSession, key: ThreadKey, controller: AbortController): void {
-    this.clearSseStallTimer(session);
-    session.sseStallTimer = setTimeout(() => {
-      session.sseStallTimer = null;
-      appendDiagLog(`sse stall key=${keyToString(key)} idle>${sseStallTimeoutMs}ms`);
+  private armSseStallWatchdog(stream: SseStreamState, controller: AbortController): void {
+    this.clearStreamStallTimer(stream);
+    stream.stallTimer = setTimeout(() => {
+      stream.stallTimer = null;
+      appendDiagLog(`sse stall dir=${stream.directory} idle>${sseStallTimeoutMs}ms`);
       controller.abort();
     }, sseStallTimeoutMs);
   }
 
-  /** Cancel the SSE stall watchdog if armed. Idempotent. */
-  private clearSseStallTimer(session: OpenCodeSession): void {
-    if (session.sseStallTimer) {
-      clearTimeout(session.sseStallTimer);
-      session.sseStallTimer = null;
+  /** Cancel a stream's stall watchdog if armed. Idempotent. */
+  private clearStreamStallTimer(stream: SseStreamState): void {
+    if (stream.stallTimer) {
+      clearTimeout(stream.stallTimer);
+      stream.stallTimer = null;
     }
   }
 
   /**
-   * @description Handle SSE reconnection with server health check, auto-restart, and exponential backoff.
-   * If the server is dead, attempts to restart it before reconnecting SSE.
-   * Never gives up while the session is active — reconnects until success —
-   * with the backoff capped at `maxSseReconnectDelayMs`. The only exits are an
-   * unrestartable server (handled by `restartServer`) or an inactive session.
+   * @description Handle SSE reconnection for a directory's stream with server
+   * health check, auto-restart, and exponential backoff. If the server is dead,
+   * attempts a restart before reconnecting. Never gives up while the stream is
+   * still wanted — reconnects until success — with backoff capped at
+   * `maxSseReconnectDelayMs`. The only exits are an unrestartable server
+   * (handled by `restartServer`) or a closed stream.
    */
   private async handleSseReconnect(
-    key: ThreadKey,
+    stream: SseStreamState,
     sseUrl: string,
     attempt: number,
     reconnectStartTs: number,
     reason: string,
   ): Promise<void> {
-    const k = keyToString(key);
-    const session = this.sessions.get(k);
-    if (!session?.isActive) return;
+    if (stream.isClosed) return;
+    const { directory } = stream;
 
     const elapsed = Date.now() - reconnectStartTs;
 
@@ -1985,50 +2118,54 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         // restartServer already notified threads and cleaned up sessions
         return;
       }
+      // restartServer re-opens streams for every still-active directory via the
+      // resume path; if this stream was torn down in the process, stop here so
+      // we don't double-open it.
+      if (stream.isClosed) return;
       // Server restarted — reset the attempt counter so backoff starts fresh.
       attempt = 0;
     }
 
-    // Never give up while the session is active: reconnect forever until
+    // Never give up while the stream is wanted: reconnect forever until
     // success. Cap the exponential backoff so steady-state retries settle at
     // `maxSseReconnectDelayMs` instead of growing without bound.
     const delay = Math.min(
       sseReconnectBaseDelayMs * Math.pow(2, Math.min(attempt, maxSseReconnectBackoffExponent)),
       maxSseReconnectDelayMs,
     );
-    console.log(`[OpenCode] SSE reconnecting in ${delay}ms (attempt ${attempt + 1}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
-    appendDiagLog(`sse reconnect attempt=${attempt + 1} reason=${reason} delay=${delay}ms`);
+    console.log(`[OpenCode] SSE reconnecting ${directory} in ${delay}ms (attempt ${attempt + 1}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
+    appendDiagLog(`sse reconnect dir=${directory} attempt=${attempt + 1} reason=${reason} delay=${delay}ms`);
 
-    // Store the timer handle on the session so `stopSession` / `disconnectSse`
-    // can cancel it; otherwise a `setTimeout` fired after the session is
-    // gone re-enters `pollSse` for a dead session and keeps the event
-    // loop alive (audit S8 / #14).
+    // Store the timer handle on the stream so `closeDirectoryStream` can cancel
+    // it; otherwise a `setTimeout` fired after the stream is gone re-enters
+    // `pollSseStream` for a dead stream and keeps the event loop alive (audit
+    // S8 / #14).
     await new Promise<void>(resolve => {
-      session.reconnectTimer = setTimeout(() => {
-        session.reconnectTimer = null;
+      stream.reconnectTimer = setTimeout(() => {
+        stream.reconnectTimer = null;
         resolve();
       }, delay);
     });
 
-    if (session.isActive) {
-      this.pollSse(key, sseUrl, attempt + 1, reconnectStartTs).catch(() => {});
+    if (!stream.isClosed) {
+      this.pollSseStream(stream, sseUrl, attempt + 1, reconnectStartTs).catch(() => {});
     }
   }
 
   /**
-   * @description Parse a single SSE data line. The JSON envelope is either
-   * { type, properties } or `/global/event`'s { payload: { type, properties } }.
+   * @description Route a single raw SSE `data:` line from a directory's stream
+   * (the live per-directory reader path, plan 2026-06-05 S5). The JSON is parsed
+   * ONCE here, the owning session is resolved from its sessionID/lineage, and
+   * the event is dispatched to that session. `streamDirectory` is the stream's
+   * own bound folder — passed through so instance-local replies
+   * (questions/permissions) target the right project instance even though the
+   * bare `/event` payload carries no `directory` field.
    *
-   * The OpenCode server multiplexes events for ALL sessions on one `/event` stream,
-   * so we filter by `sessionID` to dispatch only the ones belonging to this `key`.
-   * Note: every `ThreadKey` opens its own SSE connection to the server, so this
-   * filter is double-defence — even if the server ever changes its routing,
-   * we never deliver a cross-thread event by accident.
+   * Also the entry the SSE unit tests drive (a session injected into the map +
+   * synthesized event JSON for its own folder), so the real parse→route→dispatch
+   * path is exercised end to end.
    */
-  private handleSseData(key: ThreadKey, dataStr: string): void {
-    const session = this.sessions.get(keyToString(key));
-    if (!session?.isActive) return;
-
+  private routeSseData(streamDirectory: string, dataStr: string): void {
     let parsed: unknown;
     try {
       parsed = JSON.parse(dataStr);
@@ -2039,6 +2176,35 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const event = normaliseOpenCodeSseEvent(parsed);
     if (!event) return;
 
+    const ownerKeyStr = this.resolveSseEventOwner(event);
+    if (ownerKeyStr === undefined) return;
+
+    // The instance directory is the stream's own folder; the bare `/event`
+    // payload omits it, so a wrapped envelope's value (legacy/global) is only a
+    // fallback when present.
+    const directory = event.directory ?? streamDirectory;
+
+    if (ownerKeyStr === null) {
+      // Session-less event (server.connected / heartbeat) — no owner to look up.
+      this.dispatchSessionLessEvent(event);
+      return;
+    }
+
+    const ownerSession = this.sessions.get(ownerKeyStr);
+    if (!ownerSession?.isActive) return;
+    this.dispatchSseEvent(ownerSession.key, event, directory);
+  }
+
+  /**
+   * @description Resolve which thread (if any) should process `event`, applying
+   * the single-owner invariant (B20) and recording subagent lineage. Returns:
+   *   - the owning thread's serialised key for a per-session event;
+   *   - `null` for a session-less event (`server.connected`/`heartbeat`) that
+   *     every reader handles directly;
+   *   - `undefined` to signal "do not dispatch" (missing sessionID, or no bound
+   *     thread owns the session — a genuine drop, throttle-logged).
+   */
+  private resolveSseEventOwner(event: OpenCodeSseEvent): string | null | undefined {
     const eventType = event.type;
 
     // OpenCode runs subagents in CHILD sessions; their events carry the child
@@ -2050,46 +2216,61 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.trackSessionLineage(event.properties);
     }
 
-    // Filter events by session ID (SSE stream contains events for all sessions).
-    // Audit S5 / #6: the previous filter `if (eventSessionId &&
-    // eventSessionId !== session.sessionId) return` LET THROUGH events
-    // whose `eventSessionId` was null. For `permission.asked` and
-    // `question.asked`, whose payloads carry `requestID`/`id` but no
-    // `sessionID`, this meant every active thread's SSE handler processed
-    // the same global event — each POST'ing `reply: 'always'` and each
-    // emitting `question` to its own user. We now require sessionID for
-    // any event that mutates per-session state; events that are
-    // genuinely server-wide (server.connected, server.heartbeat) are
-    // session-less by design and handled separately.
+    // Session-less events are server-wide by design; they have no owner to
+    // resolve and are processed directly by the dispatch switch.
+    if (eventType === 'server.connected' || eventType === 'server.heartbeat') {
+      return null;
+    }
+
     const eventSessionId = this.getSessionIdFromEvent(event);
-    const sessionLessOk = eventType === 'server.connected' || eventType === 'server.heartbeat';
-    if (!sessionLessOk) {
-      if (!eventSessionId) {
-        console.warn(`[OpenCode] dropping ${eventType} without sessionID`);
-        return;
+    if (!eventSessionId) {
+      console.warn(`[OpenCode] dropping ${eventType} without sessionID`);
+      return undefined;
+    }
+
+    // Single-owner delivery (B20): resolve the ONE thread that owns
+    // `eventSessionId` (direct id match, else nearest lineage ancestor). A
+    // false lineage link or a duplicated session id must never emit the same
+    // answer to two topics.
+    const ownerKeyStr = this.resolveEventOwnerKey(eventSessionId);
+    if (ownerKeyStr === null) {
+      // A genuine loss is "no thread owns this event at all". Throttle the log
+      // per (eventType, eventSessionId) — an orphaned session's delta firehose
+      // would otherwise flood the diag file (B19).
+      if (criticalSseEventTypes.has(eventType)) {
+        this.logSseDropOncePerWindow(eventType, eventSessionId);
       }
-      // Single-owner delivery (B20): the server multiplexes EVERY session's
-      // events onto each thread's stream, so the same event reaches this
-      // handler once per bound thread. Resolve the ONE thread that owns
-      // `eventSessionId` (direct id match, else nearest lineage ancestor) and
-      // process it here only if THIS key is that owner — otherwise a false
-      // lineage link or a duplicated session id would emit the same answer to
-      // two topics.
-      const ownerKeyStr = this.resolveEventOwnerKey(eventSessionId);
-      if (ownerKeyStr !== keyToString(key)) {
-        // A genuine loss is "no thread owns this event at all". Log it at most
-        // once per (eventType, eventSessionId) window — the same no-owner verdict
-        // reaches every bound thread, so per-thread logging floods the diag file
-        // (B19). When ANOTHER thread owns it, this is the normal multiplex skip:
-        // stay silent (the owner will process it).
-        if (ownerKeyStr === null && criticalSseEventTypes.has(eventType)) {
-          this.logSseDropOncePerWindow(eventType, eventSessionId);
-        }
-        return;
-      }
-      if (eventSessionId !== session.sessionId) {
-        appendDiagLog(`sse route-descendant ${eventType} es=${eventSessionId} -> ${session.sessionId}`);
-      }
+      return undefined;
+    }
+    return ownerKeyStr;
+  }
+
+  /**
+   * @description Handle a session-less event (`server.connected` /
+   * `server.heartbeat`) — server-wide by design, with no owning topic. Kept
+   * separate from {@link dispatchSseEvent} so the latter always has a real
+   * owner key.
+   */
+  private dispatchSessionLessEvent(event: OpenCodeSseEvent): void {
+    if (event.type === 'server.connected') {
+      console.log(`[OpenCode] SSE: server.connected`);
+    }
+    // server.heartbeat is intentionally silent — it only re-arms the watchdog.
+  }
+
+  /**
+   * @description Dispatch a normalised, OWNED SSE event to its owning session's
+   * handlers. `key` is the resolved single owner (B20); `directory` is the
+   * owning project instance (the stream's folder), used for instance-scoped
+   * question / permission replies.
+   */
+  private dispatchSseEvent(key: ThreadKey, event: OpenCodeSseEvent, directory: string | undefined): void {
+    const eventType = event.type;
+    const eventSessionId = this.getSessionIdFromEvent(event);
+
+    const session = this.sessions.get(keyToString(key));
+    if (session?.isActive && eventSessionId && eventSessionId !== session.sessionId) {
+      appendDiagLog(`sse route-descendant ${eventType} es=${eventSessionId} -> ${session.sessionId}`);
     }
 
     switch (eventType) {
@@ -2124,15 +2305,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         break;
 
       case 'permission.asked':
-        this.handlePermissionAsked(key, event.properties, event.directory);
+        this.handlePermissionAsked(key, event.properties, directory);
         break;
 
       case 'question.asked':
-        this.handleQuestionAsked(key, event.properties, event.directory);
-        break;
-
-      case 'server.connected':
-        console.log(`[OpenCode] SSE: server.connected`);
+        this.handleQuestionAsked(key, event.properties, directory);
         break;
 
       default:
@@ -2221,10 +2398,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.statusDebounceTimer);
       session.statusDebounceTimer = null;
     }
-    if (session.reconnectTimer) {
-      clearTimeout(session.reconnectTimer);
-      session.reconnectTimer = null;
-    }
+    // Tear down the directory's SSE stream if this was its last active session.
     this.disconnectSse(key);
     this.sessions.delete(k);
     this.emit('stopped', key);

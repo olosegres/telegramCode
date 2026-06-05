@@ -10,7 +10,7 @@
  * Fix: track `lastEmittedLength` and emit only the unsent tail in both places.
  *
  * These tests drive the REAL adapter event path: synthesized SSE JSON is fed
- * through `handleSseData` (the same entry the live `/global/event` reader
+ * through `routeSseData` (the same entry the live per-directory `/event` reader
  * uses), `output` events (text + `meta`) are captured off the adapter
  * EventEmitter, and the 500ms debounce is advanced with `node:test` mock timers.
  *
@@ -30,6 +30,10 @@ import { keyToString, type OutputEventMeta, type ThreadKey } from '../types';
 const sseOutputBatchMs = 500;
 const ownSessionId = 'ses_own';
 const key: ThreadKey = { chatId: -100123, threadId: 42 };
+/** The injected session's bound folder — the stream directory `routeSseData`
+ * resolves the owner within. The events carry `ownSessionId`, so the owner is
+ * the injected session regardless of the directory string itself. */
+const workDir = '/tmp/work';
 
 /** Build a minimal-but-complete live session and inject it into the adapter. */
 function createAdapterWithSession(): {
@@ -41,7 +45,7 @@ function createAdapterWithSession(): {
   const session = {
     key,
     sessionId: ownSessionId,
-    workDir: '/tmp/work',
+    workDir,
     isActive: true,
     currentResponseText: '',
     lastEmittedLength: 0,
@@ -61,7 +65,7 @@ function createAdapterWithSession(): {
     reconnectTimer: null,
     sseStallTimer: null,
   };
-  // sessions / handleSseData are private; tests are excluded from tsconfig and
+  // sessions / routeSseData are private; tests are excluded from tsconfig and
   // run via tsx (type-stripping), so bracket access is runtime-only and does
   // not affect `yarn typecheck`.
   adapter['sessions'].set(keyToString(key), session);
@@ -77,8 +81,8 @@ function createAdapterWithSession(): {
 
 /** Feed one `message.part.delta` text event through the real SSE dispatcher. */
 function feedTextDelta(adapter: OpenCodeAdapter, delta: string): void {
-  adapter['handleSseData'](
-    key,
+  adapter['routeSseData'](
+    workDir,
     JSON.stringify({
       type: 'message.part.delta',
       properties: { sessionID: ownSessionId, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta },
@@ -88,8 +92,8 @@ function feedTextDelta(adapter: OpenCodeAdapter, delta: string): void {
 
 /** Feed a `session.idle` event (the second emit site, via flushOutput). */
 function feedSessionIdle(adapter: OpenCodeAdapter): void {
-  adapter['handleSseData'](
-    key,
+  adapter['routeSseData'](
+    workDir,
     JSON.stringify({
       type: 'session.idle',
       properties: { sessionID: ownSessionId },

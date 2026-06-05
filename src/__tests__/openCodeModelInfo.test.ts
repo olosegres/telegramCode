@@ -89,8 +89,8 @@ function createAdapterWithSession(): {
 
 /** Feed a `message.updated` assistant event through the real SSE dispatcher. */
 function feedAssistantMessage(adapter: OpenCodeAdapter, providerID: string, modelID: string): void {
-  adapter['handleSseData'](
-    key,
+  adapter['routeSseData'](
+    '/tmp/work',
     JSON.stringify({
       type: 'message.updated',
       properties: {

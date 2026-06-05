@@ -73,30 +73,21 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.outside_root': '❌ Путь выходит за пределы `WORK_ROOT`.',
     'bind.not_directory': '❌ `{subdir}` существует, но это не папка.',
 
-    // ── /ls /list /new (General-scoped) ──
+    // ── /ls /list (General-scoped) ──
     'ls.header': '📁 Подпапки `{workRoot}`:',
     'ls.empty': '📁 В `WORK_ROOT` нет подходящих подпапок.',
     'list.header': '🧵 Привязки тредов ({count}):',
     'list.empty': '🧵 Привязок ещё нет. Создай тред и напиши /bind.',
     'list.row': '• {threadId}: `{subdir}` · {agent} · {status}',
     'list.row_closed': '• {threadId}: `{subdir}` · {agent} · 🔒 closed',
-    'new.in_topic': '/new можно только в General — открой General и попробуй ещё раз.',
-    'new.usage':
-      'Использование: /new <thread-name> [subdir]\nПример: /new ovr-feature overview',
-    'new.created':
-      '✅ Создан тред `{name}` (id {threadId}), привязан к `{subdir}`.\nПерейди: {link}',
-    'new.created_unbound':
-      '✅ Создан тред `{name}` (id {threadId}).\nПривяжи папку: /bind в самом треде.\nПерейди: {link}',
-    'new.failed': '❌ Не удалось создать тред: {error}',
-    'new.bind_failed':
-      '⚠️ Тред создан, но автопривязка к `{subdir}` не удалась: {error}\nЗайди в тред и выполни /bind.',
+    'new.general_hint':
+      '/new работает внутри привязанного треда — открой тред и выполни /new, чтобы перезапустить сессию агента.',
 
     // ── /help context-aware ──
     'help.general':
       '*Команды в General:*\n' +
       '/ls — подпапки `WORK_ROOT`\n' +
       '/list — список тредов\n' +
-      '/new <name> [subdir] — создать тред\n' +
       '/where — общая сводка\n' +
       '/status — статус всех тредов\n' +
       '/stopall — остановить все агенты\n' +
@@ -110,6 +101,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_bound':
       '*Тред привязан к `{subdir}`.*\n' +
       '/claude /opencode — старт агента\n' +
+      '/new — перезапустить сессию (старая → /sessions)\n' +
       '/agent /model /sessions — выбор/переключение\n' +
       '/effort — уровень reasoning effort\n' +
       '/stop /status /output — контроль\n' +
@@ -359,30 +351,21 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.outside_root': '❌ Path escapes `WORK_ROOT`.',
     'bind.not_directory': '❌ `{subdir}` exists but is not a directory.',
 
-    // ── /ls /list /new (General-scoped) ──
+    // ── /ls /list (General-scoped) ──
     'ls.header': '📁 Subfolders of `{workRoot}`:',
     'ls.empty': '📁 No bindable subfolders under `WORK_ROOT`.',
     'list.header': '🧵 Thread bindings ({count}):',
     'list.empty': '🧵 No bindings yet. Create a thread and run /bind.',
     'list.row': '• {threadId}: `{subdir}` · {agent} · {status}',
     'list.row_closed': '• {threadId}: `{subdir}` · {agent} · 🔒 closed',
-    'new.in_topic': '/new only works in General — switch back to General and try again.',
-    'new.usage':
-      'Usage: /new <thread-name> [subdir]\nExample: /new ovr-feature overview',
-    'new.created':
-      '✅ Created thread `{name}` (id {threadId}), bound to `{subdir}`.\nOpen: {link}',
-    'new.created_unbound':
-      '✅ Created thread `{name}` (id {threadId}).\nBind a folder: /bind inside that thread.\nOpen: {link}',
-    'new.failed': '❌ Failed to create thread: {error}',
-    'new.bind_failed':
-      '⚠️ Thread created but auto-bind to `{subdir}` failed: {error}\nOpen the thread and run /bind.',
+    'new.general_hint':
+      '/new works inside a bound topic — open a thread and run /new to restart its agent session.',
 
     // ── /help context-aware ──
     'help.general':
       '*Commands in General:*\n' +
       '/ls — list `WORK_ROOT` subfolders\n' +
       '/list — list threads\n' +
-      '/new <name> [subdir] — create a thread\n' +
       '/where — global summary\n' +
       '/status — status of all threads\n' +
       '/stopall — stop every running agent\n' +
@@ -396,6 +379,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_bound':
       '*Thread bound to `{subdir}`.*\n' +
       '/claude /opencode — start an agent\n' +
+      '/new — restart the session (old one → /sessions)\n' +
       '/agent /model /sessions — choose/switch\n' +
       '/effort — reasoning-effort level\n' +
       '/stop /status /output — control\n' +

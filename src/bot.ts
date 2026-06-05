@@ -1716,6 +1716,20 @@ function stopAllAdaptersFor(key: ThreadKey, adapterNames?: string[]) {
 }
 
 /**
+ * @description Explicit-stop teardown shared by `/stop` and `/new`/`/clear_session`:
+ * sweep every adapter active for the thread, then RELEASE the persisted session
+ * ids (even when nothing was running) so a later bot restart won't auto-reattach
+ * and any half-dead state from a crash/SSE-giveup is cleared. The session stays
+ * on disk → still reachable via `/sessions`. Returns the sweep result so callers
+ * can decide what to reply.
+ */
+async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof stopAllAdaptersFor>> {
+  const result = stopAllAdaptersFor(key);
+  await state.clearAgentSessionIds(key);
+  return result;
+}
+
+/**
  * @description Switch a thread's adapter and clear the previous adapter's
  * persisted session id, so a later restart can't re-attach to the wrong
  * one. Audit S12 / #21: `setAgent({ name })` patched `agents[key].name`
@@ -2231,22 +2245,8 @@ command('where', async (_ctx, key) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  /ls /list /new — General-scoped info & creation (plan §11 Этап 4)
+//  /ls /list — General-scoped info (plan §11 Этап 4)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * @description Build the Telegram deeplink for a thread inside our private
- * supergroup. Format `https://t.me/c/<chatid_short>/<thread_id>/1` matches
- * what the official client uses; `chatid_short` is the chat id with the
- * `-100` supergroup prefix stripped.
- *
- * Telegram requires the trailing `/1` to land on the *first* message of the
- * topic; without it, clients sometimes open the chat root and lose context.
- */
-function makeThreadDeeplink(chatId: number, threadId: number): string {
-  const shortId = String(chatId).replace(/^-100/, '');
-  return `https://t.me/c/${shortId}/${threadId}/1`;
-}
 
 // `/ls` is intentionally available in topical threads too — there's no
 // security reason to refuse, and it's handy when the user wants to see
@@ -2341,70 +2341,35 @@ command('list', async (_ctx, key) => {
   );
 });
 
-command('new', async (ctx, key) => {
-  if (!checkIsGeneral(key)) {
-    await replyToThread(key, t('new.in_topic'));
+/**
+ * @description `/new` (alias `/clear_session`) — stop the thread's current agent
+ * session and immediately start a fresh one in the SAME topic with the SAME
+ * adapter. The old session is RELEASED (not deleted): its transcript stays on
+ * disk so it's still resumable via `/sessions`, but a bot restart won't
+ * auto-reattach it. Unlike `/stop` + `/claude`, this is one tap and keeps the
+ * thread's chosen backend.
+ *
+ * Guards mirror `handleStartCommand`: General has no binding/agent, so it just
+ * hints; an unbound topic gets the standard bind-required reply.
+ */
+command(['new', 'clear_session'], async (_ctx, key) => {
+  if (checkIsGeneral(key)) {
+    await replyToThread(key, t('new.general_hint'));
     return;
   }
-  const parts = ctx.message.text.trim().split(/\s+/).slice(1);
-  if (parts.length === 0) {
-    await replyToThread(key, t('new.usage'));
+  if (!state.getBinding(key)) {
+    await replyToThread(key, t('thread.bind_required'));
     return;
   }
-  const name = parts[0];
-  // When `subdir` is omitted, fall back to the thread name — same logic as
-  // `forum_topic_created` auto-bind, so `/new overview` and "create topic
-  // named overview manually" produce identical state.
-  const requestedSubdir = parts[1] ?? name;
-
-  let topic: { message_thread_id: number };
-  try {
-    topic = await bot.telegram.createForumTopic(key.chatId, name);
-  } catch (e) {
-    const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
-    await replyToThread(key, t('new.failed', { error: desc }));
-    return;
-  }
-
-  const newKey: ThreadKey = { chatId: key.chatId, threadId: topic.message_thread_id };
-  const link = makeThreadDeeplink(newKey.chatId, newKey.threadId);
-
-  // Audit S11 / #27: route through `applyBinding` so a user who creates
-  // a topic for an already-bound subdir gets the collision warning that
-  // `/bind` would surface. Going around it would silently join two
-  // threads to one workspace without acknowledgement.
-  // The bot created the topic, so its display name is known here — persist it
-  // on the binding for the thread-context preamble (S1).
-  const result = await applyBinding(newKey, requestedSubdir, { topicName: name });
-  if (result.ok) {
-    await replyToThread(
-      key,
-      t('new.created', { name, threadId: newKey.threadId, subdir: result.subdir, link }),
-      { parse_mode: 'Markdown' },
-    );
-    // First message in the new thread = the bind ack (which may be a
-    // collision warning). Mirror `forum_topic_created`'s welcome stack.
-    await replyToThread(newKey, result.message);
-    await sendBindingWelcome(newKey, result.subdir);
-    return;
-  }
-
-  // Bind failed — keep the thread, point the user at /bind.
-  if (parts.length >= 2) {
-    // User explicitly named a subdir → tell them why bind failed.
-    await replyToThread(key, t('new.bind_failed', { subdir: requestedSubdir, error: result.message }));
-  } else {
-    // Implicit subdir (= thread name) didn't match a folder; that's normal
-    // for ad-hoc topic names, just point at /bind.
-    await replyToThread(
-      key,
-      t('new.created_unbound', { name, threadId: newKey.threadId, link }),
-      { parse_mode: 'Markdown' },
-    );
-  }
-  const subdirs = listAvailableSubdirs(ENV.workRoot);
-  const extra = subdirs.length > 0 ? buildBindKeyboard(subdirs) : undefined;
-  await replyToThread(newKey, t('thread.welcome_pick'), extra);
+  // Release the current session the same way `/stop` does (sweep + clear ids).
+  // The fresh start below uses the thread's current adapter, so we keep the
+  // adapter selection untouched.
+  await releaseThreadSession(key);
+  // `startAgentSession` handles startup buffering, the typing indicator, the
+  // preamble-marker reset, and sends its own `agent.ready` — no extra "started"
+  // notice here to avoid double-posting.
+  const msg = await startAgentSession(key);
+  await replyToThread(key, msg);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3212,12 +3177,9 @@ command('stop', async (_ctx, key) => {
   // Sweep every adapter, not just the one the in-memory map currently
   // points at — keeps `/stop` working when state and reality have drifted
   // apart (a previous switch left a live session on the other adapter).
-  const { stopped, attempted } = stopAllAdaptersFor(key);
-  // Explicit stop = release the session for good: wipe the persisted ids
-  // unconditionally (even when nothing was running) so a later bot restart
-  // won't auto-reattach, and so half-dead state from a crash/SSE-giveup is
-  // cleared too.
-  await state.clearAgentSessionIds(key);
+  // `releaseThreadSession` also wipes the persisted ids unconditionally so a
+  // later bot restart won't auto-reattach and half-dead state is cleared.
+  const { stopped, attempted } = await releaseThreadSession(key);
   if (attempted === 0) {
     await replyToThread(key, 'No agent running');
     return;
@@ -3506,7 +3468,7 @@ command('clear_messages', async (ctx, key) => {
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
-  'bind', 'unbind', 'where', 'ls', 'list', 'new', 'whoami', 'version', 'help',
+  'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session',
 ]);
 
@@ -4864,10 +4826,11 @@ const COMMANDS_MENU = [
   { command: 'where', description: '📍 Show current binding' },
   { command: 'ls', description: '📂 List WORK_ROOT subfolders' },
   { command: 'list', description: '🧵 List all bound threads' },
-  { command: 'new', description: '🆕 Create a new thread (General)' },
   { command: 'mcp', description: '🔌 List active MCP servers' },
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
+  { command: 'new', description: '🆕 Restart session (alias /clear_session)' },
+  { command: 'clear_session', description: '🆕 Restart session (alias /new)' },
   { command: 'model', description: '🧠 Switch model' },
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'agent', description: '🔄 Choose agent' },

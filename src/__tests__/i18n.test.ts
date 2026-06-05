@@ -53,6 +53,19 @@ test('thread.bind_required resolves in ru (not the bare-code fallback) and names
   assert.ok(out.includes('/bind'), `expected "/bind" in "${out}"`);
 });
 
+test('new.general_hint exists in every locale and names /new', () => {
+  assert.ok(checkKeyInAllLangs('new.general_hint'), 'new.general_hint missing in some locale');
+  const out = t('new.general_hint');
+  assert.ok(out.includes('/new'), `expected "/new" in "${out}"`);
+});
+
+test('retired topic-creation keys are gone from both locales', () => {
+  // The old /new created a forum topic; its keys must not linger as orphans.
+  for (const code of ['new.in_topic', 'new.usage', 'new.created', 'new.created_unbound', 'new.failed', 'new.bind_failed']) {
+    assert.ok(!checkKeyInAllLangs(code), `retired key still present: ${code}`);
+  }
+});
+
 test('file intake keys exist in every locale', () => {
   assert.ok(checkKeyInAllLangs('file.too_big'), 'file.too_big missing in some locale');
   assert.ok(checkKeyInAllLangs('file.download_failed'), 'file.download_failed missing in some locale');

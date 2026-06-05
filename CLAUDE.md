@@ -79,7 +79,7 @@ config/variants, not a per-message API field).
   choke point). Rides the next prompt only when it changed since last sent —
   per-thread in-memory marker, reset on session start/stop/closed and on
   forwarding a bare `/clear`. Topic name comes from `forum_topic_created` /
-  `_edited` / `/new` (persisted on the binding); the group title from an
+  `_edited` (persisted on the binding); the group title from an
   in-memory cache fed by authorised updates. Slash commands skip the preamble.
 - **File intake.** A file sent to a bound, agent-active topic (photo,
   document incl. PDF, video, video_note, audio, animation) is downloaded into
@@ -148,9 +148,18 @@ as a command in `bot.ts`.
 
 ## Commands (all registered in `bot.ts`)
 
-- **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/stop`, `/stop-all`,
-  `/quit` (`/q`), `/sessions` (`/resume`), `/rename_session`, `/cancel`,
-  `/clear_messages`, `/compact`
+- **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/new`
+  (`/clear_session`), `/stop`, `/stop-all`, `/quit` (`/q`), `/sessions`
+  (`/resume`), `/rename_session`, `/cancel`, `/clear_messages`, `/compact`
+  - `/new` (alias `/clear_session`) stops the thread's current agent session
+    and immediately starts a fresh one in the SAME topic with the SAME adapter.
+    The old session is **released, not deleted** (its transcript stays on disk
+    → still resumable via `/sessions`; a bot restart won't auto-reattach it).
+    Reuses the `/stop` release path (`releaseThreadSession`) then
+    `startAgentSession` (so it carries startup buffering, typing indicator,
+    preamble-marker reset, and the single `agent.ready` notice). Unbound topic →
+    bind-required reply; General → a hint that `/new` works inside a bound topic.
+    It no longer creates a forum topic (that behavior was removed).
   - `/clear_messages` (formerly `/clear`) deletes this thread's Telegram
     messages (up to 48h, Telegram limit). The bare `/clear` is **no longer
     bot-owned** — it's forwarded verbatim to the agent like `/compact` (Claude
@@ -188,7 +197,7 @@ as a command in `bot.ts`.
     "not supported". No args → usage hint; no active session → "start an agent
     first".
 - **Binding & navigation:** `/bind`, `/unbind`, `/where`, `/ls`, `/list`,
-  `/new`, `/pair`
+  `/pair`
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw
   TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
   - While a Claude TUI selector is on screen (`isQuestionPending`), a bare

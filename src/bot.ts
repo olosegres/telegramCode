@@ -28,7 +28,7 @@ import { keyToString, keyFromString } from './types';
 // booting Telegraf (audit S19 / #25).
 import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
 import { checkSessionPickAction } from './sessionPick';
-import { ClaudeCliAdapter } from './adapters/claudeCliAdapter';
+import { ClaudeCliAdapter, checkIsSelectorControlReply } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
   enqueueSend,
@@ -3636,6 +3636,19 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
+  // Claude TUI selector on screen + a bare control reply (option digit or
+  // y/n) → drive the selector in place. Forwarding it as a prompt would first
+  // send Escape (interruptAndWaitIdle) and cancel the menu — live-caught with
+  // /login: the user replied "1" and got "⎿ Login interrupted". sendInput
+  // types the digit + an instant Enter (short-control path), which jumps the
+  // selector to that option and confirms it. Only an on-screen selector
+  // (isQuestionPending) arms this — a normal "1" prompt is never hijacked.
+  if (adapter.isQuestionPending?.(key) && checkIsSelectorControlReply(text)) {
+    markNeedsNewMessage(key);
+    adapter.sendInput(key, text);
+    return;
+  }
+
   // Forward text to a running agent. Every user message is treated as a fresh
   // turn: forwardPromptToAgent interrupts the current turn for TUI backends
   // (cancelling any on-screen selector and breaking Claude out of the busy
@@ -3643,7 +3656,8 @@ bot.on(message('text'), async (ctx) => {
   // behind the current turn — EXCEPT while a sub-agent runs or context is
   // compacting, where it deliberately does NOT interrupt and lets the message
   // queue. Deliberately driving a selector in place is still available via the
-  // explicit /up /down /enter /y /n /c keys.
+  // explicit /up /down /enter /y /n /c keys, and a bare digit / y / n while a
+  // selector is on screen is routed to it above.
   if (adapter.checkIsActive(key)) {
     // A bare `/clear` forwarded to the agent wipes its context (Claude TUI),
     // so the next prompt must re-carry the thread-context preamble. Reset the

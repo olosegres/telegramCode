@@ -171,6 +171,14 @@ as a command in `bot.ts`.
   `/new`, `/pair`
 - **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw
   TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
+  - While a Claude TUI selector is on screen (`isQuestionPending`), a bare
+    digit / `y` / `n` reply drives the menu in place (`sendInput`, no
+    interrupt Escape); any other text breaks out as a fresh prompt. Pre-fix
+    the digit was forwarded as a prompt and its Escape cancelled the menu
+    ("Login interrupted").
+  - `/model` picked with NO running session persists as the thread pref and
+    applies on the next agent start (OpenCode; Claude refuses — its model
+    switch is a TUI keystroke with nothing to persist).
   - `/effort` sets per-thread reasoning effort and offers tappable inline
     buttons (one per available level). **Two backends differ:** Claude has a
     native `/effort <level>` slash command (typed into the TUI; canonical set

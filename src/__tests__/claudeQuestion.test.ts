@@ -195,6 +195,24 @@ test('non-question text returns null', () => {
   assert.equal(extractClaudeQuestion(''), null);
 });
 
+// The real /login method selector as scraped live (2026-06-05). Detection is
+// what arms `isQuestionPending`, which in turn lets a bare digit reply drive
+// the menu in place — pre-fix the "1" was forwarded as a prompt, whose
+// interrupt Escape cancelled the menu ("⎿ Login interrupted").
+test('the /login method menu is detected as a question (digit-reply armed)', () => {
+  const loginMenu = [
+    'Select login method:',
+    '',
+    '❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise',
+    '  2. Anthropic Console account · API usage billing',
+  ].join('\n');
+  const q = extractClaudeQuestion(loginMenu)!;
+  assert.ok(q);
+  assert.match(q.text, /Select login method:/);
+  assert.match(q.text, /❯ 1\. Claude account with subscription/);
+  assert.match(q.text, /2\. Anthropic Console account/);
+});
+
 // ── Selector reply routing (break-out vs drive-in-place) ──
 //
 // While a selector is on screen, only a bare option number or a single y/n

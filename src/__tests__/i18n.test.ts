@@ -132,6 +132,28 @@ test('bind.create_failed substitutes the {error}', () => {
   assert.ok(!out.includes('{error}'), `placeholder not substituted: "${out}"`);
 });
 
+test('trace toggle keys exist in every locale', () => {
+  for (const code of [
+    'trace.onThisThreadReply',
+    'trace.offThisThreadReply',
+    'trace.onAllThreadsReply',
+    'trace.offAllThreadsReply',
+    'trace.statusReply',
+    'trace.statusOnLabel',
+    'trace.statusOffLabel',
+    'trace.usageHint',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('trace.statusReply substitutes thisThread/allThreads/count placeholders', () => {
+  const out = t('trace.statusReply', { thisThread: 'on', allThreads: 'off', count: 3 });
+  assert.ok(out.includes('3'), `expected count in "${out}"`);
+  assert.ok(!out.includes('{thisThread}') && !out.includes('{allThreads}') && !out.includes('{count}'),
+    `placeholders not substituted: "${out}"`);
+});
+
 test('t falls back to last code segment for unknown key', () => {
   const out = t('nonexistent.key.path');
   assert.equal(out, 'path');

@@ -66,7 +66,13 @@ import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
-import { installCallApiTrace, traceAgentEmit, traceRecvUpdate } from './outputTrace';
+import {
+  flushTraceBufferSyncOnExit,
+  installCallApiTrace,
+  setTraceConfig,
+  traceAgentEmit,
+  traceRecvUpdate,
+} from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import { getBindGateDecision } from './utils/bindGateDecision';
@@ -203,10 +209,13 @@ const telegramAgent = new https.Agent({
 });
 const bot = new Telegraf(ENV.botToken, { telegram: { agent: telegramAgent } });
 
-// Output-trace special mode (`OUTPUT_TRACE=1`): record every outgoing Bot API
-// call with its outcome at the single `callApi` chokepoint. Installed
-// unconditionally — when the mode is off each call costs one env check.
+// Output-trace mode (toggled at runtime via `/trace`): record every outgoing
+// Bot API call with its outcome at the single `callApi` chokepoint. Installed
+// unconditionally — when tracing is off each call costs one boolean check.
+// The buffered writer is flushed synchronously on process exit so the final
+// window is not lost on shutdown.
 installCallApiTrace(bot.telegram);
+process.on('exit', flushTraceBufferSyncOnExit);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Access control — who may talk to the agent
@@ -3494,6 +3503,71 @@ command('output', async (_ctx, key) => {
 });
 
 /**
+ * @description `/trace` — toggle the output-trace recorder at runtime.
+ *
+ *   /trace on        → trace THIS topic's events
+ *   /trace off       → stop tracing this topic
+ *   /trace on all    → trace every thread (cross-thread forensics)
+ *   /trace off all   → clear the all-threads flag AND the per-thread set
+ *   /trace           → status: this thread on/off, all-flag, traced count
+ *
+ * Replaces the boot-time `OUTPUT_TRACE` env var. The toggle is persisted in
+ * `state.json` and re-seeded into `outputTrace.ts` at boot, so a `/trace`
+ * setting survives a hot rebuild mid-debug. Lifecycle-independent: nothing in
+ * the session lifecycle (stop, /new, /quit, resume, /unbind) touches it.
+ */
+command('trace', async (ctx, key) => {
+  const args = ctx.message.text.split(' ').slice(1).map(a => a.toLowerCase()).filter(Boolean);
+  const config = state.getTraceConfig();
+  const keyStr = keyToString(key);
+
+  // Bare `/trace` — status only.
+  if (args.length === 0) {
+    const onLabel = t('trace.statusOnLabel');
+    const offLabel = t('trace.statusOffLabel');
+    const isThisThreadOn = config.allThreads || config.threadKeys.includes(keyStr);
+    await replyToThread(key, t('trace.statusReply', {
+      thisThread: isThisThreadOn ? onLabel : offLabel,
+      allThreads: config.allThreads ? onLabel : offLabel,
+      count: config.threadKeys.length,
+    }));
+    return;
+  }
+
+  const [action, scope] = args;
+  const isAllScope = scope === 'all';
+  if ((action !== 'on' && action !== 'off') || (scope !== undefined && !isAllScope)) {
+    await replyToThread(key, t('trace.usageHint'));
+    return;
+  }
+
+  let nextConfig: { allThreads: boolean; threadKeys: string[] };
+  let reply: string;
+  if (action === 'on' && isAllScope) {
+    nextConfig = { allThreads: true, threadKeys: config.threadKeys };
+    reply = t('trace.onAllThreadsReply');
+  } else if (action === 'off' && isAllScope) {
+    nextConfig = { allThreads: false, threadKeys: [] };
+    reply = t('trace.offAllThreadsReply');
+  } else if (action === 'on') {
+    nextConfig = { allThreads: config.allThreads, threadKeys: [...config.threadKeys, keyStr] };
+    reply = t('trace.onThisThreadReply');
+  } else {
+    nextConfig = {
+      allThreads: config.allThreads,
+      threadKeys: config.threadKeys.filter(k => k !== keyStr),
+    };
+    reply = t('trace.offThisThreadReply');
+  }
+
+  // Persist first, then seed the in-memory writer from the normalised config so
+  // the two never drift (the store dedups/sorts the thread keys).
+  await state.setTraceConfig(nextConfig);
+  setTraceConfig(state.getTraceConfig());
+  await replyToThread(key, reply);
+});
+
+/**
  * @description `/clear` — delete the bot's messages in this thread.
  *
  * Plan §11 Этап 3 / §13.20 (T6):
@@ -3574,7 +3648,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
-  'doctor', 'mcp', 'rename_session',
+  'doctor', 'mcp', 'rename_session', 'trace',
 ]);
 
 /**
@@ -5142,6 +5216,10 @@ export async function startBot(): Promise<void> {
   // 1. State store.
   state = await getStateStore();
   console.log(`Data dir:         ${path.dirname(state.stateFilePath)}`);
+
+  // Seed the output-trace toggle from persisted state so a `/trace` setting
+  // survives a hot rebuild mid-debug (the writer state lives in outputTrace.ts).
+  setTraceConfig(state.getTraceConfig());
 
   // 1.5. Boot classification — hot reload vs cold start. Read the gap to
   //      the last persisted heartbeat BEFORE we stamp a fresh one

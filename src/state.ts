@@ -120,6 +120,16 @@ export interface StateV1 {
    * conservative default we want.
    */
   lastHeartbeatAt?: number;
+  /**
+   * Output-trace toggle (`/trace`). `tracedThreads` holds the {@link ThreadKey}
+   * strings explicitly opted into tracing; `traceAllThreads` traces every
+   * thread (cross-thread forensics). Persisted so the toggle survives a hot
+   * rebuild mid-debug — the writer state in `outputTrace.ts` is re-seeded from
+   * these at boot. Both optional (absent = OFF) so older state files stay valid.
+   * Lifecycle-independent: only `/trace` mutates them, never session teardown.
+   */
+  tracedThreads?: string[];
+  traceAllThreads?: boolean;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -785,6 +795,37 @@ export class StateStore {
   async setPairedGroupId(groupId: number): Promise<void> {
     this.state.pairedGroupId = groupId;
     await this.flush();
+  }
+
+  // ── output-trace toggle (`/trace`) ──
+
+  /**
+   * @description Current persisted trace toggle. `threadKeys` are the
+   * {@link ThreadKey} strings opted into tracing; `allThreads` traces
+   * everything. Both default empty/false on a fresh or pre-feature state file.
+   * Read at boot to seed `outputTrace.ts`.
+   */
+  getTraceConfig(): { allThreads: boolean; threadKeys: string[] } {
+    return {
+      allThreads: this.state.traceAllThreads ?? false,
+      threadKeys: this.state.tracedThreads?.slice() ?? [],
+    };
+  }
+
+  /**
+   * @description Persist the trace toggle. Not crash-critical (a debug aid), so
+   * it rides the debounced save loop rather than an immediate `flush()`. The
+   * `tracedThreads` array is normalised to a deduped, sorted form so the
+   * on-disk shape is stable across toggles. Empty/false fields are dropped so
+   * an OFF state leaves a clean `state.json`.
+   */
+  async setTraceConfig(config: { allThreads: boolean; threadKeys: string[] }): Promise<void> {
+    const uniqueKeys = [...new Set(config.threadKeys)].sort();
+    if (uniqueKeys.length > 0) this.state.tracedThreads = uniqueKeys;
+    else delete this.state.tracedThreads;
+    if (config.allThreads) this.state.traceAllThreads = true;
+    else delete this.state.traceAllThreads;
+    this.scheduleSave();
   }
 
   // ── persistence ──

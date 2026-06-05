@@ -131,7 +131,7 @@ config/variants, not a per-message API field).
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
-| `outputTrace.ts` | Output-trace special mode (`OUTPUT_TRACE=1`): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram |
+| `outputTrace.ts` | Output-trace mode, toggled at runtime via `/trace` (no env var): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram. The toggle (`tracedThreads` set + `traceAllThreads` flag) is persisted in `state.json` and re-seeded at boot; an async-buffered, single-flight writer flushes on a 500ms timer / 200-entry threshold (sync flush on process exit). OFF by default → one boolean check per hook. Filtering: `recv`/`emit`/send-with-thread-id record iff the thread is traced (all-flag or in the set); send records with NO derivable thread id (e.g. `editMessageText`) record whenever ANY tracing is active |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `utils/pollBackoff.ts` | Pure adaptive poll cadence: `getNextPollDelay` (300ms while the pane changes → ×2 up to 1.5s after 10 unchanged polls; any write/change snaps back) |
@@ -232,7 +232,12 @@ as a command in `bot.ts`.
     prompt request (no env configuration). See plan
     `agent/tasks/completed/2026-05-31-effort-buttons-both-backends.md`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
-  `/doctor`, `/mcp`
+  `/doctor`, `/mcp`, `/trace`
+  - `/trace on|off` toggles the output-trace recorder for THIS topic; `/trace
+    on all` / `/trace off all` flips the every-thread flag (and `off all`
+    clears the per-thread set too); bare `/trace` reports status. Persisted in
+    `state.json`, lifecycle-independent (session stop/new/quit/resume/unbind
+    never touch it). Replaces the retired boot-time `OUTPUT_TRACE` env var.
 
 When adding a command, follow the existing pattern: register via the
 group-gated `command()` wrapper in `bot.ts`, put user-facing text in `i18n.ts`,
@@ -277,10 +282,13 @@ per-backend, persisted agent setting.
   live agent sessions. (User instruction, 2026-06-04.)
 
 - **For send-path / responsiveness / ordering verification, enable the
-  output-trace mode** (`OUTPUT_TRACE=1` in the instance `.env`, hot-restart
-  picks it up) and assert against `DATA_DIR/output-trace.jsonl`, not just
-  `get_history`: recv→sendOk latency per command, `sendErr` 429s with
-  `retryAfterSec`, emit-vs-sendOk order per topic.
+  output-trace mode** at runtime: send `/trace on` in the topic under test
+  (or `/trace on all` for cross-thread forensics), then assert against
+  `DATA_DIR/output-trace.jsonl`, not just `get_history`: recv→sendOk latency
+  per command, `sendErr` 429s with `retryAfterSec`, emit-vs-sendOk order per
+  topic. `/trace off` (or `/trace off all`) stops it; `/trace` reports status.
+  The toggle is persisted in `state.json`, so it survives a hot rebuild
+  mid-debug — no `.env` edit, no restart.
 
 - **`OpenCode error: Invalid authentication credentials` → restart the OpenCode
   server** (the `opencode serve` process on port 4096) — its provider credentials

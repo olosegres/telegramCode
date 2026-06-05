@@ -327,6 +327,17 @@ const dict: Record<Lang, Record<string, string>> = {
     'resume.context_header': '↩️ Возобновлено — последние {count} сообщений:',
     'resume.context_user_label': '👤',
     'resume.context_assistant_label': '🤖',
+
+    // ── output-trace toggle (/trace). {count}=кол-во тредов в трейсе ──
+    'trace.onThisThreadReply': '🔎 Трейс включён для этого треда.',
+    'trace.offThisThreadReply': '🔎 Трейс выключен для этого треда.',
+    'trace.onAllThreadsReply': '🔎 Трейс включён для ВСЕХ тредов.',
+    'trace.offAllThreadsReply': '🔎 Трейс выключен везде (флаг «all» и список тредов очищены).',
+    'trace.statusReply':
+      '🔎 Трейс — этот тред: {thisThread}\nВсе треды: {allThreads}\nТредов в трейсе: {count}',
+    'trace.statusOnLabel': 'вкл',
+    'trace.statusOffLabel': 'выкл',
+    'trace.usageHint': 'Использование: /trace on | off | on all | off all | (без аргумента — статус)',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -606,6 +617,17 @@ const dict: Record<Lang, Record<string, string>> = {
     'resume.context_header': '↩️ Resumed — last {count} messages:',
     'resume.context_user_label': '👤',
     'resume.context_assistant_label': '🤖',
+
+    // ── output-trace toggle (/trace). {count}=number of traced threads ──
+    'trace.onThisThreadReply': '🔎 Tracing enabled for this thread.',
+    'trace.offThisThreadReply': '🔎 Tracing disabled for this thread.',
+    'trace.onAllThreadsReply': '🔎 Tracing enabled for ALL threads.',
+    'trace.offAllThreadsReply': '🔎 Tracing disabled everywhere (the «all» flag and the thread list are cleared).',
+    'trace.statusReply':
+      '🔎 Trace — this thread: {thisThread}\nAll threads: {allThreads}\nTraced threads: {count}',
+    'trace.statusOnLabel': 'on',
+    'trace.statusOffLabel': 'off',
+    'trace.usageHint': 'Usage: /trace on | off | on all | off all | (no arg — status)',
   },
 };
 

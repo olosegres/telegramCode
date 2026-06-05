@@ -358,3 +358,54 @@ test('setBindingTopicName: no-op when the binding does not exist (no dangling ro
   await store.setBindingTopicName(key1, 'orphan');
   assert.equal(store.getBinding(key1), null, 'must not create a binding row');
 });
+
+// ── output-trace toggle (/trace) ──
+
+test('traceConfig: defaults to off/empty on a fresh state file', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  assert.deepEqual(store.getTraceConfig(), { allThreads: false, threadKeys: [] });
+});
+
+test('traceConfig: set → get round-trips and survives a reload from disk', async () => {
+  const keyStr = `${key1.chatId}:${key1.threadId}`;
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setTraceConfig({ allThreads: false, threadKeys: [keyStr] });
+  assert.deepEqual(first.getTraceConfig(), { allThreads: false, threadKeys: [keyStr] });
+  await first.flush();
+
+  // The whole point of persisting the toggle: a hot rebuild mid-debug must
+  // re-seed the SAME traced threads, or the trace silently turns off.
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.deepEqual(second.getTraceConfig(), { allThreads: false, threadKeys: [keyStr] });
+});
+
+test('traceConfig: the all-flag persists and reloads', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setTraceConfig({ allThreads: true, threadKeys: [] });
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getTraceConfig().allThreads, true);
+});
+
+test('traceConfig: dedups + sorts thread keys and drops empty/false fields on disk', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTraceConfig({ allThreads: false, threadKeys: ['-1:2', '-1:1', '-1:2'] });
+  assert.deepEqual(store.getTraceConfig().threadKeys, ['-1:1', '-1:2'], 'deduped + sorted');
+  await store.flush();
+  const rawOn = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal('traceAllThreads' in rawOn, false, 'false all-flag must be absent on disk');
+
+  // Turning everything off must leave a clean state file (no empty array, no flag).
+  await store.setTraceConfig({ allThreads: false, threadKeys: [] });
+  await store.flush();
+  const rawOff = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal('tracedThreads' in rawOff, false, 'empty thread list must be absent on disk');
+  assert.equal('traceAllThreads' in rawOff, false, 'off all-flag must be absent on disk');
+});

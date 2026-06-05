@@ -15,10 +15,14 @@ agent's output back into the topic.
 **Core mental model — the bot is a proxy/relay.** Most commands are *forwarded*
 to the agent rather than handled locally:
 
-- **Claude Code** runs as an interactive TUI inside `tmux`, spawned via
-  `node-pty`. The bot drives it by **writing keystrokes / slash commands**
-  into the pty (e.g. `/model …`, `/clear`, arrow keys, Enter) and scrapes the
-  rendered terminal output. There is no API — it is screen-driving.
+- **Claude Code** runs as an interactive TUI inside `tmux`. The bot drives it
+  by **writing keystrokes / slash commands** into the pane via `tmux send-keys`
+  (e.g. `/model …`, `/clear`, arrow keys, Enter) and scrapes the rendered
+  terminal output with adaptive `capture-pane` polling (300ms while the pane
+  changes, backing off to 1.5s when it doesn't; an unchanged frame is skipped
+  without any parsing). There is no API — it is screen-driving.
+  `CLAUDE_SCRAPE_DEBUG=1` logs full RAW/FILTERED scrape chunks (default:
+  one-line size summaries).
 - **OpenCode** runs as a local HTTP server. The bot talks to it over
   **HTTP + SSE**: it POSTs prompts to `/session/:id/prompt_async` (with a
   `model: {providerID, modelID}` override) and consumes the `/global/event`
@@ -130,6 +134,7 @@ config/variants, not a per-message API field).
 | `outputTrace.ts` | Output-trace special mode (`OUTPUT_TRACE=1`): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
+| `utils/pollBackoff.ts` | Pure adaptive poll cadence: `getNextPollDelay` (300ms while the pane changes → ×2 up to 1.5s after 10 unchanged polls; any write/change snaps back) |
 | `types.ts` | Shared types incl. the `AgentAdapter` contract and `ThreadKey` |
 
 ### Adapters (`src/adapters/`) — the proxy boundary
@@ -137,7 +142,7 @@ config/variants, not a per-message API field).
 | File | Responsibility |
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
-| `claudeCliAdapter.ts` | Claude Code via `tmux` + `node-pty` (keystroke driving, output scraping) |
+| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping) |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts, stream `/global/event`) |
 
 The `AgentAdapter` interface (in `types.ts`) is the seam. Per-backend agent

@@ -16,6 +16,7 @@ import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
+import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -89,20 +90,44 @@ interface ClaudeSession {
   resumeSeedPolls: number;
   /** Pane content seen on the previous seeding poll, for the "unchanged across 2 polls" exit. */
   resumeSeedPrevContent: string;
+  /**
+   * Raw `capture-pane` text from the previous poll. When the new capture is
+   * byte-identical we skip `cleanOutput` entirely (S1) — identical raw ⇒
+   * identical cleaned content, so the ~15-regex parse is pure wasted work on
+   * an idle pane. Reset wherever {@link lastContent} resets.
+   */
+  lastRawCapture: string;
+  /**
+   * Current poll delay in ms (S2 adaptive backoff). Starts at
+   * {@link basePollIntervalMs}; {@link getNextPollDelay} grows it toward
+   * {@link maxPollIntervalMs} while the pane stays unchanged and snaps it back
+   * to base on any change or explicit write (see {@link resetPollCadence}).
+   */
+  currentPollDelayMs: number;
+  /** Consecutive unchanged polls — drives {@link getNextPollDelay}'s backoff. */
+  unchangedPollStreak: number;
 }
-
-const pollInterval = 300;
 
 /**
  * @description Hard cap on resume flood-suppression polls. The normal exit is
  * "pane non-empty and unchanged across 2 consecutive polls" (the restored
  * transcript finished painting), but if the paint stutters indefinitely we
- * force-exit after this many polls (≈ {@link pollInterval} × this) so seeding
+ * force-exit after this many polls (≈ {@link basePollIntervalMs} × this) so seeding
  * can never wedge a session into permanent silence. See {@link getResumeSeedDecision}.
  */
 const resumeSeedMaxPolls = 40;
 
 const claudePath = resolveClaudeBinary();
+
+/**
+ * @description When set (`CLAUDE_SCRAPE_DEBUG=1`), the poll loop logs the FULL
+ * RAW and FILTERED chunk bodies — a forensic dump useful when debugging the
+ * scrape pipeline. Default OFF: those two sync stdout writes per changed poll
+ * (up to ~600KB each under load) were starving the event loop in prod, so we
+ * log only one-line size summaries instead. Read once at module init like the
+ * other env flags in the codebase (see `outputTrace.ts`).
+ */
+const isClaudeScrapeDebugEnabled = process.env.CLAUDE_SCRAPE_DEBUG === '1';
 
 /**
  * @description Max number of `.jsonl` transcripts to parse per folder.
@@ -1686,6 +1711,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'resumeSeeding'
       | 'resumeSeedPolls'
       | 'resumeSeedPrevContent'
+      | 'lastRawCapture'
+      | 'currentPollDelayMs'
+      | 'unchangedPollStreak'
     >,
   ): ClaudeSession {
     return {
@@ -1705,6 +1733,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       resumeSeeding: false,
       resumeSeedPolls: 0,
       resumeSeedPrevContent: '',
+      lastRawCapture: '',
+      // S2: every fresh session (start / resume / adopt all flow through here)
+      // begins at base cadence — this IS the "reset on session start/resume".
+      // No timer is armed yet, so an explicit resetPollCadence would be a no-op.
+      currentPollDelayMs: basePollIntervalMs,
+      unchangedPollStreak: 0,
     };
   }
 
@@ -1781,7 +1815,30 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           this.schedulePoll(key, session);
         }
       })();
-    }, pollInterval);
+    }, session.currentPollDelayMs);
+  }
+
+  /**
+   * @description Snap a session's poll cadence back to base (S2). Called on
+   * every explicit write (keystroke / signal) and on session start/resume so a
+   * fresh prompt never waits up to {@link maxPollIntervalMs} for the next
+   * capture — user-visible latency after a write must stay at base cadence.
+   *
+   * If a poll timer is already pending we re-arm it at the base delay so the
+   * backed-off idle timer can't keep the next capture far in the future. The
+   * existing {@link ClaudeSession.isPolling} guard is respected: a poll already
+   * in flight will reschedule itself from the (now reset) delay, so we never
+   * double-poll.
+   */
+  private resetPollCadence(key: ThreadKey, session: ClaudeSession): void {
+    session.currentPollDelayMs = basePollIntervalMs;
+    session.unchangedPollStreak = 0;
+    if (!session.isActive || session.isPolling) return;
+    if (session.pollTimer) {
+      clearTimeout(session.pollTimer);
+      session.pollTimer = null;
+      this.schedulePoll(key, session);
+    }
   }
 
   async startSession(
@@ -1905,6 +1962,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     console.log(`[Claude] sendInput: "${input}"`);
+    this.resetPollCadence(key, session);
 
     // Argv-based send-keys: tmux never invokes a shell here, so user-typed
     // `$(...)` / backticks are delivered to claude's stdin as literal
@@ -1997,6 +2055,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
+    this.resetPollCadence(key, session);
     if (signal === 'SIGINT') {
       this.enqueueTmuxBestEffort(session, async () => {
         if (!session.isActive) return '';
@@ -2010,6 +2069,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
+    this.resetPollCadence(key, session);
     console.log(`[Claude] sendEnter`);
     this.enqueueTmuxBestEffort(session, async () => {
       if (!session.isActive) return '';
@@ -2021,6 +2081,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
+    this.resetPollCadence(key, session);
     console.log(`[Claude] sendArrow: ${direction}`);
     this.enqueueTmuxBestEffort(session, async () => {
       if (!session.isActive) return '';
@@ -2032,6 +2093,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
+    this.resetPollCadence(key, session);
     console.log(`[Claude] sendTab`);
     this.enqueueTmuxBestEffort(session, async () => {
       if (!session.isActive) return '';
@@ -2061,6 +2123,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
+    this.resetPollCadence(key, session);
     const paneBefore = await this.enqueueTmux(session, () => tmuxAsync('capture-pane', '-t', session.sessionName, '-p'));
     if (!session.isActive) return;
     if (checkIsClaudeUninterruptible(paneBefore)) {
@@ -2462,6 +2525,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const initialRaw = await this.enqueueTmux(session, () => tmuxAsync('capture-pane', '-t', sessionName, '-p', '-e', '-S', '-2000'));
     if (initialRaw) {
       session.lastContent = cleanOutput(initialRaw);
+      // S1: seed the raw baseline too so the first poll after adoption — which
+      // captures the same idle pane — skips the redundant `cleanOutput`.
+      session.lastRawCapture = initialRaw;
     }
 
     this.sessions.set(k, session);
@@ -2517,7 +2583,32 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       return;
     }
 
-    const content = cleanOutput(raw);
+    // S1: when the raw capture is byte-identical to the previous poll's, the
+    // pane did not change, so the cleaned content is identical too — skip the
+    // ~15-regex `cleanOutput` pass and reuse the cached result. Runs AFTER the
+    // empty-raw death probe above (an empty capture short-circuits there and
+    // never reaches the skip). All downstream branches behave bit-for-bit the
+    // same: the resume-seeding "unchanged across 2 polls" exit still sees its
+    // no-change signal, and the `content !== lastContent` compare still no-ops.
+    const isRawChanged = raw !== session.lastRawCapture;
+    let content: string;
+    if (isRawChanged) {
+      session.lastRawCapture = raw;
+      content = cleanOutput(raw);
+    } else {
+      content = session.lastContent;
+    }
+
+    // S2: grow the poll delay while the pane stays idle, snap back to base on
+    // any change. A change always resets the cadence so streaming latency is
+    // unaffected; only no-activity panes slow down (toward maxPollIntervalMs).
+    const nextCadence = getNextPollDelay({
+      isChanged: isRawChanged,
+      currentDelayMs: session.currentPollDelayMs,
+      unchangedStreak: session.unchangedPollStreak,
+    });
+    session.currentPollDelayMs = nextCadence.delayMs;
+    session.unchangedPollStreak = nextCadence.unchangedStreak;
 
     // Resume flood-suppression: while seeding, Claude is repainting the whole
     // restored transcript into the pane. We advance the baseline every poll but
@@ -2550,7 +2641,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       session.lastContent = content;
 
       if (newPart) {
-        console.log(`[Claude] RAW output (${newPart.length}):\n---\n${newPart}\n---`);
+        // S4: full body only when explicitly debugging the scrape pipeline;
+        // default is a one-line size summary (the sync stdout write of up to
+        // ~600KB per changed poll was starving the event loop in prod).
+        console.log(
+          isClaudeScrapeDebugEnabled
+            ? `[Claude] RAW output (${newPart.length}):\n---\n${newPart}\n---`
+            : `[Claude] RAW output (${newPart.length} chars)`,
+        );
 
         // Interactive question/choice prompts are detected on the FULL pane
         // (not this diff): moving the `❯` cursor repaints only the changed
@@ -2585,7 +2683,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
             // relaying it reads as a ghost message in the topic.
             console.log(`[Claude] input-echo frame filtered`);
           } else if (cleanedOutput) {
-            console.log(`[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`);
+            // S4: gated full body (see the RAW dump above for the rationale).
+            console.log(
+              isClaudeScrapeDebugEnabled
+                ? `[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`
+                : `[Claude] FILTERED output (${cleanedOutput.length} chars)`,
+            );
 
             if (checkIsStatusOutput(cleanedOutput)) {
               // Deduplicate spinner updates: normalize spinner character and compare

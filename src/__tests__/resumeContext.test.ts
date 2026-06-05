@@ -1,7 +1,8 @@
 /**
  * @description Unit coverage for `formatResumeContext` — the pure renderer of
- * the resume context block (the short "last N turns" preview posted on resume
- * instead of flooding the topic with the whole restored transcript).
+ * the resume context block (the last N turns, rendered in full, posted on
+ * resume instead of flooding the topic with the whole restored transcript;
+ * the turn count is the only flood bound — the bot splits over-cap blocks).
  *
  * Locale-agnostic: the i18n module reads `BOT_LANG` once at import time (static
  * imports hoist, so an in-file assignment lands too late to influence it).
@@ -12,10 +13,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  formatResumeContext,
-  resumeContextTurnCharCap,
-} from '../resumeContext';
+import { formatResumeContext } from '../resumeContext';
 import type { RecentTurn } from '../types';
 
 describe('formatResumeContext', () => {
@@ -50,28 +48,28 @@ describe('formatResumeContext', () => {
     );
   });
 
-  it('truncates an over-cap turn with an ellipsis, leaves short turns intact', () => {
-    const longText = 'x'.repeat(resumeContextTurnCharCap + 50);
+  it('renders a long turn in FULL — no per-turn truncation (the bug: resume showed cut messages)', () => {
+    // Longer than the retired 500-char per-turn cap and longer than the
+    // Telegram message cap, to prove the renderer itself never trims; the
+    // bot's send path (`splitMessage`) handles over-cap blocks downstream.
+    const longBody = 'x'.repeat(800);
+    const longText = `Here is the full final answer: ${longBody} END`;
     const turns: RecentTurn[] = [
       { role: 'assistant', text: longText },
       { role: 'user', text: 'short' },
     ];
     const out = formatResumeContext(turns);
     assert.ok(out);
-    // The long turn is cut to the cap and ends with the ellipsis.
-    assert.ok(out.includes('…'), 'over-cap turn must end with ellipsis');
-    const xRun = out.match(/x+/);
-    assert.ok(xRun);
+    // Load-bearing: the COMPLETE long turn text survives verbatim, including
+    // the tail after the old cut point — assert the full string, not a length.
     assert.ok(
-      xRun[0].length <= resumeContextTurnCharCap,
-      `truncated body (${xRun[0].length}) must not exceed cap (${resumeContextTurnCharCap})`,
+      out.includes(`🤖 ${longText}`),
+      'the full long turn must be rendered verbatim, with no truncation',
     );
-    // The short turn is untouched (no ellipsis attached to it).
+    // The retired ellipsis marker must never appear.
+    assert.ok(!out.includes('…'), 'no per-turn ellipsis/truncation must remain');
+    // The short turn is untouched.
     assert.ok(out.includes('👤 short'));
-    // A turn at exactly the cap is NOT truncated.
-    const exact = formatResumeContext([{ role: 'user', text: 'y'.repeat(resumeContextTurnCharCap) }]);
-    assert.ok(exact);
-    assert.ok(!exact.includes('…'), 'a turn exactly at the cap must not be truncated');
   });
 
   it('strips the forwarded thread-context preamble from user turns (service glue is not user speech)', () => {

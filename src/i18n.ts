@@ -338,6 +338,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'trace.statusOnLabel': 'вкл',
     'trace.statusOffLabel': 'выкл',
     'trace.usageHint': 'Использование: /trace on | off | on all | off all | (без аргумента — статус)',
+
+    // ── scheduler fire announcement ({name}=имя задачи, {schedule}=расписание
+    //    словами, {prompt}=текст промпта, {missedNote}=пометка о пропуске или
+    //    пусто для запуска вовремя) ──
+    'schedule.fired':
+      '⏰ Расписание «{name}» ({schedule}){missedNote}\n\n{prompt}',
+    'schedule.missedNote': ' — пропущено в {time}, догоняю',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -628,6 +635,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'trace.statusOnLabel': 'on',
     'trace.statusOffLabel': 'off',
     'trace.usageHint': 'Usage: /trace on | off | on all | off all | (no arg — status)',
+
+    // ── scheduler fire announcement ({name}=job name, {schedule}=human
+    //    schedule text, {prompt}=prompt text, {missedNote}=catch-up note or
+    //    empty for an on-time run) ──
+    'schedule.fired':
+      '⏰ Schedule "{name}" ({schedule}){missedNote}\n\n{prompt}',
+    'schedule.missedNote': ' — missed at {time}, catching up',
   },
 };
 

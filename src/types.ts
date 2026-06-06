@@ -153,6 +153,26 @@ export interface AgentAdapter extends EventEmitter {
   stopSession(key: ThreadKey): void;
   checkIsActive(key: ThreadKey): boolean;
 
+  /**
+   * @description Whether the session bound to `key` is mid-turn (an in-progress
+   * reply). `false` when there is no session or it is idle. Sync and read from
+   * in-memory state only (no tmux/HTTP call) so a caller can poll it cheaply —
+   * the scheduler's wait-for-idle loop polls this before forwarding a scheduled
+   * prompt, so a fire never interrupts live work.
+   *
+   * Per-backend signal:
+   *  - **Claude** — the same pane busy marker `interruptAndWaitIdle` polls
+   *    (`esc to interrupt` footer), evaluated against the session's last cached
+   *    capture.
+   *  - **OpenCode** — the in-flight response state tracked from SSE (own
+   *    generation running, a sub-agent running, or context compacting).
+   *
+   * Optional (optional-method pattern, like {@link setModel}): adapters that
+   * can't report busy-ness omit it and a caller treats the session as never
+   * busy.
+   */
+  checkIsBusy?(key: ThreadKey): boolean;
+
   // — Input —
 
   sendInput(key: ThreadKey, input: string): void;

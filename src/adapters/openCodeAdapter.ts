@@ -529,6 +529,20 @@ export function getOpenCodeInterruptAction(state: OpenCodeInterruptState): OpenC
   return 'abort';
 }
 
+/**
+ * @description Sync "is this session occupied with a turn?" decision for the
+ * scheduler's wait-for-idle loop ({@link AgentAdapter.checkIsBusy}). Reuses the
+ * exact in-flight state {@link getOpenCodeInterruptAction} reads: the session is
+ * busy whenever it is NOT in the `skip-idle` case — i.e. its own generation is
+ * running, a sub-agent is running, or context is compacting. (The delivery
+ * loop only needs "free vs occupied"; the abort-vs-queue distinction is
+ * `forwardPromptToAgent`'s job once the prompt is handed over.) Pure + exported
+ * for unit testing alongside `getOpenCodeInterruptAction`.
+ */
+export function checkIsOpenCodeSessionBusy(state: OpenCodeInterruptState): boolean {
+  return getOpenCodeInterruptAction(state) !== 'skip-idle';
+}
+
 /** Mutable busy-tracking slice of a session, updated from SSE status/idle events. */
 export interface OpenCodeBusyTracking {
   isBusy: boolean;
@@ -1219,6 +1233,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   checkIsActive(key: ThreadKey): boolean {
     const session = this.sessions.get(keyToString(key));
     return session?.isActive ?? false;
+  }
+
+  checkIsBusy(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return false;
+    return checkIsOpenCodeSessionBusy({
+      isBusy: session.isBusy,
+      isCompacting: session.isCompacting,
+      busyChildCount: session.busyChildSessionIds.size,
+    });
   }
 
   sendInput(key: ThreadKey, input: string): void {

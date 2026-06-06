@@ -15,6 +15,7 @@ import {
   getAdapter,
   getThreadAdapter,
   getThreadAdapterName,
+  getThreadAdapterNameRaw,
   setThreadAdapter,
   getAvailableAdapters,
   getDefaultAdapterName,
@@ -1869,6 +1870,87 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
       error: e instanceof Error ? e.message : String(e),
     });
   }
+}
+
+/**
+ * @name EnsureAgentSessionResult
+ * @description Outcome of {@link ensureAgentSession}. `ok` means a session is
+ * ready to receive prompts NOW — either it was already active, it is in its
+ * async startup window (prompts get buffered + replayed on ready), or it was
+ * just started. `message` is the localized text the caller MAY surface (the
+ * `agent.ready` notice on a fresh start, empty when nothing user-facing
+ * happened). On failure, `reason` distinguishes a missing binding (`unbound`)
+ * from a start that threw (`start-failed`), and `message` carries the
+ * matching localized text.
+ */
+export type EnsureAgentSessionResult =
+  | { ok: true; message: string }
+  | { ok: false; reason: 'unbound' | 'start-failed'; message: string };
+
+/**
+ * @name EnsureAgentSessionOptions
+ * @description Tuning for {@link ensureAgentSession}.
+ *  - `preferredAdapterName` — an EXPLICIT user choice that outranks every
+ *    resolved name (the natural-language-start path passes the matched
+ *    `/claude` vs `/opencode` adapter here).
+ *  - `fallbackAdapterName` — used only when nothing else resolves (the
+ *    scheduler passes a job's `lastAdapterName` snapshot for a start after a
+ *    rebind, where the thread has no live or persisted adapter).
+ *  - `args` — forwarded to `startAgentSession` (e.g. the natural-language
+ *    start phrase's trailing args).
+ */
+export interface EnsureAgentSessionOptions {
+  preferredAdapterName?: string;
+  fallbackAdapterName?: string;
+  args?: string;
+}
+
+/**
+ * @description Ensure the thread `key` has an agent session ready to take a
+ * prompt, starting one if needed — the single choke point shared by the
+ * natural-language-start path, the `/schedule` command (S7), and the scheduler
+ * delivery (S4). It does NOT itself send any user-facing reply: it returns the
+ * outcome (and the message to show) so each caller decides its own messaging
+ * (e.g. the natural-language path adds a General-topic guard + a folder picker
+ * on `unbound`, the scheduler annotates the run ledger instead).
+ *
+ * Cases:
+ *  - already active                → `{ ok: true }` (no message; nothing started).
+ *  - mid-startup (window open)     → `{ ok: true }` (prompts will buffer + replay).
+ *  - no session, no binding        → `{ ok: false, reason: 'unbound' }`.
+ *  - no session, has binding       → resolve the adapter name (explicit
+ *    `preferredAdapterName` → in-memory thread pick → persisted
+ *    `agents[key].name` → `fallbackAdapterName` → default), `switchThreadAdapter`
+ *    + `startAgentSession`, then report `ok` from whether the session came up.
+ */
+async function ensureAgentSession(
+  key: ThreadKey,
+  options: EnsureAgentSessionOptions = {},
+): Promise<EnsureAgentSessionResult> {
+  const adapter = getThreadAdapter(key);
+  if (adapter.checkIsActive(key)) return { ok: true, message: '' };
+  if (startupPromptBuffer.checkIsStarting(keyToString(key))) return { ok: true, message: '' };
+
+  if (!state.getBinding(key)) {
+    return { ok: false, reason: 'unbound', message: t('thread.bind_required') };
+  }
+
+  // Resolve which adapter to start. `getThreadAdapterNameRaw` returns the
+  // in-memory pick WITHOUT the default fallback, so "no pick yet" stays
+  // distinguishable from "picked the default" and the chain doesn't short out.
+  const adapterName =
+    options.preferredAdapterName ??
+    getThreadAdapterNameRaw(key) ??
+    state.getAgent(key)?.name ??
+    options.fallbackAdapterName ??
+    getDefaultAdapterName();
+
+  await switchThreadAdapter(key, adapterName);
+  const message = await startAgentSession(key, options.args);
+  if (getThreadAdapter(key).checkIsActive(key)) {
+    return { ok: true, message };
+  }
+  return { ok: false, reason: 'start-failed', message };
 }
 
 /**
@@ -3800,18 +3882,22 @@ bot.on(message('text'), async (ctx) => {
         await replyToThread(key, t('error.start_in_general'));
         return;
       }
-      // Plan §11 Этап 4: starting an agent without a binding would silently
-      // launch it against WORK_ROOT itself. That's almost never what the
-      // user wants, so refuse and offer the picker instead.
-      if (!state.getBinding(key)) {
+      // The shared `ensureAgentSession` does the bind-check + switch + start.
+      // The explicit matched adapter wins (`preferredAdapterName`); the phrase's
+      // trailing args ride along. On `unbound` we keep this path's own reply:
+      // the folder picker (plan §11 Этап 4 — starting without a binding would
+      // silently launch against WORK_ROOT, which is almost never wanted).
+      const result = await ensureAgentSession(key, {
+        preferredAdapterName: startMatch.adapterName,
+        args: startMatch.args,
+      });
+      if (!result.ok && result.reason === 'unbound') {
         const subdirs = listAvailableSubdirs(ENV.workRoot);
         const extra = buildBindKeyboard(subdirs);
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
-      await switchThreadAdapter(key, startMatch.adapterName);
-      const msg = await startAgentSession(key, startMatch.args);
-      await replyToThread(key, msg);
+      await replyToThread(key, result.message);
       return;
     }
   }

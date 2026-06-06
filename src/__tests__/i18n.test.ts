@@ -154,6 +154,30 @@ test('trace.statusReply substitutes thisThread/allThreads/count placeholders', (
     `placeholders not substituted: "${out}"`);
 });
 
+test('scheduler fire keys exist in every locale', () => {
+  assert.ok(checkKeyInAllLangs('schedule.fired'), 'schedule.fired missing in some locale');
+  assert.ok(checkKeyInAllLangs('schedule.missedNote'), 'schedule.missedNote missing in some locale');
+});
+
+test('schedule.fired substitutes name/schedule/prompt and an empty missedNote on-time', () => {
+  const out = t('schedule.fired', {
+    name: 'Daily reminder',
+    schedule: 'daily at 09:00',
+    prompt: 'check the deploy',
+    missedNote: '',
+  });
+  assert.ok(out.includes('Daily reminder'), `expected the job name in "${out}"`);
+  assert.ok(out.includes('daily at 09:00'), `expected the schedule text in "${out}"`);
+  assert.ok(out.includes('check the deploy'), `expected the prompt in "${out}"`);
+  assert.ok(!out.includes('{'), `placeholders not substituted: "${out}"`);
+});
+
+test('schedule.missedNote substitutes the {time}', () => {
+  const out = t('schedule.missedNote', { time: '09:00' });
+  assert.ok(out.includes('09:00'), `expected the time in "${out}"`);
+  assert.ok(!out.includes('{time}'), `placeholder not substituted: "${out}"`);
+});
+
 test('t falls back to last code segment for unknown key', () => {
   const out = t('nonexistent.key.path');
   assert.equal(out, 'path');

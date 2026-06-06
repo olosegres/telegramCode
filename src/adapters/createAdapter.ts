@@ -135,6 +135,17 @@ export function getThreadAdapterName(key: ThreadKey): string {
   return threadAdapterNames.get(keyToString(key)) || getDefaultAdapterName();
 }
 
+/**
+ * @description The thread's EXPLICIT in-memory adapter pick, or `undefined`
+ * when none was made this run. Unlike {@link getThreadAdapterName} this does
+ * NOT fold in the `DEFAULT_AGENT` fallback, so a caller building a longer
+ * resolution chain (e.g. in-memory → persisted → snapshot → default) can tell
+ * "no pick yet" apart from "picked the default".
+ */
+export function getThreadAdapterNameRaw(key: ThreadKey): string | undefined {
+  return threadAdapterNames.get(keyToString(key));
+}
+
 /** Record that a given thread is now using a specific adapter. */
 export function setThreadAdapter(key: ThreadKey, adapterName: string): void {
   if (!adapterFactories[adapterName]) {

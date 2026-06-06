@@ -1440,6 +1440,23 @@ export function checkIsClaudeBusy(paneText: string): boolean {
 }
 
 /**
+ * @description Sync, in-memory "is this session mid-turn?" decision for the
+ * scheduler's wait-for-idle loop ({@link AgentAdapter.checkIsBusy}). Reuses the
+ * SAME pane predicate {@link interruptAndWaitIdle} polls
+ * ({@link checkIsClaudeBusy} on the `esc to interrupt` footer), evaluated
+ * against the session's last CLEANED pane content instead of a fresh `tmux`
+ * call — so it stays synchronous and adds no tmux load. The cleaned text is
+ * load-bearing: the raw `-e` capture carries ANSI/SGR runs that can split the
+ * footer marker mid-word and make the regex miss (the predicate's other
+ * callers read plain no-`-e` captures for the same reason). A dead/missing
+ * session is never busy. Exported pure so the gate is unit-testable without a
+ * live session.
+ */
+export function checkIsClaudeSessionBusy(args: { isActive: boolean; lastContent: string }): boolean {
+  return args.isActive && checkIsClaudeBusy(args.lastContent);
+}
+
+/**
  * @description Markers that a frame carries real agent content (a tool header
  * `●`, a tool-result `⎿`, or a ``` ``` ``` code fence). Their presence vetoes
  * the input-echo classification in {@link checkIsInputEchoFrame}.
@@ -2018,6 +2035,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   checkIsActive(key: ThreadKey): boolean {
     const session = this.sessions.get(keyToString(key));
     return session?.isActive ?? false;
+  }
+
+  checkIsBusy(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
+    if (!session) return false;
+    return checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: session.lastContent });
   }
 
   sendInput(key: ThreadKey, input: string): void {

@@ -76,3 +76,31 @@ export interface ScheduleRecord {
   /** Adapter name to start when delivering with no live session after a rebind. */
   lastAdapterName?: string;
 }
+
+/**
+ * @name FireContext
+ * @description Passed by the engine to the `deliver` callback so the
+ * announcement can annotate a missed run.
+ *
+ *  - `on-time` — fired at (or within tolerance of) its scheduled instant.
+ *  - `catch-up` — replayed once at boot for a run missed while the bot was
+ *    down; `missedAtMs` carries the original due instant so the announcement
+ *    can render the "missed at HH:MM" note.
+ */
+export interface FireContext {
+  kind: 'on-time' | 'catch-up';
+  /** Original due instant (epoch ms) for a catch-up fire. */
+  missedAtMs?: number;
+}
+
+/**
+ * @name DeliveryOutcome
+ * @description Result of one delivery attempt, returned by the `deliver`
+ * callback (the real implementation lands in `delivery.ts`, S4). The engine
+ * maps `status` onto the record's `lastRunStatus` and the ledger end record.
+ * `error` carries a readable failure message when `status === 'failed'`.
+ */
+export interface DeliveryOutcome {
+  status: 'delivered' | 'failed';
+  error?: string;
+}

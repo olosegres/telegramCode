@@ -219,8 +219,24 @@ as a command in `bot.ts`.
     normal welcome stack. Invalid name → error, mode stays armed for retry.
     `/cancel` or any other command exits the mode. `/bind <subdir>` direct form
     is unchanged.
-- **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`, and raw
-  TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
+- **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`,
+  `/schedule`, and raw TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`,
+  `/tab`
+  - `/schedule <free text>` is a **thin prompt wrapper** — the bot owns NO
+    scheduling logic. It wraps the request in an agent-facing instruction
+    (`schedule.forwardPromptTemplate`; bare `/schedule` →
+    `schedule.interviewPromptTemplate`, agent asks what + when) and delivers it
+    EXACTLY like a plain user message: `ensureAgentSession` does the
+    bind-check + start (unbound → bind-required reply), then
+    `deliverPromptOrBuffer` forwards to the live agent or buffers it
+    mid-startup. The agent does all the work (parse time → cron/one-shot, call
+    the `schedule_create` / `schedule_list` / `schedule_cancel` MCP tools).
+    Template instructions stay English in both locales (agent-facing, not
+    user-read), but the TARGET reply language is baked per locale (ru → reply
+    in Russian, en → in English): a fresh session's only user-language signal
+    is the bot locale (live 2026-06-06: "in their language" made the agent
+    interview in English). Until the scheduler MCP tools land (plan S5/S6)
+    the agent simply replies it can't schedule — accepted intermediate state.
   - While a Claude TUI selector is on screen (`isQuestionPending`), a bare
     digit / `y` / `n` reply drives the menu in place (`sendInput`, no
     interrupt Escape); any other text breaks out as a fresh prompt. Pre-fix

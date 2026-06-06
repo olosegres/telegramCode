@@ -13,7 +13,7 @@ import * as assert from 'node:assert/strict';
 // is, in practice, because tests are run fresh per file.
 process.env.BOT_LANG = 'ru';
 
-import { t, checkKeyInAllLangs } from '../i18n';
+import { t, checkKeyInAllLangs, getKeyInLang } from '../i18n';
 
 test('t substitutes single {name} placeholder', () => {
   // Use any known key that takes a placeholder. `cb.binding_to` was
@@ -176,6 +176,52 @@ test('schedule.missedNote substitutes the {time}', () => {
   const out = t('schedule.missedNote', { time: '09:00' });
   assert.ok(out.includes('09:00'), `expected the time in "${out}"`);
   assert.ok(!out.includes('{time}'), `placeholder not substituted: "${out}"`);
+});
+
+test('schedule command wrapper keys exist in every locale (S7)', () => {
+  assert.ok(
+    checkKeyInAllLangs('schedule.forwardPromptTemplate'),
+    'schedule.forwardPromptTemplate missing in some locale',
+  );
+  assert.ok(
+    checkKeyInAllLangs('schedule.interviewPromptTemplate'),
+    'schedule.interviewPromptTemplate missing in some locale',
+  );
+});
+
+test('schedule.forwardPromptTemplate: English instructions, per-locale reply language (agent-facing)', () => {
+  // These wrap the user request as an instruction the AGENT reads, never the
+  // user. The instructions stay English in both catalogs, but the TARGET
+  // reply language is baked per locale — on a fresh session the locale is
+  // the only reliable user-language signal (live 2026-06-06: "in their
+  // language" made the agent ask in English). `getKeyInLang` reads each
+  // catalog directly (the active-lang `t` can't compare the other locale).
+  const ru = getKeyInLang('ru', 'schedule.forwardPromptTemplate');
+  const en = getKeyInLang('en', 'schedule.forwardPromptTemplate');
+  assert.ok(ru && en, 'forward template missing in a catalog');
+  assert.ok(ru.includes('IN RUSSIAN'), `ru catalog must direct replies to Russian: "${ru}"`);
+  assert.ok(en.includes('IN ENGLISH'), `en catalog must direct replies to English: "${en}"`);
+  // It must name the MCP tools so the agent knows how to act.
+  assert.ok(ru.includes('schedule_create') && en.includes('schedule_create'));
+});
+
+test('schedule.interviewPromptTemplate: English instructions, per-locale reply language (agent-facing)', () => {
+  const ru = getKeyInLang('ru', 'schedule.interviewPromptTemplate');
+  const en = getKeyInLang('en', 'schedule.interviewPromptTemplate');
+  assert.ok(ru && en, 'interview template missing in a catalog');
+  assert.ok(ru.includes('IN RUSSIAN'), `ru catalog must direct the interview to Russian: "${ru}"`);
+  assert.ok(en.includes('IN ENGLISH'), `en catalog must direct the interview to English: "${en}"`);
+  assert.ok(ru.includes('schedule_create') && en.includes('schedule_create'));
+});
+
+test('schedule.forwardPromptTemplate substitutes {text} verbatim (markdown + quotes preserved)', () => {
+  // The wrapper rides every /schedule <text> call — a request containing
+  // markdown / quotes / braces must survive substitution untouched so the
+  // agent sees exactly what the user typed (no escaping, single regex pass).
+  const request = 'remind me to ship **release** and say "done" at 9am `daily`';
+  const out = t('schedule.forwardPromptTemplate', { text: request });
+  assert.ok(out.includes(request), `expected the verbatim request in "${out}"`);
+  assert.ok(!out.includes('{text}'), `placeholder not substituted: "${out}"`);
 });
 
 test('t falls back to last code segment for unknown key', () => {

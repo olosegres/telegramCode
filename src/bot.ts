@@ -3650,6 +3650,43 @@ command('trace', async (ctx, key) => {
 });
 
 /**
+ * @description `/schedule` (S7) — a thin prompt wrapper. The bot owns NO
+ * scheduling logic: it wraps the user's request in an agent-facing instruction
+ * (forward template with args, interview template without) and delivers it
+ * EXACTLY like a plain user message — reusing the agent session or starting one
+ * with the thread's last-used agent. All the intelligence (parse the time,
+ * call schedule_create / schedule_list / schedule_cancel) lives in the agent +
+ * the bot's MCP tools (S5/S6). Until those land the agent simply replies it
+ * can't schedule — an accepted intermediate state.
+ *
+ *   /schedule <free text>  → forward template wrapping {text}
+ *   /schedule              → interview template (agent asks what + when)
+ *
+ * Routing mirrors the plain-text handler via the shared choke points:
+ * `ensureAgentSession` does the bind-check + start (returns `unbound` →
+ * bind-required reply, same as every agent-facing path), then
+ * `deliverPromptOrBuffer` forwards (active) or buffers (mid-startup), reading
+ * the startup window AFTER the ensure so a freshly-started session forwards.
+ */
+command('schedule', async (ctx, key) => {
+  const text = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const wrappedPrompt = text
+    ? t('schedule.forwardPromptTemplate', { text })
+    : t('schedule.interviewPromptTemplate');
+
+  const result = await ensureAgentSession(key);
+  if (!result.ok) {
+    await replyToThread(key, result.message);
+    return;
+  }
+  // Fresh-start notice (empty when the session was already active / starting).
+  if (result.message) await replyToThread(key, result.message);
+
+  const isStarting = startupPromptBuffer.checkIsStarting(keyToString(key));
+  await deliverPromptOrBuffer(key, wrappedPrompt, isStarting);
+});
+
+/**
  * @description `/clear` — delete the bot's messages in this thread.
  *
  * Plan §11 Этап 3 / §13.20 (T6):
@@ -3730,7 +3767,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
-  'doctor', 'mcp', 'rename_session', 'trace',
+  'doctor', 'mcp', 'rename_session', 'trace', 'schedule',
 ]);
 
 /**
@@ -4196,12 +4233,18 @@ async function downloadIncomingFile(
 }
 
 /**
- * @description Send one already-built file/album announcement to the agent,
+ * @description Deliver one already-built prompt to the thread's agent,
  * honouring the startup window: mid-startup the prompt is buffered (replays in
  * order when ready, exactly like a text prompt typed during boot); otherwise it
- * is forwarded immediately through the normal choke point.
+ * is forwarded immediately through the normal choke point. This is the single
+ * "buffer-or-forward" unit shared by file/album intake and the `/schedule`
+ * command (S7) so the startup-window handling never drifts between them.
+ *
+ * `isStarting` is passed in (not read here) because the album collector
+ * captures it AT FLUSH TIME — a session that finished booting mid-burst must
+ * forward, not buffer.
  */
-async function announceFilePrompt(
+async function deliverPromptOrBuffer(
   key: ThreadKey,
   promptText: string,
   isStarting: boolean,
@@ -4240,7 +4283,7 @@ interface AlbumCollectorItem {
  * album as N messages sharing `media_group_id` in a quick burst; this coalesces
  * them so the agent gets ONE combined prompt after the burst settles, and gating
  * / error hints fire once per album. The flush forwards the combined prompt
- * through {@link announceFilePrompt}, re-reading the startup state AT FLUSH TIME
+ * through {@link deliverPromptOrBuffer}, re-reading the startup state AT FLUSH TIME
  * so a session that finished booting mid-burst forwards instead of buffers.
  */
 const albumCollector = createMediaGroupCollector<AlbumCollectorItem>({
@@ -4257,7 +4300,7 @@ const albumCollector = createMediaGroupCollector<AlbumCollectorItem>({
       const promptText = buildAlbumPromptText(files, caption);
       const isStarting = startupPromptBuffer.checkIsStarting(keyToString(key));
       try {
-        await announceFilePrompt(key, promptText, isStarting);
+        await deliverPromptOrBuffer(key, promptText, isStarting);
       } catch (err) {
         console.error('[Bot] album flush failed:', err);
         await replyToThread(key, t('file.download_failed')).catch(() => {});
@@ -4347,7 +4390,7 @@ async function handleIncomingFile(
   if (savedPath === null) return;
 
   const promptText = buildFilePromptText(meta.kind, savedPath, meta.fileSize, meta.caption);
-  await announceFilePrompt(key, promptText, isStarting);
+  await deliverPromptOrBuffer(key, promptText, isStarting);
 }
 
 bot.on(
@@ -5138,6 +5181,7 @@ const COMMANDS_MENU = [
   { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },
   { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
   { command: 'compact', description: '🧹 Compact agent context' },
+  { command: 'schedule', description: '⏰ Schedule a prompt (agent does the work)' },
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
   { command: 'whoami', description: '🪪 Show debug ids' },

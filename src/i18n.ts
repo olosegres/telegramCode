@@ -345,6 +345,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'schedule.fired':
       '⏰ Расписание «{name}» ({schedule}){missedNote}\n\n{prompt}',
     'schedule.missedNote': ' — пропущено в {time}, догоняю',
+    // ── /schedule command wrapper prompts (agent-facing instructions: kept
+    //    English instructions in BOTH locales (the agent acts on them, the user
+    //    never reads them); the TARGET reply language is baked per locale — the
+    //    locale is the only reliable user-language signal on a fresh session ──
+    'schedule.forwardPromptTemplate':
+      'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN RUSSIAN what you scheduled.\n\nRequest: {text}',
+    'schedule.interviewPromptTemplate':
+      'The user invoked /schedule with no details. Ask them IN RUSSIAN what prompt they want scheduled and WHEN (one-time or repeating). Once you have both, create it with the schedule_create MCP tool and confirm IN RUSSIAN what you scheduled.',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -642,6 +650,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'schedule.fired':
       '⏰ Schedule "{name}" ({schedule}){missedNote}\n\n{prompt}',
     'schedule.missedNote': ' — missed at {time}, catching up',
+    // ── /schedule command wrapper prompts (agent-facing instructions: kept
+    //    English instructions in BOTH locales (the agent acts on them, the user
+    //    never reads them); the TARGET reply language is baked per locale — the
+    //    locale is the only reliable user-language signal on a fresh session ──
+    'schedule.forwardPromptTemplate':
+      'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN ENGLISH what you scheduled.\n\nRequest: {text}',
+    'schedule.interviewPromptTemplate':
+      'The user invoked /schedule with no details. Ask them IN ENGLISH what prompt they want scheduled and WHEN (one-time or repeating). Once you have both, create it with the schedule_create MCP tool and confirm IN ENGLISH what you scheduled.',
   },
 };
 
@@ -715,4 +731,16 @@ export function getActiveLang(): Lang {
  */
 export function checkKeyInAllLangs(code: string): boolean {
   return (Object.keys(dict) as Lang[]).every((l) => dict[l][code] !== undefined);
+}
+
+/**
+ * @description Read one catalog's raw value for `code` (tests). Lets a single
+ * test process compare the SAME key across locales — needed for agent-facing
+ * keys (e.g. the `/schedule` wrapper prompts) whose English instructions must
+ * carry a PER-LOCALE reply-language directive (ru → "IN RUSSIAN", en → "IN
+ * ENGLISH"), a property `checkKeyInAllLangs` (presence only) and the
+ * active-locale `t` cannot prove.
+ */
+export function getKeyInLang(lang: Lang, code: string): string | undefined {
+  return dict[lang][code];
 }

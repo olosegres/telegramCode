@@ -1,9 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": [
-    "~/.claude/CLAUDE.md",
-    ".claude/CLAUDE.md",
-    ".claude/rules/*.md",
+    "~/src/.claude/CLAUDE.md",
+    "~/src/.claude/rules/*.md",
     "./CLAUDE.md"
   ]
 }

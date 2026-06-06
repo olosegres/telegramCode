@@ -1,3 +1,0 @@
-[submodule ".claude"]
-	path = .claude
-	url = git@gitlab.com:example/agent-configs.git

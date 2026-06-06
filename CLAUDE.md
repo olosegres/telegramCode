@@ -1,6 +1,6 @@
 # telegram-code — project guide
 
-> Shared rules live in `.claude/rules/` (loaded automatically). This file is
+> Shared rules live in `~/src/.claude/rules/` (loaded automatically). This file is
 > the **project map**: read it first to understand what the code does before
 > changing it.
 

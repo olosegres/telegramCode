@@ -21,6 +21,7 @@
     "claude": "UID=$(id -u) GID=$(id -g) docker compose run --rm claude"
   },
   "dependencies": {
+    "croner": "^10.0.1",
     "dotenv": "^16.4.5",
     "form-data": "^4.0.5",
     "node-pty": "^1.0.0",

@@ -3,6 +3,7 @@ import { promises as fsp } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { keyToString, type ThreadKey } from './types';
+import type { ScheduleRecord } from './scheduler/types';
 
 /**
  * @description On-disk state for the multi-thread telegram bot.
@@ -130,6 +131,15 @@ export interface StateV1 {
    */
   tracedThreads?: string[];
   traceAllThreads?: boolean;
+  /**
+   * Persisted scheduled jobs, keyed by {@link ScheduleRecord.id}. Optional so
+   * older state files (created before the scheduler feature) stay valid —
+   * `loadStateFile`'s shape check doesn't require it and a missing value is an
+   * empty schedule set. The crash-critical `nextRunAt` inside each record is
+   * why the engine calls {@link StateStore.flush} after every fire rather than
+   * relying on the debounced save.
+   */
+  schedules?: Record<string, ScheduleRecord>;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -826,6 +836,87 @@ export class StateStore {
     if (config.allThreads) this.state.traceAllThreads = true;
     else delete this.state.traceAllThreads;
     this.scheduleSave();
+  }
+
+  // ── scheduled jobs (`/schedule`) ──
+
+  /**
+   * @description Every persisted schedule across all threads, keyed by id.
+   * Read at boot by the engine to re-arm timers. Returns a shallow copy of the
+   * map so callers can't mutate the live state object.
+   */
+  getSchedules(): Record<string, ScheduleRecord> {
+    return { ...(this.state.schedules ?? {}) };
+  }
+
+  /** Schedules owned by `key`, in insertion order. Empty array when none. */
+  getThreadSchedules(key: ThreadKey): ScheduleRecord[] {
+    const target = keyToString(key);
+    const all = this.state.schedules ?? {};
+    return Object.values(all).filter(record => record.threadKey === target);
+  }
+
+  /**
+   * @description Upsert a schedule by its id. The record's `threadKey` is the
+   * source of truth for ownership; callers build it via the scheduler module's
+   * `createScheduleRecord`. Crash-critical fields (`nextRunAt`) ride the
+   * debounced save like every other mutation — the engine calls
+   * {@link flush} explicitly after a fire when the new `nextRunAt` must hit disk
+   * before the process can die.
+   */
+  async upsertSchedule(record: ScheduleRecord): Promise<void> {
+    const target = parseKeyString(record.threadKey);
+    if (!target) return;
+    await this.withLock(target, async () => {
+      (this.state.schedules ??= {})[record.id] = record;
+      this.scheduleSave();
+    });
+  }
+
+  /** Remove a schedule by id. No-op (no save) when absent. */
+  async removeSchedule(id: string): Promise<void> {
+    const existing = this.state.schedules?.[id];
+    if (!existing) return;
+    const owner = parseKeyString(existing.threadKey);
+    const run = async () => {
+      if (this.state.schedules) {
+        delete this.state.schedules[id];
+        if (Object.keys(this.state.schedules).length === 0) delete this.state.schedules;
+      }
+      this.scheduleSave();
+    };
+    if (owner) await this.withLock(owner, run);
+    else await run();
+  }
+
+  /**
+   * @description Set the paused flag for a schedule (used by /unbind pause and
+   * /bind resume in S8). Clearing the pause drops both `isPaused` and
+   * `pauseReason` so the on-disk shape stays clean. No-op when the id is absent.
+   */
+  async setSchedulePaused(
+    id: string,
+    paused: boolean,
+    reason?: ScheduleRecord['pauseReason'],
+  ): Promise<void> {
+    const existing = this.state.schedules?.[id];
+    if (!existing) return;
+    const owner = parseKeyString(existing.threadKey);
+    const run = async () => {
+      const current = this.state.schedules?.[id];
+      if (!current) return;
+      if (paused) {
+        current.isPaused = true;
+        if (reason !== undefined) current.pauseReason = reason;
+      } else {
+        delete current.isPaused;
+        delete current.pauseReason;
+      }
+      current.updatedAt = new Date().toISOString();
+      this.scheduleSave();
+    };
+    if (owner) await this.withLock(owner, run);
+    else await run();
   }
 
   // ── persistence ──

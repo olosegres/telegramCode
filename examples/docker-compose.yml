@@ -65,7 +65,6 @@ services:
       - TARGET_GID=${GID:-1000}
       # ── required ──
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_PET}
-      - ALLOWED_USERS=${ALLOWED_USERS}
       - ALLOWED_GROUP_ID=${ALLOWED_GROUP_ID_PET}
       - WORK_ROOT=/workspace
       - DATA_DIR=/data
@@ -74,6 +73,8 @@ services:
       - BOT_LANG=${BOT_LANG:-ru}
       # OpenCode server port — DIFFERENT from work instance (plan §13.8).
       - OPENCODE_URL=http://localhost:4096
+      # Scheduler MCP must not share the OpenCode port inside this container.
+      - SCHEDULER_MCP_PORT=${SCHEDULER_MCP_PORT_PET:-4097}
       # Provider API keys (used by claude/opencode + voice transcription).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
@@ -116,7 +117,6 @@ services:
       - TARGET_UID=${UID:-1000}
       - TARGET_GID=${GID:-1000}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_WORK}
-      - ALLOWED_USERS=${ALLOWED_USERS}
       - ALLOWED_GROUP_ID=${ALLOWED_GROUP_ID_WORK}
       - WORK_ROOT=/workspace
       - DATA_DIR=/data
@@ -125,6 +125,8 @@ services:
       # DIFFERENT port from pet — otherwise both instances try to bind 4096
       # and share an opencode-server (plan §13.8).
       - OPENCODE_URL=http://localhost:4097
+      # Scheduler MCP must not share the OpenCode port inside this container.
+      - SCHEDULER_MCP_PORT=${SCHEDULER_MCP_PORT_WORK:-4107}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}

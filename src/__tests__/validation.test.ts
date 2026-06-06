@@ -23,6 +23,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   validateSubdir,
+  resolveBoundWorkDir,
   BindError,
   findAutobindSubdir,
   normaliseTopicName,
@@ -66,6 +67,29 @@ after(() => {
 test('accepts a plain immediate subdirectory', () => {
   const rel = validateSubdir(workRoot, 'alpha');
   assert.equal(rel, 'alpha');
+});
+
+test('resolveBoundWorkDir refuses a missing binding', () => {
+  assert.deepEqual(resolveBoundWorkDir(workRoot, null), { kind: 'refuse' });
+});
+
+test('resolveBoundWorkDir validates a persisted binding before returning workDir', () => {
+  assert.deepEqual(resolveBoundWorkDir(workRoot, { subdir: 'alpha' }), {
+    kind: 'proceed',
+    subdir: 'alpha',
+    workDir: path.join(workRoot, 'alpha'),
+  });
+});
+
+test('resolveBoundWorkDir rejects a deleted persisted binding target', () => {
+  const gone = path.join(workRoot, 'gone');
+  fs.mkdirSync(gone);
+  fs.rmSync(gone, { recursive: true, force: true });
+
+  const decision = resolveBoundWorkDir(workRoot, { subdir: 'gone' });
+  assert.equal(decision.kind, 'invalid');
+  if (decision.kind !== 'invalid') return;
+  assert.equal(decision.error.code, 'BIND_NOT_FOUND');
 });
 
 test('accepts a nested subdirectory', () => {

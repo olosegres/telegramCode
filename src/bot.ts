@@ -48,7 +48,7 @@ import { releaseLock } from './cli/lock';
 import { gracefulShutdown } from './shutdown';
 import { classifyBoot } from './bootClassifier';
 import { t } from './i18n';
-import { validateSubdir, BindError, findAutobindSubdir, paginateBindList } from './validation';
+import { validateSubdir, resolveBoundWorkDir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { validateNewFolderName, NewFolderNameError } from './folderName';
 import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
 import { AdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
@@ -76,7 +76,6 @@ import {
 } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
-import { getBindGateDecision } from './utils/bindGateDecision';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
   buildThreadContextPreamble,
@@ -1626,9 +1625,22 @@ async function transcribeAudio(filePath: string, retryCount = 0): Promise<Transc
  * agent-facing entry point (start / list / resume) refuses with
  * `thread.bind_required` when this returns `null`.
  */
-function getWorkDir(key: ThreadKey): string | null {
-  const decision = getBindGateDecision(state.getBinding(key), ENV.workRoot);
-  return decision.kind === 'proceed' ? decision.workDir : null;
+function formatBindErrorMessage(error: BindError, rawSubdir: string): string {
+  switch (error.code) {
+    case 'BIND_INVALID_CHARS': return t('bind.invalid_chars');
+    case 'BIND_NOT_FOUND':     return t('bind.not_found', { subdir: rawSubdir, workRoot: ENV.workRoot });
+    case 'BIND_OUTSIDE_ROOT':  return t('bind.outside_root');
+    case 'BIND_NOT_DIRECTORY': return t('bind.not_directory', { subdir: rawSubdir });
+    default:                   return `❌ ${error.message}`;
+  }
+}
+
+function getWorkDirStartDecision(key: ThreadKey): { ok: true; workDir: string } | { ok: false; message: string } {
+  const binding = state.getBinding(key);
+  const decision = resolveBoundWorkDir(ENV.workRoot, binding);
+  if (decision.kind === 'proceed') return { ok: true, workDir: decision.workDir };
+  if (decision.kind === 'refuse') return { ok: false, message: t('thread.bind_required') };
+  return { ok: false, message: formatBindErrorMessage(decision.error, binding?.subdir ?? '') };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1835,8 +1847,9 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
   // command/natural-language callers gate on the binding too, but a binding
   // can vanish (/unbind) between their check and here, so re-check before any
   // side effect (startup window / markers) opens.
-  const workDir = getWorkDir(key);
-  if (!workDir) return t('thread.bind_required');
+  const workDirDecision = getWorkDirStartDecision(key);
+  if (!workDirDecision.ok) return workDirDecision.message;
+  const workDir = workDirDecision.workDir;
   // Open the startup window synchronously (before the first await) so text
   // typed right after `/claude` / `/opencode` is buffered, not dropped.
   startupPromptBuffer.markStarting(kStr);
@@ -2249,13 +2262,7 @@ async function applyBinding(
   } catch (e) {
     let msg: string;
     if (e instanceof BindError) {
-      switch (e.code) {
-        case 'BIND_INVALID_CHARS': msg = t('bind.invalid_chars'); break;
-        case 'BIND_NOT_FOUND':     msg = t('bind.not_found', { subdir: rawSubdir, workRoot: ENV.workRoot }); break;
-        case 'BIND_OUTSIDE_ROOT':  msg = t('bind.outside_root'); break;
-        case 'BIND_NOT_DIRECTORY': msg = t('bind.not_directory', { subdir: rawSubdir }); break;
-        default:                   msg = `❌ ${e.message}`;
-      }
+      msg = formatBindErrorMessage(e, rawSubdir);
     } else {
       msg = `❌ ${e instanceof Error ? e.message : String(e)}`;
     }
@@ -3362,11 +3369,12 @@ async function handleSessionsList(key: ThreadKey): Promise<void> {
 
   // Guarded by the `!state.getBinding` early-return above, so workDir is
   // non-null here; the explicit check keeps the no-fallback contract honest.
-  const workDir = getWorkDir(key);
-  if (!workDir) {
-    await replyToThread(key, t('thread.bind_required'));
+  const workDirDecision = getWorkDirStartDecision(key);
+  if (!workDirDecision.ok) {
+    await replyToThread(key, workDirDecision.message);
     return;
   }
+  const workDir = workDirDecision.workDir;
   const adapter = getThreadAdapter(key);
   let sessions: AgentSession[];
   try {
@@ -3426,8 +3434,9 @@ async function resumeSessionByIndex(
   // Pick-mode is armed only by `handleSessionsList` (binding-gated), but a
   // binding can vanish (/unbind) between listing and picking — resume must
   // never run against an unbound thread (no WORK_ROOT fallback).
-  const workDir = getWorkDir(key);
-  if (!workDir) return t('thread.bind_required');
+  const workDirDecision = getWorkDirStartDecision(key);
+  if (!workDirDecision.ok) return workDirDecision.message;
+  const workDir = workDirDecision.workDir;
   const adapter = getThreadAdapter(key);
   markNeedsNewMessage(key);
   try {
@@ -5385,7 +5394,17 @@ async function reattachExistingSessions(
           killed += 1;
           continue;
         }
-        const workDir = path.join(ENV.workRoot, binding.subdir);
+        const workDirDecision = getWorkDirStartDecision(key);
+        if (!workDirDecision.ok) {
+          console.warn(`[reattach] claude ${keyToString(key)} refused: ${workDirDecision.message}`);
+          await claudeAdapter.killOrphanTmuxSession(sessionName);
+          killed += 1;
+          if (!opts.quietReattach) {
+            replyToThread(key, workDirDecision.message).catch(() => {});
+          }
+          continue;
+        }
+        const workDir = workDirDecision.workDir;
         if (await claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
           adopted += 1;
           if (!opts.quietReattach) {
@@ -5405,12 +5424,20 @@ async function reattachExistingSessions(
   //    from `getThreadAdapter(key)` (review CRITICAL #2).
   const opencodeAdapter = getAdapter('opencode');
   let reopened = 0;
-  for (const { key, data: binding } of state.listBindings()) {
+  for (const { key } of state.listBindings()) {
     const agent = state.getAgent(key);
     if (!agent || agent.name !== 'opencode' || !agent.opencodeSessionId) continue;
     if (opencodeAdapter.checkIsActive(key)) continue;
     try {
-      const workDir = path.join(ENV.workRoot, binding.subdir);
+      const workDirDecision = getWorkDirStartDecision(key);
+      if (!workDirDecision.ok) {
+        console.warn(`[reattach] opencode ${keyToString(key)} refused: ${workDirDecision.message}`);
+        if (!opts.quietReattach) {
+          replyToThread(key, workDirDecision.message).catch(() => {});
+        }
+        continue;
+      }
+      const workDir = workDirDecision.workDir;
       await opencodeAdapter.resumeSession(key, workDir, agent.opencodeSessionId);
       reopened += 1;
       if (!opts.quietReattach) {

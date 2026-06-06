@@ -233,8 +233,13 @@ non-anonymously.
 | `DEFAULT_AGENT` | `claude` | `claude` or `opencode` |
 | `BOT_LANG` | `ru` | `ru` or `en` |
 | `OPENCODE_URL` | `http://localhost:4096` | OpenCode server URL — must differ per instance on the same host |
+| `OPENCODE_USERNAME` | `opencode` | Basic-auth username when `OPENCODE_PASSWORD` is set |
+| `OPENCODE_PASSWORD` | — | Basic-auth password for a protected OpenCode server |
+| `OPENCODE_ALLOW_REMOTE` | — | Set to `1` only if `OPENCODE_URL` intentionally points outside loopback |
 | `OPENCODE_BIN` | (auto) | Custom opencode binary path |
 | `CLAUDE_BIN` | (auto) | Custom Claude binary path for nvm/asdf/systemd PATH differences |
+| `CLAUDE_SCRAPE_DEBUG` | — | Set to `1` to log full Claude RAW/FILTERED scrape chunks |
+| `SCHEDULER_MCP_PORT` | `4097` | Loopback port for the bot-owned scheduler MCP server injected into agent sessions. Must differ from the `OPENCODE_URL` port in the same process/container |
 | `ANTHROPIC_API_KEY` | — | For Claude Code |
 | `GROQ_API_KEY` | — | Voice transcription (free, preferred) |
 | `OPENAI_API_KEY` | — | Voice transcription (fallback) |
@@ -301,8 +306,10 @@ Each pair of variables below must differ to avoid silent corruption:
 | `WORK_ROOT` | Each instance manages its subtree; sharing → tmux name collisions |
 | `DATA_DIR` | `state.json` / `mcp.json` / `threads/` per instance; sharing → corrupted JSON |
 | `OPENCODE_URL` port | OpenCode server binds the port; second start fails with `EADDRINUSE` and you'd silently share sessions |
+| `SCHEDULER_MCP_PORT` | Scheduler MCP binds a local port inside the same bot process; it must differ from that instance's `OPENCODE_URL` port |
 
-The shipped compose uses ports `4096` (pet) and `4097` (work). If you run
+The shipped compose uses OpenCode ports `4096` (pet) and `4097` (work),
+with scheduler MCP on `4097` (pet) and `4107` (work). If you run
 both as different Linux users with separate Docker networks, the port
 isolation is already handled by the network — but keeping ports explicit
 is the safer default.

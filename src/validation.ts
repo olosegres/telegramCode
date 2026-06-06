@@ -118,6 +118,31 @@ export function validateSubdir(workRoot: string, rawSubdir: string): string {
   return path.relative(realRoot, realCandidate);
 }
 
+export type BoundWorkDirDecision =
+  | { kind: 'proceed'; subdir: string; workDir: string }
+  | { kind: 'refuse' }
+  | { kind: 'invalid'; error: BindError };
+
+/**
+ * @description Resolve a persisted binding back to a real working directory.
+ * A binding row in state.json is not enough: the folder may have been deleted
+ * or replaced after `/bind`. Agent startup/list/resume must fail before any
+ * adapter side effects in that case.
+ */
+export function resolveBoundWorkDir(
+  workRoot: string,
+  binding: { subdir: string } | null,
+): BoundWorkDirDecision {
+  if (!binding) return { kind: 'refuse' };
+  try {
+    const subdir = validateSubdir(workRoot, binding.subdir);
+    return { kind: 'proceed', subdir, workDir: path.join(workRoot, subdir) };
+  } catch (e) {
+    if (e instanceof BindError) return { kind: 'invalid', error: e };
+    throw e;
+  }
+}
+
 /**
  * @description Normalise a name (topic title or subdir) for fuzzy auto-bind
  * matching.

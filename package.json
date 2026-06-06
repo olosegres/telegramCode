@@ -21,11 +21,13 @@
     "claude": "UID=$(id -u) GID=$(id -g) docker compose run --rm claude"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "croner": "^10.0.1",
     "dotenv": "^16.4.5",
     "form-data": "^4.0.5",
     "node-pty": "^1.0.0",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

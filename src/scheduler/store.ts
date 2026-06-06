@@ -111,6 +111,7 @@ export async function createScheduleForThread(
     createdBy: ScheduleCreatedBy;
     nowMs: number;
     lastAdapterName?: string;
+    isPinSilent?: boolean;
   },
 ): Promise<CreateScheduleResult> {
   const existing = store.getThreadSchedules(args.threadKey);

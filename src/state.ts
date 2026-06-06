@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import { promises as fsp } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { randomBytes } from 'node:crypto';
 import { keyToString, type ThreadKey } from './types';
 import type { ScheduleRecord } from './scheduler/types';
 
@@ -140,6 +141,14 @@ export interface StateV1 {
    * relying on the debounced save.
    */
   schedules?: Record<string, ScheduleRecord>;
+  /**
+   * Secret keying the HMAC tokens the bot mints for its own scheduler MCP
+   * server (see `scheduler/mcpSurface.ts`). Generated once on first use
+   * (`getSchedulerMcpSecret`) and persisted so the tokens injected into agent
+   * sessions stay valid across restarts. Optional so older state files stay
+   * valid — a missing value is created lazily on the first read.
+   */
+  schedulerMcpSecret?: string;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -154,6 +163,9 @@ function emptyState(): StateV1 {
 
 /** Per-thread message-id cap — older ids beyond this are dropped to keep state small. */
 const MESSAGE_ID_RING_CAP = 500;
+
+/** Byte length of the lazily-minted scheduler MCP HMAC secret (32 bytes → 64 hex chars). */
+const schedulerMcpSecretByteLength = 32;
 
 /**
  * @description Promise-chain per-key lock. The map holds the tail of each
@@ -917,6 +929,24 @@ export class StateStore {
     };
     if (owner) await this.withLock(owner, run);
     else await run();
+  }
+
+  // ── scheduler MCP secret ──
+
+  /**
+   * @description The HMAC secret keying the scheduler MCP tokens, created lazily
+   * on first read and persisted immediately. Generated once with
+   * `crypto.randomBytes` (32 bytes, hex) so the tokens the bot injects into
+   * agent sessions survive restarts. The first-time write is flushed eagerly
+   * (not debounced) so a crash right after minting the first token can't lose
+   * the secret that token was signed with.
+   */
+  async getSchedulerMcpSecret(): Promise<string> {
+    if (this.state.schedulerMcpSecret) return this.state.schedulerMcpSecret;
+    const secret = randomBytes(schedulerMcpSecretByteLength).toString('hex');
+    this.state.schedulerMcpSecret = secret;
+    await this.flush();
+    return secret;
   }
 
   // ── persistence ──

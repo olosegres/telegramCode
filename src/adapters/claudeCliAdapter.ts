@@ -1972,7 +1972,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // other two reach Claude through repeated `--mcp-config` flags. The flag
     // values point at tmp files because the bot expands `${VAR}` env-var
     // placeholders itself before handing the config off (plan §13.18, T2).
-    const mcpFlagsArr = prepareMcpFlags({ key, dataDir: resolveDataDir() });
+    const mcpFlagsArr = await prepareMcpFlags({ key, dataDir: resolveDataDir() });
     const claudeArgv: string[] = [
       claudePath,
       '--dangerously-skip-permissions',
@@ -2470,7 +2470,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // are re-applied here so a resumed session sees the same servers as a
     // fresh one would (plan §19). Argv-style shell-quoting mirrors
     // `startSession` (audit S1).
-    const mcpFlagsArr = prepareMcpFlags({ key, dataDir: resolveDataDir() });
+    const mcpFlagsArr = await prepareMcpFlags({ key, dataDir: resolveDataDir() });
     const claudeArgv: string[] = [
       claudePath,
       '--dangerously-skip-permissions',

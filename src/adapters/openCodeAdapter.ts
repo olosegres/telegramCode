@@ -18,6 +18,7 @@ import {
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { stripThreadContextPreamble } from '../threadContextPreamble';
+import { buildOpenCodeSchedulerMcpRegistration } from '../scheduler/injection';
 import {
   buildSessionTitleSnippet,
   checkIsMeaningfulPrompt,
@@ -283,6 +284,16 @@ interface SseStreamState {
    * promise may already hold a stale reference.
    */
   isClosed: boolean;
+  /**
+   * Latch set once the scheduler MCP server has been registered for this
+   * directory's instance (plan S6). The stream's lifetime IS the server
+   * generation: a fresh stream opens per directory on start/resume and again
+   * after `restartServer` re-opens streams, so registering on the first
+   * `ensureDirectoryStream` per stream re-registers exactly when the runtime
+   * registration would have died with the old server — once per directory per
+   * server generation, not once per session.
+   */
+  isSchedulerMcpRegistered: boolean;
 }
 
 /**
@@ -1839,8 +1850,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       stallTimer: null,
       reconnectTimer: null,
       isClosed: false,
+      isSchedulerMcpRegistered: false,
     };
     this.sseStreams.set(directory, stream);
+
+    // Register the bot's scheduler MCP server for this directory's instance
+    // (plan S6). Tied to the stream so it re-runs once per server generation:
+    // a runtime registration dies with the opencode server, and a fresh stream
+    // is what `restartServer` re-opens after the self-heal. Fire-and-forget —
+    // `ensureDirectoryStream` is sync and the registration is an enhancement,
+    // not a dependency of the session starting.
+    void this.registerSchedulerMcpForDirectory(stream);
 
     // `/event?directory=<dir>` delivers ONLY this directory instance's events
     // (verified live, opencode 1.16.0) — no `/global/event` multiplex, so each
@@ -1853,6 +1873,37 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.error(`[OpenCode] SSE connection error for ${directory}:`, e);
       this.emitToDirectorySessions(directory, 'error', e instanceof Error ? e : new Error(String(e)));
     });
+  }
+
+  /**
+   * @description Register the bot's scheduler MCP server for `stream.directory`'s
+   * OpenCode instance via the runtime `POST /mcp?directory=` endpoint (plan S6).
+   * Idempotent on the server (re-POSTing the same `name` overwrites/no-ops), and
+   * gated by `stream.isSchedulerMcpRegistered` so it runs once per stream (i.e.
+   * once per directory per server generation). Inert until S8 wires injection —
+   * the builder returns `null` and this no-ops. A registration FAILURE is logged
+   * and swallowed: scheduling tools are an enhancement, the session must still
+   * start (and the stream may have closed mid-flight, so re-check before latching).
+   */
+  private async registerSchedulerMcpForDirectory(stream: SseStreamState): Promise<void> {
+    if (stream.isSchedulerMcpRegistered || stream.isClosed) return;
+    const registration = await buildOpenCodeSchedulerMcpRegistration(stream.directory);
+    if (!registration) return;
+    if (stream.isClosed) return;
+    try {
+      await this.apiRequest(
+        'POST',
+        buildDirectoryScopedPath('/mcp', stream.directory),
+        registration,
+      );
+      stream.isSchedulerMcpRegistered = true;
+      appendDiagLog(`scheduler mcp registered dir=${stream.directory}`);
+    } catch (e) {
+      console.warn(
+        `[OpenCode] scheduler MCP registration failed for ${stream.directory}:`,
+        e instanceof Error ? e.message : e,
+      );
+    }
   }
 
   /**

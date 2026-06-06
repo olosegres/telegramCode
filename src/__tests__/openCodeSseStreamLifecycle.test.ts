@@ -22,6 +22,12 @@ import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenCodeAdapter } from '../adapters/openCodeAdapter';
 import { keyToString, type ThreadKey } from '../types';
+import {
+  configureSchedulerMcpInjection,
+  resetSchedulerMcpInjection,
+  schedulerMcpServerName,
+} from '../scheduler/injection';
+import { verifySchedulerMcpToken } from '../scheduler/mcpSurface';
 
 const sharedDir = '/work/shared';
 const otherDir = '/work/other';
@@ -159,6 +165,79 @@ describe('shared-directory routing parses once and delivers to the owner', () =>
   });
 });
 
+describe('scheduler MCP registration on directory stream open (plan S6)', () => {
+  const secret = 'a'.repeat(64);
+  const port = 4097;
+
+  afterEach(() => {
+    resetSchedulerMcpInjection();
+  });
+
+  it('inert (injection unconfigured): opening a stream POSTs nothing', () => {
+    const adapter = createAdapter();
+    const calls: { method: string; url: string }[] = [];
+    adapter['apiRequest'] = (async (method: string, url: string) => {
+      calls.push({ method, url });
+    }) as OpenCodeAdapter['apiRequest'];
+
+    adapter['ensureDirectoryStream'](sharedDir);
+    assert.equal(calls.length, 0, 'no registration POST when injection is inert');
+    assert.equal(adapter['sseStreams'].get(sharedDir)?.isSchedulerMcpRegistered, false);
+  });
+
+  it('configured: opening a stream POSTs the dir-scoped registration once', async () => {
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    const adapter = createAdapter();
+    const calls: { method: string; url: string; body: unknown }[] = [];
+    adapter['apiRequest'] = (async (method: string, url: string, body: unknown) => {
+      calls.push({ method, url, body });
+    }) as OpenCodeAdapter['apiRequest'];
+
+    adapter['ensureDirectoryStream'](sharedDir);
+    // Registration is fire-and-forget (async); let the microtask settle.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(calls.length, 1, 'exactly one registration POST');
+    assert.equal(calls[0].method, 'POST');
+    assert.equal(calls[0].url, `/mcp?directory=${encodeURIComponent(sharedDir)}`);
+
+    const body = calls[0].body as {
+      name: string;
+      config: { type: string; url: string; enabled: boolean; headers: { Authorization: string } };
+    };
+    assert.equal(body.name, schedulerMcpServerName);
+    assert.equal(body.config.type, 'remote');
+    assert.equal(body.config.enabled, true);
+    assert.equal(body.config.url, `http://127.0.0.1:${port}/mcp`);
+    // The token verifies to the EXACT directory scope.
+    const token = body.config.headers.Authorization.slice('Bearer '.length);
+    assert.deepEqual(verifySchedulerMcpToken(secret, token), { kind: 'dir', directory: sharedDir });
+
+    // Latched: a second ensure for the SAME stream does not re-POST.
+    adapter['registerSchedulerMcpForDirectory'](adapter['sseStreams'].get(sharedDir)!);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 1, 'idempotent — registered flag prevents a re-POST');
+  });
+
+  it('registration failure is swallowed (the stream/session is never torn down)', async () => {
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    const adapter = createAdapter();
+    adapter['apiRequest'] = (async () => {
+      throw new Error('opencode 404 / server sick');
+    }) as OpenCodeAdapter['apiRequest'];
+
+    // Must not throw out of the sync ensure path, and the stream stays open.
+    assert.doesNotThrow(() => adapter['ensureDirectoryStream'](sharedDir));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(adapter['sseStreams'].has(sharedDir), true, 'stream survives a failed registration');
+    assert.equal(
+      adapter['sseStreams'].get(sharedDir)?.isSchedulerMcpRegistered,
+      false,
+      'a failed registration leaves the flag unset so a later open retries',
+    );
+  });
+});
+
 describe('per-stream stall watchdog aborts only its own stream', () => {
   beforeEach(() => {
     mock.timers.enable({ apis: ['setTimeout'] });
@@ -176,6 +255,7 @@ describe('per-stream stall watchdog aborts only its own stream', () => {
       stallTimer: null,
       reconnectTimer: null,
       isClosed: false,
+      isSchedulerMcpRegistered: true,
     };
 
     adapter['armSseStallWatchdog'](stream, controller);
@@ -196,6 +276,7 @@ describe('per-stream stall watchdog aborts only its own stream', () => {
       stallTimer: null,
       reconnectTimer: null,
       isClosed: false,
+      isSchedulerMcpRegistered: true,
     };
 
     adapter['armSseStallWatchdog'](stream, controller);

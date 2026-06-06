@@ -81,6 +81,15 @@ config/variants, not a per-message API field).
   isolated `DATA_DIR`, group, and OpenCode port.
 - **MCP hierarchy.** MCP servers merge across user / group / project / thread
   scopes with `${VAR}` env expansion.
+- **Agent scheduling tools (injected).** Separately from that user hierarchy,
+  the bot injects its OWN `telegramBot` MCP server (HTTP, loopback `127.0.0.1`,
+  per-session thread/dir-scoped HMAC tokens) into EVERY bot-started session —
+  Claude via a bot-generated `--mcp-config` file (thread-scoped), OpenCode via
+  runtime `POST /mcp?directory=` (dir-scoped, re-registered after a server
+  restart). This server exposes the `schedule_*` tools and is bot-owned
+  plumbing; it is NOT part of the user-editable `/mcp` hierarchy and never
+  touches the user's group/thread config files. Builders live in
+  `scheduler/injection.ts` (inert until boot wiring configures the secret+port).
 - **Thread-context preamble.** The bot prepends a `[Telegram thread context]`
   block (topic name, group title, `chatId:threadId`, bound folder) to the
   forwarded prompt so the agent knows WHERE it works. Built in

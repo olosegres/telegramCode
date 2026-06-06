@@ -29,6 +29,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
+import { buildClaudeSchedulerMcpConfig } from './scheduler/injection';
 
 export interface PrepareMcpOptions {
   key: ThreadKey;
@@ -132,6 +133,38 @@ function threadMcpTmp(dataDir: string, key: ThreadKey): string {
 }
 
 /**
+ * Bot-OWNED scheduler MCP config tmp (plan S6). A third `--mcp-config` whose
+ * contents the bot generates from {@link buildClaudeSchedulerMcpConfig} — it
+ * never touches the user's group/thread files. Distinct per-key filename so a
+ * second startSession overwrites rather than piling up, matching the group/
+ * thread tmp convention.
+ */
+function schedulerMcpTmp(dataDir: string, key: ThreadKey): string {
+  return path.join(dataDir, 'tmp', `mcp-${keyToString(key)}-scheduler.json`);
+}
+
+/**
+ * @description Write an already-built JSON config object to a bot-owned tmp with
+ * the same `0700` dir / `0600` file conventions as {@link writeExpandedTmp}. No
+ * `${VAR}` expansion: the bot generated this object itself (the only `${VAR}`
+ * concern is user-authored configs). Returns the tmp path, or `null` if the write
+ * failed (a broken scheduler config must never gate the agent start).
+ */
+function writeGeneratedTmp(config: unknown, tmpPath: string): string | null {
+  fs.mkdirSync(path.dirname(tmpPath), { recursive: true, mode: 0o700 });
+  try {
+    const fd = fs.openSync(tmpPath, 'w', 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify(config)); }
+    finally { fs.closeSync(fd); }
+    fs.chmodSync(tmpPath, 0o600);
+  } catch (e) {
+    console.warn(`[mcp] cannot write tmp ${tmpPath}:`, e);
+    return null;
+  }
+  return tmpPath;
+}
+
+/**
  * @description Build the `--mcp-config <path>` argument pairs to interleave
  * into the Claude CLI invocation for a fresh or resumed session. Returns
  * an empty array when neither group nor thread level has a config — claude
@@ -139,12 +172,15 @@ function threadMcpTmp(dataDir: string, key: ThreadKey): string {
  * the right default for a bot that hasn't been configured with bespoke
  * tooling yet.
  *
- * The function is sync (`fs.*Sync`) on purpose — startSession is already
- * sequenced before tmux send-keys, and the synchronous block (≈ low ms on
- * small JSON files) is cheaper than the await ceremony. Both source files
- * combined are kept under a few KB by design.
+ * The user-config reads are sync (`fs.*Sync`) on purpose — both source files
+ * combined are kept under a few KB by design. The function is async only to
+ * await the bot's scheduler MCP config (plan S6), which mints a scope token via
+ * the persisted HMAC secret. When scheduler injection is inert (S8 not wired)
+ * {@link buildClaudeSchedulerMcpConfig} returns `null`, so the output is
+ * byte-identical to the pre-scheduler behavior — only the user's group/thread
+ * configs are emitted.
  */
-export function prepareMcpFlags(opts: PrepareMcpOptions): string[] {
+export async function prepareMcpFlags(opts: PrepareMcpOptions): Promise<string[]> {
   const flags: string[] = [];
 
   const groupPath = writeExpandedTmp(
@@ -159,6 +195,18 @@ export function prepareMcpFlags(opts: PrepareMcpOptions): string[] {
   );
   if (threadPath) flags.push('--mcp-config', threadPath);
 
+  // Bot-generated scheduler MCP config: NEVER touches the user's files. Inert
+  // (null) until S8 configures injection — then a third `--mcp-config` carrying
+  // the thread-scoped token reaches Claude.
+  const schedulerConfig = await buildClaudeSchedulerMcpConfig(opts.key);
+  if (schedulerConfig) {
+    const schedulerPath = writeGeneratedTmp(
+      schedulerConfig,
+      schedulerMcpTmp(opts.dataDir, opts.key),
+    );
+    if (schedulerPath) flags.push('--mcp-config', schedulerPath);
+  }
+
   return flags;
 }
 
@@ -169,7 +217,11 @@ export function prepareMcpFlags(opts: PrepareMcpOptions): string[] {
  * for a thread that never had MCP configured.
  */
 export function cleanupMcpTempFiles(opts: PrepareMcpOptions): void {
-  for (const tmp of [groupMcpTmp(opts.dataDir, opts.key), threadMcpTmp(opts.dataDir, opts.key)]) {
+  for (const tmp of [
+    groupMcpTmp(opts.dataDir, opts.key),
+    threadMcpTmp(opts.dataDir, opts.key),
+    schedulerMcpTmp(opts.dataDir, opts.key),
+  ]) {
     try { fs.unlinkSync(tmp); }
     catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {

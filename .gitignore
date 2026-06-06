@@ -7,7 +7,6 @@ data/
 *.log
 .DS_Store
 .idea/
-.claude/
 *.tsbuildinfo
 coverage/
 agent/tmp/

@@ -345,6 +345,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'schedule.fired':
       '⏰ Расписание «{name}» ({schedule}){missedNote}\n\n{prompt}',
     'schedule.missedNote': ' — пропущено в {time}, догоняю',
+    'schedule.pausedUnbound':
+      '⏸ Расписаний на паузе: {count} — топик отвязан от папки. /bind вернёт их в строй.',
+    'schedule.resumedRebind': '▶️ Расписаний возобновлено: {count} (следующий запуск пересчитан от текущего момента).',
     // ── /schedule command wrapper prompts (agent-facing instructions: kept
     //    English instructions in BOTH locales (the agent acts on them, the user
     //    never reads them); the TARGET reply language is baked per locale — the
@@ -650,6 +653,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'schedule.fired':
       '⏰ Schedule "{name}" ({schedule}){missedNote}\n\n{prompt}',
     'schedule.missedNote': ' — missed at {time}, catching up',
+    'schedule.pausedUnbound':
+      '⏸ Schedules paused: {count} — the topic was unbound from its folder. /bind will bring them back.',
+    'schedule.resumedRebind': '▶️ Schedules resumed: {count} (next run recomputed from now).',
     // ── /schedule command wrapper prompts (agent-facing instructions: kept
     //    English instructions in BOTH locales (the agent acts on them, the user
     //    never reads them); the TARGET reply language is baked per locale — the

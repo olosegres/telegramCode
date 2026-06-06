@@ -89,7 +89,22 @@ config/variants, not a per-message API field).
   restart). This server exposes the `schedule_*` tools and is bot-owned
   plumbing; it is NOT part of the user-editable `/mcp` hierarchy and never
   touches the user's group/thread config files. Builders live in
-  `scheduler/injection.ts` (inert until boot wiring configures the secret+port).
+  `scheduler/injection.ts`, configured at boot by `wireScheduler` in `bot.ts`
+  (if the MCP server fails to bind its port, the bot still boots — injection
+  stays inert and only the agent-facing tools are unavailable that run).
+- **Scheduled prompts (`src/scheduler/`).** A topic can have scheduled prompts:
+  at fire time the bot posts the prompt into the topic, PINS the announcement
+  (pins accumulate as run history — the bot never auto-unpins; per-job
+  `isPinSilent` makes the pin not notify members, default notifies), then
+  delivers the prompt to the topic's agent — reusing an active session
+  (waiting for idle up to 10 min rather than interrupting live work) or
+  starting one with the thread's last-used adapter. Created via `/schedule`
+  (prompt wrapper) or by the agent itself (`schedule_create/list/cancel` MCP
+  tools; cron / one-shot / N-times, min interval 5 min, ≤30 jobs per thread).
+  Restart-safe: timers re-arm from `state.json` at boot and missed runs fire
+  ONE catch-up annotated with the missed time. `/unbind` pauses the thread's
+  jobs (one notice); `/bind` resumes them from now (an expired one-shot is
+  dropped). Run history: `DATA_DIR/scheduler-runs.jsonl`.
 - **Thread-context preamble.** The bot prepends a `[Telegram thread context]`
   block (topic name, group title, `chatId:threadId`, bound folder) to the
   forwarded prompt so the agent knows WHERE it works. Built in
@@ -145,6 +160,15 @@ config/variants, not a per-message API field).
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
+| `scheduler/recurrence.ts` | Pure schedule math on `croner`: `ScheduleSpec` (cron / once / N-times), validation (min fire interval 5 min), next-occurrence, human description, catch-up decision |
+| `scheduler/store.ts` | Schedule records: create path (slug ids, ≤30/thread cap, `isPinSilent`), persisted in `state.json` `schedules` (lifecycle-independent) |
+| `scheduler/engine.ts` | Timer engine: one unref'd timer per job, boot replay with one-catch-up-per-missed-run, no-overlap guard, N-times/once bookkeeping, `whenIdle` drain |
+| `scheduler/delivery.ts` | Fire pipeline: announce → pin (notify by default) → wait-for-idle (5s polls, 10 min cap) → forward with the `[Scheduled run]` marker; unbound topic → distinct error |
+| `scheduler/mcpSurface.ts` | Bot-owned MCP server (stateless streamable HTTP, `127.0.0.1:4097`): `schedule_create/list/cancel`, HMAC bearer tokens scoped `thread:`/`dir:` |
+| `scheduler/injection.ts` | Builders for injecting the bot's MCP entry into sessions: Claude `--mcp-config` object, OpenCode `POST /mcp` registration; inert until configured |
+| `scheduler/runLedger.ts` | Append-only JSONL run history (`DATA_DIR/scheduler-runs.jsonl`, 10MB→.1 rotation) |
+| `scheduler/directoryThreads.ts` | Pure inversion: directory → thread keys bound to it (the MCP `dir:` scope resolution) |
+| `scheduler/rebindResume.ts` | Pure rebind decision: resume a paused job from now, or drop an expired one-shot |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
 | `outputTrace.ts` | Output-trace mode, toggled at runtime via `/trace` (no env var): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram. The toggle (`tracedThreads` set + `traceAllThreads` flag) is persisted in `state.json` and re-seeded at boot; an async-buffered, single-flight writer flushes on a 500ms timer / 200-entry threshold (sync flush on process exit). OFF by default → one boolean check per hook. Filtering: `recv`/`emit`/send-with-thread-id record iff the thread is traced (all-flag or in the set); send records with NO derivable thread id (e.g. `editMessageText`) record whenever ANY tracing is active |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
@@ -244,8 +268,8 @@ as a command in `bot.ts`.
     user-read), but the TARGET reply language is baked per locale (ru → reply
     in Russian, en → in English): a fresh session's only user-language signal
     is the bot locale (live 2026-06-06: "in their language" made the agent
-    interview in English). Until the scheduler MCP tools land (plan S5/S6)
-    the agent simply replies it can't schedule — accepted intermediate state.
+    interview in English). The agent's `schedule_*` MCP tools are injected
+    into every bot-started session (see "Agent scheduling tools" above).
   - While a Claude TUI selector is on screen (`isQuestionPending`), a bare
     digit / `y` / `n` reply drives the menu in place (`sendInput`, no
     interrupt Escape); any other text breaks out as a fresh prompt. Pre-fix

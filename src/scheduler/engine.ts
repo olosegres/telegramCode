@@ -299,6 +299,17 @@ export function createSchedulerEngine(deps: SchedulerEngineDeps): SchedulerEngin
       return;
     }
 
+    if (fresh.isPaused) {
+      // Paused DURING delivery (e.g. the deliver callback hit an unbound topic
+      // and parked the job, S8): the engine never arms a paused job, so do NOT
+      // re-arm a recurring one or delete a one-shot — just stay disarmed and let
+      // the rebind-resume path own its lifecycle. (A pause BEFORE the timer fires
+      // is caught earlier in onTimer as a paused-skip.)
+      disarmJob(fresh.id);
+      await store.flush();
+      return;
+    }
+
     const lastRunStatus = outcome.status === 'delivered' ? 'delivered' : 'failed';
 
     if (fresh.spec.kind === 'once') {

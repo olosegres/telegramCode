@@ -106,6 +106,14 @@ import {
   fileRetentionMs,
   fileSweepIntervalMs,
 } from './botFileStorage';
+import { RunLedger } from './scheduler/runLedger';
+import { createScheduleDelivery, unboundDeliveryError } from './scheduler/delivery';
+import { createSchedulerEngine, type SchedulerEngine } from './scheduler/engine';
+import { createSchedulerMcpServer, type SchedulerMcpHandle } from './scheduler/mcpSurface';
+import { configureSchedulerMcpInjection } from './scheduler/injection';
+import { getThreadKeysForDirectory } from './scheduler/directoryThreads';
+import { getRebindResumeAction } from './scheduler/rebindResume';
+import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/types';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -312,6 +320,14 @@ const COOLDOWN_RETRY_SLACK_MS = 250;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let state!: StateStore;
+
+/**
+ * @description The scheduler timer engine (S3), constructed in {@link startBot}.
+ * Module-level so the `/unbind` pause path, the `/bind` resume path, and the
+ * shutdown handler can reach `armJob` / `disarmJob` / `shutdown` without
+ * threading the instance through every caller. `null` until boot wires it.
+ */
+let schedulerEngine: SchedulerEngine | null = null;
 
 /**
  * @description Resolve the live `DATA_DIR` from the state store. The store
@@ -2258,7 +2274,74 @@ async function applyBinding(
         threads: peers.map(k => `\`${keyToString(k)}\``).join(', '),
       })
     : t('thread.bound', { subdir });
+
+  // Rebind resume (S8): a thread that was unbound paused its schedules; binding
+  // it again (this thread, possibly a different folder) resumes them. Best
+  // effort — a folder pick must succeed even if the resume bookkeeping hiccups.
+  await resumeThreadSchedulesOnRebind(key).catch((e) =>
+    console.warn(`[scheduler] resume-on-rebind failed for ${keyToString(key)}:`, e),
+  );
+
   return { ok: true, message, subdir };
+}
+
+/**
+ * @description Pause every schedule owned by `key` because its topic was just
+ * unbound (S8): flag each `isPaused` with reason `'unbound'`, disarm its timer,
+ * and post ONE notice naming the count (only when > 0). Scheduler pins are NOT
+ * touched (user decision: pins accumulate). Returns the number paused so the
+ * caller can decide whether anything happened. The engine stays generic — this
+ * unbound-specific policy lives here in bot.ts.
+ */
+async function pauseThreadSchedulesOnUnbind(key: ThreadKey): Promise<number> {
+  const records = state.getThreadSchedules(key);
+  if (records.length === 0) return 0;
+  for (const record of records) {
+    await state.setSchedulePaused(record.id, true, 'unbound');
+    schedulerEngine?.disarmJob(record.id);
+  }
+  await replyToThread(key, t('schedule.pausedUnbound', { count: records.length }));
+  return records.length;
+}
+
+/**
+ * @description Resume the schedules paused for `'unbound'` on `key` when its
+ * topic is rebound (S8): recompute each `nextRunAt` FROM NOW (no catch-up for a
+ * deliberate pause), then either un-pause + re-arm, or — for a one-shot whose
+ * instant already passed while unbound — drop the record (a past one-shot has no
+ * future occurrence, so it cannot be resumed). Posts ONE notice with the resumed
+ * count (only when > 0). Jobs paused for other reasons (none exist in v1) are
+ * left alone.
+ */
+async function resumeThreadSchedulesOnRebind(key: ThreadKey): Promise<void> {
+  const paused = state
+    .getThreadSchedules(key)
+    .filter((record) => record.isPaused && record.pauseReason === 'unbound');
+  if (paused.length === 0) return;
+
+  const nowMs = Date.now();
+  let resumed = 0;
+  for (const record of paused) {
+    const action = getRebindResumeAction(record, nowMs);
+    if (action.kind === 'remove') {
+      await state.removeSchedule(record.id);
+      schedulerEngine?.disarmJob(record.id);
+      continue;
+    }
+    const updated: ScheduleRecord = {
+      ...record,
+      nextRunAt: action.nextRunAt,
+      updatedAt: new Date(nowMs).toISOString(),
+    };
+    delete updated.isPaused;
+    delete updated.pauseReason;
+    await state.upsertSchedule(updated);
+    schedulerEngine?.armJob(updated);
+    resumed += 1;
+  }
+  if (resumed > 0) {
+    await replyToThread(key, t('schedule.resumedRebind', { count: resumed }));
+  }
 }
 
 /**
@@ -2392,6 +2475,13 @@ command('unbind', async (_ctx, key) => {
     // Release persisted session ids too — otherwise re-binding this thread
     // later + a bot restart would resurrect the old session the user unbound.
     await state.clearAgentSessionIds(key);
+    // Pause this thread's schedules BEFORE dropping the binding: a fire against
+    // an unbound topic can't deliver, so the jobs park (paused + disarmed) and
+    // the next /bind resumes them. `removeBinding` only touches bindings/agents/
+    // messages — schedules are their own collection and survive (S8).
+    await pauseThreadSchedulesOnUnbind(key).catch((e) =>
+      console.warn(`[scheduler] pause-on-unbind failed for ${kStr}:`, e),
+    );
     await state.removeBinding(key);
     clearInMemoryThreadState(key);
     await replyToThread(key, t('thread.unbound'));
@@ -5333,6 +5423,83 @@ async function reattachExistingSessions(
   console.log(`[reattach] opencode: reopened ${reopened} sessions (quiet=${opts.quietReattach})`);
 }
 
+/**
+ * @description Construct the scheduler stack (S8): run ledger → delivery (thin
+ * lambdas over the bot's existing send/session functions) → timer engine
+ * (assigned to the module-level {@link schedulerEngine}) → the bot-owned MCP
+ * server handle (NOT started — the caller starts it and wires the injection
+ * with the actually-bound port). Lives outside `startBot` only for readability;
+ * it captures the same module-level state the rest of bot.ts uses.
+ */
+function wireScheduler(): SchedulerMcpHandle {
+  const ledger = new RunLedger();
+
+  const delivery = createScheduleDelivery({
+    announce: (threadKeyStr, text) => replyToThread(keyFromString(threadKeyStr), text),
+    pin: async (threadKeyStr, messageId, isSilent) => {
+      const key = keyFromString(threadKeyStr);
+      await enqueueSend(
+        key,
+        () =>
+          bot.telegram.pinChatMessage(key.chatId, messageId, {
+            disable_notification: isSilent,
+          }),
+        'interactive',
+      );
+    },
+    checkBusy: (threadKeyStr) => {
+      const key = keyFromString(threadKeyStr);
+      return getThreadAdapter(key).checkIsBusy?.(key) ?? false;
+    },
+    ensureSession: async (threadKeyStr, fallbackAdapterName) => {
+      const result = await ensureAgentSession(keyFromString(threadKeyStr), { fallbackAdapterName });
+      return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+    },
+    forwardPrompt: async (threadKeyStr, text) => {
+      const key = keyFromString(threadKeyStr);
+      await deliverPromptOrBuffer(key, text, startupPromptBuffer.checkIsStarting(threadKeyStr));
+    },
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
+
+  /**
+   * The engine's deliver callback: the S4 pipeline plus the S8 unbound-pause
+   * policy — a fire that hits an unbound topic parks the job (paused +
+   * disarmed + one notice) instead of failing forever on every occurrence.
+   * The engine's bookkeeping sees the paused record and leaves it disarmed.
+   */
+  const deliver = async (job: ScheduleRecord, fireContext: FireContext): Promise<DeliveryOutcome> => {
+    const outcome = await delivery(job, fireContext);
+    if (outcome.status === 'failed' && outcome.error === unboundDeliveryError) {
+      await state.setSchedulePaused(job.id, true, 'unbound');
+      schedulerEngine?.disarmJob(job.id);
+      await replyToThread(keyFromString(job.threadKey), t('schedule.pausedUnbound', { count: 1 })).catch(() => {});
+    }
+    return outcome;
+  };
+
+  schedulerEngine = createSchedulerEngine({
+    store: state,
+    ledger,
+    deliver,
+    now: () => Date.now(),
+  });
+
+  return createSchedulerMcpServer({
+    store: state,
+    armJob: (record) => schedulerEngine?.armJob(record),
+    disarmJob: (jobId) => schedulerEngine?.disarmJob(jobId),
+    getThreadsForDirectory: (directory) =>
+      getThreadKeysForDirectory(state.listBindings(), ENV.workRoot, directory),
+    getThreadAdapterName: (threadKeyStr) => {
+      const key = keyFromString(threadKeyStr);
+      return getThreadAdapterNameRaw(key) ?? state.getAgent(key)?.name;
+    },
+    getSecret: () => state.getSchedulerMcpSecret(),
+  });
+}
+
 export async function startBot(): Promise<void> {
   console.log('');
   console.log('=================================');
@@ -5431,6 +5598,38 @@ export async function startBot(): Promise<void> {
   //    reload so the user isn't spammed with "session reattached" notices
   //    on every nodemon swap; verbose on a real cold start.
   await reattachExistingSessions({ quietReattach: bootMode.isHotReload });
+
+  // 5-scheduler. Wire the scheduler (S8): run ledger → delivery (thin lambdas
+  //    over existing bot functions) → timer engine → bot-owned MCP server →
+  //    boot replay. Runs AFTER reattach so a catch-up fire finds adapters
+  //    registered. The MCP server is the only piece that can fail at boot (port
+  //    busy); if it does, the bot still boots and the engine still runs — only
+  //    the agent-facing tools stay unavailable (injection stays inert).
+  const schedulerMcpHandle = wireScheduler();
+  let schedulerMcpStarted = false;
+  try {
+    await schedulerMcpHandle.start();
+    schedulerMcpStarted = true;
+    const boundPort = schedulerMcpHandle.port;
+    configureSchedulerMcpInjection({
+      getSecret: () => state.getSchedulerMcpSecret(),
+      port: boundPort,
+    });
+    console.log(`[scheduler] MCP server listening on 127.0.0.1:${boundPort}`);
+  } catch (e) {
+    // Port busy / bind failure: keep booting WITHOUT the scheduler MCP server.
+    // Injection stays unconfigured (inert), so agent sessions get no scheduling
+    // tools, but engine timers still fire for jobs created in previous runs.
+    console.error(
+      '[scheduler] MCP server failed to start; scheduling tools unavailable this run:',
+      e instanceof Error ? e.message : e,
+    );
+  }
+  // Boot catch-up replay: arm every persisted job, fire one catch-up per missed
+  // run. Independent of the MCP server (delivery does not need it).
+  await schedulerEngine!.rearmAll().catch((e) =>
+    console.error('[scheduler] rearmAll failed:', e),
+  );
 
   // 5a. Refresh pinned banners for every binding. Threads that have a
   //     stored `pinnedStatusMessageId` get their banner edited in place;
@@ -5559,6 +5758,10 @@ export async function startBot(): Promise<void> {
         clearInterval(inMemoryGcInterval);
         clearInterval(heartbeatInterval);
         clearInterval(fileSweepInterval);
+        // Scheduler (S8): clear every armed job timer; persisted nextRunAt
+        // means the next boot's rearmAll picks them back up (catch-up replay).
+        schedulerEngine?.shutdown();
+        if (schedulerMcpStarted) void schedulerMcpHandle.stop().catch(() => {});
       },
     });
   };

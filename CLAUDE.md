@@ -31,7 +31,17 @@ to the agent rather than handled locally:
   sharing a folder share one stream and every event is JSON-parsed once and
   routed to the owning session (plan `agent/tasks/completed/2026-06-05-event-loop-saturation-phase1.md`,
   S5). The stream opens with the first active session in a folder and closes
-  with the last.
+  with the last. **Owner resolution is robust (plan
+  `agent/tasks/actual/2026-06-08-fix-lost-final-message-and-silent-question-drops.md`,
+  S1+S2):** an event routes by `sessionID` (direct id, else child→parent lineage
+  ancestor — sub-agents run in CHILD sessions), and when both miss it falls back
+  to the stream's DIRECTORY (the sole active session there, or — when two topics
+  share a folder — only the one that is a genuine lineage ancestor, else a LOUD
+  drop, never a guess). Lineage is recorded from ANY event exposing `parentID`
+  (not just `session.updated`) and refreshed-on-use so an actively-routing child
+  is never evicted from the bounded map. `question.asked`/`permission.asked` are
+  CRITICAL: a genuinely unroutable one is logged, never silently swallowed (the
+  old silent drop = the user's "question vanished, looked hung" bug).
 
 When adding a feature, first decide: *is this a bot-local concern, or something
 that must be proxied to the agent?* If it changes agent behavior (model,
@@ -360,6 +370,23 @@ per-backend, persisted agent setting.
   topic. `/trace off` (or `/trace off all`) stops it; `/trace` reports status.
   The toggle is persisted in `state.json`, so it survives a hot rebuild
   mid-debug — no `.env` edit, no restart.
+  - **Diagnosing "a message never reached the user"** (dropped agent output,
+    missing question / option buttons) — `output-trace.jsonl` is the SOURCE OF
+    TRUTH, not the bot's stdout (which goes to the operator's terminal, not a
+    file). Method: `/trace on` in the topic → reproduce → follow the chain per
+    message and localize the loss:
+    `recv` (update arrived) → `emit` (adapter produced output/question) →
+    `sendTry` → `sendOk` / `sendErr`.
+      - no `emit` → lost in the adapter (SSE event not routed/handled);
+      - `emit` but no `sendTry`/`sendOk` → lost in the bot's send path;
+      - `sendErr` (429 `retryAfterSec`) → rate-limited / dropped under load
+        (the prime suspect for *intermittent* loss — event-loop saturation);
+      - `sendOk` but absent in `get_history` → spilled into / edited onto
+        another message.
+    Then diff the trace (what the bot DID) against `get_history` (what the user
+    SEES). This beats reasoning from code or a homemade SSE listener — a stale
+    code comment can lie (e.g. `question.asked` was once documented as carrying
+    no `sessionID`; the live event now does), the trace cannot.
 
 - **`OpenCode error: Invalid authentication credentials` → restart the OpenCode
   server** (the `opencode serve` process on port 4096) — its provider credentials

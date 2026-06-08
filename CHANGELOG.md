@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **`WORK_DIR` is no longer fatal.** Launch `telegramCode` from the parent
+  folder containing your projects — that `$PWD` becomes the work root.
+  `WORK_ROOT` is now an advanced override (services / containers where the
+  process cwd can't be controlled); a stray legacy `WORK_DIR` is ignored, not a
+  startup error.
+- **`ALLOWED_GROUP_ID` is now optional.** Leave it empty to auto-pair with the
+  first forum supergroup an admin contacts the bot from; set it only to pin a
+  specific group before first contact.
+- **OpenCode no longer interrupts a running turn for a new prompt.** A prompt
+  sent while OpenCode is busy is queued by `prompt_async` and picked up promptly
+  instead of aborting the live turn (which only lost work). Claude keeps its
+  Escape-and-wait — its TUI ignores typed input mid-turn.
+
 ## 2.1.0 — 2026-05-13
 
 **Audit fixes release.** Full repo audit (50 findings across security,

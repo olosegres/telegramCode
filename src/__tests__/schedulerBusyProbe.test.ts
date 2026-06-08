@@ -3,8 +3,8 @@
  * predicates added in S4 (the scheduler's wait-for-idle probe). These are the
  * sync, in-memory busy decisions each adapter's `checkIsBusy` method delegates
  * to, exported so they are testable without spawning a tmux pane / OpenCode
- * server. The underlying signals (`checkIsClaudeBusy` footer scrape,
- * `getOpenCodeInterruptAction`) have their own coverage — here we lock the
+ * server. The underlying signals (`checkIsClaudeBusy` footer scrape, the
+ * SSE-driven busy tracking) have their own coverage — here we lock the
  * "session active AND mid-turn" gating those methods add.
  */
 

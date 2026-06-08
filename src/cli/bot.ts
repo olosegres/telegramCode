@@ -11,9 +11,9 @@ import { acquireLock, installLockCleanupHandlers } from './lock';
  *      the bot module is imported, because `src/bot.ts` reads many
  *      `process.env.*` values at top-level (TELEGRAM_BOT_TOKEN, WORK_ROOT,
  *      ALLOWED_GROUP_ID, etc.).
- *   2. Default `WORK_ROOT` to `process.cwd()` if still unset, with a stderr
- *      warning so the user knows what happened. This replaces the historical
- *      fatal error at `src/bot.ts:101-103`.
+ *   2. Default `WORK_ROOT` to `process.cwd()` if still unset. This is the
+ *      normal path: start `telegramCode` from the parent folder containing
+ *      the projects/topics you want to bind.
  *   3. Validate `WORK_ROOT` resolves to an existing directory — fail fast
  *      with a clear message if not.
  *   4. Acquire the single-instance lock and wire cleanup handlers.
@@ -39,7 +39,7 @@ export async function runBot(): Promise<void> {
   if (!process.env.WORK_ROOT) {
     process.env.WORK_ROOT = process.cwd();
     process.stderr.write(
-      `WORK_ROOT not set, defaulting to $PWD = ${process.env.WORK_ROOT}\n`,
+      `Using $PWD as WORK_ROOT: ${process.env.WORK_ROOT}\n`,
     );
   }
   const wr = process.env.WORK_ROOT;

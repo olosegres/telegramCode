@@ -123,8 +123,9 @@ import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/t
  * process via `index.ts`) on any required mis-configuration so the bot
  * never silently runs in a half-broken state.
  *
- * Plan §10.7 lists the obligatory variables; §13.4 / §13.12 spell out
- * the breaking renames (`WORK_DIR` → `WORK_ROOT`, new `ALLOWED_GROUP_ID`).
+ * `TELEGRAM_BOT_TOKEN` is the only normal required env var. `WORK_ROOT` is
+ * usually supplied by the CLI wrapper as `$PWD`; the fallback here keeps a
+ * direct import from silently becoming stricter than the public entrypoint.
  */
 function parseEnv() {
   const errors: string[] = [];
@@ -152,27 +153,14 @@ function parseEnv() {
     }
   }
 
-  // WORK_DIR deprecation (plan §13.12, D20).
-  if (process.env.WORK_DIR && !process.env.WORK_ROOT) {
-    errors.push(
-      'WORK_DIR is deprecated in 2.0; set WORK_ROOT to the parent folder ' +
-        'containing your projects (e.g., WORK_ROOT=/home/user/src). ' +
-        'Each forum thread will bind to a subdirectory under WORK_ROOT.',
-    );
-  }
-
-  const workRoot = process.env.WORK_ROOT;
-  if (!workRoot) {
-    errors.push('WORK_ROOT is required (parent dir of your project subfolders)');
-  } else {
-    try {
-      if (!fs.statSync(workRoot).isDirectory()) {
-        errors.push(`WORK_ROOT="${workRoot}" is not a directory`);
-      }
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code ?? 'unknown';
-      errors.push(`WORK_ROOT="${workRoot}" is not accessible (${code})`);
+  const workRoot = process.env.WORK_ROOT || process.cwd();
+  try {
+    if (!fs.statSync(workRoot).isDirectory()) {
+      errors.push(`WORK_ROOT="${workRoot}" is not a directory`);
     }
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code ?? 'unknown';
+    errors.push(`WORK_ROOT="${workRoot}" is not accessible (${code})`);
   }
 
   if (errors.length > 0) {
@@ -183,7 +171,7 @@ function parseEnv() {
   return {
     botToken: botToken!,
     allowedGroupId,
-    workRoot: workRoot!,
+    workRoot,
     defaultAgent: process.env.DEFAULT_AGENT || 'claude',
     openaiApiKey: process.env.OPENAI_API_KEY,
     groqApiKey: process.env.GROQ_API_KEY,
@@ -2009,12 +1997,13 @@ async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
  * the loader/marker behaviour stays identical across all three.
  *
  * If the adapter implements `interruptAndWaitIdle`, we interrupt the running
- * turn and wait until it is actually idle before handing over the text —
- * waiting (instead of a fixed delay) is what keeps the prompt from queuing
- * behind a still-running turn. Claude does this via Escape + a TUI poll,
- * OpenCode via `POST /abort` + an SSE-state wait; both leave a running
- * sub-agent / compaction untouched and let the prompt queue instead. An
- * adapter without the method forwards directly.
+ * turn and wait until it is actually idle before handing over the text. Only
+ * Claude implements it (Escape + a TUI poll) — its TUI ignores typed input for
+ * a long stretch of a running turn, so interrupting is what makes it read the
+ * new message promptly. OpenCode deliberately does NOT: `prompt_async` queues
+ * the prompt and the agent picks it up quickly, so aborting the live turn cost
+ * work for nothing (user decision 2026-06-06). An adapter without the method
+ * forwards directly.
  */
 async function forwardPromptToAgent(
   key: ThreadKey,

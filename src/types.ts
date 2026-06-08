@@ -304,12 +304,12 @@ export interface AgentAdapter extends EventEmitter {
   /**
    * @description Interrupt the current turn and resolve only once the agent is
    * idle again, so the caller can forward a fresh prompt without it being
-   * queued behind the running turn. Claude sends Escape (which also cancels an
-   * on-screen selector) then polls the TUI until it leaves the busy state;
-   * OpenCode issues `POST /session/:id/abort` then waits for idle via its SSE
-   * status stream. Both deliberately leave a running sub-agent / in-flight
-   * compaction untouched (the prompt queues instead). Adapters that don't
-   * implement it forward the prompt directly.
+   * queued behind the running turn. Implement it ONLY when the backend ignores
+   * queued input while busy: Claude's TUI does (Escape — which also cancels an
+   * on-screen selector — then a poll until the busy state clears). OpenCode
+   * deliberately does NOT implement it — `prompt_async` queues the new prompt
+   * and the turn picks it up quickly, so aborting live work would only lose it
+   * (user decision 2026-06-06). Adapters without the method forward directly.
    */
   interruptAndWaitIdle?(key: ThreadKey): Promise<void>;
 

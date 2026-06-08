@@ -1,58 +1,41 @@
 /**
- * @description For OpenCode (HTTP+SSE, not keystroke-driven — no Escape, single
- * or double), a new prompt to a busy session aborts the current generation via
- * `POST /session/:id/abort` so it starts fresh — EXCEPT while a sub-agent
- * (child session) runs or context is compacting, where aborting would kill the
- * child / discard the summary, so the prompt must queue instead.
- * `getOpenCodeInterruptAction` is the pure decision driving that.
+ * @description OpenCode never interrupts a running turn for a new prompt:
+ * `prompt_async` queues the message and the agent reads it promptly, so unlike
+ * the Claude TUI (which ignores typed input mid-turn and needs Escape first)
+ * aborting would only lose live work (user decision 2026-06-06). The contract
+ * tests lock that asymmetry on the adapter prototypes; the tracking tests cover
+ * `applyOpenCodeStatusEvent`, the SSE-driven busy state behind
+ * `checkIsOpenCodeSessionBusy` (the scheduler's wait-for-idle probe).
  */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
-  getOpenCodeInterruptAction,
+  OpenCodeAdapter,
   applyOpenCodeStatusEvent,
   type OpenCodeBusyTracking,
 } from '../adapters/openCodeAdapter';
+import { ClaudeCliAdapter } from '../adapters/claudeCliAdapter';
 
 const own = 'ses_own';
 const child = 'ses_child';
 const freshTracking = (): OpenCodeBusyTracking => ({ isBusy: false, busyChildSessionIds: new Set() });
 
-test('busy generation → abort before new prompt', () => {
+// ── interrupt-before-prompt contract ──
+
+test('opencode adapter does NOT implement interruptAndWaitIdle — a new prompt queues, never aborts', () => {
   assert.equal(
-    getOpenCodeInterruptAction({ isBusy: true, isCompacting: false, busyChildCount: 0 }),
-    'abort',
+    'interruptAndWaitIdle' in OpenCodeAdapter.prototype,
+    false,
+    'forwardPromptToAgent must forward directly for OpenCode',
   );
 });
 
-test('idle session → no interrupt needed', () => {
-  assert.equal(
-    getOpenCodeInterruptAction({ isBusy: false, isCompacting: false, busyChildCount: 0 }),
-    'skip-idle',
-  );
+test('claude adapter DOES implement interruptAndWaitIdle — its TUI ignores input mid-turn without Escape', () => {
+  assert.equal(typeof ClaudeCliAdapter.prototype.interruptAndWaitIdle, 'function');
 });
 
-test('compaction in flight → queue, never abort (even if also flagged busy)', () => {
-  assert.equal(
-    getOpenCodeInterruptAction({ isBusy: true, isCompacting: true, busyChildCount: 0 }),
-    'queue-compacting',
-  );
-});
-
-test('sub-agent child running → queue, never abort', () => {
-  assert.equal(
-    getOpenCodeInterruptAction({ isBusy: true, isCompacting: false, busyChildCount: 1 }),
-    'queue-subagent',
-  );
-});
-
-test('compaction takes priority over a busy sub-agent (most-protective wins)', () => {
-  assert.equal(
-    getOpenCodeInterruptAction({ isBusy: true, isCompacting: true, busyChildCount: 2 }),
-    'queue-compacting',
-  );
-});
+// ── SSE busy tracking ──
 
 test('own-session status drives isBusy (busy then idle)', () => {
   const t = freshTracking();

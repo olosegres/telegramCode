@@ -52,6 +52,10 @@ config/variants, not a per-message API field).
   (the old smoke-test fallback is retired). For OpenCode the bind is the
   server-instance selector: sessions are created and listed in that folder's
   project instance via `?directory=<workDir>`.
+- **Launch path defines the work root.** The normal operator workflow is
+  `cd <projects-parent> && telegramCode`; when `WORK_ROOT` is unset, the
+  wrapper uses `$PWD`. Treat `WORK_ROOT` as an advanced override for services or
+  containers where the process cwd cannot be controlled.
 - **Per-thread isolation.** Routing, sessions, MCP config, model/effort prefs,
   and history are keyed per topic (`ThreadKey` = `"<chatId>:<threadId>"`).
 - **Restart-safe.** State is persisted to `state.json`; on restart the bot

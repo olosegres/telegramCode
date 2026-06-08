@@ -21,9 +21,9 @@ project for parallel work.
 </table>
 
 > **Breaking 2.0** — the old "one bot = one private chat = one folder" mode
-> is gone. The bot now requires a Telegram forum supergroup; `WORK_DIR` was
-> renamed to `WORK_ROOT` (parent folder containing your projects). See
-> [Migration from 1.x](#migration-from-1x).
+> is gone. The bot now requires a Telegram forum supergroup; start
+> `telegramCode` from the parent folder containing your projects and that `$PWD`
+> becomes the work root. See [Migration from 1.x](#migration-from-1x).
 
 ## Quick Start
 
@@ -96,8 +96,8 @@ The wrapper looks for env in two places (in order):
 1. `~/.config/telegram-code/.env` — base, set once, used everywhere
 2. `$PWD/.env` — per-project override
 
-`WORK_ROOT` defaults to `$PWD` when unset, so you can `cd` into your
-projects parent and just type `telegramCode`. A single-instance lockfile
+`telegramCode` should normally be launched from your projects parent; that
+directory becomes the work root. A single-instance lockfile
 (`$DATA_DIR/instance.lock`) prevents a second bot starting under the same
 user; cross-user instances are naturally isolated by `HOME`-derived
 `DATA_DIR`. Stale locks (after `kill -9`) are reclaimed automatically.
@@ -128,7 +128,7 @@ and vice versa.
 ## Architecture
 
 ```
-WORK_ROOT=/home/user/src                ← one host folder per instance
+$PWD=/home/user/src                     ← launch `telegramCode` here
 ├── projectAlpha/      ← Topic "projectAlpha"        (claude)
 ├── overview/         ← Topic "projB-frontend"       (claude)
 │                     ← Topic "projB-backend"        (opencode)   ← one folder, two topics
@@ -209,12 +209,14 @@ Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 
 ## Environment Variables
 
-### Required
+### Set Before Launch
 
 | Variable | Description |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | From @BotFather |
-| `WORK_ROOT` | Host parent folder; topics bind to its subdirs. Defaults to `$PWD` when launched via the `telegramCode` wrapper |
+| `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
+
+Start from the parent folder containing your projects: `cd ~/projects && telegramCode`.
+That `$PWD` is the work root; do not set `WORK_ROOT` for normal use.
 
 **Access control.** There is no user allow-list. Whoever is a **creator or
 administrator of the served forum group** may talk to the agent — read live from
@@ -224,7 +226,7 @@ refresh). The bot must be a group admin itself (it already needs that to create
 topics and pin). Anonymous admins can't be matched from their messages, so post
 non-anonymously.
 
-### Optional
+### External Optional
 
 | Variable | Default | Description |
 |---|---|---|
@@ -232,23 +234,32 @@ non-anonymously.
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
 | `DEFAULT_AGENT` | `claude` | `claude` or `opencode` |
 | `BOT_LANG` | `ru` | `ru` or `en` |
-| `OPENCODE_URL` | `http://localhost:4096` | OpenCode server URL — must differ per instance on the same host |
-| `OPENCODE_USERNAME` | `opencode` | Basic-auth username when `OPENCODE_PASSWORD` is set |
-| `OPENCODE_PASSWORD` | — | Basic-auth password for a protected OpenCode server |
-| `OPENCODE_ALLOW_REMOTE` | — | Set to `1` only if `OPENCODE_URL` intentionally points outside loopback |
-| `OPENCODE_BIN` | (auto) | Custom opencode binary path |
-| `CLAUDE_BIN` | (auto) | Custom Claude binary path for nvm/asdf/systemd PATH differences |
-| `CLAUDE_SCRAPE_DEBUG` | — | Set to `1` to log full Claude RAW/FILTERED scrape chunks |
-| `SCHEDULER_MCP_PORT` | `4097` | Loopback port for the bot-owned scheduler MCP server injected into agent sessions. Must differ from the `OPENCODE_URL` port in the same process/container |
-| `ANTHROPIC_API_KEY` | — | For Claude Code |
-| `GROQ_API_KEY` | — | Voice transcription (free, preferred) |
-| `OPENAI_API_KEY` | — | Voice transcription (fallback) |
+| `GROQ_API_KEY` | — | Recommended for voice transcription. Without it, voice messages are not transcribed unless you intentionally configure the OpenAI fallback |
 
-> `WORK_DIR` (1.x) is **fatal** in 2.0 — set `WORK_ROOT` to the parent
-> instead. The bot reports a clear error on boot, see
-> [Migration from 1.x](#migration-from-1x). When started via the
-> `telegramCode` CLI wrapper, an unset `WORK_ROOT` is no longer fatal —
-> it defaults to `$PWD` with a stderr warning.
+Agent provider/auth setup is normally done inside the agents themselves:
+`claude login` for Claude CLI and OpenCode's own config/plugins for OpenCode.
+No provider API key env var is required by the bot for text sessions. For
+OpenCode, install any third-party provider plugins or authentication resolvers
+before launch if your chosen providers need them.
+
+### Advanced / Not Normally Needed
+
+| Variable | Default | Set only when |
+|---|---|---|
+| `WORK_ROOT` | `$PWD` | You cannot control the process cwd; normal launch uses `cd <projects-parent> && telegramCode` |
+| `OPENCODE_URL` | `http://localhost:4096` | You use a custom OpenCode port or external server; the port must differ per instance |
+| `OPENCODE_USERNAME` | `opencode` | `OPENCODE_PASSWORD` is set for a protected OpenCode server |
+| `OPENCODE_PASSWORD` | — | Connecting to a protected OpenCode server |
+| `OPENCODE_ALLOW_REMOTE` | — | `OPENCODE_URL` intentionally points outside loopback |
+| `OPENCODE_BIN` | (auto) | The `opencode` binary is not on PATH or you use a fork |
+| `CLAUDE_BIN` | (auto) | The `claude` binary is not on PATH due to nvm/asdf/systemd PATH differences |
+| `OPENAI_API_KEY` | — | You intentionally use OpenAI Whisper as the voice fallback instead of Groq |
+| `ANTHROPIC_API_KEY` | — | A custom MCP/OpenCode plugin/auth resolver explicitly reads it; not needed for normal Claude CLI auth |
+| `SCHEDULER_MCP_PORT` | `4097` | The default collides with another local port, including this instance's `OPENCODE_URL` port |
+| `CLAUDE_SCRAPE_DEBUG` | off | You are debugging Claude tmux scraping and need full RAW/FILTERED chunks |
+
+> `WORK_DIR` (1.x) is retired. Use the wrapper from the desired parent folder
+> instead of carrying the old env forward.
 
 ## MCP servers — user / group / project / thread
 
@@ -423,8 +434,8 @@ There is no in-place upgrade; the steps are:
 
 1. Stop the old bot.
 2. Create a forum supergroup, add the bot, follow [Quick Start §2-3](#2-create-the-forum-supergroup).
-3. Rename `WORK_DIR` → `WORK_ROOT` in your env and point it at the
-   parent folder (e.g. `/home/user/src`).
+3. Remove the old `WORK_DIR` env and launch from the projects parent:
+   `cd /home/user/src && telegramCode`.
 4. Leave `ALLOWED_GROUP_ID` empty to auto-pair on first contact (or set
    the numeric id by hand).
 5. Set `DATA_DIR` if you run two instances on the same host.

@@ -198,7 +198,7 @@ test('cli claude forwards SIGINT and dies by signal (preserves canonical exit st
   );
 });
 
-test('runBot defaults WORK_ROOT to $PWD when unset and proceeds past preflight', () => {
+test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () => {
   // Use a fake telegram token so the bot can't actually start polling — it'll
   // fail at the Telegram API call. That's fine: we only care that the
   // preflight (env load, WORK_ROOT default, lock acquire) happened.
@@ -221,12 +221,11 @@ test('runBot defaults WORK_ROOT to $PWD when unset and proceeds past preflight',
     timeout: 10_000,
   });
 
-  // The "WORK_ROOT not set, defaulting to $PWD" line must appear, with the
-  // correct project dir.
+  // The normal wrapper path uses the current directory as the project parent.
   assert.match(
     r.stderr,
     new RegExp(
-      `WORK_ROOT not set, defaulting to \\$PWD = ${projectDir.replace(/\//g, '\\/')}`,
+      `Using \\$PWD as WORK_ROOT: ${projectDir.replace(/\//g, '\\/')}`,
     ),
   );
 });

@@ -155,6 +155,14 @@ export interface OutputEventMeta {
    * Absent/false = a standalone output (new logical message).
    */
   isContinuation?: boolean;
+  /**
+   * True when this `output` is the LAST frame of a turn (emitted as the session
+   * goes idle). The bot flushes it promptly instead of waiting out the
+   * possibly-429-stretched debounce, so the final message never lingers behind
+   * a cooldown. Only affects flush TIMING — append/continuation semantics are
+   * unchanged.
+   */
+  isFinal?: boolean;
 }
 
 /**

@@ -2606,11 +2606,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * resets `lastEmittedLength` to 0 after the final tail, so the next response
    * again starts with a non-continuation first tail.
    */
-  private emitResponseTail(key: ThreadKey, session: OpenCodeSession): void {
+  private emitResponseTail(key: ThreadKey, session: OpenCodeSession, isFinal = false): void {
     const tail = session.currentResponseText.slice(session.lastEmittedLength);
     if (!tail.trim()) return;
     const isContinuation = session.lastEmittedLength > 0;
-    const meta: OutputEventMeta = { isContinuation };
+    // `isFinal` rides only the idle-triggered flush so the bot can skip the
+    // possibly-429-stretched debounce for the turn's last frame.
+    const meta: OutputEventMeta = { isContinuation, isFinal };
     this.emit('output', key, tail, meta);
     session.lastEmittedLength = session.currentResponseText.length;
   }
@@ -2753,7 +2755,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     applyOpenCodeStatusEvent(session, session.sessionId, sessionId ?? null, false);
 
     console.log(`[OpenCode] Session idle`);
-    this.flushOutput(key);
+    // The turn just ended: mark this flush final so the bot delivers the last
+    // frame promptly instead of letting it sit out a stretched 429 debounce.
+    this.flushOutput(key, true);
   }
 
   /**
@@ -2890,7 +2894,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return JSON.stringify(error);
   }
 
-  private flushOutput(key: ThreadKey): void {
+  private flushOutput(key: ThreadKey, isFinal = false): void {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
 
@@ -2909,7 +2913,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       session.pendingStatus = null;
     }
 
-    this.emitResponseTail(key, session);
+    this.emitResponseTail(key, session, isFinal);
 
     session.currentResponseText = '';
     session.lastEmittedLength = 0;

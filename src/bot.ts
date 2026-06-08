@@ -66,6 +66,7 @@ import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
+import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import {
   flushTraceBufferSyncOnExit,
@@ -1361,25 +1362,51 @@ function escapeMarkdown(text: string): string {
 /**
  * Audit S13 / #30: extracted from two near-identical ternaries; lengthens
  * the debounce window during a 429 cooldown so we don't keep hammering
- * Telegram while it's already throttling us.
+ * Telegram while it's already throttling us. Now a thin wrapper over the pure
+ * {@link getOutputFlushTiming} — used by the re-trigger timer (always non-final,
+ * so it never returns `'now'`).
  */
 function getOutputDelay(chatId: number): number {
-  return checkIsRateLimited(chatId)
-    ? Math.max(OUTPUT_DEBOUNCE_MS, 5000)
-    : OUTPUT_DEBOUNCE_MS;
+  const timing = getOutputFlushTiming({
+    isFinal: false,
+    isRateLimited: checkIsRateLimited(chatId),
+    normalDebounceMs: OUTPUT_DEBOUNCE_MS,
+  });
+  // Non-final input can only yield a numeric delay, never `'now'`.
+  return timing === 'now' ? OUTPUT_DEBOUNCE_MS : timing;
 }
 
-function queueOutput(key: ThreadKey, output: string, isContinuation = false): void {
+/**
+ * @param isFinal True when this is the turn's last frame (the OpenCode session
+ *   went idle). The frame is appended exactly like any other (continuation
+ *   semantics unchanged), but instead of waiting out the possibly-429-stretched
+ *   debounce it is flushed immediately so the turn never looks hung behind a
+ *   cooldown.
+ */
+function queueOutput(key: ThreadKey, output: string, isContinuation = false, isFinal = false): void {
   const q = getOutputQueueState(key);
   // The continuation flag of the FIRST batch in a fresh buffer decides whether
   // the whole flush extends the last sent message; later batches only append.
   if (q.pendingOutput === null) q.pendingIsContinuation = isContinuation;
   q.pendingOutput = appendPendingOutput(q.pendingOutput, output, isContinuation);
   if (q.debounceTimer) clearTimeout(q.debounceTimer);
+
+  const timing = getOutputFlushTiming({
+    isFinal,
+    isRateLimited: checkIsRateLimited(key.chatId),
+    normalDebounceMs: OUTPUT_DEBOUNCE_MS,
+  });
+  if (timing === 'now') {
+    // Final frame: flush immediately. `processOutputQueue` already guards
+    // `isProcessing`, so this is idempotent if a flush is mid-flight (the
+    // pending frame will be picked up by the re-trigger timer it arms).
+    void processOutputQueue(key);
+    return;
+  }
   q.debounceTimer = setTimeout(() => {
     q.debounceTimer = null;
     processOutputQueue(key);
-  }, getOutputDelay(key.chatId));
+  }, timing);
 }
 
 async function processOutputQueue(key: ThreadKey): Promise<void> {
@@ -5023,7 +5050,7 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     if (adapter.outputsDeltas) msgState.needsNewMessage = true;
     void deleteStatusMessage(key).catch(() => {});
   }
-  queueOutput(key, output, meta?.isContinuation === true);
+  queueOutput(key, output, meta?.isContinuation === true, meta?.isFinal === true);
 }
 
 /**

@@ -13,6 +13,12 @@
  */
 
 import { splitMessage } from '../messageSplit';
+import { renderAgentHtml } from '../renderAgentHtml';
+
+/** Inject the real render into the splitter so chunks are sized by their
+ *  rendered HTML length (escaping + tags inflate the source past Telegram's
+ *  cap), keeping `messageSplit.ts` dependency-free. */
+const measureRenderedLength = (chunk: string): number => renderAgentHtml(chunk).length;
 
 export interface OutputFlushInput {
   /** The batch of output text to flush (already debounce-coalesced). */
@@ -49,10 +55,13 @@ export function getOutputFlushPlan(input: OutputFlushInput): OutputFlushPlan {
     input.lastMessageId !== null &&
     input.lastMessageText !== null;
   if (!canAppend) {
-    return { chunks: splitMessage(input.output), shouldEditFirstChunk: false };
+    return {
+      chunks: splitMessage(input.output, undefined, measureRenderedLength),
+      shouldEditFirstChunk: false,
+    };
   }
   return {
-    chunks: splitMessage(input.lastMessageText + input.output),
+    chunks: splitMessage(input.lastMessageText + input.output, undefined, measureRenderedLength),
     shouldEditFirstChunk: true,
   };
 }

@@ -5157,7 +5157,10 @@ function armStatusDeferRetry(key: ThreadKey, c: StatusCoalesceState): void {
  */
 async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean> {
   const msgState = getThreadMessageState(key);
-  const chunks = splitMessage(status);
+  // Render-aware split: status frames are sent through `renderAgentHtml` below,
+  // which inflates the source past Telegram's cap, so size chunks by their
+  // rendered length (same measure the durable-output flush plan uses).
+  const chunks = splitMessage(status, undefined, chunk => renderAgentHtml(chunk).length);
   let landed = false;
   try {
     const firstRendered = renderAgentHtml(chunks[0]);

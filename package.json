@@ -17,7 +17,7 @@
     "dev": "tsx watch src/cli.ts",
     "hot": "node dist/cli.js hot",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test 'src/__tests__/**/*.test.ts'",
+    "test": "node --import tsx --import ./src/__tests__/globalTestSetup.ts --test 'src/__tests__/**/*.test.ts'",
     "claude": "UID=$(id -u) GID=$(id -g) docker compose run --rm claude"
   },
   "dependencies": {

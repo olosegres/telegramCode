@@ -88,6 +88,62 @@ export function keysEqual(a: ThreadKey, b: ThreadKey): boolean {
 }
 
 /**
+ * @description One tappable option of an interactive agent question
+ * (OpenCode's `ask`/question tool). `description` is shown beneath the label
+ * when present.
+ */
+export interface OpenCodeQuestionOption {
+  label: string;
+  description?: string;
+}
+
+/**
+ * @description One question of an interactive agent prompt. `multiple` means
+ * several options may be selected. The bot renders one Telegram message per
+ * question with an inline button per option.
+ */
+export interface OpenCodeQuestion {
+  question: string;
+  header?: string;
+  options: OpenCodeQuestionOption[];
+  multiple?: boolean;
+}
+
+/**
+ * @description A pending interactive question the agent is blocked on, awaiting
+ * the user's answer. Plain serialisable data (no functions / class instances)
+ * so it can be persisted in `state.json` and restored after a bot restart —
+ * which is the whole point: without persistence the in-memory pending-question
+ * map is lost on restart, the agent's question tool hangs forever, and the
+ * existing Telegram option buttons go dead. Lives here (a leaf module both
+ * `bot.ts` and `state.ts` already import) rather than in `openCodeAdapter.ts`
+ * so persisting it does not create a `state.ts → adapter → types` import cycle.
+ */
+export interface OpenCodePendingQuestion {
+  requestId: string;
+  questions: OpenCodeQuestion[];
+  /**
+   * Project-instance directory that owns the question request (from the
+   * `/global/event` envelope). The reply must select the same instance via
+   * `?directory=` — see `buildDirectoryScopedPath` in `openCodeAdapter.ts`.
+   */
+  directory?: string;
+}
+
+/**
+ * @description The bot's per-thread record of an interactive question on screen:
+ * the question {@link OpenCodePendingQuestion} plus the Telegram `messageId`
+ * of the posted option-button message (`null` until `replyToThread` resolves).
+ * Both fields are serialisable, so the whole record is persisted to `state.json`
+ * and restored at boot for threads whose session reattached — re-arming the
+ * existing buttons so a restart no longer hangs the agent.
+ */
+export interface PendingQuestionState {
+  data: OpenCodePendingQuestion;
+  messageId: number | null;
+}
+
+/**
  * @description Metadata riding an `output` event alongside the text.
  */
 export interface OutputEventMeta {

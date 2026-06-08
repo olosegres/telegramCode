@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
+import type { AgentAdapter, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
@@ -359,28 +359,14 @@ interface OpenCodeToolState {
   time?: { start?: number; end?: number };
 }
 
-export interface OpenCodeQuestionOption {
-  label: string;
-  description?: string;
-}
-
-export interface OpenCodeQuestion {
-  question: string;
-  header?: string;
-  options: OpenCodeQuestionOption[];
-  multiple?: boolean;
-}
-
-export interface OpenCodePendingQuestion {
-  requestId: string;
-  questions: OpenCodeQuestion[];
-  /**
-   * Project-instance directory that owns the question request (from the
-   * `/global/event` envelope). The reply must select the same instance via
-   * `?directory=` — see {@link buildDirectoryScopedPath}.
-   */
-  directory?: string;
-}
+// The interactive-question shapes moved to `types.ts` (a leaf module) so they
+// can be persisted from `state.ts` without an adapter→state import cycle.
+// Re-exported here so existing importers keep resolving them from the adapter.
+export type {
+  OpenCodeQuestionOption,
+  OpenCodeQuestion,
+  OpenCodePendingQuestion,
+} from '../types';
 
 interface OpenCodeMessageInfo {
   id?: string;

@@ -3,7 +3,7 @@ import { promises as fsp } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { randomBytes } from 'node:crypto';
-import { keyToString, type ThreadKey } from './types';
+import { keyToString, type PendingQuestionState, type ThreadKey } from './types';
 import type { ScheduleRecord } from './scheduler/types';
 
 /**
@@ -149,6 +149,18 @@ export interface StateV1 {
    * valid — a missing value is created lazily on the first read.
    */
   schedulerMcpSecret?: string;
+  /**
+   * In-flight interactive agent questions, keyed by {@link ThreadKey} string.
+   * Persisted so a pending question survives a bot restart / hot reload: the
+   * in-memory `pendingQuestions` map (see `bot.ts`) is otherwise lost, leaving
+   * the agent's question tool blocked forever and the posted Telegram option
+   * buttons dead ("no pending question"). The persisted `messageId` lets the
+   * OLD buttons resolve once the map is re-armed at boot, so no question is
+   * re-posted. Optional so older state files stay valid — a missing value is
+   * an empty set. Restored at boot only for threads whose session reattached
+   * and is active; otherwise dropped (the question is unreachable).
+   */
+  pendingQuestions?: Record<string, PendingQuestionState>;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -947,6 +959,51 @@ export class StateStore {
     this.state.schedulerMcpSecret = secret;
     await this.flush();
     return secret;
+  }
+
+  // ── pending interactive questions (restart survival) ──
+
+  /**
+   * @description Every persisted pending question across all threads, keyed by
+   * {@link ThreadKey} string. Read at boot to re-arm the in-memory map for
+   * threads whose session reattached. Returns a shallow copy so callers can't
+   * mutate the live state object.
+   */
+  getPendingQuestions(): Record<string, PendingQuestionState> {
+    return { ...(this.state.pendingQuestions ?? {}) };
+  }
+
+  /**
+   * @description Persist (upsert) the pending question for `key`, mirroring the
+   * in-memory `pendingQuestions.set(...)` in `bot.ts` so memory and disk never
+   * drift. Crash-window is acceptable on the debounced save: the worst case
+   * (process dies in the <=500ms before the flush) just falls back to the
+   * pre-fix behaviour for that one question. The `messageId` patch goes through
+   * here too, so the persisted record always carries the live button message.
+   */
+  async setPendingQuestion(key: ThreadKey, value: PendingQuestionState): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      (this.state.pendingQuestions ??= {})[k] = value;
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Remove the pending question for `key`. Mirrors every in-memory
+   * `pendingQuestions.delete(...)` in `bot.ts`. No-op (no save) when absent. The
+   * whole map is dropped once empty so an idle bot leaves a clean `state.json`.
+   */
+  async clearPendingQuestion(key: ThreadKey): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      if (!this.state.pendingQuestions?.[k]) return;
+      delete this.state.pendingQuestions[k];
+      if (Object.keys(this.state.pendingQuestions).length === 0) {
+        delete this.state.pendingQuestions;
+      }
+      this.scheduleSave();
+    });
   }
 
   // ── persistence ──

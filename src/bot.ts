@@ -23,7 +23,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, OutputEventMeta } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, OutputEventMeta, PendingQuestionState } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -365,11 +365,6 @@ interface OutputQueueState {
   debounceTimer: NodeJS.Timeout | null;
 }
 
-interface PendingQuestionState {
-  data: OpenCodePendingQuestion;
-  messageId: number | null;
-}
-
 /**
  * @description Per-thread coalescer for `status` (thinking / spinner) events.
  *
@@ -418,6 +413,33 @@ const pendingQuestions = new Map<string, PendingQuestionState>();
 const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
+
+/**
+ * @description Register/replace a thread's pending interactive question in BOTH
+ * the in-memory `pendingQuestions` map and the persisted store, so a restart
+ * can restore it (the in-memory map is otherwise lost — see `state.ts`). Single
+ * choke point for every `pendingQuestions.set(...)` / `messageId` patch so the
+ * two copies never drift. The store write is debounced + fire-and-forget; the
+ * in-memory set is what the live button handlers read, so it must be synchronous.
+ */
+function setPendingQuestion(key: ThreadKey, value: PendingQuestionState): void {
+  pendingQuestions.set(keyToString(key), value);
+  state.setPendingQuestion(key, value).catch(e =>
+    console.error('[pendingQuestion] persist failed:', e),
+  );
+}
+
+/**
+ * @description Drop a thread's pending interactive question from BOTH the
+ * in-memory map and the persisted store. Single choke point for every
+ * `pendingQuestions.delete(...)` so memory and disk stay in lockstep.
+ */
+function clearPendingQuestion(key: ThreadKey): void {
+  pendingQuestions.delete(keyToString(key));
+  state.clearPendingQuestion(key).catch(e =>
+    console.error('[pendingQuestion] clear failed:', e),
+  );
+}
 
 /**
  * @description Buffers prompts typed while an agent session is still booting so
@@ -743,7 +765,11 @@ async function handleSendError(key: ThreadKey, err: unknown): Promise<void> {
  * @description Drop all in-memory traces of a thread.
  *
  * Used after a `forum_topic_deleted` event or a 400-thread-not-found
- * cleanup. Does NOT touch state.json — caller already did or will.
+ * cleanup. Does NOT touch state.json bindings/agents/messages — the caller
+ * already removed those. The ONE persisted thing cleared here is the pending
+ * question (`clearPendingQuestion`): leaving it on disk after the binding is
+ * gone would orphan an unreachable entry that boot-restore would just drop
+ * anyway, so we release it eagerly to keep `state.json` clean.
  */
 function clearInMemoryThreadState(key: ThreadKey): void {
   const k = keyToString(key);
@@ -754,7 +780,7 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   clearThreadQueues(key);
   threadMessageStates.delete(k);
   outputQueues.delete(k);
-  pendingQuestions.delete(k);
+  clearPendingQuestion(key);
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
   threadSessionLists.delete(k);
@@ -2352,7 +2378,7 @@ function armFolderCreation(key: ThreadKey): void {
   awaitingSessionSelection.delete(kStr);
   // A stale pending question would otherwise consume the message AFTER the
   // folder name as an answer to the old (pre-rebind) agent question.
-  pendingQuestions.delete(kStr);
+  clearPendingQuestion(key);
   awaitingFolderName.add(kStr);
 }
 
@@ -4031,7 +4057,7 @@ bot.on(message('text'), async (ctx) => {
   const pending = pendingQuestions.get(kStr);
   if (pending && adapter.checkIsActive(key) && adapter.answerQuestion) {
     const answers: string[][] = pending.data.questions.map(() => [text]);
-    pendingQuestions.delete(kStr);
+    clearPendingQuestion(key);
     if (pending.messageId) {
       const q = pending.data.questions[0];
       const header = q?.header || q?.question || 'Question';
@@ -4938,7 +4964,7 @@ bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
   const answers: string[][] = pending.data.questions.map((_, i) =>
     i === qIdx ? [selectedLabel] : [''],
   );
-  pendingQuestions.delete(kStr);
+  clearPendingQuestion(key);
   if (pending.messageId) {
     await editThreadMessage(
       key,
@@ -5149,7 +5175,7 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   // "no pending question" answerCbQuery. The messageId is patched in
   // after `replyToThread` resolves.
   const kStr = keyToString(key);
-  pendingQuestions.set(kStr, { data: questionData, messageId: null });
+  setPendingQuestion(key, { data: questionData, messageId: null });
 
   (async () => {
     try {
@@ -5181,9 +5207,13 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
         if (messageId !== null) {
           // Patch the messageId on the existing entry (it may already
           // have been deleted by a `qa_*` callback firing in between).
+          // Route through `setPendingQuestion` so the persisted copy gets the
+          // live button message id too — that id is what lets the OLD buttons
+          // resolve after a restart without re-posting the question.
           const existing = pendingQuestions.get(kStr);
           if (existing && existing.data === questionData) {
             existing.messageId = messageId;
+            setPendingQuestion(key, existing);
           }
         }
       }
@@ -5199,7 +5229,7 @@ function handleAgentClosed(key: ThreadKey): void {
   // a 429 backlog could let queued deltas land seconds after the close).
   clearThreadQueues(key);
   deleteStatusMessage(key).catch(() => {});
-  pendingQuestions.delete(keyToString(key));
+  clearPendingQuestion(key);
   const adapter = getThreadAdapter(key);
   replyToThread(key, t('agent.session_ended', { label: adapter.label })).catch(() => {});
   // Banner now reads `idle`; closed sessions may also persist with the
@@ -5211,7 +5241,7 @@ function handleAgentError(key: ThreadKey, error: Error): void {
   console.error(`[Bot] adapter error ${keyToString(key)}:`, error.message);
   getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
-  pendingQuestions.delete(keyToString(key));
+  clearPendingQuestion(key);
   replyToThread(key, `Error: ${error.message}`).catch(() => {});
 }
 
@@ -5440,6 +5470,45 @@ async function reattachExistingSessions(
 }
 
 /**
+ * @description Restore persisted pending interactive questions into the
+ * in-memory `pendingQuestions` map so the existing Telegram option buttons
+ * work again after a restart (without this the map is lost, the agent's
+ * question tool hangs forever, and the buttons go dead — the live bug this
+ * fixes). MUST run AFTER {@link reattachExistingSessions} so session activity
+ * is known.
+ *
+ * A persisted question is restored ONLY when its thread's session reattached
+ * and is currently active (`adapter.checkIsActive`). Otherwise the question is
+ * unreachable — the agent that asked it is gone — so it is dropped from the
+ * store, preventing a stale entry from lingering across boots. The persisted
+ * `messageId` is preserved, so the OLD buttons resolve correctly; the question
+ * is never re-posted.
+ */
+function restorePendingQuestions(): void {
+  let restored = 0;
+  let dropped = 0;
+  for (const [keyStr, value] of Object.entries(state.getPendingQuestions())) {
+    let key: ThreadKey;
+    try {
+      key = keyFromString(keyStr);
+    } catch {
+      // Hand-edited / corrupt key (can't come from `keyToString`): skip it,
+      // keep booting. Tolerated-and-skipped, like state.ts's own key parsers.
+      continue;
+    }
+    const adapter = getThreadAdapter(key);
+    if (adapter.checkIsActive(key)) {
+      pendingQuestions.set(keyStr, value);
+      restored += 1;
+    } else {
+      clearPendingQuestion(key);
+      dropped += 1;
+    }
+  }
+  console.log(`[reattach] pending questions: restored ${restored}, dropped ${dropped}`);
+}
+
+/**
  * @description Construct the scheduler stack (S8): run ledger → delivery (thin
  * lambdas over the bot's existing send/session functions) → timer engine
  * (assigned to the module-level {@link schedulerEngine}) → the bot-owned MCP
@@ -5614,6 +5683,12 @@ export async function startBot(): Promise<void> {
   //    reload so the user isn't spammed with "session reattached" notices
   //    on every nodemon swap; verbose on a real cold start.
   await reattachExistingSessions({ quietReattach: bootMode.isHotReload });
+
+  // 5b. Re-arm pending interactive questions that survived the restart, so the
+  //     existing option buttons keep working. MUST run AFTER reattach so each
+  //     thread's session-active state is known (a question is restored only for
+  //     a thread whose session came back; otherwise it is unreachable, dropped).
+  restorePendingQuestions();
 
   // 5-scheduler. Wire the scheduler (S8): run ledger → delivery (thin lambdas
   //    over existing bot functions) → timer engine → bot-owned MCP server →

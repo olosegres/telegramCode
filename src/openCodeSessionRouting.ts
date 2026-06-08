@@ -165,8 +165,13 @@ function getLineageDepthToAncestor(
 }
 
 /**
- * Record a child→parent session link learned from a `session.updated` event,
- * keeping the map bounded (oldest insertion evicted past `maxEntries`).
+ * Record a child→parent session link learned from an event that exposes both
+ * ids, keeping the map bounded (oldest insertion evicted past `maxEntries`).
+ *
+ * Originally fed only by `session.updated`, but a child's lineage must be known
+ * BEFORE that beat or its earliest events drop "no owner" — so the adapter now
+ * records from ANY event whose properties expose `parentID` (S2 lineage
+ * durability), not just `session.updated`.
  *
  * Returns `true` only when a genuinely new or changed link was stored, so the
  * caller can emit a diagnostic line for exactly the links worth knowing about.
@@ -197,4 +202,86 @@ export function updateSessionLineage(
     if (oldestSessionId !== undefined) childToParent.delete(oldestSessionId);
   }
   return true;
+}
+
+/**
+ * @description Mark every lineage hop walked to route `eventSessionId` to one of
+ * its bound ancestors as MOST-recently-used, so an actively-routing child is
+ * never the eviction victim.
+ *
+ * Why this exists: the lineage map is bounded by `maxEntries` and evicts the
+ * OLDEST INSERTION first (a Map preserves insertion order). A long-lived
+ * subagent that keeps streaming but never re-emits its `parentID` would, after
+ * `maxEntries` newer links land, be evicted mid-turn and its remaining events
+ * would drop "no owner" (the ~9 min gap proven live for a child of thread 688).
+ * Re-inserting a USED link (delete + set — a plain `set` on an existing key does
+ * NOT reorder a JS Map) moves it to the tail, so the entries doing real routing
+ * work are evicted LAST. The cap is untouched; only the victim choice changes
+ * from "oldest inserted" to "oldest unused".
+ *
+ * Walks the same chain as {@link getLineageDepthToAncestor} (visited-set guards
+ * a corrupt cycle) and touches each link UP TO `ancestorSessionId` inclusive.
+ */
+export function touchLineageOnUse(
+  childToParent: Map<string, string>,
+  eventSessionId: string,
+  ancestorSessionId: string,
+): void {
+  const visitedSessionIds = new Set<string>();
+  let currentSessionId = eventSessionId;
+
+  while (!visitedSessionIds.has(currentSessionId)) {
+    visitedSessionIds.add(currentSessionId);
+
+    const parentSessionId = childToParent.get(currentSessionId);
+    if (parentSessionId === undefined) return;
+
+    // Re-insert to move this link to the tail (most-recently-used).
+    childToParent.delete(currentSessionId);
+    childToParent.set(currentSessionId, parentSessionId);
+
+    if (parentSessionId === ancestorSessionId) return;
+    currentSessionId = parentSessionId;
+  }
+}
+
+/**
+ * @description Resolve an event's owner by DIRECTORY when id/lineage resolution
+ * has already failed — the SSE-routing fallback (S2). The stream is opened per
+ * bound folder (`?directory=<dir>`), so an event arriving on it provably belongs
+ * to one of the threads bound to THAT folder, even when the per-session lineage
+ * map briefly disagrees (the child's `parentID` link was evicted or not yet
+ * recorded). Pure: the caller passes the directory's ACTIVE bound sessions, so
+ * it is unit-testable without a live server.
+ *
+ * Decision rule (never guess a topic — a wrong topic is worse than a logged
+ * drop):
+ *   - exactly ONE active session in the directory → it owns the event;
+ *   - more than one → disambiguate ONLY via in-memory lineage: route to the one
+ *     active session that is a lineage ancestor of `eventSessionId`. If zero or
+ *     several active sessions are ancestors → ambiguous → `null`;
+ *   - zero active sessions → `null`.
+ *
+ * @returns the owning thread's `keyStr`, or `null` when it cannot be resolved
+ *   unambiguously (the caller then loud-drops).
+ */
+export function resolveOwnerByDirectoryFallback(
+  eventSessionId: string,
+  directoryActiveSessions: readonly BoundSessionRef[],
+  childToParent: ReadonlyMap<string, string>,
+): string | null {
+  if (directoryActiveSessions.length === 0) return null;
+  if (directoryActiveSessions.length === 1) return directoryActiveSessions[0].keyStr;
+
+  // >1 active in the same folder (two topics on one project): only route when
+  // exactly one of them is a genuine lineage ancestor of the event's session.
+  let ancestorOwnerKey: string | null = null;
+  for (const bound of directoryActiveSessions) {
+    if (bound.sessionId === eventSessionId) return bound.keyStr;
+    if (getLineageDepthToAncestor(eventSessionId, bound.sessionId, childToParent) !== null) {
+      if (ancestorOwnerKey !== null) return null; // two ancestors → ambiguous
+      ancestorOwnerKey = bound.keyStr;
+    }
+  }
+  return ancestorOwnerKey;
 }

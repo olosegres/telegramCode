@@ -12,6 +12,8 @@ import {
   checkIsEventForSession,
   checkShouldLogDrop,
   getEventOwnerKey,
+  resolveOwnerByDirectoryFallback as resolveOwnerByDirectoryFallbackPure,
+  touchLineageOnUse,
   updateSessionLineage,
   type BoundSessionRef,
 } from '../openCodeSessionRouting';
@@ -435,8 +437,11 @@ export function mapOpenCodeMessagesToTurns(records: unknown, limit: number): Rec
 }
 
 /**
- * Shape of `properties.info` on a `session.updated` event — the only event
- * that exposes the child→parent session link used for subagent routing.
+ * Shape of `properties.info` carrying the child→parent session link used for
+ * subagent routing. Reliably present on `session.updated`; lineage is also
+ * recorded opportunistically from any other event that happens to expose
+ * `parentID` (S2 durability), so a child's link is known before its first
+ * routed event rather than only at the next `session.updated` beat.
  */
 interface OpenCodeSessionUpdatedInfo {
   id?: string;
@@ -482,13 +487,22 @@ const sseDropLogThrottleMs = 60_000;
  * sessions can't grow it without limit (matches the lineage-map discipline). */
 const maxSseDropThrottleEntries = 500;
 
-/** SSE event types whose loss makes a turn silently hang — diag-logged on drop. */
-const criticalSseEventTypes = new Set<string>([
+/**
+ * SSE event types whose loss makes a turn silently hang — diag-logged on drop.
+ * `question.asked` / `permission.asked` are here so an unrouted one is LOGGED
+ * (the user's question vanishing silently was the worst failure mode): they DO
+ * carry a real top-level `sessionID` in the current OpenCode build (verified
+ * live 2026-06-08), so they resolve like any other event — by sessionID, with a
+ * directory fallback — and a genuine miss is loud, never a no-op.
+ */
+export const criticalSseEventTypes = new Set<string>([
   'message.part.updated',
   'message.part.delta',
   'message.updated',
   'session.idle',
   'session.error',
+  'question.asked',
+  'permission.asked',
 ]);
 
 /**
@@ -2173,7 +2187,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const event = normaliseOpenCodeSseEvent(parsed);
     if (!event) return;
 
-    const ownerKeyStr = this.resolveSseEventOwner(event);
+    const ownerKeyStr = this.resolveSseEventOwner(event, streamDirectory);
     if (ownerKeyStr === undefined) return;
 
     // The instance directory is the stream's own folder; the bare `/event`
@@ -2194,24 +2208,26 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   /**
    * @description Resolve which thread (if any) should process `event`, applying
-   * the single-owner invariant (B20) and recording subagent lineage. Returns:
+   * the single-owner invariant (B20) and recording subagent lineage. Owner
+   * resolution is by sessionID (direct id, else lineage ancestor) with a
+   * DIRECTORY fallback off `streamDirectory` when both miss (S2). Returns:
    *   - the owning thread's serialised key for a per-session event;
    *   - `null` for a session-less event (`server.connected`/`heartbeat`) that
    *     every reader handles directly;
    *   - `undefined` to signal "do not dispatch" (missing sessionID, or no bound
-   *     thread owns the session — a genuine drop, throttle-logged).
+   *     thread owns the session — a genuine drop, loud-logged for every critical
+   *     type incl. question/permission, so a routable event is never a no-op).
    */
-  private resolveSseEventOwner(event: OpenCodeSseEvent): string | null | undefined {
+  private resolveSseEventOwner(event: OpenCodeSseEvent, streamDirectory: string): string | null | undefined {
     const eventType = event.type;
 
     // OpenCode runs subagents in CHILD sessions; their events carry the child
-    // sessionID, not the bound parent's. `session.updated` is the only event
-    // exposing the child→parent link — capture it BEFORE the session-id gate
-    // below (which would otherwise drop it as "without sessionID"), so
-    // descendant events can be routed back to the owning topic.
-    if (eventType === 'session.updated') {
-      this.trackSessionLineage(event.properties);
-    }
+    // sessionID, not the bound parent's. The child→parent link must be known
+    // BEFORE the child's first routed event or that event drops "no owner".
+    // `session.updated` is no longer the ONLY source — record from ANY event
+    // whose properties expose `parentID` (S2 lineage durability), capturing it
+    // BEFORE the session-id gate below so descendant events route to the owner.
+    this.trackSessionLineage(event.properties);
 
     // Session-less events are server-wide by design; they have no owner to
     // resolve and are processed directly by the dispatch switch.
@@ -2222,24 +2238,41 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const eventSessionId = this.getSessionIdFromEvent(event);
     if (!eventSessionId) {
       console.warn(`[OpenCode] dropping ${eventType} without sessionID`);
+      if (criticalSseEventTypes.has(eventType)) {
+        this.logSseDropOncePerWindow(eventType, '<no-session-id>');
+      }
       return undefined;
     }
 
     // Single-owner delivery (B20): resolve the ONE thread that owns
     // `eventSessionId` (direct id match, else nearest lineage ancestor). A
     // false lineage link or a duplicated session id must never emit the same
-    // answer to two topics.
-    const ownerKeyStr = this.resolveEventOwnerKey(eventSessionId);
-    if (ownerKeyStr === null) {
-      // A genuine loss is "no thread owns this event at all". Throttle the log
-      // per (eventType, eventSessionId) — an orphaned session's delta firehose
-      // would otherwise flood the diag file (B19).
-      if (criticalSseEventTypes.has(eventType)) {
-        this.logSseDropOncePerWindow(eventType, eventSessionId);
-      }
-      return undefined;
+    // answer to two topics. On success, refresh the lineage links walked so an
+    // actively-routing child is never the eviction victim (S2 durability).
+    const ownerKeyStr = this.resolveEventOwnerKey(eventSessionId, { refreshLineageOnUse: true });
+    if (ownerKeyStr !== null) return ownerKeyStr;
+
+    // Id/lineage resolution failed. Before dropping, fall back to the stream's
+    // DIRECTORY (S2): the stream is opened per bound folder, so the event
+    // provably belongs to a thread bound to THAT folder even when the per-session
+    // lineage map briefly disagrees (link evicted / not yet recorded). SYNC only
+    // — no HTTP on the per-event hot path; the decision uses in-memory state.
+    const fallbackOwnerKeyStr = this.resolveOwnerByDirectoryFallback(eventSessionId, streamDirectory);
+    if (fallbackOwnerKeyStr !== null) {
+      appendDiagLog(
+        `sse dir-fallback ${eventType} es=${eventSessionId} dir=${streamDirectory} -> ${fallbackOwnerKeyStr}`,
+      );
+      return fallbackOwnerKeyStr;
     }
-    return ownerKeyStr;
+
+    // A genuine loss is "no thread owns this event at all". Throttle the log
+    // per (eventType, eventSessionId) — an orphaned session's delta firehose
+    // would otherwise flood the diag file (B19). question/permission are now
+    // critical, so a vanished question is LOUD, never silent (S1).
+    if (criticalSseEventTypes.has(eventType)) {
+      this.logSseDropOncePerWindow(eventType, eventSessionId);
+    }
+    return undefined;
   }
 
   /**
@@ -2332,21 +2365,39 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Record a child→parent session link from a `session.updated`
-   * event so subagent (child-session) events can be routed to the topic bound
-   * to the parent. Root sessions (no `parentID`) and non-session ids are
-   * ignored; the map is bounded by `maxTrackedSessionLineageEntries`.
+   * @description Record a child→parent session link from ANY event that exposes
+   * `parentID`, so subagent (child-session) events route to the topic bound to
+   * the parent. Reliably populated by `session.updated` (its `info` carries the
+   * child id + `parentID`); also reads a top-level `properties.parentID`
+   * (paired with the event's session id) when a build emits it on other events,
+   * so a child's link is known BEFORE its first routed event instead of dropping
+   * "no owner" until the next `session.updated` beat (S2 durability). Root
+   * sessions (no `parentID`) and non-session ids are ignored by
+   * {@link updateSessionLineage}; the map is bounded by
+   * `maxTrackedSessionLineageEntries`.
    */
   private trackSessionLineage(properties: Record<string, unknown>): void {
     const info = properties.info as OpenCodeSessionUpdatedInfo | undefined;
+    // `session.updated` shape: info.id is the CHILD, info.parentID its parent.
+    this.recordSessionLineageLink(info?.id, info?.parentID);
+
+    // Other events: a top-level parentID belongs to the event's OWN session id.
+    const topLevelParentId = properties.parentID;
+    if (typeof topLevelParentId === 'string') {
+      this.recordSessionLineageLink(this.getSessionIdFromEvent({ type: '', properties }), topLevelParentId);
+    }
+  }
+
+  /** @description Store one child→parent link and diag-log it when it is new. */
+  private recordSessionLineageLink(childSessionId: string | null | undefined, parentSessionId: string | undefined): void {
     const recorded = updateSessionLineage(
       this.sessionLineage,
-      info?.id,
-      info?.parentID,
+      childSessionId ?? undefined,
+      parentSessionId,
       maxTrackedSessionLineageEntries,
     );
     if (recorded) {
-      appendDiagLog(`sse lineage child=${info?.id} parent=${info?.parentID}`);
+      appendDiagLog(`sse lineage child=${childSessionId} parent=${parentSessionId}`);
     }
   }
 
@@ -2406,13 +2457,55 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * `eventSessionId` (single-owner delivery, B20). Direct session-id match wins
    * over lineage descent; ties resolve deterministically. Returns the owning
    * thread's serialised key, or `null` if no active thread owns it.
+   *
+   * `refreshLineageOnUse` marks the lineage links walked to reach the owner as
+   * most-recently-used, so an actively-routing child can never be the eviction
+   * victim of the bounded lineage map (S2 durability) — only set on the live
+   * routing path, never when merely probing.
    */
-  private resolveEventOwnerKey(eventSessionId: string): string | null {
+  private resolveEventOwnerKey(
+    eventSessionId: string,
+    options?: { refreshLineageOnUse: boolean },
+  ): string | null {
+    const boundSessions = this.getActiveBoundSessions();
+    const ownerKeyStr = getEventOwnerKey(eventSessionId, boundSessions, this.sessionLineage);
+    if (ownerKeyStr !== null && options?.refreshLineageOnUse) {
+      const ownerSessionId = boundSessions.find((bound) => bound.keyStr === ownerKeyStr)?.sessionId;
+      // Only a descendant (event id ≠ owner id) walked the lineage chain; a
+      // direct id match used no links to refresh.
+      if (ownerSessionId !== undefined && ownerSessionId !== eventSessionId) {
+        touchLineageOnUse(this.sessionLineage, eventSessionId, ownerSessionId);
+      }
+    }
+    return ownerKeyStr;
+  }
+
+  /** @description Every currently-active session as a routing `BoundSessionRef`. */
+  private getActiveBoundSessions(): BoundSessionRef[] {
     const boundSessions: BoundSessionRef[] = [];
     for (const [keyStr, session] of this.sessions) {
       if (session.isActive) boundSessions.push({ keyStr, sessionId: session.sessionId });
     }
-    return getEventOwnerKey(eventSessionId, boundSessions, this.sessionLineage);
+    return boundSessions;
+  }
+
+  /**
+   * @description Directory fallback (S2): resolve an owner from the stream's
+   * bound folder when id/lineage resolution already failed. The stream is opened
+   * per directory (`?directory=`), so an event on it provably belongs to a
+   * thread bound to that folder. SYNC — uses only in-memory session state, NEVER
+   * an HTTP call on the per-event hot path. Delegates the decision to the pure
+   * {@link resolveOwnerByDirectoryFallbackPure}; the wiring here is just
+   * selecting the directory's active sessions.
+   */
+  private resolveOwnerByDirectoryFallback(eventSessionId: string, streamDirectory: string): string | null {
+    const directoryActiveSessions: BoundSessionRef[] = [];
+    for (const [keyStr, session] of this.sessions) {
+      if (session.isActive && session.workDir === streamDirectory) {
+        directoryActiveSessions.push({ keyStr, sessionId: session.sessionId });
+      }
+    }
+    return resolveOwnerByDirectoryFallbackPure(eventSessionId, directoryActiveSessions, this.sessionLineage);
   }
 
   /**

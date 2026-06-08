@@ -293,7 +293,12 @@ as a command in `bot.ts`.
     applies on the next agent start (OpenCode; Claude refuses — its model
     switch is a TUI keystroke with nothing to persist).
   - `/effort` sets per-thread reasoning effort and offers tappable inline
-    buttons (one per available level). **Two backends differ:** Claude has a
+    buttons (one per available level). **Works pre-session like `/model`** (no
+    `checkIsActive` gate): the pick is persisted and the next session replays it
+    — the picker lists the PROSPECTIVE model's levels (OpenCode resolves it from
+    the live session → saved `/model` pref → server default; Claude's canonical
+    set is session-independent). Picking before a session start returns a soft
+    "start an agent" notice, not a refusal. **Two backends differ:** Claude has a
     native `/effort <level>` slash command (typed into the TUI; canonical set
     `low…ultracode`, claude clamps unsupported levels per model). OpenCode
     encodes effort as the model's **variant** — read live from

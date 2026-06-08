@@ -3291,10 +3291,10 @@ command('effort', async (ctx, key) => {
     await replyToThread(key, t('effort.unsupported_backend', { label: adapter.label }));
     return;
   }
-  if (!adapter.checkIsActive(key)) {
-    await replyToThread(key, t('effort.no_session'));
-    return;
-  }
+  // No `checkIsActive` gate — like `/model`, effort works pre-session: the
+  // adapter persists the pick (OpenCode/Claude) and a later session replays it.
+  // The picker lists the PROSPECTIVE model's levels; the direct-set path
+  // surfaces the adapter's own notice (e.g. Claude's `effort.start_agent_first`).
 
   // Direct set: `/effort <level>`. The adapter validates (Claude against its
   // canonical set, OpenCode against the model's variants) and returns a
@@ -4850,10 +4850,9 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const level = ctx.match[1];
   const adapter = getThreadAdapter(key);
-  if (!adapter.checkIsActive(key)) {
-    await ctx.answerCbQuery(t('cb.no_active_session'));
-    return;
-  }
+  // No `checkIsActive` gate — effort is persisted pre-session (mirrors the
+  // `/effort` command and `/model`). The adapter returns its own notice if the
+  // pick can't apply live; we surface it via `cb.effort_error` below.
   if (!adapter.setEffort) {
     await ctx.answerCbQuery(t('cb.not_supported', { label: adapter.label }));
     return;

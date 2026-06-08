@@ -1477,14 +1477,70 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Effort levels the current thread can use: exactly the
-   * variants the current model declares. Empty when no session is running
-   * or the model has no variants.
+   * @description Resolve the model the thread's effort applies to, WITHOUT
+   * requiring a live session — the prospective model the NEXT session will
+   * use. Priority mirrors `fetchModelInfo`'s resolution order so the
+   * pre-session effort surface lines up with what a started session would
+   * actually run:
+   *   1. live session's model ref (active session wins), else
+   *   2. the thread's saved `/model` pref (`loadSavedModel`), else
+   *   3. the OpenCode server's default model (`GET /config`
+   *      `defaultModel` / `model`).
+   * Returns `null` only when none of these yield a complete `{providerID,
+   * modelID}` ref, so `/effort` pre-session validates against the same model
+   * `/model` would persist.
+   */
+  private async getProspectiveModelRef(key: ThreadKey): Promise<OpenCodeModelOverride | null> {
+    const session = this.sessions.get(keyToString(key));
+    if (session?.isActive) {
+      const liveRef = this.getSessionModelRef(session);
+      if (liveRef) return liveRef;
+    }
+
+    const saved = loadSavedModel(key);
+    if (saved) return saved;
+
+    // No session and no saved pref → fall back to the server's default model,
+    // resolved the SAME way `fetchModelInfo` does (defaultModel, then a
+    // `provider/model` config string). Best-effort: a sick/booting server
+    // just yields null and the picker reports "no levels".
+    try {
+      const config = await this.apiRequest<{
+        model?: string;
+        defaultModel?: { providerID: string; modelID: string };
+      }>('GET', '/config');
+      if (config?.defaultModel?.providerID && config?.defaultModel?.modelID) {
+        return { providerID: config.defaultModel.providerID, modelID: config.defaultModel.modelID };
+      }
+      if (config?.model) {
+        const slashIdx = config.model.indexOf('/');
+        if (slashIdx > 0) {
+          return {
+            providerID: config.model.slice(0, slashIdx),
+            modelID: config.model.slice(slashIdx + 1),
+          };
+        }
+      }
+    } catch (e) {
+      console.warn(`[OpenCode] getProspectiveModelRef config lookup failed:`, e instanceof Error ? e.message : e);
+    }
+    return null;
+  }
+
+  /**
+   * @description Effort levels the thread can use: exactly the variants its
+   * model declares. Works pre-session too — with no live session it resolves
+   * the PROSPECTIVE model (saved `/model` pref → server default) so the
+   * `/effort` picker can list the next session's variants before `/opencode`,
+   * mirroring how `/model` works pre-session. Empty when the (live or
+   * prospective) model declares no variants or can't be resolved.
    */
   async getAvailableEffortLevels(key: ThreadKey): Promise<string[]> {
     const session = this.sessions.get(keyToString(key));
-    if (!session?.isActive) return [];
-    return this.getModelVariants(this.getSessionModelRef(session));
+    if (session?.isActive) {
+      return this.getModelVariants(this.getSessionModelRef(session));
+    }
+    return this.getModelVariants(await this.getProspectiveModelRef(key));
   }
 
   getEffort(key: ThreadKey): string | null {
@@ -1495,26 +1551,54 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   /**
    * @description Set the per-thread effort (variant). Validates against the
-   * current model's available variants; persists on success (applied
-   * per-prompt by `sendPromptAsync`, plan D3). Returns a user-facing notice
-   * string on any non-success, `null` on success.
+   * thread's available variants — live model when a session is running, the
+   * PROSPECTIVE model (saved `/model` pref → server default) when not — then
+   * persists on success (applied per-prompt by `sendPromptAsync`, plan D3; a
+   * later session seeds `effortLevel` from this pref at creation). Returns a
+   * user-facing notice string on any non-success, `null` on success.
+   *
+   * Mirrors `setModel`'s persist-first symmetry (no `'No active session'`
+   * hard-fail): a level picked BEFORE `/opencode` is saved and replayed by the
+   * next session, instead of being lost — same intent as the model pref.
    */
   async setEffort(key: ThreadKey, level: string): Promise<string | null> {
-    const session = this.sessions.get(keyToString(key));
-    if (!session?.isActive) return 'No active session';
-
+    // Session-free capable: resolves variants from the live model if active,
+    // else the prospective model the next session will use.
     const available = await this.getAvailableEffortLevels(key);
     if (available.length === 0) {
-      return t('effort.not_supported', { model: session.currentModelLabel ?? '?' });
+      // Name the model the validation ran against — the live label if a
+      // session is up, else the prospective model — so the notice is correct
+      // pre-session (the live `currentModelLabel` is null then).
+      const modelLabel = await this.getEffortModelLabel(key);
+      return t('effort.not_supported', { model: modelLabel });
     }
     if (!available.includes(level)) {
       return t('effort.invalid_level', { level, valid: available.join(', ') });
     }
 
-    session.effortLevel = level;
+    // Persist unconditionally (like `setModel`'s `saveModelPref`): a session
+    // started later seeds `effortLevel: loadSavedEffort(key)` at creation.
     saveEffortPref(key, level);
+
+    // Live session → also apply now so the in-flight session honours it on the
+    // next prompt without waiting for a restart.
+    const session = this.sessions.get(keyToString(key));
+    if (session?.isActive) session.effortLevel = level;
     console.log(`[OpenCode] Effort set to: ${level}`);
     return null;
+  }
+
+  /**
+   * @description Human label for the model the thread's effort validates
+   * against — the live session's label when active, else the prospective
+   * model's `provider/model` — for the `effort.not_supported` notice. `'?'`
+   * only when no model can be resolved at all.
+   */
+  private async getEffortModelLabel(key: ThreadKey): Promise<string> {
+    const session = this.sessions.get(keyToString(key));
+    if (session?.isActive && session.currentModelLabel) return session.currentModelLabel;
+    const prospective = await this.getProspectiveModelRef(key);
+    return prospective ? `${prospective.providerID}/${prospective.modelID}` : '?';
   }
 
   /**

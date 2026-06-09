@@ -449,6 +449,14 @@ function clearPendingQuestion(key: ThreadKey): void {
 const apiRetryMsPerMinute = 60_000;
 
 /**
+ * Catch-up delay for a retry whose `fireAt` is already in the past at boot.
+ * Small (not zero) so the kick is armed via `setTimeout` instead of firing
+ * synchronously in the adopt tick — a freshly-adopted Claude pane may still be
+ * repainting, and the Enter-verification in `sendInput` covers the residual race.
+ */
+const apiRetryCatchUpDelayMs = 5_000;
+
+/**
  * @description One thread's live armed-retry timer + bookkeeping. The persisted
  * twin lives in `state.json` (`ApiRetryState`); this in-memory entry additionally
  * holds the actual `NodeJS.Timeout` (not serialisable) and `firedAt` (set when
@@ -923,6 +931,9 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   threadMessageStates.delete(k);
   outputQueues.delete(k);
   clearPendingQuestion(key);
+  // The thread is going away (/unbind, topic deleted) → cancel any pending
+  // API-error retry silently; there's nothing left to resume into.
+  cancelApiRetry(key);
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
   threadSessionLists.delete(k);
@@ -1966,6 +1977,10 @@ function stopAllAdaptersFor(key: ThreadKey, adapterNames?: string[]) {
  * can decide what to reply.
  */
 async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof stopAllAdaptersFor>> {
+  // User took over (/stop, /new) → cancel any pending API-error retry silently
+  // before the session is released, so the kick never lands in a torn-down
+  // session.
+  cancelApiRetry(key);
   const result = stopAllAdaptersFor(key);
   await state.clearAgentSessionIds(key);
   return result;
@@ -3740,6 +3755,10 @@ const CLAUDE_DOUBLE_SIGINT_GAP_MS = 250;
 //   directly so `/quit` behaves like a real exit instead of two
 //   no-op aborts.
 command(['quit', 'q'], async (_ctx, key) => {
+  // User took over (/quit) → cancel any pending API-error retry silently. /quit
+  // does NOT go through releaseThreadSession (it stops adapters + clears ids
+  // inline), so the cancel is wired here explicitly.
+  cancelApiRetry(key);
   const adapter = getThreadAdapter(key);
   const adapterName = getThreadAdapterName(key);
   const primaryActive = adapter.checkIsActive(key);
@@ -4068,6 +4087,11 @@ bot.on(message('text'), async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) return;
 
+  // User took over before a pending API-error retry fired → cancel it silently
+  // (no give-up notice). Fires for EVERY authorised inbound text — a plain
+  // prompt AND an owned slash-command — before the bot-command early-return.
+  cancelApiRetry(key);
+
   // In groups Telegram appends `@botusername` to slash commands
   // (`/compact` → `/compact@my_bot`). Strip it up-front so BOTH the
   // bot-owned-command check below AND the verbatim forward to the agent see
@@ -4299,6 +4323,10 @@ bot.on(message('text'), async (ctx) => {
 bot.on(message('voice'), async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) return;
+
+  // User took over (voice note) before a pending API-error retry fired → cancel
+  // it silently, like the text handler.
+  cancelApiRetry(key);
 
   await state.pushMessageId(key, ctx.message.message_id);
 
@@ -4581,6 +4609,9 @@ const albumCollector = createMediaGroupCollector<AlbumCollectorItem>({
       const caption = orderedItems.find((item) => item.caption && item.caption.trim())?.caption;
       const promptText = buildAlbumPromptText(files, caption);
       const isStarting = startupPromptBuffer.checkIsStarting(keyToString(key));
+      // User took over (album upload) before a pending API-error retry fired →
+      // cancel it silently, like the text/voice handlers.
+      cancelApiRetry(key);
       try {
         await deliverPromptOrBuffer(key, promptText, isStarting);
       } catch (err) {
@@ -4672,6 +4703,9 @@ async function handleIncomingFile(
   if (savedPath === null) return;
 
   const promptText = buildFilePromptText(meta.kind, savedPath, meta.fileSize, meta.caption);
+  // User took over (file upload) before a pending API-error retry fired →
+  // cancel it silently, like the text/voice handlers.
+  cancelApiRetry(key);
   await deliverPromptOrBuffer(key, promptText, isStarting);
 }
 
@@ -5683,6 +5717,48 @@ function restorePendingQuestions(): void {
 }
 
 /**
+ * @description Re-arm persisted API-error retries (S6) so a pending kick —
+ * especially a multi-hour usage-limit wait — survives a bot restart. MUST run
+ * AFTER {@link reattachExistingSessions} (and right after
+ * {@link restorePendingQuestions}) so each thread's session is already
+ * adopted/resumed and the kick lands in a live session.
+ *
+ * For each record we re-populate `apiRetryTimers` and arm one unref'd timer at
+ * `fireAt - now` (clamped to `maxTimeoutMs`). A `fireAt` already in the past
+ * fires ONE catch-up after {@link apiRetryCatchUpDelayMs} — not synchronously in
+ * the adopt tick, since a freshly-adopted Claude pane may still be repainting.
+ * The arm notice is NOT re-posted (the user saw it before the restart); the
+ * `↻ resuming` notice fires when the timer fires.
+ */
+function restoreApiRetries(): void {
+  let restored = 0;
+  for (const [keyStr, record] of Object.entries(state.getApiRetries())) {
+    let key: ThreadKey;
+    try {
+      key = keyFromString(keyStr);
+    } catch {
+      // Hand-edited / corrupt key (can't come from `keyToString`): skip it,
+      // keep booting. Tolerated-and-skipped, like restorePendingQuestions.
+      continue;
+    }
+    const dueInMs = record.fireAt - Date.now();
+    const delayMs = dueInMs > 0 ? Math.min(dueInMs, maxTimeoutMs) : apiRetryCatchUpDelayMs;
+    const timer = setTimeout(() => {
+      void fireApiRetry(key);
+    }, delayMs);
+    timer.unref?.();
+    apiRetryTimers.set(keyStr, {
+      timer,
+      attempt: record.attempt,
+      kind: record.kind,
+      firedAt: null,
+    });
+    restored += 1;
+  }
+  console.log(`[reattach] api retries: re-armed ${restored}`);
+}
+
+/**
  * @description Construct the scheduler stack (S8): run ledger → delivery (thin
  * lambdas over the bot's existing send/session functions) → timer engine
  * (assigned to the module-level {@link schedulerEngine}) → the bot-owned MCP
@@ -5864,6 +5940,11 @@ export async function startBot(): Promise<void> {
   //     thread's session-active state is known (a question is restored only for
   //     a thread whose session came back; otherwise it is unreachable, dropped).
   restorePendingQuestions();
+
+  // 5c. Re-arm persisted API-error retries (S6) so a pending kick survives the
+  //     restart. AFTER reattach (and restorePendingQuestions) so the kick lands
+  //     in a live session; a past fireAt fires one delayed catch-up.
+  restoreApiRetries();
 
   // 5-scheduler. Wire the scheduler (S8): run ledger → delivery (thin lambdas
   //    over existing bot functions) → timer engine → bot-owned MCP server →

@@ -40,6 +40,14 @@ export const usageLimitDefaultMs = 60 * msPerMinute;
 /** Max usage-limit attempts before giving up (~6h with the default delay). */
 export const usageLimitMaxAttempts = 6;
 /**
+ * Grace window after a retry fires: another API error within this window counts
+ * as the SAME error episode (escalate to attempt+1, longer backoff); an error
+ * later than this is a FRESH episode (reset to attempt 1). Decouples the
+ * decision from session-end events — a recovered turn just leaves a stale record
+ * that the next, much-later error resets to attempt 1.
+ */
+export const retryRecurrenceGraceMs = 2 * msPerMinute;
+/**
  * Padding added to a parsed reset time so the retry fires just AFTER the window
  * actually rolls over, never a hair before it (which would re-error instantly).
  */
@@ -189,4 +197,68 @@ export function getRetryPlan(args: RetryPlanArgs): RetryPlan {
 /** Clamp a delay into `[0, maxTimeoutMs]` (the Node `setTimeout` safe range). */
 function clampDelay(delayMs: number): number {
   return Math.min(Math.max(0, delayMs), maxTimeoutMs);
+}
+
+/**
+ * @description A read-only view of the bot's per-thread armed-retry record, fed
+ * into {@link decideRetryAction}. The bot owns the live `Map`; this snapshot is
+ * the only state the pure decision needs.
+ */
+export interface RetryEntrySnapshot {
+  /** 1-based attempt of the currently / last armed retry. */
+  attempt: number;
+  /** Epoch ms when the last armed retry actually fired, or `null` if still pending. */
+  firedAt: number | null;
+  /** True while a retry timer is armed and has not fired yet. */
+  pending: boolean;
+}
+
+/**
+ * @description The action the bot must take in response to one `apiError`:
+ *  - `ignore`  — a retry is already armed and waiting; dedup this duplicate
+ *    error frame (Claude re-scrapes the same line; OpenCode can repeat
+ *    `session.error`).
+ *  - `arm`     — arm a timer for `attempt` after `delayMs` (firing at `fireAt`).
+ *  - `giveUp`  — the retry cap was reached; `attempts` is how many were already
+ *    made before giving up.
+ */
+export type RetryAction =
+  | { action: 'ignore' }
+  | { action: 'arm'; attempt: number; delayMs: number; fireAt: number }
+  | { action: 'giveUp'; attempts: number };
+
+export interface DecideRetryActionArgs {
+  kind: AgentApiErrorClass['kind'];
+  /** Parsed reset time (usage class only); absent → the fixed default delay. */
+  resetAt?: number;
+  /** Current epoch ms. */
+  now: number;
+  /** The thread's existing armed-retry snapshot, or `null` if none. */
+  prev: RetryEntrySnapshot | null;
+}
+
+/**
+ * @description Decide the bot's reaction to an incoming API error, combining the
+ * episode/attempt bookkeeping with {@link getRetryPlan}. Pure — the caller
+ * passes `now` and the `prev` snapshot, so the decision is deterministic.
+ *
+ * Rules (evaluated in order):
+ *  1. `prev.pending` → `ignore` (a retry is already armed — dedup the episode;
+ *     this is what stops Claude's repeated scrape frames AND any duplicate
+ *     `session.error` from re-arming).
+ *  2. same episode (a `prev` that fired within {@link retryRecurrenceGraceMs}) →
+ *     escalate to `prev.attempt + 1`; otherwise a fresh episode → attempt 1.
+ *  3. ask {@link getRetryPlan}: `giveUp` → `giveUp` with `attempts` already made
+ *     (= attempt − 1); else `arm` at `now + delayMs`.
+ */
+export function decideRetryAction(args: DecideRetryActionArgs): RetryAction {
+  const { kind, resetAt, now, prev } = args;
+  if (prev?.pending) return { action: 'ignore' };
+
+  const sameEpisode = !!prev && prev.firedAt != null && now - prev.firedAt <= retryRecurrenceGraceMs;
+  const attempt = sameEpisode ? prev.attempt + 1 : 1;
+
+  const plan = getRetryPlan({ kind, attempt, resetAt, now });
+  if ('giveUp' in plan) return { action: 'giveUp', attempts: attempt - 1 };
+  return { action: 'arm', attempt, delayMs: plan.delayMs, fireAt: now + plan.delayMs };
 }

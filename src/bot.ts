@@ -23,7 +23,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, OutputEventMeta, PendingQuestionState } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, OutputEventMeta, PendingQuestionState, AgentApiErrorClass } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -108,12 +108,13 @@ import {
 } from './botFileStorage';
 import { RunLedger } from './scheduler/runLedger';
 import { createScheduleDelivery, unboundDeliveryError } from './scheduler/delivery';
-import { createSchedulerEngine, type SchedulerEngine } from './scheduler/engine';
+import { createSchedulerEngine, maxTimeoutMs, type SchedulerEngine } from './scheduler/engine';
 import { createSchedulerMcpServer, type SchedulerMcpHandle } from './scheduler/mcpSurface';
 import { configureSchedulerMcpInjection } from './scheduler/injection';
 import { getThreadKeysForDirectory } from './scheduler/directoryThreads';
 import { getRebindResumeAction } from './scheduler/rebindResume';
 import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/types';
+import { decideRetryAction } from './apiErrorRetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -440,6 +441,146 @@ function clearPendingQuestion(key: ThreadKey): void {
   state.clearPendingQuestion(key).catch(e =>
     console.error('[pendingQuestion] clear failed:', e),
   );
+}
+
+// ── auto-retry after a provider-side API error (plan S4/S5/S6) ──
+
+/** One minute in ms — used only to render the "in N min" notices. */
+const apiRetryMsPerMinute = 60_000;
+
+/**
+ * @description One thread's live armed-retry timer + bookkeeping. The persisted
+ * twin lives in `state.json` (`ApiRetryState`); this in-memory entry additionally
+ * holds the actual `NodeJS.Timeout` (not serialisable) and `firedAt` (set when
+ * the timer fires) so {@link decideRetryAction} can tell a same-episode
+ * recurrence (escalate) from a fresh one (reset to attempt 1).
+ */
+interface ApiRetryTimerEntry {
+  /** The armed timer, or `null` once it has fired (record kept until outcome known). */
+  timer: NodeJS.Timeout | null;
+  /** 1-based attempt the current/last timer was armed for. */
+  attempt: number;
+  /** Error class that armed it. */
+  kind: AgentApiErrorClass['kind'];
+  /** Epoch ms when the timer fired, or `null` while still pending. */
+  firedAt: number | null;
+}
+
+const apiRetryTimers = new Map<string, ApiRetryTimerEntry>();
+
+/**
+ * @description `apiError` from the adapter — arm (or escalate) an auto-retry, or
+ * give up. The pure decision lives in {@link decideRetryAction}; this handler is
+ * the I/O shell: it posts the class-specific notice, persists the armed record,
+ * and arms one unref'd timer whose fire callback is {@link fireApiRetry}.
+ *
+ * Dedup is delegated to `decideRetryAction` (a `pending` retry → `ignore`), so a
+ * repeated Claude scrape frame or a duplicate `session.error` never double-arms.
+ */
+function handleApiError(key: ThreadKey, cls: AgentApiErrorClass): void {
+  const k = keyToString(key);
+  const entry = apiRetryTimers.get(k);
+  const prev = entry
+    ? { attempt: entry.attempt, firedAt: entry.firedAt, pending: entry.timer !== null }
+    : null;
+
+  const action = decideRetryAction({
+    kind: cls.kind,
+    resetAt: cls.resetAt,
+    now: Date.now(),
+    prev,
+  });
+
+  if (action.action === 'ignore') return;
+
+  if (action.action === 'giveUp') {
+    void replyToThread(key, t('apiRetry.giveUp', { attempts: action.attempts }));
+    void state.clearApiRetry(key).catch(e => console.error('[apiRetry] clear failed:', e));
+    apiRetryTimers.delete(k);
+    return;
+  }
+
+  // action === 'arm'
+  if (cls.resetAt !== undefined) {
+    void replyToThread(key, t('apiRetry.usageLimitResetNotice', {
+      time: formatLocalClock(cls.resetAt),
+    }));
+  } else if (cls.kind === 'usageLimit') {
+    void replyToThread(key, t('apiRetry.usageLimitDelayNotice', {
+      minutes: Math.round(action.delayMs / apiRetryMsPerMinute),
+      attempt: action.attempt,
+    }));
+  } else {
+    void replyToThread(key, t('apiRetry.transientNotice', {
+      minutes: Math.round(action.delayMs / apiRetryMsPerMinute),
+      attempt: action.attempt,
+    }));
+  }
+
+  void state
+    .setApiRetry(key, { kind: cls.kind, attempt: action.attempt, fireAt: action.fireAt })
+    .catch(e => console.error('[apiRetry] persist failed:', e));
+
+  const delayMs = Math.min(action.delayMs, maxTimeoutMs);
+  const timer = setTimeout(() => {
+    void fireApiRetry(key);
+  }, delayMs);
+  timer.unref?.();
+  apiRetryTimers.set(k, { timer, attempt: action.attempt, kind: cls.kind, firedAt: null });
+}
+
+/**
+ * @description The retry kick (timer callback): tell the user we're resuming,
+ * make sure a session is up (after an OpenCode `session.error` it still is, so
+ * `ensureAgentSession` is a no-op and the nudge lands in the SAME live session —
+ * context intact; only a genuinely-dead session is restarted via the thread's
+ * last adapter), then forward a neutral "continue" nudge.
+ *
+ * CRITICAL: the kick goes through {@link forwardPromptToAgent} directly, NEVER a
+ * scheduler wait-for-idle path — OpenCode's optimistic `isBusy` is not cleared on
+ * `session.error`, so a wait-for-idle kick would stall the full 10-min cap.
+ *
+ * The armed record is intentionally KEPT after firing (timer nulled, `firedAt`
+ * stamped): a recurrence within the grace window re-arms at attempt+1 via
+ * {@link handleApiError}; a recovery leaves a harmless stale record that the
+ * next, later error resets to attempt 1.
+ */
+async function fireApiRetry(key: ThreadKey): Promise<void> {
+  const k = keyToString(key);
+  const entry = apiRetryTimers.get(k);
+  if (!entry) return;
+  entry.timer = null;
+  entry.firedAt = Date.now();
+
+  void replyToThread(key, t('apiRetry.resuming'));
+  try {
+    await ensureAgentSession(key);
+    await forwardPromptToAgent(key, getThreadAdapter(key), t('apiRetry.continueNudge'));
+  } catch (e) {
+    console.error('[apiRetry] kick failed:', e instanceof Error ? e.message : e);
+  }
+}
+
+/**
+ * @description Cancel a thread's armed retry SILENTLY — the user took over, so
+ * there is nothing to resume and no give-up notice to post (cancel and give-up
+ * must never share a code path). Clears the timer, the in-memory entry, and the
+ * persisted record. Wired at the session-end sites (`handleAgentClosed` /
+ * `handleAgentStopped`); the remaining user-takeover call-sites are S6.
+ */
+function cancelApiRetry(key: ThreadKey): void {
+  const k = keyToString(key);
+  const entry = apiRetryTimers.get(k);
+  if (entry?.timer) clearTimeout(entry.timer);
+  apiRetryTimers.delete(k);
+  void state.clearApiRetry(key).catch(e => console.error('[apiRetry] clear failed:', e));
+}
+
+/** Host-local `HH:MM` of an epoch-ms instant, for the usage-limit reset notice. */
+function formatLocalClock(epochMs: number): string {
+  const at = new Date(epochMs);
+  const pad = (value: number): string => value.toString().padStart(2, '0');
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
 }
 
 /**
@@ -5259,6 +5400,8 @@ function handleAgentClosed(key: ThreadKey): void {
   clearThreadQueues(key);
   deleteStatusMessage(key).catch(() => {});
   clearPendingQuestion(key);
+  // A closed session has nothing to resume — drop any armed retry silently.
+  cancelApiRetry(key);
   const adapter = getThreadAdapter(key);
   replyToThread(key, t('agent.session_ended', { label: adapter.label })).catch(() => {});
   // Banner now reads `idle`; closed sessions may also persist with the
@@ -5297,6 +5440,8 @@ function handleAgentStopped(key: ThreadKey): void {
   // Session ended — a future session starts with empty context, so forget the
   // last-injected thread-context preamble; the next prompt re-carries it.
   clearThreadContextMarker(key);
+  // A stopped session has nothing to resume — drop any armed retry silently.
+  cancelApiRetry(key);
   updatePinnedStatus(key).catch(() => {});
 }
 
@@ -5678,6 +5823,7 @@ export async function startBot(): Promise<void> {
     onOutput: handleAgentOutput,
     onStatus: handleAgentStatus,
     onQuestion: handleAgentQuestion,
+    onApiError: handleApiError,
     onClosed: handleAgentClosed,
     onStarted: handleAgentStarted,
     onStopped: handleAgentStopped,

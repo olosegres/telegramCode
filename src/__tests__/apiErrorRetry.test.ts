@@ -14,6 +14,8 @@ import {
   classifyAgentApiError,
   parseResetAt,
   getRetryPlan,
+  decideRetryAction,
+  retryRecurrenceGraceMs,
   usageLimitDefaultMs,
   resetBufferMs,
 } from '../apiErrorRetry';
@@ -142,4 +144,71 @@ test('getRetryPlan: a resetAt already in the past clamps to 0 (never negative)',
   const plan = getRetryPlan({ kind: 'usageLimit', attempt: 1, resetAt, now: fixedNow });
   assert.ok('delayMs' in plan);
   assert.equal(plan.delayMs, 0);
+});
+
+test('decideRetryAction: no prior record → arm attempt 1 at the first transient delay', () => {
+  const result = decideRetryAction({ kind: 'transient', now: fixedNow, prev: null });
+  assert.deepEqual(result, {
+    action: 'arm',
+    attempt: 1,
+    delayMs: 5 * minuteMs,
+    fireAt: fixedNow + 5 * minuteMs,
+  });
+});
+
+test('decideRetryAction: a retry already pending → ignore (dedup the same error episode)', () => {
+  const result = decideRetryAction({
+    kind: 'transient',
+    now: fixedNow,
+    prev: { attempt: 1, firedAt: null, pending: true },
+  });
+  assert.deepEqual(result, { action: 'ignore' });
+});
+
+test('decideRetryAction: a prior fire WITHIN the grace window → escalate to attempt 2 (longer delay)', () => {
+  const result = decideRetryAction({
+    kind: 'transient',
+    now: fixedNow,
+    prev: { attempt: 1, firedAt: fixedNow - retryRecurrenceGraceMs, pending: false },
+  });
+  assert.deepEqual(result, {
+    action: 'arm',
+    attempt: 2,
+    delayMs: 10 * minuteMs,
+    fireAt: fixedNow + 10 * minuteMs,
+  });
+});
+
+test('decideRetryAction: a prior fire BEYOND the grace window → fresh episode, back to attempt 1', () => {
+  const result = decideRetryAction({
+    kind: 'transient',
+    now: fixedNow,
+    prev: { attempt: 3, firedAt: fixedNow - retryRecurrenceGraceMs - 1, pending: false },
+  });
+  assert.deepEqual(result, {
+    action: 'arm',
+    attempt: 1,
+    delayMs: 5 * minuteMs,
+    fireAt: fixedNow + 5 * minuteMs,
+  });
+});
+
+test('decideRetryAction: transient escalation past the cap → giveUp with attempts=3', () => {
+  const result = decideRetryAction({
+    kind: 'transient',
+    now: fixedNow,
+    // attempt 3 fired inside grace → next attempt is 4 → over the cap of 3.
+    prev: { attempt: 3, firedAt: fixedNow - 1, pending: false },
+  });
+  assert.deepEqual(result, { action: 'giveUp', attempts: 3 });
+});
+
+test('decideRetryAction: usageLimit escalation past the cap → giveUp with attempts=6', () => {
+  const result = decideRetryAction({
+    kind: 'usageLimit',
+    now: fixedNow,
+    // attempt 6 fired inside grace → next attempt is 7 → over the cap of 6.
+    prev: { attempt: 6, firedAt: fixedNow - 1, pending: false },
+  });
+  assert.deepEqual(result, { action: 'giveUp', attempts: 6 });
 });

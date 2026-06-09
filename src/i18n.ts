@@ -356,6 +356,21 @@ const dict: Record<Lang, Record<string, string>> = {
       'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN RUSSIAN what you scheduled.\n\nRequest: {text}',
     'schedule.interviewPromptTemplate':
       'The user invoked /schedule with no details. Ask them IN RUSSIAN what prompt they want scheduled and WHEN (one-time or repeating). Once you have both, create it with the schedule_create MCP tool and confirm IN RUSSIAN what you scheduled.',
+
+    // ── auto-retry after a provider-side API error (S4/S5). The notices are
+    //    user-read (localized); continueNudge is agent-facing (the language is
+    //    baked per locale, mirroring schedule.*). {minutes}=delay in minutes,
+    //    {attempt}=1-based attempt, {time}=HH:MM reset clock, {attempts}=tries made ──
+    'apiRetry.transientNotice':
+      '⏳ API перегружен (rate limit) — повторю автоматически через {minutes} мин (попытка {attempt}).',
+    'apiRetry.usageLimitDelayNotice':
+      '🚧 Лимит исчерпан — повторю через {minutes} мин (попытка {attempt}).',
+    'apiRetry.usageLimitResetNotice':
+      '🚧 Лимит исчерпан — продолжу автоматически после сброса (~{time}).',
+    'apiRetry.resuming': '↻ Продолжаю…',
+    'apiRetry.giveUp':
+      '⚠️ Не смог возобновить после {attempts} попыток. Напиши, когда продолжить.',
+    'apiRetry.continueNudge': 'Продолжай с того места, где ты остановился.',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -664,6 +679,21 @@ const dict: Record<Lang, Record<string, string>> = {
       'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN ENGLISH what you scheduled.\n\nRequest: {text}',
     'schedule.interviewPromptTemplate':
       'The user invoked /schedule with no details. Ask them IN ENGLISH what prompt they want scheduled and WHEN (one-time or repeating). Once you have both, create it with the schedule_create MCP tool and confirm IN ENGLISH what you scheduled.',
+
+    // ── auto-retry after a provider-side API error (S4/S5). The notices are
+    //    user-read (localized); continueNudge is agent-facing (the language is
+    //    baked per locale, mirroring schedule.*). {minutes}=delay in minutes,
+    //    {attempt}=1-based attempt, {time}=HH:MM reset clock, {attempts}=tries made ──
+    'apiRetry.transientNotice':
+      '⏳ API rate-limited — auto-retrying in {minutes} min (attempt {attempt}).',
+    'apiRetry.usageLimitDelayNotice':
+      '🚧 Usage limit reached — retrying in {minutes} min (attempt {attempt}).',
+    'apiRetry.usageLimitResetNotice':
+      '🚧 Usage limit reached — will auto-resume after reset (~{time}).',
+    'apiRetry.resuming': '↻ Resuming…',
+    'apiRetry.giveUp':
+      "⚠️ Couldn't resume after {attempts} attempts. Message me when to continue.",
+    'apiRetry.continueNudge': 'Continue from where you left off.',
   },
 };
 

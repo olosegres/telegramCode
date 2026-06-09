@@ -14,6 +14,8 @@
  * Both adapters (Claude + OpenCode) share this single render path.
  */
 
+import { renderMarkdownTables } from './utils/markdownTableRender';
+
 /** HTML-escape the three characters Telegram's HTML parse_mode treats as
  *  special. Nothing else needs escaping in HTML text nodes / code spans. */
 export function escapeHtmlText(text: string): string {
@@ -62,9 +64,15 @@ export function renderAgentHtml(text: string): string {
   //    `stash` is the only `\x00` left to restore in step 5.
   const source = text.replace(CONTROL_CHARS_REGEX, '');
 
+  // 0.5. Rewrite raw GFM markdown tables (mostly from OpenCode) into a readable
+  //    form: narrow tables become a ```-fenced box (→ <pre> below), wide ones
+  //    become plain "field: value" lines. Fence-aware + leaves non-table text
+  //    untouched, so the downstream passes are unchanged.
+  const withTables = renderMarkdownTables(source);
+
   // 1. Fenced blocks first — they contain the backticks inline code would
   //    otherwise mis-match. Escape only `& < >` inside code.
-  let work = source.replace(FENCE_REGEX, (_match, info: string, body: string) => {
+  let work = withTables.replace(FENCE_REGEX, (_match, info: string, body: string) => {
     // The info string's first token is the language (CommonMark); ignore any
     // trailing metadata. Escape `"` too, or it would break the class attribute.
     const language = info.trim().split(/\s+/)[0] ?? '';

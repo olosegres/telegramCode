@@ -144,6 +144,20 @@ export interface PendingQuestionState {
 }
 
 /**
+ * @description Classification of a provider-side API error surfaced by either
+ * agent backend (Claude terminal "API Error" line or OpenCode `session.error`).
+ * Drives the auto-retry decision: `transient` (rate-limit / overloaded — short
+ * backoff) vs `usageLimit` (subscription / quota exhausted — long wait). Auth /
+ * non-retryable errors are NOT represented here — the classifier returns `null`
+ * for those so they are never retried.
+ */
+export interface AgentApiErrorClass {
+  kind: 'transient' | 'usageLimit';
+  /** Epoch ms when a usage window resets, if the error text exposed one. */
+  resetAt?: number;
+}
+
+/**
  * @description Metadata riding an `output` event alongside the text.
  */
 export interface OutputEventMeta {

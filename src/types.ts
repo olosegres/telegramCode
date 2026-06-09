@@ -158,6 +158,25 @@ export interface AgentApiErrorClass {
 }
 
 /**
+ * @description The bot's per-thread record of an armed auto-retry after a
+ * provider-side API error: the error {@link AgentApiErrorClass.kind} that armed
+ * it, the 1-based attempt already scheduled, and the epoch-ms `fireAt` when the
+ * retry timer should fire. No prompt is stored — the kick is a neutral "continue"
+ * nudge that resumes the agent's intact session, not a re-send of the original
+ * prompt. No adapter name either — the kick reuses the thread's existing
+ * last-used adapter via `ensureAgentSession`. All fields are serialisable, so the
+ * whole record is persisted to `state.json` and re-armed at boot — a multi-hour
+ * usage-limit wait survives a restart.
+ */
+export interface ApiRetryState {
+  kind: AgentApiErrorClass['kind'];
+  /** 1-based attempt already scheduled. */
+  attempt: number;
+  /** Epoch ms when the retry timer should fire. */
+  fireAt: number;
+}
+
+/**
  * @description Metadata riding an `output` event alongside the text.
  */
 export interface OutputEventMeta {

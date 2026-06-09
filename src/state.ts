@@ -3,7 +3,7 @@ import { promises as fsp } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { randomBytes } from 'node:crypto';
-import { keyToString, type PendingQuestionState, type ThreadKey } from './types';
+import { keyToString, type ApiRetryState, type PendingQuestionState, type ThreadKey } from './types';
 import type { ScheduleRecord } from './scheduler/types';
 
 /**
@@ -161,6 +161,18 @@ export interface StateV1 {
    * and is active; otherwise dropped (the question is unreachable).
    */
   pendingQuestions?: Record<string, PendingQuestionState>;
+  /**
+   * Armed auto-retries after a provider-side API error, keyed by
+   * {@link ThreadKey} string. Persisted so a pending retry survives a bot
+   * restart / hot reload: the in-memory `apiRetries` map (see `bot.ts`) is
+   * otherwise lost, so an agent that died on a rate-limit / usage-limit error
+   * would never get its scheduled nudge — especially a multi-hour usage-limit
+   * wait. The persisted `fireAt` lets boot re-arm the timer (or fire one
+   * immediate catch-up when the time already passed). Optional so older state
+   * files stay valid — a missing value is an empty set. Restored at boot only
+   * after sessions are reattached, so the kick lands in a live session.
+   */
+  apiRetries?: Record<string, ApiRetryState>;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -1001,6 +1013,52 @@ export class StateStore {
       delete this.state.pendingQuestions[k];
       if (Object.keys(this.state.pendingQuestions).length === 0) {
         delete this.state.pendingQuestions;
+      }
+      this.scheduleSave();
+    });
+  }
+
+  // ── armed API-error auto-retries (restart survival) ──
+
+  /**
+   * @description Every persisted armed auto-retry across all threads, keyed by
+   * {@link ThreadKey} string. Read at boot to re-arm the in-memory map after
+   * sessions reattach. Returns a shallow copy so callers can't mutate the live
+   * state object.
+   */
+  getApiRetries(): Record<string, ApiRetryState> {
+    return { ...(this.state.apiRetries ?? {}) };
+  }
+
+  /**
+   * @description Persist (upsert) the armed retry for `key`, mirroring the
+   * in-memory `apiRetries.set(...)` in `bot.ts` so memory and disk never drift.
+   * Crash-window is acceptable on the debounced save: the worst case (process
+   * dies in the <=500ms before the flush) just loses that one armed retry, which
+   * falls back to the pre-fix behaviour for that thread. Each re-arm (next
+   * attempt) goes through here too, so the persisted record always carries the
+   * latest attempt and `fireAt`.
+   */
+  async setApiRetry(key: ThreadKey, value: ApiRetryState): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      (this.state.apiRetries ??= {})[k] = value;
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Remove the armed retry for `key`. Mirrors every in-memory
+   * `apiRetries.delete(...)` in `bot.ts`. No-op (no save) when absent. The whole
+   * map is dropped once empty so an idle bot leaves a clean `state.json`.
+   */
+  async clearApiRetry(key: ThreadKey): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      if (!this.state.apiRetries?.[k]) return;
+      delete this.state.apiRetries[k];
+      if (Object.keys(this.state.apiRetries).length === 0) {
+        delete this.state.apiRetries;
       }
       this.scheduleSave();
     });

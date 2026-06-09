@@ -45,6 +45,10 @@ const sampleQuestion = (messageId: number | null): PendingQuestionState => ({
     ],
   },
   messageId,
+  // S2 sequential-answer fields — persisted alongside the question so a restart
+  // restores the in-progress collection state, not just the question text.
+  answers: [null],
+  currentIndex: 0,
 });
 
 describe('StateStore pending-question collection', () => {
@@ -100,6 +104,9 @@ describe('StateStore pending-question collection', () => {
     assert.equal(restored.data.questions[0].options[0].label, 'Postgres');
     assert.equal(restored.data.questions[0].options[0].description, 'relational');
     assert.equal(restored.data.questions[0].options[1].label, 'SQLite');
+    // S2: the sequential-answer progress survives the reload too.
+    assert.deepEqual(restored.answers, [null]);
+    assert.equal(restored.currentIndex, 0);
   });
 
   it('persists the LATEST messageId patch (null → real id)', async () => {

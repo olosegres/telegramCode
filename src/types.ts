@@ -134,13 +134,27 @@ export interface OpenCodePendingQuestion {
  * @description The bot's per-thread record of an interactive question on screen:
  * the question {@link OpenCodePendingQuestion} plus the Telegram `messageId`
  * of the posted option-button message (`null` until `replyToThread` resolves).
- * Both fields are serialisable, so the whole record is persisted to `state.json`
+ * All fields are serialisable, so the whole record is persisted to `state.json`
  * and restored at boot for threads whose session reattached — re-arming the
  * existing buttons so a restart no longer hangs the agent.
+ *
+ * Sequential multi-question: when the agent asks more than one question in a
+ * turn, the bot shows them ONE AT A TIME and collects the answers locally,
+ * replying to the agent only once EVERY question is answered (OpenCode's reply
+ * API takes the whole answer matrix at once). The progress lives here so it
+ * survives a restart:
+ *  - `answers` — one slot per question (same order as `data.questions`), `null`
+ *    until that question is answered, then the chosen labels/text;
+ *  - `currentIndex` — which question is currently on screen;
+ *  - `messageId` — the Telegram message id of the CURRENTLY shown question.
  */
 export interface PendingQuestionState {
   data: OpenCodePendingQuestion;
   messageId: number | null;
+  /** One slot per question (null = unanswered). Length === questions.length. */
+  answers: (string[] | null)[];
+  /** Index into `data.questions` of the question currently on screen. */
+  currentIndex: number;
 }
 
 /**

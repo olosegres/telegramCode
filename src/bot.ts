@@ -32,6 +32,13 @@ import { checkSessionPickAction } from './sessionPick';
 import { ClaudeCliAdapter, getClaudeReplyRoute } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import {
+  buildQuestionBodyLines,
+  buildQuestionBodyLinesPlain,
+  recordAnswerAndAdvance,
+  migratePendingQuestionState,
+} from './openCodeQuestionFlow';
+import { checkShouldRepostPendingQuestion } from './pendingQuestionRepost';
+import {
   enqueueSend,
   checkIsRateLimited,
   getRateLimitRemainingMs,
@@ -494,6 +501,104 @@ function clearPendingQuestion(key: ThreadKey): void {
   state.clearPendingQuestion(key).catch(e =>
     console.error('[pendingQuestion] clear failed:', e),
   );
+  clearQuestionRepostState(key);
+}
+
+// ── keep a pending question at the bottom of its topic (plan S3) ──
+
+/**
+ * @description Per-thread bookkeeping for the "keep the question at the bottom"
+ * re-post (S3). `wasLastSendTheQuestion` is the loop guard: true right after the
+ * question is (re-)posted, flipped false by {@link onThreadActivityWhileQuestionPending}
+ * as soon as anything else is sent below it. `repostTimer` debounces a burst of
+ * output into ONE re-post.
+ */
+interface QuestionRepostState {
+  wasLastSendTheQuestion: boolean;
+  repostTimer: NodeJS.Timeout | null;
+}
+
+const questionRepostStates = new Map<string, QuestionRepostState>();
+
+/**
+ * Debounce window for the S3 re-post: a busy sub-agent streams many chunks back
+ * to back; collapse the whole burst into a single delete+re-post of the
+ * question instead of thrashing it per chunk.
+ */
+const questionRepostDebounceMs = 1_200;
+
+function getQuestionRepostState(key: ThreadKey): QuestionRepostState {
+  const kStr = keyToString(key);
+  let s = questionRepostStates.get(kStr);
+  if (!s) {
+    s = { wasLastSendTheQuestion: false, repostTimer: null };
+    questionRepostStates.set(kStr, s);
+  }
+  return s;
+}
+
+function clearQuestionRepostState(key: ThreadKey): void {
+  const s = questionRepostStates.get(keyToString(key));
+  if (s?.repostTimer) clearTimeout(s.repostTimer);
+  questionRepostStates.delete(keyToString(key));
+}
+
+/**
+ * @description Record that the question message itself was just (re-)posted —
+ * so the next {@link onThreadActivityWhileQuestionPending} knows the question is
+ * currently at the bottom and must NOT re-post in reaction to its own send (the
+ * loop guard). Called by {@link postPendingQuestionAt} after a successful send.
+ */
+function markQuestionMessageSent(key: ThreadKey, _messageId: number): void {
+  const s = getQuestionRepostState(key);
+  s.wasLastSendTheQuestion = true;
+}
+
+/**
+ * @description Hook called right after ANY non-question output is sent into a
+ * topic (agent output, status frame, sub-agent/tool emit, api-retry notice).
+ * If a question is pending and it is no longer the last message, schedule a
+ * debounced re-post so the question returns to the bottom (S3). Cheap no-op when
+ * no question is pending — safe to call from every emit handler.
+ */
+function onThreadActivityWhileQuestionPending(key: ThreadKey): void {
+  if (!pendingQuestions.has(keyToString(key))) return;
+  const s = getQuestionRepostState(key);
+  // Something other than the question just landed below it.
+  s.wasLastSendTheQuestion = false;
+  if (!checkShouldRepostPendingQuestion({
+    isQuestionPending: true,
+    wasLastSendTheQuestion: s.wasLastSendTheQuestion,
+  })) {
+    return;
+  }
+  // Debounce: a burst of output re-posts the question ONCE, not per chunk.
+  if (s.repostTimer) clearTimeout(s.repostTimer);
+  s.repostTimer = setTimeout(() => {
+    s.repostTimer = null;
+    void repostPendingQuestionToBottom(key);
+  }, questionRepostDebounceMs);
+}
+
+/**
+ * @description Re-post the current pending question as the newest thread message
+ * (S3): delete the old question message, then send the current question again
+ * via {@link postPendingQuestionAt} (which re-renders with S1 descriptions /
+ * S2 current index and re-owns `messageId`). No-op if the question was answered
+ * meanwhile, or if it is already the last message (the loop guard re-checked at
+ * fire time, since the debounce window may have closed the gap).
+ */
+async function repostPendingQuestionToBottom(key: ThreadKey): Promise<void> {
+  const kStr = keyToString(key);
+  const pending = pendingQuestions.get(kStr);
+  if (!pending) return;
+  const s = getQuestionRepostState(key);
+  if (s.wasLastSendTheQuestion) return; // already at the bottom — nothing to do
+  const oldMessageId = pending.messageId;
+  if (oldMessageId !== null) {
+    await deleteThreadMessage(key, oldMessageId);
+  }
+  await postPendingQuestionAt(key);
 }
 
 // ── auto-retry after a provider-side API error (plan S4/S5/S6) ──
@@ -577,6 +682,10 @@ function handleApiError(key: ThreadKey, cls: AgentApiErrorClass): void {
       attempt: action.attempt,
     }));
   }
+
+  // S3: the notice landed below any pending question — bring it back to the
+  // bottom (debounced; no-op when no question is pending).
+  onThreadActivityWhileQuestionPending(key);
 
   void state
     .setApiRetry(key, { kind: cls.kind, attempt: action.attempt, fireAt: action.fireAt })
@@ -1711,6 +1820,10 @@ async function sendOutputImmediate(key: ThreadKey, output: string, isContinuatio
       msgState.needsNewMessage = false;
     }
   }
+
+  // S3: output just landed below any pending question — bring the question back
+  // to the bottom (debounced; no-op when no question is pending).
+  onThreadActivityWhileQuestionPending(key);
 }
 
 /**
@@ -4322,18 +4435,22 @@ bot.on(message('text'), async (ctx) => {
     }
   }
 
-  // Pending interactive question (OpenCode) → custom text answer.
+  // Pending interactive question (OpenCode) → answer the CURRENT question only,
+  // then advance / submit via the shared sequential collector (S2). A bare digit
+  // in range of the current question's options is treated as that option (the
+  // `agent.question_hint` tells users to "reply with the option number"), so a
+  // typed digit selects the same label a button tap would; any other text is
+  // sent verbatim as a free-form answer.
   const pending = pendingQuestions.get(kStr);
   if (pending && adapter.checkIsActive(key) && adapter.answerQuestion) {
-    const answers: string[][] = pending.data.questions.map(() => [text]);
-    clearPendingQuestion(key);
-    if (pending.messageId) {
-      const q = pending.data.questions[0];
-      const header = q?.header || q?.question || 'Question';
-      await editThreadMessage(key, pending.messageId, `✅ ${header}: ${text}`);
+    const currentQuestion = pending.data.questions[pending.currentIndex];
+    let answerForCurrent: string[] = [text];
+    if (/^\d+$/.test(text) && currentQuestion) {
+      const optionIndex = parseInt(text, 10) - 1;
+      const picked = currentQuestion.options[optionIndex];
+      if (picked) answerForCurrent = [picked.label];
     }
-    adapter.answerQuestion(key, answers);
-    markNeedsNewMessage(key);
+    await applyQuestionAnswer(key, answerForCurrent);
     return;
   }
 
@@ -5280,30 +5397,64 @@ bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
   const kStr = keyToString(key);
   const pending = pendingQuestions.get(kStr);
   if (!pending) { await ctx.answerCbQuery(t('cb.no_pending_question')); return; }
+  // A button must belong to the question currently on screen. With sequential
+  // posting we only ever show `currentIndex`, so a click for any other index is
+  // a stale button from a question that was already answered/advanced.
+  if (qIdx !== pending.currentIndex) {
+    await ctx.answerCbQuery(t('cb.no_pending_question'));
+    return;
+  }
   const question = pending.data.questions[qIdx];
   if (!question || !question.options[optIdx]) {
     await ctx.answerCbQuery(t('cb.invalid_option'));
     return;
   }
   const selectedLabel = question.options[optIdx].label;
-  const adapter = getThreadAdapter(key);
-  const answers: string[][] = pending.data.questions.map((_, i) =>
-    i === qIdx ? [selectedLabel] : [''],
-  );
-  clearPendingQuestion(key);
-  if (pending.messageId) {
+  await applyQuestionAnswer(key, [selectedLabel]);
+  await ctx.answerCbQuery(selectedLabel);
+});
+
+/**
+ * @description Record one answer for the CURRENTLY shown OpenCode question and
+ * either advance to the next unanswered question or, once every question is
+ * answered, reply to the agent with the full answer matrix (S2). Shared by the
+ * inline-button (`qa_`) and custom-text answer paths so both collect answers
+ * locally instead of closing the request on the first answer with empties.
+ */
+async function applyQuestionAnswer(key: ThreadKey, answerForCurrent: string[]): Promise<void> {
+  const kStr = keyToString(key);
+  const pending = pendingQuestions.get(kStr);
+  if (!pending) return;
+
+  const answeredQuestion = pending.data.questions[pending.currentIndex];
+  const { nextState, action } = recordAnswerAndAdvance(pending, answerForCurrent);
+
+  // Mark the answered question's message as done (the chosen answer in place).
+  if (pending.messageId !== null && answeredQuestion) {
     await editThreadMessage(
       key,
       pending.messageId,
-      `✅ ${question.header || question.question}: ${selectedLabel}`,
+      `✅ ${answeredQuestion.header || answeredQuestion.question}: ${answerForCurrent.join(', ')}`,
     );
   }
-  if (adapter.answerQuestion) {
-    adapter.answerQuestion(key, answers);
-    markNeedsNewMessage(key);
+
+  if (action.kind === 'submit') {
+    const adapter = getThreadAdapter(key);
+    clearPendingQuestion(key);
+    if (adapter.answerQuestion) {
+      // Load-bearing: send the REAL collected answers (all questions), not the
+      // old per-answer matrix that blanked every other question.
+      adapter.answerQuestion(key, action.matrix);
+      markNeedsNewMessage(key);
+    }
+    return;
   }
-  await ctx.answerCbQuery(selectedLabel);
-});
+
+  // More questions remain: persist the advanced state, then post the next one
+  // (which re-owns `messageId`). DO NOT reply to the agent yet.
+  setPendingQuestion(key, nextState);
+  await postPendingQuestionAt(key);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Adapter event handlers (output / status / question / closed / error)
@@ -5542,6 +5693,9 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
   } catch (err) {
     console.error('[sendStatusFrame] Failed:', err);
   }
+  // S3: a status/liveness frame landed below any pending question — bring the
+  // question back to the bottom (debounced; no-op when no question is pending).
+  if (landed) onThreadActivityWhileQuestionPending(key);
   return landed;
 }
 
@@ -5691,53 +5845,88 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   // (the network reply was still in flight) and get a confusing
   // "no pending question" answerCbQuery. The messageId is patched in
   // after `replyToThread` resolves.
+  //
+  // S2: post ONLY the first question. The rest are shown one at a time as the
+  // user answers, with answers collected locally (`answers`) and replied to the
+  // agent as a full matrix once every question is answered. Posting all at once
+  // was the bug: answering the first reply-closed the request with empty
+  // answers for the rest.
+  setPendingQuestion(key, {
+    data: questionData,
+    messageId: null,
+    answers: new Array(questionData.questions.length).fill(null),
+    currentIndex: 0,
+  });
+
+  void postPendingQuestionAt(key);
+}
+
+/**
+ * @description Render + send ONE OpenCode question (the one at the pending
+ * state's `currentIndex`) as the newest thread message, then patch the
+ * resulting message id back onto the pending state (in memory + persisted).
+ *
+ * This is the SINGLE owner of the pending `messageId` for an on-screen
+ * transition — the initial post (S1), the "advance to the next question" step
+ * (S2), and the "re-post at the bottom" step (S3) all route through here so
+ * they never double-set or orphan the id.
+ *
+ * S1: option descriptions are rendered under each numbered label in the body
+ * via {@link buildQuestionBodyLines}; the inline buttons stay label-only
+ * (40-char cap). Callback ids stay `qa_<qIdx>_<optIdx>` against the absolute
+ * question index so a restored old button still resolves.
+ */
+async function postPendingQuestionAt(key: ThreadKey): Promise<void> {
   const kStr = keyToString(key);
-  setPendingQuestion(key, { data: questionData, messageId: null });
+  const pending = pendingQuestions.get(kStr);
+  if (!pending) return;
 
-  (async () => {
-    try {
-      for (let qIdx = 0; qIdx < questionData.questions.length; qIdx++) {
-        const q = questionData.questions[qIdx];
-        const header = q.header || q.question || 'Question';
-        const lines: string[] = [`❓ *${escapeMarkdown(header)}*`];
-        if (q.question && q.question !== header) lines.push(escapeMarkdown(q.question));
+  const qIdx = pending.currentIndex;
+  const question = pending.data.questions[qIdx];
+  if (!question) return;
 
-        const buttons = q.options.map((opt, optIdx) => {
-          const label = opt.label.length > 40 ? opt.label.slice(0, 37) + '...' : opt.label;
-          return [Markup.button.callback(label, `qa_${qIdx}_${optIdx}`)];
-        });
-        const keyboard = buttons.length > 0 ? Markup.inlineKeyboard(buttons) : undefined;
+  const buttons = question.options.map((opt, optIdx) => {
+    const label = opt.label.length > 40 ? opt.label.slice(0, 37) + '...' : opt.label;
+    return [Markup.button.callback(label, `qa_${qIdx}_${optIdx}`)];
+  });
+  const keyboard = buttons.length > 0 ? Markup.inlineKeyboard(buttons) : undefined;
 
-        const extra: Record<string, unknown> = { parse_mode: 'Markdown' };
-        if (keyboard) Object.assign(extra, keyboard);
+  try {
+    const extra: Record<string, unknown> = { parse_mode: 'Markdown' };
+    if (keyboard) Object.assign(extra, keyboard);
 
-        let messageId = await replyToThread(key, lines.join('\n'), extra);
-        if (!messageId) {
-          // Markdown rejected — retry plain.
-          const plainLines = [`❓ ${header}`];
-          if (q.question && q.question !== header) plainLines.push(q.question);
-          const plainExtra: Record<string, unknown> = {};
-          if (keyboard) Object.assign(plainExtra, keyboard);
-          messageId = await replyToThread(key, plainLines.join('\n'), plainExtra);
-        }
-
-        if (messageId !== null) {
-          // Patch the messageId on the existing entry (it may already
-          // have been deleted by a `qa_*` callback firing in between).
-          // Route through `setPendingQuestion` so the persisted copy gets the
-          // live button message id too — that id is what lets the OLD buttons
-          // resolve after a restart without re-posting the question.
-          const existing = pendingQuestions.get(kStr);
-          if (existing && existing.data === questionData) {
-            existing.messageId = messageId;
-            setPendingQuestion(key, existing);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('[handleAgentQuestion] Failed:', err);
+    let messageId = await replyToThread(
+      key,
+      buildQuestionBodyLines(question, escapeMarkdown).join('\n'),
+      extra,
+    );
+    if (!messageId) {
+      // Markdown rejected — retry plain.
+      const plainExtra: Record<string, unknown> = {};
+      if (keyboard) Object.assign(plainExtra, keyboard);
+      messageId = await replyToThread(
+        key,
+        buildQuestionBodyLinesPlain(question).join('\n'),
+        plainExtra,
+      );
     }
-  })();
+
+    if (messageId !== null) {
+      // Patch the messageId on the existing entry (it may already have been
+      // cleared/advanced by an answer callback firing in between). Route
+      // through `setPendingQuestion` so the persisted copy gets the live
+      // button message id too — that id is what lets the OLD buttons resolve
+      // after a restart, and what S3 deletes when re-posting to the bottom.
+      const existing = pendingQuestions.get(kStr);
+      if (existing && existing.data === pending.data && existing.currentIndex === qIdx) {
+        existing.messageId = messageId;
+        setPendingQuestion(key, existing);
+        markQuestionMessageSent(key, messageId);
+      }
+    }
+  } catch (err) {
+    console.error('[postPendingQuestionAt] Failed:', err);
+  }
 }
 
 /**
@@ -6060,7 +6249,11 @@ function restorePendingQuestions(): void {
     }
     const adapter = getThreadAdapter(key);
     if (adapter.checkIsActive(key)) {
-      pendingQuestions.set(keyStr, value);
+      // Restore-compat (S2): an OLD persisted entry has only `{ data, messageId }`
+      // — `answers`/`currentIndex` are undefined and would crash the answer
+      // handlers. Migrate to the new shape and re-persist so disk catches up.
+      const migrated = migratePendingQuestionState(value);
+      setPendingQuestion(key, migrated);
       restored += 1;
     } else {
       clearPendingQuestion(key);

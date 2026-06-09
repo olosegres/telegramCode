@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, OutputEventMeta, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, OutputEventMeta, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -26,6 +26,7 @@ const threadAdapterNames = new Map<string, string>();
 type OutputHandler = (key: ThreadKey, output: string, meta?: OutputEventMeta) => void;
 type StatusHandler = (key: ThreadKey, status: string) => void;
 type QuestionHandler = (key: ThreadKey, question: OpenCodePendingQuestion) => void;
+type SurveyHandler = (key: ThreadKey, survey: ClaudeSurveyEvent) => void;
 type ApiErrorHandler = (key: ThreadKey, error: AgentApiErrorClass) => void;
 type ThreadKeyHandler = (key: ThreadKey) => void;
 type ErrorHandler = (key: ThreadKey, error: Error) => void;
@@ -33,6 +34,7 @@ type ErrorHandler = (key: ThreadKey, error: Error) => void;
 let onOutput: OutputHandler | null = null;
 let onStatus: StatusHandler | null = null;
 let onQuestion: QuestionHandler | null = null;
+let onSurvey: SurveyHandler | null = null;
 let onApiError: ApiErrorHandler | null = null;
 let onClosed: ThreadKeyHandler | null = null;
 let onStarted: ThreadKeyHandler | null = null;
@@ -43,6 +45,7 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onOutput) adapter.on('output', onOutput);
   if (onStatus) adapter.on('status', onStatus);
   if (onQuestion) adapter.on('question', onQuestion);
+  if (onSurvey) adapter.on('survey', onSurvey);
   if (onApiError) adapter.on('apiError', onApiError);
   if (onClosed) adapter.on('closed', onClosed);
   if (onStarted) adapter.on('started', onStarted);
@@ -65,6 +68,7 @@ export function registerAdapterEventHandlers(handlers: {
   onOutput: OutputHandler;
   onStatus?: StatusHandler;
   onQuestion?: QuestionHandler;
+  onSurvey?: SurveyHandler;
   onApiError?: ApiErrorHandler;
   onClosed: ThreadKeyHandler;
   onStarted?: ThreadKeyHandler;
@@ -74,6 +78,7 @@ export function registerAdapterEventHandlers(handlers: {
   onOutput = handlers.onOutput;
   onStatus = handlers.onStatus ?? null;
   onQuestion = handlers.onQuestion ?? null;
+  onSurvey = handlers.onSurvey ?? null;
   onApiError = handlers.onApiError ?? null;
   onClosed = handlers.onClosed;
   onStarted = handlers.onStarted ?? null;

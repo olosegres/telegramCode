@@ -199,6 +199,46 @@ export interface OutputEventMeta {
 }
 
 /**
+ * @description One option of a Claude CLI bare-digit survey (e.g. the periodic
+ * session-feedback prompt: `1: Bad  2: Fine  3: Good  0: Dismiss`). The TUI
+ * submits on the bare digit alone — no Enter — so `digit` is exactly the
+ * keystroke to send.
+ */
+export interface ClaudeSurveyOption {
+  /** The bare digit keystroke that selects this option (e.g. `'1'`, `'0'`). */
+  digit: string;
+  /** Human-readable label shown on the button (e.g. `'Bad'`, `'Dismiss'`). */
+  label: string;
+}
+
+/**
+ * @description Payload of the adapter `survey` event — a Claude CLI fixed-shape
+ * bare-digit prompt the bot should render with tappable buttons. Distinct from
+ * the OpenCode `question` event (a real AskUserQuestion); a survey is lighter
+ * and answered by a single keystroke with NO Enter.
+ */
+export interface ClaudeSurveyEvent {
+  /** The survey header line (e.g. `How is Claude doing this session?`). */
+  header: string;
+  /** Each selectable option, in display order. */
+  options: ClaudeSurveyOption[];
+}
+
+/**
+ * @description Per-call options for {@link AgentAdapter.sendInput}.
+ */
+export interface SendInputOptions {
+  /**
+   * Whether the adapter appends an Enter after the literal keystrokes. Defaults
+   * to `true` so every existing caller is byte-for-byte unchanged. A Claude CLI
+   * bare-digit survey auto-submits on the keypress, so the survey answer path
+   * passes `false` to suppress the spurious Enter (which would otherwise submit
+   * an empty prompt line after the survey resolved).
+   */
+  appendEnter?: boolean;
+}
+
+/**
  * @description Unified interface for AI agent backends (Claude CLI, OpenCode, etc.).
  * Each adapter manages sessions keyed by `ThreadKey` and communicates via EventEmitter.
  *
@@ -206,6 +246,7 @@ export interface OutputEventMeta {
  * - 'output'   (key: ThreadKey, text: string, meta?: OutputEventMeta) — permanent text response
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
+ * - 'survey'   (key: ThreadKey, survey: ClaudeSurveyEvent) — Claude CLI bare-digit survey to render with answerable buttons
  * - 'apiError' (key: ThreadKey, error: AgentApiErrorClass) — provider-side API error at the proxy boundary (auto-retry trigger; only when {@link AgentApiErrorClass} classification matched)
  * - 'started'  (key: ThreadKey)                  — session is up and ready
  * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)
@@ -273,7 +314,7 @@ export interface AgentAdapter extends EventEmitter {
 
   // — Input —
 
-  sendInput(key: ThreadKey, input: string): void;
+  sendInput(key: ThreadKey, input: string, options?: SendInputOptions): void;
   sendSignal(key: ThreadKey, signal: string): void;
 
   // — Session history —
@@ -418,6 +459,15 @@ export interface AgentAdapter extends EventEmitter {
    * should break out of it (Escape + send as a fresh instruction).
    */
   isQuestionPending?(key: ThreadKey): boolean;
+
+  /**
+   * @description Whether a Claude CLI bare-digit survey (the periodic
+   * session-feedback prompt) is currently on the TUI screen. Distinct from
+   * {@link isQuestionPending} (a real AskUserQuestion selector). A real
+   * question takes PRECEDENCE: when both could match, the bot treats the reply
+   * as a selector answer, not a survey answer. Only Claude implements it.
+   */
+  isSurveyPending?(key: ThreadKey): boolean;
 
   getFullOutput?(key: ThreadKey, lines?: number): string | null;
 }

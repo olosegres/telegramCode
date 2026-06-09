@@ -223,8 +223,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.starting': 'Запускаю {label} в `{subdir}`…',
     'agent.queued_starting': '⏳ {label} ещё запускается — сообщение в очереди, отправлю как только будет готов.',
     'agent.question_hint': 'ℹ️ Ответь цифрой варианта (например 1) или y/n. Также: /up /down — выбор, /enter — подтвердить, /c — отмена.',
+    'agent.survey_hint': 'ℹ️ Нажми кнопку или ответь цифрой варианта — отправлю в Claude.',
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
+
+    // ── Claude CLI bare-digit survey (session-feedback prompt) ──
+    'survey.message': '📋 {header}\n{hint}',
+    'survey.answered': '✓ {label}',
 
     // ── /effort (reasoning effort) ──
     'effort.choose': '⚙️ Текущий effort: {current}\nВыбери уровень:',
@@ -308,6 +313,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.no_pending_question': 'Нет ожидающего вопроса',
     'cb.invalid_option': 'Некорректный вариант',
     'cb.sent_option': 'Отправлено: {option}',
+    'cb.survey_answered': 'Отправлено: {label}',
     'cb.effort_set': 'Effort: {level}',
     'cb.effort_error': 'Ошибка: {error}',
 
@@ -553,8 +559,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.starting': 'Starting {label} in `{subdir}`…',
     'agent.queued_starting': '⏳ {label} is still starting — your message is queued and will be sent once it is ready.',
     'agent.question_hint': 'ℹ️ Reply with the option number (e.g. 1) or y/n. Also: /up /down to move, /enter to confirm, /c to cancel.',
+    'agent.survey_hint': 'ℹ️ Tap a button or reply with the option number — I will send it to Claude.',
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
+
+    // ── Claude CLI bare-digit survey (session-feedback prompt) ──
+    'survey.message': '📋 {header}\n{hint}',
+    'survey.answered': '✓ {label}',
 
     // ── /effort (reasoning effort) ──
     'effort.choose': '⚙️ Current effort: {current}\nPick a level:',
@@ -631,6 +642,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.no_pending_question': 'No pending question',
     'cb.invalid_option': 'Invalid option',
     'cb.sent_option': 'Sent: {option}',
+    'cb.survey_answered': 'Sent: {label}',
     'cb.effort_set': 'Effort: {level}',
     'cb.effort_error': 'Error: {error}',
 

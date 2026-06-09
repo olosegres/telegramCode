@@ -6,7 +6,17 @@ import * as os from 'os';
 import * as path from 'path';
 import { promisify } from 'util';
 import { sleep } from '../utils';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
+import type {
+  AgentAdapter,
+  AgentApiErrorClass,
+  AgentSession,
+  ClaudeSurveyEvent,
+  ClaudeSurveyOption,
+  RecentTurn,
+  ResumeSessionOptions,
+  SendInputOptions,
+  ThreadKey,
+} from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool } from '../installManager';
@@ -57,6 +67,15 @@ interface ClaudeSession {
    * prose follows (the question is over). See {@link extractClaudeQuestion}.
    */
   lastQuestionSignature: string;
+  /**
+   * Signature of the last emitted Claude CLI bare-digit survey (header +
+   * option digits/labels). Same de-dup mechanism as
+   * {@link lastQuestionSignature}: the survey repaints every poll while on
+   * screen, so comparing signatures delivers it once. Cleared when the survey
+   * leaves the pane, so a genuinely new survey later re-emits. Drives
+   * {@link ClaudeCliAdapter.isSurveyPending}. See {@link extractClaudeSurvey}.
+   */
+  lastSurveySignature: string;
   /**
    * Handles for the auto-Enter / auto-Accept `setTimeout`s. Audit S9 / #10:
    * the callbacks used to fire 300–400 ms after detection regardless of
@@ -762,6 +781,162 @@ export function checkIsClaudeQuestionBlock(text: string): boolean {
 export function checkIsSelectorControlReply(text: string): boolean {
   const trimmed = text.trim();
   return /^\d{1,2}$/.test(trimmed) || /^[yYnN]$/.test(trimmed);
+}
+
+/**
+ * @description A Claude CLI bare-digit survey scraped from the pane, ready for
+ * answerable delivery. Distinct from {@link ClaudeQuestion} (a real
+ * AskUserQuestion box): a survey is a fixed-shape one-keystroke prompt.
+ */
+export interface ClaudeSurvey {
+  /** Header line, e.g. `How is Claude doing this session?`. */
+  header: string;
+  /** Options parsed from the inline `N: Label` row, in display order. */
+  options: ClaudeSurveyOption[];
+  /**
+   * Stable signature derived ONLY from header + option digits/labels — NOTHING
+   * volatile (no spinner glyph, no elapsed time, no surrounding pane). So the
+   * same survey across polls yields an identical signature → the bot emits it
+   * exactly once (mirrors {@link ClaudeQuestion.signature}).
+   */
+  signature: string;
+}
+
+/**
+ * @description The EXACT survey header, matched ANCHORED start-to-end of a line
+ * (after an optional leading `● ` assistant bullet), NEVER as a substring.
+ *
+ * WHY anchored, not substring: an earlier substring matcher false-fired on a
+ * user message that merely QUOTED the survey text in prose — it spammed the
+ * live topic with bogus surveys + duplicates. The header MUST be the WHOLE
+ * line (optionally suffixed by ` (optional)`), so a header embedded mid-sentence
+ * can never match.
+ */
+const CLAUDE_SURVEY_HEADER_TEXT = 'How is Claude doing this session?';
+const CLAUDE_SURVEY_HEADER_REGEX =
+  /^\s*●?\s*How is Claude doing this session\?(\s*\(optional\))?\s*$/;
+/**
+ * The inline option row: `N: Label  N: Label …` — every token is
+ * `digit: word`, ≥2 of them, and the WHOLE line is option tokens (anchored),
+ * so a prose line that merely contains `1: foo` can't pass.
+ */
+const CLAUDE_SURVEY_OPTION_ROW_REGEX = /^\s*(\d+:\s*[A-Za-z]+\s*)+$/;
+/** Pulls each `digit: label` pair out of a validated option row. */
+const CLAUDE_SURVEY_OPTION_TOKEN_REGEX = /(\d+):\s*([A-Za-z]+)/g;
+const CLAUDE_SURVEY_MIN_OPTIONS = 2;
+
+/**
+ * @description AIRTIGHT detector for the Claude CLI bare-digit survey. Returns
+ * a survey ONLY when BOTH hold:
+ *
+ *   1. Some line, after stripping an optional leading `● ` bullet, matches
+ *      {@link CLAUDE_SURVEY_HEADER_REGEX} ANCHORED start-to-end (the WHOLE
+ *      line) — so a header quoted mid-sentence is rejected.
+ *   2. The IMMEDIATELY-FOLLOWING non-empty line is an inline option row
+ *      ({@link CLAUDE_SURVEY_OPTION_ROW_REGEX}) parsing to ≥2 options.
+ *
+ * Kept fully SEPARATE from {@link extractClaudeQuestion} (the per-line
+ * AskUserQuestion selector): this is a lighter fixed-shape prompt. The
+ * signature is header + the option digits/labels only (no volatile chrome), so
+ * the same survey across polls de-dups to a single emit.
+ */
+export function extractClaudeSurvey(text: string): ClaudeSurvey | null {
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (!CLAUDE_SURVEY_HEADER_REGEX.test(lines[i])) continue;
+
+    // The option row is the IMMEDIATELY-following non-empty line — skip only
+    // blank lines, never prose. If the next content line isn't an option row,
+    // this is not a survey (the header was probably quoted in prose).
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim() === '') j++;
+    if (j >= lines.length) return null;
+    if (!CLAUDE_SURVEY_OPTION_ROW_REGEX.test(lines[j])) return null;
+
+    const options: ClaudeSurveyOption[] = [];
+    for (const match of lines[j].matchAll(CLAUDE_SURVEY_OPTION_TOKEN_REGEX)) {
+      options.push({ digit: match[1], label: match[2] });
+    }
+    if (options.length < CLAUDE_SURVEY_MIN_OPTIONS) return null;
+
+    const signature = `${CLAUDE_SURVEY_HEADER_TEXT}::${options
+      .map(option => `${option.digit}:${option.label}`)
+      .join('|')}`;
+    return { header: CLAUDE_SURVEY_HEADER_TEXT, options, signature };
+  }
+  return null;
+}
+
+/** Whether `text` is confidently showing a Claude CLI bare-digit survey. */
+export function checkIsClaudeSurvey(text: string): boolean {
+  return extractClaudeSurvey(text) !== null;
+}
+
+/**
+ * @description One ordered tmux send-keys step the adapter will enqueue for a
+ * {@link ClaudeCliAdapter.sendInput} call. Extracted as a pure plan so the
+ * "no Enter" decision is unit-testable WITHOUT a live tmux session.
+ *
+ *  - `literal`       — `send-keys -l <input>` (the typed text, literal bytes);
+ *  - `instantEnter`  — `send-keys Enter` immediately (short control reply);
+ *  - `slashEnter`    — `send-keys Enter` deferred so the slash-popup settles;
+ *  - `verifiedEnter` — `send-keys Enter` deferred past the paste-aggregation
+ *    window, plus a post-Enter unsubmitted re-check (a plain prompt).
+ */
+export type ClaudeSendKeyStep = 'literal' | 'instantEnter' | 'slashEnter' | 'verifiedEnter';
+
+/**
+ * @description Pure plan of the tmux send-keys steps for one `sendInput` call.
+ *
+ * Mirrors the three historical Enter branches (bare slash command → deferred
+ * Enter; short control reply → instant Enter; plain prompt → paste-race
+ * deferred Enter + verification). When `appendEnter === false` (the survey
+ * answer) ONLY the literal keystrokes are sent — every Enter branch is skipped,
+ * since the survey auto-submits on the bare digit. `appendEnter` defaults to
+ * `true`, so every existing caller's plan is byte-for-byte unchanged.
+ */
+export function getClaudeSendKeysPlan(
+  input: string,
+  appendEnter: boolean,
+): ClaudeSendKeyStep[] {
+  const steps: ClaudeSendKeyStep[] = ['literal'];
+  if (!appendEnter) return steps;
+
+  if (checkIsBareSlashCommand(input)) {
+    steps.push('slashEnter');
+  } else if (input.length < CLAUDE_PASTE_RACE_MIN_LENGTH) {
+    steps.push('instantEnter');
+  } else {
+    steps.push('verifiedEnter');
+  }
+  return steps;
+}
+
+/** Where a Claude text reply should be routed while a prompt may be on screen. */
+export type ClaudeReplyRoute = 'selector' | 'survey' | 'prompt';
+
+/**
+ * @description Decide how to route a user TEXT reply for a Claude thread,
+ * given which interactive prompts are currently pending. Pure so the
+ * precedence is unit-testable.
+ *
+ * Precedence (a real AskUserQuestion always wins):
+ *   1. A selector (AskUserQuestion) pending + a bare control reply
+ *      (digit / y / n) → `'selector'` (drive the menu in place).
+ *   2. Else a survey pending + a bare control reply → `'survey'`
+ *      (answer the bare-digit survey).
+ *   3. Else → `'prompt'` (a fresh turn; free-form prose breaks out of any
+ *      pending prompt, mirroring the existing selector break-out behavior).
+ */
+export function getClaudeReplyRoute(input: {
+  isQuestionPending: boolean;
+  isSurveyPending: boolean;
+  text: string;
+}): ClaudeReplyRoute {
+  const isControlReply = checkIsSelectorControlReply(input.text);
+  if (input.isQuestionPending && isControlReply) return 'selector';
+  if (input.isSurveyPending && isControlReply) return 'survey';
+  return 'prompt';
 }
 
 /**
@@ -2017,6 +2192,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'handledApiError'
       | 'lastStatusText'
       | 'lastQuestionSignature'
+      | 'lastSurveySignature'
       | 'autoEnterTimer'
       | 'autoAcceptOuterTimer'
       | 'autoAcceptInnerTimer'
@@ -2041,6 +2217,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledApiError: false,
       lastStatusText: '',
       lastQuestionSignature: '',
+      lastSurveySignature: '',
       autoEnterTimer: null,
       autoAcceptOuterTimer: null,
       autoAcceptInnerTimer: null,
@@ -2286,69 +2463,75 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     return checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: session.lastContent });
   }
 
-  sendInput(key: ThreadKey, input: string): void {
+  sendInput(key: ThreadKey, input: string, options?: SendInputOptions): void {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) {
       console.log(`[Claude] sendInput: no active session for ${keyToString(key)}`);
       return;
     }
 
-    console.log(`[Claude] sendInput: "${input}"`);
+    const appendEnter = options?.appendEnter ?? true;
+    console.log(`[Claude] sendInput: "${input}"${appendEnter ? '' : ' (no Enter)'}`);
     this.resetPollCadence(key, session);
 
-    // Argv-based send-keys: tmux never invokes a shell here, so user-typed
-    // `$(...)` / backticks are delivered to claude's stdin as literal
-    // bytes. The previous implementation used `execSync` with a shell
-    // template; `JSON.stringify(input)` wraps the text in double quotes,
-    // and `/bin/sh` happily expands `$(...)` inside double quotes BEFORE
-    // tmux ever sees the keys — that was the RCE flagged by audit S1 / #1.
-    //
-    // `-l` tells tmux to treat the next argument as literal keys, not as
-    // tmux special-key names (so the user typing the word "Enter" wouldn't
-    // be rewritten to a newline). A separate call adds the actual Enter.
-    this.enqueueTmuxBestEffort(session, async () => {
-      if (!session.isActive) return '';
-      return tmuxAsync('send-keys', '-t', session.sessionName, '-l', input);
-    });
-
-    // Bare slash commands (`/compact`, `/clear`, …) open Claude's command
-    // autocomplete popup; an Enter fired the same instant accepts the popup
-    // highlight instead of running the command (so it silently no-ops). Defer
-    // the Enter so the popup settles first. Re-check the session is still
-    // alive when the timer fires — it may have been stopped meanwhile.
-    if (checkIsBareSlashCommand(input)) {
-      const sessionName = session.sessionName;
-      setTimeout(() => {
-        const current = this.sessions.get(keyToString(key));
-        if (!current?.isActive || current.sessionName !== sessionName) return;
-        this.enqueueTmuxBestEffort(current, async () => {
-          if (!current.isActive) return '';
-          return tmuxAsync('send-keys', '-t', sessionName, 'Enter');
+    // The ordered keystroke plan is pure (getClaudeSendKeysPlan) so the "no
+    // Enter" decision is unit-testable; here we just execute each step.
+    const steps = getClaudeSendKeysPlan(input, appendEnter);
+    for (const step of steps) {
+      if (step === 'literal') {
+        // Argv-based send-keys: tmux never invokes a shell here, so user-typed
+        // `$(...)` / backticks are delivered to claude's stdin as literal
+        // bytes. The previous implementation used `execSync` with a shell
+        // template; `JSON.stringify(input)` wraps the text in double quotes,
+        // and `/bin/sh` happily expands `$(...)` inside double quotes BEFORE
+        // tmux ever sees the keys — that was the RCE flagged by audit S1 / #1.
+        //
+        // `-l` tells tmux to treat the next argument as literal keys, not as
+        // tmux special-key names (so the user typing the word "Enter" wouldn't
+        // be rewritten to a newline). A separate call adds the actual Enter.
+        this.enqueueTmuxBestEffort(session, async () => {
+          if (!session.isActive) return '';
+          return tmuxAsync('send-keys', '-t', session.sessionName, '-l', input);
         });
-      }, CLAUDE_SLASH_ENTER_DELAY_MS);
-    } else if (input.length < CLAUDE_PASTE_RACE_MIN_LENGTH) {
-      // Short control replies (y/n/option digits) can't trigger paste
-      // aggregation — submit instantly, no verification capture.
-      this.enqueueTmuxBestEffort(session, async () => {
-        if (!session.isActive) return '';
-        return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
-      });
-    } else {
-      // Plain prompt: defer the Enter past the TUI's paste-aggregation window
-      // (see CLAUDE_TEXT_ENTER_DELAY_MS) so it submits instead of being absorbed
-      // as a paste newline. The delay runs INSIDE the queued fn (not a bare
-      // setTimeout): the per-session queue is the ordering guarantee, so any op
-      // enqueued later — the next prompt's text, an interrupt Escape from
-      // startup-prompt replay — physically cannot land between this text and
-      // its submit Enter. An 80ms hold of THIS session's queue is harmless
-      // (polls run every 300ms); other sessions' queues are independent.
-      this.enqueueTmuxBestEffort(session, async () => {
-        if (!session.isActive) return '';
-        await sleep(CLAUDE_TEXT_ENTER_DELAY_MS);
-        if (!session.isActive) return '';
-        return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
-      });
-      this.scheduleEnterVerification(key, session.sessionName, input);
+      } else if (step === 'slashEnter') {
+        // Bare slash commands (`/compact`, `/clear`, …) open Claude's command
+        // autocomplete popup; an Enter fired the same instant accepts the popup
+        // highlight instead of running the command (so it silently no-ops). Defer
+        // the Enter so the popup settles first. Re-check the session is still
+        // alive when the timer fires — it may have been stopped meanwhile.
+        const sessionName = session.sessionName;
+        setTimeout(() => {
+          const current = this.sessions.get(keyToString(key));
+          if (!current?.isActive || current.sessionName !== sessionName) return;
+          this.enqueueTmuxBestEffort(current, async () => {
+            if (!current.isActive) return '';
+            return tmuxAsync('send-keys', '-t', sessionName, 'Enter');
+          });
+        }, CLAUDE_SLASH_ENTER_DELAY_MS);
+      } else if (step === 'verifiedEnter') {
+        // Plain prompt: defer the Enter past the TUI's paste-aggregation window
+        // (see CLAUDE_TEXT_ENTER_DELAY_MS) so it submits instead of being absorbed
+        // as a paste newline. The delay runs INSIDE the queued fn (not a bare
+        // setTimeout): the per-session queue is the ordering guarantee, so any op
+        // enqueued later — the next prompt's text, an interrupt Escape from
+        // startup-prompt replay — physically cannot land between this text and
+        // its submit Enter. An 80ms hold of THIS session's queue is harmless
+        // (polls run every 300ms); other sessions' queues are independent.
+        this.enqueueTmuxBestEffort(session, async () => {
+          if (!session.isActive) return '';
+          await sleep(CLAUDE_TEXT_ENTER_DELAY_MS);
+          if (!session.isActive) return '';
+          return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+        });
+        this.scheduleEnterVerification(key, session.sessionName, input);
+      } else {
+        // Short control replies (y/n/option digits) can't trigger paste
+        // aggregation — submit instantly, no verification capture.
+        this.enqueueTmuxBestEffort(session, async () => {
+          if (!session.isActive) return '';
+          return tmuxAsync('send-keys', '-t', session.sessionName, 'Enter');
+        });
+      }
     }
   }
 
@@ -2491,6 +2674,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   isQuestionPending(key: ThreadKey): boolean {
     const session = this.sessions.get(keyToString(key));
     return Boolean(session?.isActive && session.lastQuestionSignature);
+  }
+
+  /**
+   * @description Whether a bare-digit survey is currently on screen. Backed by
+   * `lastSurveySignature` the poll loop sets when it scrapes a survey (see the
+   * `extractClaudeSurvey` call). A real AskUserQuestion takes precedence — when
+   * one is pending the bot routes a digit to the SELECTOR, not the survey — so
+   * callers must check {@link isQuestionPending} first.
+   */
+  isSurveyPending(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
+    return Boolean(session?.isActive && session.lastSurveySignature);
   }
 
   /**
@@ -3060,6 +3255,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         // transient status frame that gets deleted — and suppress repaints.
         const question = extractClaudeQuestion(content);
         if (question) {
+          // A real AskUserQuestion selector takes PRECEDENCE over a survey: a
+          // digit reply must drive the selector, not be eaten by a stale
+          // survey signal. Clear the survey de-dup so it can't shadow the
+          // question's digit routing.
+          session.lastSurveySignature = '';
           if (question.signature !== session.lastQuestionSignature) {
             session.lastQuestionSignature = question.signature;
             session.lastStatusText = '';
@@ -3070,6 +3270,24 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           // No question on screen — clear the de-dup so an identical question
           // asked again later is delivered, not silently swallowed.
           session.lastQuestionSignature = '';
+
+          // Claude CLI bare-digit survey (the periodic session-feedback prompt):
+          // arm the answerable state + emit tappable buttons ONCE per signature.
+          // Side-channel only — the survey chrome itself still flows through the
+          // normal output path below (we do NOT strip it). The signature is
+          // header + option digits/labels (no volatile chrome), so the survey
+          // repainting every poll de-dups to a single emit; cleared when it
+          // leaves the pane so a genuinely new survey later re-emits.
+          const survey = extractClaudeSurvey(content);
+          if (survey) {
+            if (survey.signature !== session.lastSurveySignature) {
+              session.lastSurveySignature = survey.signature;
+              const surveyEvent: ClaudeSurveyEvent = { header: survey.header, options: survey.options };
+              this.emit('survey', key, surveyEvent);
+            }
+          } else {
+            session.lastSurveySignature = '';
+          }
 
           // Thread the tool-result kind across polls: the owning `● Bash(…)`
           // header of a slow command's output streamed in an earlier poll (the

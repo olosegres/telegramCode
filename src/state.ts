@@ -3,7 +3,17 @@ import { promises as fsp } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { randomBytes } from 'node:crypto';
-import { keyToString, type ApiRetryState, type PendingQuestionState, type ThreadKey } from './types';
+import {
+  keyToString,
+  type ApiRetryState,
+  type PendingQuestionState,
+  type ResolvedThreadDisplayPrefs,
+  type SubagentMode,
+  type ThinkingMode,
+  type ThreadDisplayPrefs,
+  type ThreadKey,
+  type ToolResultMode,
+} from './types';
 import type { ScheduleRecord } from './scheduler/types';
 
 /**
@@ -33,6 +43,17 @@ export const STATE_SCHEMA_VERSION = 1;
 
 /** Default debounce window (ms) for batched saves. Overridable via the store constructor for tests. */
 const DEFAULT_SAVE_DEBOUNCE_MS = 500;
+
+/**
+ * @description Locked per-thread display-preference defaults (plan
+ * §S1). Applied by {@link StateStore.getDisplayPrefs} whenever a field is
+ * absent, so the persisted record only ever stores non-default overrides.
+ * Centralised here so the three defaults live in exactly one place rather than
+ * being scattered as literals across the getter and S2–S5 render paths.
+ */
+const defaultThinkingMode: ThinkingMode = 'brief';
+const defaultToolResultMode: ToolResultMode = 'short';
+const defaultSubagentMode: SubagentMode = 'compact';
 
 export interface BindingData {
   /** Subdirectory under `WORK_ROOT` this thread is attached to. */
@@ -173,6 +194,18 @@ export interface StateV1 {
    * after sessions are reattached, so the kick lands in a live session.
    */
   apiRetries?: Record<string, ApiRetryState>;
+  /**
+   * Per-thread OpenCode output-verbosity rendering preferences (thinking /
+   * tool-results / sub-agent display), keyed by {@link ThreadKey} string. Each
+   * record only stores NON-default overrides — an absent field (or absent
+   * record) means "use the locked default" (see {@link StateStore.getDisplayPrefs}),
+   * which keeps `state.json` clean (same delete-when-default idiom as `/trace`).
+   * Optional so older state files stay valid — a missing value is "all threads
+   * on defaults". Lifecycle-independent: only `/thinking` / `/tool-results` /
+   * `/subagent` mutate it, never session teardown. These are bot-side rendering
+   * concerns, NOT agent behavior — they never change what is sent to OpenCode.
+   */
+  displayPrefs?: Record<string, ThreadDisplayPrefs>;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -872,6 +905,74 @@ export class StateStore {
     if (config.allThreads) this.state.traceAllThreads = true;
     else delete this.state.traceAllThreads;
     this.scheduleSave();
+  }
+
+  // ── per-thread display preferences (`/thinking`, `/tool-results`, `/subagent`) ──
+
+  /**
+   * @description Fully-resolved display preferences for `key`: every field is
+   * present because the locked default (thinking=`brief`, toolResults=`short`,
+   * subagent=`compact`) is applied wherever the persisted record omits it. The
+   * SSE hot path reads this, so it must never hand back an `undefined` field.
+   */
+  getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
+    const stored = this.state.displayPrefs?.[keyToString(key)];
+    return {
+      thinking: stored?.thinking ?? defaultThinkingMode,
+      toolResults: stored?.toolResults ?? defaultToolResultMode,
+      subagent: stored?.subagent ?? defaultSubagentMode,
+    };
+  }
+
+  /**
+   * @description Persist one display-preference field for `key`. Setting a
+   * field to its locked default DELETES the override (and drops the whole
+   * record / map once empty) so an all-defaults thread leaves a clean
+   * `state.json` — same delete-when-default idiom as {@link setTraceConfig}.
+   * Not crash-critical (a rendering preference), so it rides the debounced
+   * save loop rather than an immediate `flush()`.
+   *
+   * The overloads keep `field` and `value` type-linked so the compiler rejects
+   * e.g. `setDisplayPref(key, 'thinking', 'short')`.
+   */
+  setDisplayPref(key: ThreadKey, field: 'thinking', value: ThinkingMode): Promise<void>;
+  setDisplayPref(key: ThreadKey, field: 'toolResults', value: ToolResultMode): Promise<void>;
+  setDisplayPref(key: ThreadKey, field: 'subagent', value: SubagentMode): Promise<void>;
+  async setDisplayPref(
+    key: ThreadKey,
+    field: keyof ThreadDisplayPrefs,
+    value: ThinkingMode | ToolResultMode | SubagentMode,
+  ): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const isDefault =
+        (field === 'thinking' && value === defaultThinkingMode) ||
+        (field === 'toolResults' && value === defaultToolResultMode) ||
+        (field === 'subagent' && value === defaultSubagentMode);
+
+      const existing = this.state.displayPrefs?.[k];
+
+      if (isDefault) {
+        // Clear the override; drop the record (and the map) once empty so an
+        // all-defaults thread leaves no trace in state.json.
+        if (!existing || existing[field] === undefined) return;
+        const { [field]: _drop, ...rest } = existing;
+        if (Object.keys(rest).length === 0) {
+          delete this.state.displayPrefs![k];
+          if (Object.keys(this.state.displayPrefs!).length === 0) {
+            delete this.state.displayPrefs;
+          }
+        } else {
+          this.state.displayPrefs![k] = rest;
+        }
+        this.scheduleSave();
+        return;
+      }
+
+      if (existing?.[field] === value) return;
+      (this.state.displayPrefs ??= {})[k] = { ...existing, [field]: value };
+      this.scheduleSave();
+    });
   }
 
   // ── scheduled jobs (`/schedule`) ──

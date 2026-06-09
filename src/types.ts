@@ -191,6 +191,72 @@ export interface ApiRetryState {
 }
 
 /**
+ * @description How much of the agent's chain-of-thought stays in the topic.
+ * Per-thread, persisted (see `state.ts` `displayPrefs`). A bot-RENDERING
+ * concern only — it never changes what is sent to the agent.
+ *
+ * - `detailed` → the full reasoning text streams in and STAYS after the answer.
+ * - `brief`    → live "thinking …" while reasoning, then collapses to a single
+ *                "thought for {N}s" line that STAYS.
+ * - `hide`     → live "thinking …" shown, but REMOVED once the answer starts.
+ *
+ * The live indicator is shown in ALL modes; the mode only controls what
+ * remains afterward.
+ */
+export type ThinkingMode = 'detailed' | 'brief' | 'hide';
+
+/**
+ * @description How much of a tool's OUTPUT is rendered in the topic. Per-thread,
+ * persisted (`state.ts` `displayPrefs`). A bot-RENDERING concern only.
+ *
+ * - `full`  → the tool result is rendered in full, fenced.
+ * - `short` → the result is truncated to a cap (lines + chars) with a footer.
+ * - `hide`  → only the transient "🔧 …" status, no result body (legacy behavior).
+ */
+export type ToolResultMode = 'full' | 'short' | 'hide';
+
+/**
+ * @description How a sub-agent (child session) transcript surfaces in the topic.
+ * Per-thread, persisted (`state.ts` `displayPrefs`). A bot-RENDERING concern only.
+ * Deliberately 2-state — there is NO `hide`: the user always wants the "working"
+ * indicator visible.
+ *
+ * - `compact` → child transcript is NOT streamed; a single live
+ *               "🤖 sub-agent: <title> …" status mirrors the terminal.
+ * - `full`    → child transcript IS streamed, each chunk marked as sub-agent.
+ */
+export type SubagentMode = 'compact' | 'full';
+
+/**
+ * @description Per-thread bot-rendering preferences for OpenCode output
+ * verbosity. Each field is optional: an absent field means "use the locked
+ * default" (thinking=`brief`, toolResults=`short`, subagent=`compact`), so the
+ * persisted record only stores non-default overrides — keeping `state.json`
+ * clean (same delete-when-default idiom as the `/trace` toggle).
+ *
+ * These are bot-side rendering concerns, NOT agent behavior: they live in
+ * `state.json` per-thread (NOT the adapter pref files) and do not change what
+ * is sent to OpenCode.
+ */
+export interface ThreadDisplayPrefs {
+  thinking?: ThinkingMode;
+  toolResults?: ToolResultMode;
+  subagent?: SubagentMode;
+}
+
+/**
+ * @description Fully-resolved per-thread display preferences — every field is
+ * present because the locked default is applied when the persisted record omits
+ * it. Returned by the state store's getter so callers on the hot path never have
+ * to re-apply defaults themselves.
+ */
+export interface ResolvedThreadDisplayPrefs {
+  thinking: ThinkingMode;
+  toolResults: ToolResultMode;
+  subagent: SubagentMode;
+}
+
+/**
  * @description Metadata riding an `output` event alongside the text.
  */
 export interface OutputEventMeta {

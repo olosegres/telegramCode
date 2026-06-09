@@ -77,6 +77,7 @@ import {
 } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
   buildThreadContextPreamble,
@@ -297,6 +298,24 @@ bot.use(async (ctx, next) => {
 const OUTPUT_DEBOUNCE_MS = 1000;
 
 /**
+ * Tick cadence of the Claude liveness loop (bug #11). Re-checks `checkIsBusy`
+ * and refreshes the activity frame this often. ~1s reads as alive during the
+ * 300ms→1.5s scrape backoff and quiet thinking stretches, while staying at/below
+ * Telegram's ~1 edit/sec/chat budget so the rolling frame never triggers a 429
+ * storm. The coalescer + `lastSentText` dedup drop identical re-edits, so a
+ * frozen spinner glyph costs zero Bot API calls.
+ */
+const CLAUDE_LIVENESS_TICK_MS = 1000;
+
+/**
+ * Rotating spinner glyphs for the liveness frame's neutral fallback (used only
+ * when no scraped activity line is available). Cycling them on each tick makes
+ * the frame visibly alive even while the scrape is quiet. Mirrors the TUI's own
+ * whimsical spinner set so the relayed indicator looks native.
+ */
+const CLAUDE_LIVENESS_GLYPHS = ['✻', '✽', '✶', '✢'] as const;
+
+/**
  * Small slack added on top of the remaining 429 cooldown before a deferred
  * send is retried, so the retry fires *after* the cooldown has actually
  * lifted rather than racing its boundary. Shared by the status coalescer's
@@ -357,6 +376,31 @@ interface ThreadMessageState {
   loaderObsolete: boolean;
   /** Transient status/spinner message id — replaced by permanent text. */
   statusMessageId: number | null;
+  /**
+   * Monotonic generation for the status-frame lifecycle, bumped on every
+   * `deleteStatusMessage`. `sendStatusFrame` captures it before creating a new
+   * message and re-checks after the `await` (see `getStatusFrameStoreDecision`):
+   * a delete that lands mid-create bumps the generation, so the just-created
+   * message is discarded instead of resurrecting `statusMessageId` as an orphan.
+   * The anti-thrash guard that keeps the spinner a SINGLE, reliably-removed frame.
+   */
+  statusFrameGeneration: number;
+  /**
+   * Claude liveness loop (bug #11): a self-disarming per-thread timer that keeps
+   * an activity frame on screen for the WHOLE busy period, driven by
+   * `checkIsBusy` rather than opportunistic scrape emits. `null` = no loop armed.
+   */
+  livenessTimer: NodeJS.Timeout | null;
+  /**
+   * Latest activity text the Claude scrape produced (the `✻ Verb… (Ns · tokens)`
+   * line), fed in from `handleAdapterStatus`. The liveness frame prefers this
+   * over the neutral `agent.workingIndicator` fallback. `null` = none seen yet.
+   */
+  lastActivityText: string | null;
+  /** Rotating index into {@link CLAUDE_LIVENESS_GLYPHS} for the fallback frame. */
+  livenessGlyphIndex: number;
+  /** Last `checkIsBusy` reading, so the loop can detect a busy→idle edge. */
+  wasBusy: boolean;
 }
 
 interface OutputQueueState {
@@ -692,7 +736,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -706,6 +750,19 @@ function getOutputQueueState(key: ThreadKey): OutputQueueState {
     outputQueues.set(k, s);
   }
   return s;
+}
+
+/**
+ * @description Is real agent output currently mid-flight for this thread —
+ * queued, debouncing, or actively sending? The Claude liveness loop checks this
+ * to stay out of the output's way: while output owns the rolling message, the
+ * activity frame must not be created/ticked/deleted (anti-thrash). Reads with
+ * `.get()` so a thread that never streamed output is trivially "not streaming".
+ */
+function checkIsOutputStreaming(key: ThreadKey): boolean {
+  const q = outputQueues.get(keyToString(key));
+  if (!q) return false;
+  return q.pendingOutput !== null || q.isProcessing || q.debounceTimer !== null;
 }
 
 function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
@@ -937,6 +994,10 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   // `debounceTimer` would survive the `outputQueues.delete` as an orphan and
   // still fire into a freshly-bound session.
   clearThreadQueues(key);
+  // Clear the liveness timer BEFORE dropping the message-state entry, otherwise
+  // it survives the `threadMessageStates.delete` as an orphan that fires into a
+  // freshly-bound session (same reasoning as the output debounce timer above).
+  stopClaudeLiveness(key);
   threadMessageStates.delete(k);
   outputQueues.delete(k);
   clearPendingQuestion(key);
@@ -1684,6 +1745,13 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
   // is stale — clear it, otherwise an identical-text frame after a delete
   // would be wrongly skipped and the fresh status message never appear.
   getStatusCoalesceState(key).lastSentText = null;
+  // Bump UNCONDITIONALLY (even when no id is tracked): a `sendStatusFrame`
+  // create may be mid-`await` with its id not yet stored. The bump signals that
+  // in-flight create to DISCARD its message instead of storing it as an orphan
+  // (`getStatusFrameStoreDecision`). Without this, a delete that races a still
+  // null `statusMessageId` removes nothing and the create resurrects a frame
+  // that idle/output already meant to clear → the leftover spinner of bug #11.
+  s.statusFrameGeneration += 1;
   if (s.statusMessageId === null) return;
   const id = s.statusMessageId;
   s.statusMessageId = null;
@@ -5279,9 +5347,41 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
   if (hadStatusMessage) {
     const adapter = getThreadAdapter(key);
     if (adapter.outputsDeltas) msgState.needsNewMessage = true;
-    void deleteStatusMessage(key).catch(() => {});
   }
+  // Delete UNCONDITIONALLY — not only when a frame is currently visible. A
+  // liveness/scrape `sendStatusFrame` create may be mid-`await` with its id not
+  // yet stored; calling `deleteStatusMessage` here bumps the frame generation so
+  // that in-flight create discards its message instead of resurrecting it as an
+  // orphan under the freshly-arrived output (the leftover-spinner half of #11).
+  // When no id is tracked it's a cheap no-op delete that still bumps the gen.
+  void deleteStatusMessage(key).catch(() => {});
   queueOutput(key, output, meta?.isContinuation === true, meta?.isFinal === true);
+
+  // Bug #11: the agent may KEEP working after this chunk (which just deleted the
+  // status frame). Arm the liveness loop so that once output streaming pauses
+  // while still busy, the activity frame reappears — without waiting for the
+  // next opportunistic scraped spinner (which may never come during a quiet
+  // think). Claude-only; idempotent if already armed; self-disarms on idle.
+  startClaudeLiveness(key);
+}
+
+/**
+ * @description Adapter `status` event entry point. Wraps {@link handleAgentStatus}
+ * (the pure send-a-frame primitive) with the two Claude-only liveness side
+ * effects that must NOT happen for the liveness loop's own re-injected frames
+ * (those call `handleAgentStatus` directly): record the scraped activity text as
+ * the loop's preferred frame text, and arm the busy-state-driven loop (bug #11)
+ * so the frame survives the gaps between scrape emits.
+ */
+function handleAdapterStatus(key: ThreadKey, status: string): void {
+  if (status.trim()) {
+    const adapter = getThreadAdapter(key);
+    if (adapter instanceof ClaudeCliAdapter) {
+      getThreadMessageState(key).lastActivityText = status;
+      startClaudeLiveness(key);
+    }
+  }
+  handleAgentStatus(key, status);
 }
 
 /**
@@ -5393,28 +5493,51 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
   // which inflates the source past Telegram's cap, so size chunks by their
   // rendered length (same measure the durable-output flush plan uses).
   const chunks = splitMessage(status, undefined, chunk => renderAgentHtml(chunk).length);
+  // Capture the generation BEFORE any create: a `deleteStatusMessage` that races
+  // an in-flight create bumps it, telling us to discard the just-created message
+  // rather than resurrect `statusMessageId` as an orphan (the leftover-spinner
+  // bug). Single source of truth for the frame across liveness tick, scrape
+  // coalescer, and the output-supersede delete.
+  const generationAtStart = msgState.statusFrameGeneration;
+  // Store a freshly-created message id IFF no delete landed mid-create; otherwise
+  // the message is already orphaned by that delete → remove it, store nothing.
+  const storeOrDiscardCreatedFrame = async (createdId: number | null): Promise<boolean> => {
+    if (createdId === null) return false;
+    if (getStatusFrameStoreDecision(generationAtStart, msgState.statusFrameGeneration) === 'discard') {
+      await deleteThreadMessage(key, createdId, 'status');
+      return false;
+    }
+    msgState.statusMessageId = createdId;
+    return true;
+  };
   let landed = false;
   try {
     const firstRendered = renderAgentHtml(chunks[0]);
     if (msgState.statusMessageId) {
-      const ok = await editThreadMessage(key, msgState.statusMessageId, firstRendered, {
+      const editId = msgState.statusMessageId;
+      const ok = await editThreadMessage(key, editId, firstRendered, {
         parse_mode: 'HTML',
       }, 'status');
-      if (ok) {
+      // A delete that landed during the edit already nulled (or replaced) the id;
+      // don't claim the frame as live — let the create path below re-evaluate.
+      if (ok && msgState.statusMessageId === editId) {
         landed = true;
-      } else {
-        msgState.statusMessageId = null;
+      } else if (!ok) {
+        // Edit failed (e.g. the message was deleted under us). Only null it if it
+        // still points at the message we tried to edit — a concurrent delete may
+        // already have moved it. Then create a replacement under the gen guard.
+        if (msgState.statusMessageId === editId) msgState.statusMessageId = null;
         const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
-        if (id) { msgState.statusMessageId = id; landed = true; }
+        landed = await storeOrDiscardCreatedFrame(id);
       }
     } else {
       const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
-      if (id) { msgState.statusMessageId = id; landed = true; }
+      landed = await storeOrDiscardCreatedFrame(id);
     }
     for (let i = 1; i < chunks.length; i++) {
       const rendered = renderAgentHtml(chunks[i]);
       const id = await replyChunkWithFallback(key, rendered, chunks[i], 'status');
-      if (id) msgState.statusMessageId = id;
+      await storeOrDiscardCreatedFrame(id);
     }
   } catch (err) {
     console.error('[sendStatusFrame] Failed:', err);
@@ -5422,9 +5545,142 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
   return landed;
 }
 
+// ── Claude liveness loop (bug #11) ──────────────────────────────────────────
+//
+// SINGLE OWNER of the "recreate/keep-alive while busy" half of the
+// `statusMessageId` lifecycle. The other half — "delete on real output" — stays
+// in `handleAgentOutput`. They do not thrash because every liveness tick first
+// checks `checkIsOutputStreaming`: while output owns the message the tick is a
+// `noop`, so a just-deleted frame is recreated only once streaming pauses while
+// the agent is still busy. The frame text rides the SAME coalescer + send path
+// (`sendStatusFrame` via `handleAgentStatus`) as scraped spinner ticks, so the
+// 429-aware defer/dedup machinery applies unchanged — no second send path.
+
+/**
+ * @description Build the liveness frame text. Prefers the latest scraped
+ * activity line (the whimsical `✻ Verb… (Ns · tokens)` the adapter still emits
+ * as `status`), else a neutral localized fallback. A rotating leading glyph
+ * makes the frame visibly alive on each tick even when the underlying activity
+ * text is momentarily static (a quiet thinking stretch during the poll backoff).
+ */
+function getClaudeLivenessFrameText(state: ThreadMessageState): string {
+  const glyph = CLAUDE_LIVENESS_GLYPHS[state.livenessGlyphIndex % CLAUDE_LIVENESS_GLYPHS.length];
+  const activity = state.lastActivityText?.trim();
+  if (activity) {
+    // Swap the scrape's own leading spinner glyph for our rotating one so the
+    // heartbeat shows while preserving the activity word + elapsed/token tail.
+    const withoutLeadGlyph = activity.replace(/^[✻✽✶✢·*●○]\s*/, '');
+    return `${glyph} ${withoutLeadGlyph}`;
+  }
+  return t('agent.workingIndicator', { glyph });
+}
+
+/**
+ * @description One liveness tick: re-check busy, run the pure decision, execute
+ * it on the shared status path, then re-arm or stop. Self-disarming — the timer
+ * stops itself the instant the session goes idle, so the lifecycle handlers only
+ * need to call {@link stopClaudeLiveness} for the hard teardown paths (stop /
+ * close / quit / error), not for the normal busy→idle return.
+ */
+function runClaudeLivenessTick(key: ThreadKey): void {
+  const state = getThreadMessageState(key);
+  const adapter = getThreadAdapter(key);
+  // Gate to Claude: only its tmux-scrape path has the #11 gap (OpenCode liveness
+  // is a separate plan). `checkIsBusy` is Claude's cheap sync footer signal.
+  if (!(adapter instanceof ClaudeCliAdapter) || !adapter.checkIsBusy) {
+    stopClaudeLiveness(key);
+    return;
+  }
+  const isBusy = adapter.checkIsBusy(key);
+  const idleTransition = state.wasBusy && !isBusy;
+  state.wasBusy = isBusy;
+
+  const action = getClaudeLivenessAction({
+    isBusy,
+    hasStatusFrame: state.statusMessageId !== null,
+    isOutputStreaming: checkIsOutputStreaming(key),
+    idleTransition,
+  });
+
+  switch (action) {
+    case 'create':
+    case 'tick':
+      // Advance the heartbeat glyph, then push the frame through the same
+      // coalescer scraped ticks use (429-aware, dedups identical text).
+      state.livenessGlyphIndex = (state.livenessGlyphIndex + 1) % CLAUDE_LIVENESS_GLYPHS.length;
+      handleAgentStatus(key, getClaudeLivenessFrameText(state));
+      break;
+    case 'delete':
+      void deleteStatusMessage(key).catch(() => {});
+      break;
+    case 'noop':
+      break;
+  }
+
+  // Stop only when the session is truly idle (no frame left to keep alive);
+  // while busy OR a frame still lingers (mid-delete), keep ticking so the next
+  // poll either refreshes it or removes it. Never leave a frame stuck post-idle.
+  if (!isBusy && state.statusMessageId === null) {
+    stopClaudeLiveness(key);
+  } else {
+    armClaudeLivenessTimer(key, state);
+  }
+}
+
+/**
+ * @description (Re)arm the single per-thread liveness timer. Idempotent on the
+ * timer handle: clears any existing one first so two callers can't stack timers.
+ */
+function armClaudeLivenessTimer(key: ThreadKey, state: ThreadMessageState): void {
+  if (state.livenessTimer) clearTimeout(state.livenessTimer);
+  state.livenessTimer = setTimeout(() => {
+    state.livenessTimer = null;
+    runClaudeLivenessTick(key);
+  }, CLAUDE_LIVENESS_TICK_MS);
+  // Don't keep the event loop alive just for a spinner.
+  state.livenessTimer.unref?.();
+}
+
+/**
+ * @description Start the liveness loop for a Claude thread. Called on every
+ * proof of activity (a scraped `status`, or an `output` chunk that may be
+ * followed by more work). Idempotent: if a timer is already armed the running
+ * loop owns the rest, so this returns without touching its edge-tracking
+ * (`wasBusy`) — clobbering it here could mask a busy→idle edge the tick is about
+ * to act on. Seeds `wasBusy = true` only when arming a FRESH timer: the caller
+ * just observed activity, so the next tick should treat an idle reading as a
+ * genuine busy→idle transition. The first tick runs on the NEXT cadence, not
+ * immediately — the triggering event already painted the frame.
+ */
+function startClaudeLiveness(key: ThreadKey): void {
+  const adapter = getThreadAdapter(key);
+  if (!(adapter instanceof ClaudeCliAdapter) || !adapter.checkIsBusy) return;
+  const state = getThreadMessageState(key);
+  if (state.livenessTimer) return;
+  state.wasBusy = true;
+  armClaudeLivenessTimer(key, state);
+}
+
+/**
+ * @description Stop and clear the thread's liveness timer (no leaked timers).
+ * Called on every hard lifecycle teardown so the loop can't recreate a frame
+ * after the session is gone. Leaves `statusMessageId` alone — the caller's own
+ * `deleteStatusMessage` owns removing the visible frame.
+ */
+function stopClaudeLiveness(key: ThreadKey): void {
+  const state = threadMessageStates.get(keyToString(key));
+  if (!state?.livenessTimer) return;
+  clearTimeout(state.livenessTimer);
+  state.livenessTimer = null;
+  state.wasBusy = false;
+}
+
 function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuestion): void {
   console.log(`[Bot] question ${keyToString(key)} (${questionData.requestId}): ${questionData.questions.length}`);
-  // A pending status frame is now stale — the question UI replaces it.
+  // A pending status frame is now stale — the question UI replaces it. Stop the
+  // liveness loop first so it can't recreate a frame under the question prompt
+  // (Claude-only; a no-op for OpenCode threads, which never arm it).
+  stopClaudeLiveness(key);
   getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
   deleteLoaderMessage(key).catch(() => {});
@@ -5518,6 +5774,9 @@ function handleAgentClosed(key: ThreadKey): void {
   // don't surface after the "session ended" notice (the trailing-output bug:
   // a 429 backlog could let queued deltas land seconds after the close).
   clearThreadQueues(key);
+  // Session gone — stop the liveness loop so it can't recreate a frame after
+  // the close (it would otherwise outlive the session via its self-re-arm).
+  stopClaudeLiveness(key);
   deleteStatusMessage(key).catch(() => {});
   clearPendingQuestion(key);
   pendingSurveys.delete(keyToString(key));
@@ -5532,6 +5791,7 @@ function handleAgentClosed(key: ThreadKey): void {
 
 function handleAgentError(key: ThreadKey, error: Error): void {
   console.error(`[Bot] adapter error ${keyToString(key)}:`, error.message);
+  stopClaudeLiveness(key);
   getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
   clearPendingQuestion(key);
@@ -5558,6 +5818,11 @@ function handleAgentStopped(key: ThreadKey): void {
   // all emit `stopped`. Drop the thread's queued-but-unsent output here so
   // nothing coalesced before the stop posts after the "stopped" confirmation.
   clearThreadQueues(key);
+  // Stop the liveness loop and remove its frame — a stopped session is idle, so
+  // a lingering "working…" indicator would be a stuck spinner. Stopping the
+  // timer first prevents it from recreating the frame right after this delete.
+  stopClaudeLiveness(key);
+  deleteStatusMessage(key).catch(() => {});
   // Session ended — a future session starts with empty context, so forget the
   // last-injected thread-context preamble; the next prompt re-carries it.
   clearThreadContextMarker(key);
@@ -5986,7 +6251,7 @@ export async function startBot(): Promise<void> {
   // 2. Wire adapter events.
   registerAdapterEventHandlers({
     onOutput: handleAgentOutput,
-    onStatus: handleAgentStatus,
+    onStatus: handleAdapterStatus,
     onQuestion: handleAgentQuestion,
     onSurvey: handleAgentSurvey,
     onApiError: handleApiError,

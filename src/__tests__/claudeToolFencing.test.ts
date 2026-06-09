@@ -18,7 +18,25 @@
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { stripTuiElements, stripTuiElementsWithContext } from '../adapters/claudeCliAdapter';
+import {
+  mergeAdjacentFences,
+  stripTuiElements,
+  stripTuiElementsWithContext,
+} from '../adapters/claudeCliAdapter';
+
+/** True iff `line` falls inside a ```` ``` ````-delimited span of `text`. */
+function checkIsInsideFence(text: string, line: string): boolean {
+  const lines = text.split('\n');
+  let inFence = false;
+  for (const current of lines) {
+    if (/^```/.test(current)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (current.includes(line)) return inFence;
+  }
+  return false;
+}
 
 // ─── B3 — (ctrl+o …) strip ─────────────────────────────────────────────
 
@@ -151,7 +169,9 @@ test('stripTuiElements: breaks ``` inside a fenced body so it cannot close the f
 test('stripTuiElements: fences an orphan Bash ⎿ body when the tool context is "output"', () => {
   // The `yarn test` repro: the `● Bash(…)` header streamed in an earlier poll,
   // so this delta is just the result. The `output` kind threaded from that
-  // header poll (incomingKind) is what lets it still be fenced.
+  // header poll (incomingKind) is what lets it still be fenced. The trailing
+  // `… +N lines` collapse marker is chrome → it drops OUT of the fence and
+  // renders plain below the fenced stdout (S1).
   const input = [
     "  ⎿  type: 'test'",
     '     # Subtest: paginateBindList',
@@ -160,7 +180,12 @@ test('stripTuiElements: fences an orphan Bash ⎿ body when the tool context is 
   const out = stripTuiElements(input, 'output');
   assert.equal((out.match(/^```$/gm) ?? []).length, 2, `expected fenced body: ${JSON.stringify(out)}`);
   assert.ok(!out.includes('⎿'), 'the ⎿ marker glyph should be dropped inside the fence');
-  assert.ok(out.includes("type: 'test'") && out.includes('… +33 lines'));
+  assert.ok(out.includes("type: 'test'"));
+  // The collapse marker must sit OUTSIDE the fenced span (the last ``` line).
+  const lines = out.split('\n');
+  const lastFenceIndex = lines.lastIndexOf('```');
+  const markerIndex = lines.findIndex(line => line.includes('… +33 lines'));
+  assert.ok(markerIndex > lastFenceIndex, `collapse marker should be plain, after the fence: ${JSON.stringify(out)}`);
 });
 
 test('stripTuiElements: the SAME orphan body with no tool context stays prose', () => {
@@ -255,4 +280,93 @@ test('stripTuiElementsWithContext: a thinking chunk does not open a tool kind', 
   );
   assert.ok(!text.includes('```'));
   assert.equal(toolKind, null);
+});
+
+// ─── S1 — CLI status / summary lines never fenced (drop stale transients) ──
+
+test('stripTuiElements: a stale "Running…" transient is DROPPED, only real stdout fenced', () => {
+  // The msg-20718 case: a fast command captured in one frame, the transient
+  // "Running…" tick still painted above the real stdout. It must be dropped
+  // entirely (not even kept plain) so only the genuine output stays fenced.
+  const input = ['  ⎿  Running…', '     removed old hygiene plan'].join('\n');
+  const out = stripTuiElements(input, 'output');
+  assert.ok(!out.includes('Running…'), `stale transient should be dropped: ${JSON.stringify(out)}`);
+  assert.ok(checkIsInsideFence(out, 'removed old hygiene plan'), `real stdout must stay fenced: ${JSON.stringify(out)}`);
+});
+
+test('stripTuiElements: a standalone "… +1 tool use" collapse marker renders PLAIN', () => {
+  const out = stripTuiElements('     … +1 tool use', 'output');
+  assert.ok(!out.includes('```'), `collapse marker must not be fenced: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('… +1 tool use'), `collapse marker must be kept: ${JSON.stringify(out)}`);
+});
+
+test('stripTuiElements: a standalone "Waiting…" tick renders PLAIN (no real output to supersede it)', () => {
+  const out = stripTuiElements('     Waiting…', 'output');
+  assert.ok(!out.includes('```'), `lone transient must not be fenced: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('Waiting…'), `lone transient must be kept plain: ${JSON.stringify(out)}`);
+});
+
+test('stripTuiElements: a "Done (… tokens …)" completion summary renders PLAIN', () => {
+  const summary = 'Done (14 tool uses · 66.9k tokens · 1m 55s)';
+  const out = stripTuiElements(`     ${summary}`, 'output');
+  assert.ok(!out.includes('```'), `completion summary must not be fenced: ${JSON.stringify(out)}`);
+  assert.ok(out.includes(summary), `completion summary must be kept: ${JSON.stringify(out)}`);
+  assert.ok(!checkIsInsideFence(out, summary), 'completion summary must sit outside every fence');
+});
+
+test('stripTuiElements: a real one-line stdout ending in "…" is NOT matched, still fenced', () => {
+  // False-positive guard: only the literal status shapes are chrome; a genuine
+  // one-line output that happens to end in an ellipsis must stay fenced.
+  const realOutput = 'Compiling project, please wait…';
+  const out = stripTuiElements(`     ${realOutput}`, 'output');
+  assert.ok(checkIsInsideFence(out, realOutput), `genuine stdout must stay fenced: ${JSON.stringify(out)}`);
+});
+
+test('stripTuiElements: status lines mixed with real stdout — output fenced, status plain', () => {
+  // Load-bearing combined case: genuine stdout present and fenced, each status
+  // line present and OUTSIDE every fenced span.
+  const input = [
+    '  ⎿  some real stdout line',
+    '     more real output',
+    '     … +1 tool use',
+    '     Done (14 tool uses · 66.9k tokens · 1m 55s)',
+  ].join('\n');
+  const out = stripTuiElements(input, 'output');
+  assert.ok(checkIsInsideFence(out, 'some real stdout line'), `stdout must be fenced: ${JSON.stringify(out)}`);
+  assert.ok(checkIsInsideFence(out, 'more real output'), `stdout must be fenced: ${JSON.stringify(out)}`);
+  assert.ok(!checkIsInsideFence(out, '… +1 tool use'), 'collapse marker must be outside the fence');
+  assert.ok(!checkIsInsideFence(out, 'Done (14 tool uses'), 'completion summary must be outside the fence');
+});
+
+// ─── S2 — mergeAdjacentFences: blank-separated same-lang fences join ────
+
+test('mergeAdjacentFences: close + blank + open (same lang) → ONE fence', () => {
+  const input = ['```', 'body part 1', '```', '', '```', 'body part 2', '```'];
+  const out = mergeAdjacentFences(input);
+  const fenceCount = out.filter(line => line === '```').length;
+  assert.equal(fenceCount, 2, `expected a single merged fence: ${JSON.stringify(out)}`);
+  assert.deepEqual(out, ['```', 'body part 1', '', 'body part 2', '```']);
+});
+
+test('mergeAdjacentFences: two fences separated by a non-blank line stay TWO', () => {
+  // A `● Bash(…)` header between two outputs is a real separator: it blocks the
+  // merge so different tool calls never fuse into one block.
+  const input = ['```', 'first output', '```', '● Bash(echo hi)', '```', 'second output', '```'];
+  const out = mergeAdjacentFences(input);
+  const fenceCount = out.filter(line => line === '```').length;
+  assert.equal(fenceCount, 4, `expected two separate fences: ${JSON.stringify(out)}`);
+  assert.deepEqual(out, input);
+});
+
+test('mergeAdjacentFences: different-language fences are NOT merged', () => {
+  const input = ['```', 'plain body', '```', '', '```ts', 'const a = 1;', '```'];
+  const out = mergeAdjacentFences(input);
+  const fenceOpenCount = out.filter(line => /^```/.test(line)).length;
+  assert.equal(fenceOpenCount, 4, `mismatched languages must stay separate: ${JSON.stringify(out)}`);
+});
+
+test('mergeAdjacentFences: three blank-separated same-lang fences collapse into one', () => {
+  const input = ['```', 'a', '```', '', '```', 'b', '```', '', '```', 'c', '```'];
+  const out = mergeAdjacentFences(input);
+  assert.deepEqual(out, ['```', 'a', '', 'b', '', 'c', '```']);
 });

@@ -845,6 +845,89 @@ function getFenced(bodyLines: string[]): string[] {
 }
 
 /**
+ * @description Transient activity tick the TUI paints INSIDE a tool-result
+ * body while the command is still running (`Running…`, `Waiting…`), with no
+ * elapsed-time paren. {@link SPINNER_TICK_RE} only catches the glyph-led
+ * `(Ns)` form, so these bare words slip through and get fenced as if they
+ * were stdout. They are ephemeral chrome, never command output: render plain,
+ * and DROP entirely when real output supersedes them in the same body.
+ */
+const TRANSIENT_TICK_RE = /^\s*(?:Running|Waiting)…\s*(?:\([^)]*\))?\s*$/;
+/**
+ * @description The TUI's "output was collapsed" marker (`… +1 tool use`,
+ * `… +33 lines`). Anchored to the literal `… +N tool use(s)/line(s)` shape so
+ * a real one-line stdout that merely ends in `…` is never matched. Chrome, not
+ * output → render plain, never fenced.
+ */
+const COLLAPSE_MARKER_RE = /^\s*…\s*\+\d+\s+(?:tool use|line)s?\b.*$/;
+/**
+ * @description Turn / sub-agent completion summary (`Done (14 tool uses ·
+ * 66.9k tokens · 1m 55s)`). The `tokens` inside the paren is the load-bearing
+ * anchor — a real `Done (…)` stdout line without token stats is not matched.
+ * Chrome, not output → render plain, never fenced.
+ */
+const COMPLETION_SUMMARY_RE = /^\s*Done\s*\([^)]*tokens[^)]*\)\s*$/;
+
+/**
+ * @description A status / summary line the TUI paints inside a tool-result
+ * body that is chrome, not command output, and so must NEVER be fenced.
+ * Narrowly anchored to the three confirmed literal shapes — extending this to
+ * an arbitrary `…`-ending line would swallow real one-line stdout.
+ */
+function checkIsClaudeBodyStatusLine(line: string): boolean {
+  return (
+    TRANSIENT_TICK_RE.test(line) ||
+    COLLAPSE_MARKER_RE.test(line) ||
+    COMPLETION_SUMMARY_RE.test(line)
+  );
+}
+
+/**
+ * @description Split a tool-result body into the lines that should be fenced
+ * (genuine stdout / diff / file content) and the status/summary lines that
+ * must stay PLAIN. A {@link TRANSIENT_TICK_RE} tick (`Running…`/`Waiting…`)
+ * followed by ANY real output line in the SAME body is stale — superseded by
+ * the output the bot captured one frame later (the msg-20718 case) — so it is
+ * DROPPED, not even kept plain. Other status/summary lines are kept and
+ * returned in `plain` (emitted after the fence). Genuine content goes to
+ * `fenced` untouched.
+ */
+function splitStatusLinesFromBody(bodyLines: string[]): {
+  fenced: string[];
+  plain: string[];
+} {
+  const hasRealOutput = bodyLines.some(line => !checkIsClaudeBodyStatusLine(line));
+  const fenced: string[] = [];
+  const plain: string[] = [];
+  for (const line of bodyLines) {
+    if (!checkIsClaudeBodyStatusLine(line)) {
+      fenced.push(line);
+      continue;
+    }
+    // Stale transient tick superseded by real output → drop it entirely.
+    if (TRANSIENT_TICK_RE.test(line) && hasRealOutput) continue;
+    plain.push(line);
+  }
+  return { fenced, plain };
+}
+
+/**
+ * @description Fence a tool-result body while keeping its status/summary lines
+ * (`Running…`, `… +N lines`, `Done (… tokens …)`) OUT of the fence as plain
+ * text — see {@link splitStatusLinesFromBody}. Genuine content is dedented and
+ * fenced; an empty-after-filtering body emits NO ```` ``` ```` fence. The
+ * caller passes the already-dedented-and-prefixed body for the `output` kind
+ * (the `⎿` line rides with it) so dedent is applied here over the full set.
+ */
+function getFencedBodyWithStatus(bodyLines: string[]): string[] {
+  const { fenced, plain } = splitStatusLinesFromBody(bodyLines);
+  const result: string[] = [];
+  if (fenced.length > 0) result.push(...getFenced(getDedented(fenced)));
+  result.push(...plain.map(line => line.trim()));
+  return result;
+}
+
+/**
  * @description Wrap each code-producing tool's `⎿` result body in a code fence
  * (B2). Operates on the already echo-suppressed / chrome-filtered line array.
  * See {@link OUTPUT_TOOL_HEADER_RE} for the header→body classification.
@@ -931,11 +1014,12 @@ function fenceToolResultBodies(
         j++;
       }
       if (currentKind === 'output') {
-        // `⎿`-content is stdout → drop the marker glyph (keep alignment), fence all.
-        out.push(...getFenced(getDedented([line.replace('⎿', ' '), ...body])));
+        // `⎿`-content is stdout → drop the marker glyph (keep alignment), fence
+        // it with the body, but keep any status/summary line plain (never fenced).
+        out.push(...getFencedBodyWithStatus([line.replace('⎿', ' '), ...body]));
       } else {
         out.push(line); // summary line stays prose
-        if (body.length > 0) out.push(...getFenced(getDedented(body)));
+        if (body.length > 0) out.push(...getFencedBodyWithStatus(body));
       }
       i = j;
       continue;
@@ -956,7 +1040,7 @@ function fenceToolResultBodies(
         block.push(lines[j]);
         j++;
       }
-      out.push(...getFenced(getDedented(block)));
+      out.push(...getFencedBodyWithStatus(block));
       i = j;
       continue;
     }
@@ -985,6 +1069,67 @@ function fenceToolResultBodies(
   }
 
   return { out, outgoingKind: currentKind };
+}
+
+/** The language tag of a fence-OPEN line (`` ```ts `` → `ts`, bare `` ``` `` → ''). */
+function getFenceLanguage(fenceLine: string): string {
+  return fenceLine.replace(/^\s*```/, '').trim();
+}
+
+/**
+ * @description Merge two same-language fenced blocks separated by NOTHING but
+ * blank line(s) into one continuous fence (#14). One logical tool output that
+ * {@link fenceToolResultBodies} split into multiple `getFenced` runs renders as
+ * two adjacent `<pre>` ({@link FENCE_REGEX} makes one per fence) — visually two
+ * boxes for one output. A NON-blank line between the fences (a `● Bash(…)`
+ * header, prose) BLOCKS the merge, so DIFFERENT tool calls stay separate; only
+ * blank-separated same-language fences are joined, keeping one blank inside.
+ * Languages must match (or both be empty) so a plain output block and a `ts`
+ * block are never fused.
+ */
+export function mergeAdjacentFences(lines: string[]): string[] {
+  const out: string[] = [...lines];
+  let i = 0;
+  while (i < out.length) {
+    if (!CODE_FENCE_LINE_RE.test(out[i])) {
+      i++;
+      continue;
+    }
+    // `out[i]` opens a fence; find its closing delimiter.
+    const closeIndex = findFenceClose(out, i);
+    if (closeIndex === -1) break; // unbalanced — leave the tail untouched
+    const nextOpenIndex = getNextOpenAfterBlanks(out, closeIndex + 1);
+    if (
+      nextOpenIndex !== -1 &&
+      getFenceLanguage(out[nextOpenIndex]) === getFenceLanguage(out[i])
+    ) {
+      // Drop the close + the re-open, keep a single blank line between bodies.
+      out.splice(closeIndex, nextOpenIndex - closeIndex + 1, '');
+      continue; // re-test from the SAME open fence (a third block may follow)
+    }
+    i = closeIndex + 1;
+  }
+  return out;
+}
+
+/** Index of the fence-CLOSE delimiter that matches the OPEN at `openIndex`. */
+function findFenceClose(lines: string[], openIndex: number): number {
+  for (let j = openIndex + 1; j < lines.length; j++) {
+    if (CODE_FENCE_LINE_RE.test(lines[j])) return j;
+  }
+  return -1;
+}
+
+/**
+ * Index of the next fence-OPEN delimiter reachable from `fromIndex` across ONLY
+ * blank lines, or -1 if a non-blank line (a header / prose) intervenes first.
+ */
+function getNextOpenAfterBlanks(lines: string[], fromIndex: number): number {
+  for (let j = fromIndex; j < lines.length; j++) {
+    if (lines[j].trim() === '') continue;
+    return CODE_FENCE_LINE_RE.test(lines[j]) ? j : -1;
+  }
+  return -1;
 }
 
 /**
@@ -1078,7 +1223,8 @@ export function stripTuiElementsWithContext(
   }
 
   const { out, outgoingKind } = fenceToolResultBodies(filtered, incomingKind);
-  let result = out.join('\n');
+  const merged = mergeAdjacentFences(out);
+  let result = merged.join('\n');
   result = result.replace(/\n{3,}/g, '\n\n');
   return { text: result.trim(), toolKind: outgoingKind };
 }

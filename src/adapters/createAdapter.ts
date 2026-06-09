@@ -1,4 +1,4 @@
-import type { AgentAdapter, OutputEventMeta, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, OutputEventMeta, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -26,12 +26,14 @@ const threadAdapterNames = new Map<string, string>();
 type OutputHandler = (key: ThreadKey, output: string, meta?: OutputEventMeta) => void;
 type StatusHandler = (key: ThreadKey, status: string) => void;
 type QuestionHandler = (key: ThreadKey, question: OpenCodePendingQuestion) => void;
+type ApiErrorHandler = (key: ThreadKey, error: AgentApiErrorClass) => void;
 type ThreadKeyHandler = (key: ThreadKey) => void;
 type ErrorHandler = (key: ThreadKey, error: Error) => void;
 
 let onOutput: OutputHandler | null = null;
 let onStatus: StatusHandler | null = null;
 let onQuestion: QuestionHandler | null = null;
+let onApiError: ApiErrorHandler | null = null;
 let onClosed: ThreadKeyHandler | null = null;
 let onStarted: ThreadKeyHandler | null = null;
 let onStopped: ThreadKeyHandler | null = null;
@@ -41,6 +43,7 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onOutput) adapter.on('output', onOutput);
   if (onStatus) adapter.on('status', onStatus);
   if (onQuestion) adapter.on('question', onQuestion);
+  if (onApiError) adapter.on('apiError', onApiError);
   if (onClosed) adapter.on('closed', onClosed);
   if (onStarted) adapter.on('started', onStarted);
   if (onStopped) adapter.on('stopped', onStopped);
@@ -62,6 +65,7 @@ export function registerAdapterEventHandlers(handlers: {
   onOutput: OutputHandler;
   onStatus?: StatusHandler;
   onQuestion?: QuestionHandler;
+  onApiError?: ApiErrorHandler;
   onClosed: ThreadKeyHandler;
   onStarted?: ThreadKeyHandler;
   onStopped?: ThreadKeyHandler;
@@ -70,6 +74,7 @@ export function registerAdapterEventHandlers(handlers: {
   onOutput = handlers.onOutput;
   onStatus = handlers.onStatus ?? null;
   onQuestion = handlers.onQuestion ?? null;
+  onApiError = handlers.onApiError ?? null;
   onClosed = handlers.onClosed;
   onStarted = handlers.onStarted ?? null;
   onStopped = handlers.onStopped ?? null;

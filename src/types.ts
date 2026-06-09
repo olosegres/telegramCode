@@ -187,6 +187,7 @@ export interface OutputEventMeta {
  * - 'output'   (key: ThreadKey, text: string, meta?: OutputEventMeta) — permanent text response
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
+ * - 'apiError' (key: ThreadKey, error: AgentApiErrorClass) — provider-side API error at the proxy boundary (auto-retry trigger; only when {@link AgentApiErrorClass} classification matched)
  * - 'started'  (key: ThreadKey)                  — session is up and ready
  * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)
  * - 'closed'   (key: ThreadKey)                  — session died on its own (process exit, SSE giveup, server crash)

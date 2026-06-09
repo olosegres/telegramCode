@@ -3,8 +3,9 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
 import { keyToString } from '../types';
+import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
 import { resolveDataDir } from '../state';
 import { appendDiagLog } from '../diagLog';
@@ -2878,6 +2879,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const errorMsg = this.extractErrorMessage(properties.error);
     console.error(`[OpenCode] Session error:`, errorMsg);
     this.emit('output', key, `OpenCode error: ${errorMsg}`);
+
+    // Provider-side API error at the proxy boundary → arm the auto-retry. The
+    // session stays active after `session.error`, so the kick (S5) reuses it.
+    // Auth / non-retryable errors classify to `null` and emit nothing.
+    const apiError: AgentApiErrorClass | null = classifyAgentApiError(errorMsg, Date.now());
+    if (apiError) {
+      this.emit('apiError', key, apiError);
+    }
   }
 
   private handlePermissionAsked(_key: ThreadKey, properties: Record<string, unknown>, directory?: string): void {

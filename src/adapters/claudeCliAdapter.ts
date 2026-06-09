@@ -6,8 +6,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { promisify } from 'util';
 import { sleep } from '../utils';
-import type { AgentAdapter, AgentSession, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
 import { keyToString } from '../types';
+import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
@@ -38,6 +39,14 @@ interface ClaudeSession {
   isActive: boolean;
   handledAutoEnter: boolean;
   handledAutoAccept: boolean;
+  /**
+   * One-shot guard for the auto-retry `apiError` emit. Armed when the terminal
+   * `API Error:` line first classifies as retryable, reset by the same
+   * `newPart.length > 50` rule as the sibling `handled*` flags — so a later,
+   * distinct error in the same session re-arms, but a static error frame
+   * doesn't re-emit on every poll.
+   */
+  handledApiError: boolean;
   /** Normalized text of last emitted status (for deduplication of spinner updates) */
   lastStatusText: string;
   /**
@@ -1562,6 +1571,17 @@ const CLAUDE_BYPASS_WARNING_RE = /WARNING.*Bypass|Bypass.*Permissions/i;
 const CLAUDE_BYPASS_ACCEPT_RE = /Yes,?\s*I\s*accept/i;
 
 /**
+ * @description Matches the TUI's terminal provider-error row, rendered as a
+ * single line led by `API Error:` (e.g. `API Error: Server is temporarily
+ * limiting requests (not your usage limit) · Rate limited`). We anchor on this
+ * exact prefix and capture only that one line, so the API-error classifier
+ * (auto-retry trigger) never runs over arbitrary conversation text — a normal
+ * agent sentence containing "rate limit" must not false-fire. Multiline so a
+ * pane full of other rows still finds the line.
+ */
+const CLAUDE_API_ERROR_LINE_RE = /^\s*API Error:.*$/m;
+
+/**
  * @description Matches the TUI's live input box prompt row (`❯` led, optional
  * draft text after it). Its presence in a captured pane is our signal that the
  * Claude TUI has finished booting its banner and is ready to receive typed
@@ -1775,6 +1795,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'queue'
       | 'pollTimer'
       | 'lastContent'
+      | 'handledApiError'
       | 'lastStatusText'
       | 'lastQuestionSignature'
       | 'autoEnterTimer'
@@ -1796,6 +1817,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       queue: createSerialQueue(),
       pollTimer: null,
       lastContent: '',
+      // One-shot auto-retry guard — every fresh session (start / resume /
+      // adopt) begins un-armed; armed on the first retryable `API Error:` line.
+      handledApiError: false,
       lastStatusText: '',
       lastQuestionSignature: '',
       autoEnterTimer: null,
@@ -2876,6 +2900,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * resume-seeding path (which suppresses conversation TEXT) can still drive
    * these prompts; suppression must hide chatter, not the lifecycle.
    *
+   * Also the detection seam for a terminal provider `API Error:` line: when it
+   * first classifies as retryable, emit one `apiError` event (the auto-retry
+   * trigger). Detection lives here — at the proxy boundary on the recognized
+   * line only — never by scanning arbitrary conversation text.
+   *
    * A large new chunk (`newPart.length > 50`) means real conversation moved on,
    * so the one-shot `handled*` guards are reset to re-arm for a later prompt.
    */
@@ -2883,6 +2912,19 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     if (newPart.length > 50) {
       session.handledAutoEnter = false;
       session.handledAutoAccept = false;
+      session.handledApiError = false;
+    }
+
+    if (!session.handledApiError) {
+      const apiErrorLine = CLAUDE_API_ERROR_LINE_RE.exec(content);
+      if (apiErrorLine) {
+        const apiError: AgentApiErrorClass | null = classifyAgentApiError(apiErrorLine[0], Date.now());
+        if (apiError) {
+          session.handledApiError = true;
+          console.log(`[Claude] API error detected (${apiError.kind}): ${apiErrorLine[0].trim()}`);
+          this.emit('apiError', session.key, apiError);
+        }
+      }
     }
 
     if (!session.handledAutoEnter && this.checkNeedsAutoEnter(content)) {

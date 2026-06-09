@@ -147,6 +147,30 @@ config/variants, not a per-message API field).
   and a daily + at-boot age sweep deletes files older than `fileRetentionDays`
   (30). Pure helpers in `telegramFileIntake.ts`; storage/janitor in
   `botFileStorage.ts`.
+- **Auto-retry on API errors (`src/apiErrorRetry.ts` + the `bot.ts` retry
+  manager; plan `agent/tasks/completed/2026-06-09-api-error-auto-retry.md`).**
+  When the agent dies on a provider API error the bot doesn't leave the topic
+  looking hung — it classifies the error and auto-resumes after a backoff.
+  Detection is at the **adapter boundary** via a new `apiError` event: OpenCode
+  classifies in `handleSessionError` (`session.error`, structural); Claude
+  detects the terminal `API Error:` line in `handleAutoLifecycle` behind a
+  one-shot guard. Classes (markers verified against the `claude.exe` string
+  table): *transient* (rate-limit / overloaded / 429·503·529) → retry +5/10/20
+  min, 3 tries; *usageLimit* (usage-limit reached / credit-balance too low) →
+  +60 min re-armed each repeat up to 6× (or a parsed reset time, rare); *auth*
+  (login / bad credentials) → never retried. On fire the bot posts a notice and
+  nudges the still-live session with a neutral "continue" via
+  `forwardPromptToAgent` (NEVER a wait-for-idle path — OpenCode's optimistic
+  `isBusy` is not cleared on `session.error` and would stall the 10-min cap).
+  Any user message / `/stop` / `/new` / `/unbind` / `/quit` cancels a pending
+  retry; pending retries survive a bot restart (`state.json` `apiRetries`,
+  re-armed after reattach). **⚠️ Known check (not yet verified live):** the
+  Claude scrape-detection regex (`^\s*API Error:`, run over `cleanOutput(raw)`
+  WITHOUT `stripTuiElements`) was never confirmed against a real raw TUI render
+  — a rate-limit isn't inducible on demand. **So if a Claude API error did NOT
+  auto-retry, first grep the bot log for `[Claude] API error detected`: absent
+  ⇒ the regex missed the line (likely a chrome prefix like `✗ ` / box char) and
+  must be widened.** OpenCode's structural path needs no such check.
 
 ## Module map (`src/`)
 
@@ -172,6 +196,7 @@ config/variants, not a per-message API field).
 | `utils/mediaGroupCollector.ts` | Pure debounced batcher for media albums: `collect(groupKey, item)` re-arms a per-group timer, `onFlush` fires once with items in arrival order; also owns the per-group one-shot hint guard (`checkShouldAnnounceOnce`) so gating/error replies fire once per album |
 | `botFileStorage.ts` | Per-thread intake dir layout + janitor: `resolveThreadFilesDir`, `ensureThreadFilesDir`, `purgeThreadFiles` (on `/clear`), `sweepExpiredThreadFiles` (boot + daily age sweep, `fileRetentionDays = 30`) |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
+| `apiErrorRetry.ts` | Pure auto-retry decision layer for agent **API** errors: `classifyAgentApiError` (transient / usageLimit / null-for-auth; markers from the claude.exe strings), `parseResetAt`, `getRetryPlan` (backoff schedule), `decideRetryAction` (arm/ignore/giveUp + grace-window dedup). The `bot.ts` manager owns the timer + kick |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
 | `scheduler/recurrence.ts` | Pure schedule math on `croner`: `ScheduleSpec` (cron / once / N-times), validation (min fire interval 5 min), next-occurrence, human description, catch-up decision |

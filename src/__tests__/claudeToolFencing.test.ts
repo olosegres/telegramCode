@@ -370,3 +370,97 @@ test('mergeAdjacentFences: three blank-separated same-lang fences collapse into 
   const out = mergeAdjacentFences(input);
   assert.deepEqual(out, ['```', 'a', '', 'b', '', 'c', '```']);
 });
+
+// ─── S2 — sharp-corner markdown table scrape (bug #10) ─────────────────────
+//
+// Claude's TUI renders a markdown table as a SHARP-corner box-drawing frame.
+// A WIDE table body row (a long `│ … │`) used to be deleted by the chrome-drop
+// filter `/[╭─╮│╰╯]/.test(line) && trimmedLine.length > 50` — the "header
+// survives, body rows lost" bug. The fix collects the whole sharp-corner block
+// and fences it BEFORE that filter runs, so every row survives. Chrome uses
+// ROUNDED corners (`╭╮╰╯`) and is still dropped by the same filter.
+
+/** Count of flush-left ```` ``` ```` fence delimiters in `text`. */
+function getFenceDelimiterCount(text: string): number {
+  return text.split('\n').filter(line => line === '```').length;
+}
+
+test('stripTuiElements: WIDE sharp-corner table keeps ALL body rows, fenced (bug #10)', () => {
+  const input = [
+    '● ┌───────┬────────────────────────────────────────────────────────────┬─────────┐',
+    '  │ Scope │            Description of the change in detail             │ Ratchet │',
+    '  ├───────┼────────────────────────────────────────────────────────────┼─────────┤',
+    '  │ S1    │ rewrite all the date helper functions into solUtils module │ 8 → 2   │',
+    '  ├───────┼────────────────────────────────────────────────────────────┼─────────┤',
+    '  │ S2    │ migrate the legacy ScrollView component over to KitEngine  │ 1 → 0   │',
+    '  └───────┴────────────────────────────────────────────────────────────┴─────────┘',
+  ].join('\n');
+  const out = stripTuiElements(input);
+
+  // Every header + body cell must survive — these are the rows the bug dropped.
+  for (const token of [
+    'Scope',
+    'S1',
+    'rewrite all the date helper functions into solUtils module',
+    'S2',
+    'migrate the legacy ScrollView component over to KitEngine',
+    '8 → 2',
+    '1 → 0',
+  ]) {
+    assert.ok(out.includes(token), `dropped table content "${token}": ${JSON.stringify(out)}`);
+  }
+  // The block is wrapped in exactly one fence (open + close), rows in between.
+  assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
+  assert.ok(checkIsInsideFence(out, 'rewrite all the date helper functions into solUtils module'));
+});
+
+test('stripTuiElements: NARROW sharp-corner table keeps all rows, fenced', () => {
+  const input = [
+    '● ┌───────┬──────────────┬─────────┐',
+    '  │ Scope │ Что          │ Ratchet │',
+    '  ├───────┼──────────────┼─────────┤',
+    '  │ S1    │ date-хелперы │ 8 → 2   │',
+    '  └───────┴──────────────┴─────────┘',
+  ].join('\n');
+  const out = stripTuiElements(input);
+  for (const token of ['Scope', 'Что', 'Ratchet', 'S1', 'date-хелперы', '8 → 2']) {
+    assert.ok(out.includes(token), `dropped narrow-table content "${token}": ${JSON.stringify(out)}`);
+  }
+  assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
+  assert.ok(checkIsInsideFence(out, 'date-хелперы'));
+});
+
+test('stripTuiElements: leading "● " bullet does not break the table frame', () => {
+  const input = [
+    '● ┌───────┬─────────┐',
+    '  │ Scope │ Ratchet │',
+    '  ├───────┼─────────┤',
+    '  │ S1    │ 8 → 2   │',
+    '  └───────┴─────────┘',
+  ].join('\n');
+  const out = stripTuiElements(input);
+  // The bullet is gone but the box stays intact — top border survives, fenced.
+  assert.ok(!out.includes('●'), `bullet leaked into the frame: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('┌'), `top border lost: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('└'), `bottom border lost: ${JSON.stringify(out)}`);
+  assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
+});
+
+test('stripTuiElements: GUARD — WIDE rounded-corner chrome is still DROPPED', () => {
+  // A wide `│ … │` line that belongs to a ROUNDED chrome panel (no sharp `┌`
+  // top above it) must keep hitting the existing width filter, proving the new
+  // sharp-table branch did not swallow chrome handling.
+  const chromeRow =
+    '│ Recent activity in this project that you might want to resume later on │';
+  assert.ok(chromeRow.length > 50, 'fixture must exceed the 50-char width filter');
+  const input = [
+    '╭──────────────────────────────────────────────────────────────────────╮',
+    chromeRow,
+    '╰──────────────────────────────────────────────────────────────────────╯',
+  ].join('\n');
+  const out = stripTuiElements(input);
+  assert.ok(
+    !out.includes('Recent activity in this project'),
+    `rounded chrome row leaked through: ${JSON.stringify(out)}`,
+  );
+});

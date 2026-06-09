@@ -811,6 +811,53 @@ const DIFF_FALLBACK_MIN_ROWS = 2;
 const PROGRESS_PASSTHROUGH_RE = /^\s*(?:❯\s+)?◯\s|^\s*[▰▱]/;
 
 /**
+ * @description Recognise the four line shapes of a markdown table that Claude's
+ * TUI renders as a SHARP-corner box-drawing frame.
+ *
+ * WHY a dedicated detector: Claude's own UI **chrome** panels use ROUNDED
+ * corners (`╭ ╮ ╰ ╯`) — exactly what the chrome-drop filters in
+ * {@link stripTuiElementsWithContext} target by dropping any `│`/`─` line wider
+ * than 50 chars. A rendered markdown **table** uses SHARP corners
+ * (`┌ ┬ ┐ ├ ┼ ┤ └ ┴ ┘`), so a WIDE table body row (a long `│ … │`) was caught
+ * by that same width filter and dropped — the "header survives, body rows lost"
+ * bug (#10). Detecting sharp corners targets tables specifically and lets the
+ * table-collecting branch run BEFORE the chrome filters, so table rows can
+ * never be dropped while chrome (rounded) handling stays untouched.
+ *
+ * An optional leading `● ` assistant bullet + indent is tolerated on the TOP
+ * border (Claude prints the bullet on the table's first line).
+ */
+const SHARP_TABLE_TOP_RE = /^\s*●?\s*┌[─┬]+┐\s*$/;
+const SHARP_TABLE_BOTTOM_RE = /^\s*└[─┴]+┘\s*$/;
+const SHARP_TABLE_SEPARATOR_RE = /^\s*├[─┼]+┤\s*$/;
+const SHARP_TABLE_CONTENT_RE = /^\s*│.*│\s*$/;
+/** Strip a leading `● ` assistant bullet so the collected box indent is uniform. */
+const ASSISTANT_BULLET_PREFIX_RE = /^(\s*)●\s/;
+
+/** True iff `line` is the TOP border of a sharp-corner (markdown) table. */
+function checkIsSharpTableTop(line: string): boolean {
+  return SHARP_TABLE_TOP_RE.test(line);
+}
+
+/** True iff `line` is the BOTTOM border of a sharp-corner (markdown) table. */
+function checkIsSharpTableBottom(line: string): boolean {
+  return SHARP_TABLE_BOTTOM_RE.test(line);
+}
+
+/**
+ * True iff `line` is any line of a sharp-corner (markdown) table — top/bottom
+ * border, a `├─┼─┤` separator, or a `│ … │` content row.
+ */
+function checkIsSharpTableLine(line: string): boolean {
+  return (
+    checkIsSharpTableTop(line) ||
+    checkIsSharpTableBottom(line) ||
+    SHARP_TABLE_SEPARATOR_RE.test(line) ||
+    SHARP_TABLE_CONTENT_RE.test(line)
+  );
+}
+
+/**
  * @description Which tool a `⎿` result body belongs to, deciding how it is
  * fenced: `output` (Bash/Grep/Glob — the `⎿` line is stdout, fenced with the
  * body) vs `file` (Read/Edit/Update/Write — the `⎿` line is a prose summary,
@@ -1167,6 +1214,32 @@ export function stripTuiElementsWithContext(
     }
     if (/^❯\s+\S/.test(line)) {
       inUserTurnEcho = true;
+      continue;
+    }
+
+    // Markdown table (sharp-corner box). Collect the whole frame and emit it
+    // FENCED before the chrome-drop filters below — those filters delete any
+    // `│`/`─` line wider than 50 chars, which used to wipe a wide table's body
+    // rows (bug #10). Chrome uses ROUNDED corners and is left to those filters;
+    // only the sharp-corner shape is intercepted here. A table split across
+    // scrape chunks (no bottom border yet) still keeps every row it has so far.
+    if (checkIsSharpTableTop(line)) {
+      const tableBlock: string[] = [line];
+      let endIndex = i;
+      // Collect contiguous table lines; a bottom border ends the block
+      // (inclusive), as does the first non-table line (a table still painting
+      // across scrape chunks keeps every row it has so far).
+      for (let j = i + 1; j < lines.length; j++) {
+        if (!checkIsSharpTableLine(lines[j])) break;
+        tableBlock.push(lines[j]);
+        endIndex = j;
+        if (checkIsSharpTableBottom(lines[j])) break;
+      }
+      const unbulleted = tableBlock.map(tableLine =>
+        tableLine.replace(ASSISTANT_BULLET_PREFIX_RE, '$1  '),
+      );
+      filtered.push(...getFenced(getDedented(unbulleted)));
+      i = endIndex;
       continue;
     }
 

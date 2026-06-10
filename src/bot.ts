@@ -84,6 +84,7 @@ import {
   traceRecvUpdate,
 } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
+import { persistAdapterSessionIds } from './utils/persistAdapterSessionIds';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import {
   getThinkingEventAction,
@@ -2402,14 +2403,7 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
 
     // Persist backend session ids so a bot restart can re-attach without
     // losing the live conversation (Claude tmux UUID; OpenCode server UUID).
-    if (adapter instanceof ClaudeCliAdapter) {
-      const uuid = adapter.getClaudeSessionId(key);
-      if (uuid) await state.setClaudeSessionId(key, uuid);
-    } else if (adapter instanceof OpenCodeAdapter) {
-      const sessionId = adapter.getOpenCodeSessionId(key);
-      if (sessionId) await state.setOpenCodeSessionId(key, sessionId);
-    }
-    await state.setAgent(key, { name: adapter.name });
+    await persistAdapterSessionIds(key, adapter, state);
 
     // Session is active now — replay anything the user typed while it booted,
     // in arrival order, through the normal forward path. Fire-and-forget so the
@@ -4162,6 +4156,10 @@ async function resumeSessionByIndex(
     // The ONLY resume path that posts the "last N messages" context block —
     // silent re-attach (bot restart) and crash recovery must stay quiet.
     await adapter.resumeSession(key, workDir, sessionId, { isWithRecentContext: true });
+    // Persist the PICKED id — without this the next restart re-attaches to
+    // whatever id the last fresh start wrote, silently dropping the user's
+    // pick (live incident 2026-06-10).
+    await persistAdapterSessionIds(key, adapter, state);
     return t('session.resumed');
   } catch (e) {
     return t('session.resume_failed', { error: e instanceof Error ? e.message : String(e) });

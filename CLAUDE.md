@@ -258,7 +258,11 @@ as a command in `bot.ts`.
     thread's bound folder as numbered text **and** tappable inline buttons,
     then arm a per-thread pick mode: reply with a bare digit to resume that
     session, `0` or `/cancel` to exit, out-of-range stays armed, any other
-    text exits and is handled normally. **Both backends are folder-scoped now**
+    text exits and is handled normally. A picked session is **persisted** as
+    the thread's session id (`state.json`), so a bot restart (hot rebuild
+    included) re-attaches to the pick — previously only fresh starts
+    persisted and a restart silently fell back to the pre-resume session.
+    **Both backends are folder-scoped now**
     (a binding is required to even reach the list): Claude lists real
     `~/.claude/projects/<cwd-slug>/*.jsonl` transcripts filtered by
     `recordedCwd === workDir` (so sessions started by hand on the laptop in

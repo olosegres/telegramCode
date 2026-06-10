@@ -623,7 +623,10 @@ const POST_THINKING_TRAILER_RE =
  * rendered for durable delivery.
  */
 export interface ClaudeQuestion {
-  /** Header + every numbered option (highlighted one kept), ready to send. */
+  /**
+   * Header + every numbered option (highlighted one kept), each followed by
+   * its indented description sub-line(s) when the TUI shows any, ready to send.
+   */
   text: string;
   /**
    * Stable across cursor moves — the option-label set, ignoring which option
@@ -633,13 +636,41 @@ export interface ClaudeQuestion {
   signature: string;
 }
 
+/** One option scraped from the pane, with its attached description sub-lines. */
+interface ScrapedQuestionOption {
+  highlighted: boolean;
+  number: string;
+  label: string;
+  descriptionLines: string[];
+}
+
 /** Box-drawing chars Claude's TUI wraps option/question lines in. */
 const QUESTION_BORDER_REGEX = /^[│┃]\s?|\s*[│┃]\s*$/g;
 /** Numbered option line, optionally cursor-highlighted, optionally boxed. */
 const QUESTION_OPTION_REGEX = /^(❯\s*)?(\d{1,2})[.)]\s+(\S.*?)\s*$/;
 /** Lines that are pure chrome (borders / blanks / nav hints), never prose. */
 const QUESTION_CHROME_REGEX =
-  /^[╭╮╰╯─━│┃\s]*$|Enter to select|esc to|↑↓|↑\/↓|to cycle|shift\+tab|to confirm|to submit|use arrow/i;
+  /^[╭╮╰╯┌┐└┘├┤┬┴┼─━│┃\s]*$|Enter to select|esc to|↑↓|↑\/↓|to cycle|shift\+tab|to confirm|to submit|use arrow/i;
+/**
+ * The "Notes: press n to add notes" affordance the side-by-side
+ * AskUserQuestion layout renders under the preview pane. Terminal-only (a
+ * Telegram user cannot press `n`), so it is question chrome on the scrape
+ * side AND dropped on the output side. ANCHORED whole-line (live leak msg
+ * 23990, 2026-06-10: it reached Telegram as naked text when the selector
+ * frame fell through to the plain-output path) — prose merely mentioning the
+ * phrase mid-sentence must survive.
+ */
+const QUESTION_NOTES_HINT_REGEX = /^\s*Notes: press n to add notes\s*$/i;
+/**
+ * The UNNUMBERED "Chat about this" meta-row of the side-by-side
+ * AskUserQuestion layout (the single-column variant numbers it as a real
+ * option, e.g. `5. Chat about this`, which this regex deliberately does NOT
+ * match). A Telegram user gets the same affordance by simply typing free text
+ * (which breaks out of the selector as a fresh turn), so the row is chrome,
+ * not an option. ANCHORED whole-line, optional `❯` cursor — a prose sentence
+ * containing the phrase must survive.
+ */
+const QUESTION_CHAT_ABOUT_REGEX = /^\s*(?:❯\s*)?Chat about this\s*$/i;
 /** A positive "this is an interactive prompt" signal near the option group. */
 const QUESTION_SELECT_HINT_REGEX = /Enter to select|to select|↑↓|↑\/↓|use arrow|esc to/i;
 const QUESTION_MIN_OPTIONS = 2;
@@ -661,12 +692,107 @@ const QUESTION_OPTION_LOOKBACK = 4;
  */
 const QUESTION_BOX_EDGE_REGEX = /[╭╮╰╯]/;
 
+/**
+ * Every box-drawing glyph a right-hand preview pane can put ON an option line
+ * in the side-by-side AskUserQuestion layout (options column left, per-option
+ * `preview` snippet boxed right):
+ *
+ *   ❯ 1. winston   ┌────────────────────────────┐
+ *     2. pino      │ import winston from '…';   │
+ *     3. console   │                            │
+ *                  └────────────────────────────┘
+ *
+ * An option line is CUT at the first of these glyphs and only the left part
+ * is parsed — covers sharp AND rounded corner families plus double-line
+ * variants defensively (live bug #9, msg 23990 2026-06-10: unparsed preview
+ * fragments polluted the labels / broke extraction and the question reached
+ * Telegram with ZERO options). Single-column frames carry none of these
+ * glyphs on option lines after {@link stripQuestionBoxBorder}, so the cut is
+ * a no-op there.
+ */
+const PREVIEW_BOX_GLYPH_CLASS = '┌┐└┘├┤┬┴┼─━│┃╭╮╰╯╔╗╚╝║═';
+const PREVIEW_BOX_GLYPH_REGEX = new RegExp(`[${PREVIEW_BOX_GLYPH_CLASS}]`);
+/** A line whose first non-space char is a box glyph = right-column preview content, never an option/description. */
+const PREVIEW_PANE_FRAGMENT_REGEX = new RegExp(`^[${PREVIEW_BOX_GLYPH_CLASS}]`);
+
+/**
+ * The ANSI-bold artifact `cleanOutput` leaves on the ❯-highlighted option of
+ * the side-by-side layout: the TUI bolds ` winston` (space included), and the
+ * bold→`*…*` conversion trims the span, yielding `❯ 1.*winston*` — no space
+ * after the dot, so {@link QUESTION_OPTION_REGEX} missed the line, the cursor
+ * was "gone", and the whole frame fell through to the plain-output path (the
+ * live zero-options leak, msg 23990 2026-06-10). Normalised back to
+ * `❯ 1. winston`. ANCHORED start-to-end: the whole remainder after `N.` must
+ * be ONE `*…*` span, so prose like `1.5 *important* note` can never match.
+ */
+const HIGHLIGHTED_OPTION_BOLD_ARTIFACT_REGEX = /^(❯\s*)?(\d{1,2})([.)])\s*\*([^*]+)\*$/;
+
+/**
+ * How far below the last option to look for the strong `Enter to select`
+ * footer when the layout is POSITIVELY identified as side-by-side (an option
+ * line carried a preview-box fragment). The preview pane + the "Notes:" line
+ * + separator + "Chat about this" sit between the options and the footer, so
+ * the normal {@link QUESTION_HINT_LOOKAHEAD} cannot reach it. Only applied to
+ * side-by-side frames and only with the strong phrase — a prose numbered list
+ * has no box fragments on its lines, so this never widens the prose gate.
+ */
+const SIDE_BY_SIDE_FOOTER_LOOKAHEAD = 20;
+/** The strong footer anchor required within the extended side-by-side window. */
+const QUESTION_FOOTER_STRONG_REGEX = /Enter to select/i;
+
+/** Minimum leading-space width for a sub-line to count as an option's description. */
+const QUESTION_DESCRIPTION_MIN_INDENT = 4;
+/** How far below the LAST option to collect its trailing description sub-lines. */
+const QUESTION_DESCRIPTION_TRAILING_LOOKAHEAD = 3;
+
 function stripQuestionBoxBorder(line: string): string {
   return line.replace(QUESTION_BORDER_REGEX, '');
 }
 
+/**
+ * The left-column part of a side-by-side line: everything before the first
+ * preview-box glyph, trailing padding dropped. A line without box glyphs
+ * (single-column layout) passes through unchanged.
+ */
+function getPreviewPaneCutLeftPart(line: string): string {
+  const cutIndex = line.search(PREVIEW_BOX_GLYPH_REGEX);
+  return (cutIndex === -1 ? line : line.slice(0, cutIndex)).trimEnd();
+}
+
+/**
+ * Normalise a line for option matching: cut the right-hand preview-box
+ * fragment (side-by-side layout), then undo the highlighted-label bold
+ * artifact. A single-column line passes through unchanged.
+ */
+function getOptionLineCandidate(line: string): string {
+  return getPreviewPaneCutLeftPart(line).replace(
+    HIGHLIGHTED_OPTION_BOLD_ARTIFACT_REGEX,
+    '$1$2$3 $4',
+  );
+}
+
 function checkIsOptionLine(line: string): boolean {
-  return QUESTION_OPTION_REGEX.test(line);
+  return QUESTION_OPTION_REGEX.test(getOptionLineCandidate(line));
+}
+
+function getLineIndentWidth(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
+/**
+ * Whether a (border-stripped, untrimmed) line is an option's indented
+ * description sub-line. Conservative on purpose: must be non-blank, not
+ * question chrome, not right-column preview content, not itself an option,
+ * and indented at least {@link QUESTION_DESCRIPTION_MIN_INDENT} — the TUI
+ * indents descriptions under their option label.
+ */
+function checkIsOptionDescriptionLine(borderStrippedLine: string): boolean {
+  const trimmed = borderStrippedLine.trim();
+  if (trimmed === '') return false;
+  if (checkIsQuestionChrome(trimmed)) return false;
+  if (PREVIEW_PANE_FRAGMENT_REGEX.test(trimmed)) return false;
+  if (checkIsOptionLine(trimmed)) return false;
+  return getLineIndentWidth(borderStrippedLine) >= QUESTION_DESCRIPTION_MIN_INDENT;
 }
 
 /** Whether another option line sits within {@link QUESTION_OPTION_LOOKBACK} lines above `index`. */
@@ -679,7 +805,11 @@ function checkHasOptionAbove(lines: string[], index: number): boolean {
 }
 
 function checkIsQuestionChrome(line: string): boolean {
-  return QUESTION_CHROME_REGEX.test(line);
+  return (
+    QUESTION_CHROME_REGEX.test(line) ||
+    QUESTION_NOTES_HINT_REGEX.test(line) ||
+    QUESTION_CHAT_ABOUT_REGEX.test(line)
+  );
 }
 
 /**
@@ -701,9 +831,21 @@ function checkIsQuestionChrome(line: string): boolean {
  * list in prose has neither, so it returns `null` and falls through to the
  * normal output path. The `❯`-highlighted option text is preserved (the old
  * `stripTuiElements` path discarded every `^❯` line, losing the selection).
+ *
+ * Two layouts (plan §2026-06-09 question-ux / S4):
+ *  - single-column — options with optional indented description sub-lines,
+ *    which are ATTACHED to their option in the rendering (S1: previously
+ *    discarded);
+ *  - side-by-side (options WITH `preview` content) — each option line carries
+ *    a right-hand preview-box fragment that is CUT off; the preview body is
+ *    deliberately NOT relayed (Telegram gets labels + descriptions, the
+ *    preview is a TUI-only nicety). See {@link PREVIEW_BOX_GLYPH_CLASS} and
+ *    {@link HIGHLIGHTED_OPTION_BOLD_ARTIFACT_REGEX} for the live bug both
+ *    rules close.
  */
 export function extractClaudeQuestion(text: string): ClaudeQuestion | null {
-  const lines = text.split('\n').map(line => stripQuestionBoxBorder(line).trim());
+  const borderStrippedLines = text.split('\n').map(line => stripQuestionBoxBorder(line));
+  const lines = borderStrippedLines.map(line => line.trim());
 
   // Bottom-most option line anchors the active prompt (it sits at the pane
   // bottom). The option run is NOT contiguous — descriptions / separators sit
@@ -728,19 +870,63 @@ export function extractClaudeQuestion(text: string): ClaudeQuestion | null {
     if (!checkHasOptionAbove(lines, i)) break;
   }
 
-  const options = lines
-    .slice(start, end + 1)
-    .filter(checkIsOptionLine)
-    .map(line => {
-      const match = line.match(QUESTION_OPTION_REGEX)!;
-      return { highlighted: Boolean(match[1]), number: match[2], label: match[3].trim() };
-    });
+  // Collect options AND their indented description sub-lines (S1: the old
+  // flat `.filter(checkIsOptionLine)` discarded descriptions). A description
+  // attaches only while DIRECTLY under its option (or a previous description
+  // line of the same option) — chrome / separators / preview fragments end
+  // the run, so an indented stray further down can never mis-attach.
+  const options: ScrapedQuestionOption[] = [];
+  let isSideBySideLayout = false;
+  let isDirectlyUnderOption = false;
+  for (let i = start; i <= end; i++) {
+    const match = getOptionLineCandidate(lines[i]).match(QUESTION_OPTION_REGEX);
+    if (match) {
+      isSideBySideLayout = isSideBySideLayout || PREVIEW_BOX_GLYPH_REGEX.test(lines[i]);
+      options.push({
+        highlighted: Boolean(match[1]),
+        number: match[2],
+        label: match[3].trim(),
+        descriptionLines: [],
+      });
+      isDirectlyUnderOption = true;
+      continue;
+    }
+    if (isDirectlyUnderOption && checkIsOptionDescriptionLine(borderStrippedLines[i])) {
+      // The cut keeps a description clean if a right-column preview fragment
+      // rides the same row (side-by-side); single-column lines are unchanged.
+      options[options.length - 1].descriptionLines.push(getPreviewPaneCutLeftPart(lines[i]));
+      continue;
+    }
+    isDirectlyUnderOption = false;
+  }
   if (options.length < QUESTION_MIN_OPTIONS) return null;
+
+  // The LAST option's description sub-line(s) sit BELOW `end`; collect the
+  // directly-adjacent qualifying run (bounded, stops at the first blank /
+  // chrome / preview-fragment line).
+  const trailingLimit = Math.min(lines.length - 1, end + QUESTION_DESCRIPTION_TRAILING_LOOKAHEAD);
+  for (let i = end + 1; i <= trailingLimit; i++) {
+    if (!checkIsOptionDescriptionLine(borderStrippedLines[i])) break;
+    options[options.length - 1].descriptionLines.push(getPreviewPaneCutLeftPart(lines[i]));
+  }
 
   // Positive interactive signal, or it's not a real choice prompt.
   const hasCursor = options.some(option => option.highlighted);
-  const tail = lines.slice(end + 1, end + 1 + QUESTION_HINT_LOOKAHEAD).join('\n');
-  if (!hasCursor && !QUESTION_SELECT_HINT_REGEX.test(tail)) return null;
+  if (!hasCursor) {
+    const tail = lines.slice(end + 1, end + 1 + QUESTION_HINT_LOOKAHEAD).join('\n');
+    if (!QUESTION_SELECT_HINT_REGEX.test(tail)) {
+      // Side-by-side only: the preview pane pushes the footer beyond the
+      // normal lookahead (e.g. the cursor sits on the unnumbered "Chat about
+      // this" meta-row, so no option is highlighted). Demand the STRONG
+      // footer phrase within the extended window; never applied to frames
+      // without preview fragments, so the prose gate stays as tight as before.
+      if (!isSideBySideLayout) return null;
+      const extendedTail = lines
+        .slice(end + 1, end + 1 + SIDE_BY_SIDE_FOOTER_LOOKAHEAD)
+        .join('\n');
+      if (!QUESTION_FOOTER_STRONG_REGEX.test(extendedTail)) return null;
+    }
+  }
 
   // Header: skip the blank/border gap above the options, then collect the
   // contiguous prose line(s) above that.
@@ -753,9 +939,17 @@ export function extractClaudeQuestion(text: string): ClaudeQuestion | null {
   }
 
   const header = headerLines.join('\n').trim();
+  // Descriptions render indented under their option label, mirroring the
+  // OpenCode question body (`buildQuestionBodyLines`).
   const renderedOptions = options
-    .map(option => `${option.highlighted ? '❯' : ' '} ${option.number}. ${option.label}`)
+    .map(option => {
+      const optionLine = `${option.highlighted ? '❯' : ' '} ${option.number}. ${option.label}`;
+      const descriptionLines = option.descriptionLines.map(line => `   ${line}`);
+      return [optionLine, ...descriptionLines].join('\n');
+    })
     .join('\n');
+  // Labels only — descriptions and the cursor stay out so the signature is
+  // stable across cursor moves and description repaints (de-dup holds).
   const signature = options.map(option => `${option.number}.${option.label}`).join('|');
 
   return {
@@ -1457,6 +1651,13 @@ export function stripTuiElementsWithContext(
     if (/^←.*→\s*$/.test(trimmedLine)) continue;
     // Interactive question UI: selection/navigation hints
     if (/Enter to select/i.test(line)) continue;
+    // Interactive question UI: side-by-side AskUserQuestion chrome — the
+    // "Notes: press n…" affordance and the unnumbered "Chat about this"
+    // meta-row leaked as naked text when a selector frame fell through to
+    // this path (live msg 23990, 2026-06-10). Both regexes are anchored
+    // whole-line, so prose containing the phrases survives.
+    if (QUESTION_NOTES_HINT_REGEX.test(line)) continue;
+    if (QUESTION_CHAT_ABOUT_REGEX.test(line)) continue;
     if (/Recent activity|What's new|\/resume for more/i.test(line)) continue;
     if (/Welcome\s*back/i.test(line)) continue;
     if (/[╭─╮│╰╯]/.test(line) && trimmedLine.length > 50) continue;

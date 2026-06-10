@@ -13,6 +13,7 @@ import {
   extractClaudeQuestion,
   checkIsClaudeQuestionBlock,
   checkIsSelectorControlReply,
+  stripTuiElements,
 } from '../adapters/claudeCliAdapter';
 
 // A realistic permission box as it looks after `cleanOutput` (box borders
@@ -120,8 +121,39 @@ test('AskUserQuestion box: spans descriptions + separator, keeps ALL options', (
   assert.match(q.text, /4\. Type something\./);
   assert.match(q.text, /5\. Chat about this/);
   assert.equal(q.signature, '1.Red|2.Green|3.Blue|4.Type something.|5.Chat about this');
-  // The indented description sub-lines must not leak into the rendered options.
-  assert.doesNotMatch(q.text, /The color red\./);
+});
+
+// S1 (Claude half, deferred into S4): the indented description sub-lines are
+// ATTACHED to their option in the rendering — indented under the label, the
+// same shape OpenCode's `buildQuestionBodyLines` produces. They previously
+// were discarded entirely.
+test('AskUserQuestion box: description sub-lines attach indented under their option', () => {
+  const q = extractClaudeQuestion(askUserQuestionBox(1))!;
+  assert.ok(q);
+  assert.match(q.text, /❯ 1\. Red\n   The color red\./);
+  assert.match(q.text, /  2\. Green\n   The color green\./);
+  assert.match(q.text, /  3\. Blue\n   The color blue\./);
+  // The separator between option 4 and 5 is chrome, never a description.
+  assert.doesNotMatch(q.text, /Type something\.\n   ─/);
+});
+
+test('AskUserQuestion box: descriptions stay OUT of the signature (de-dup unaffected)', () => {
+  const withDescriptions = extractClaudeQuestion(askUserQuestionBox(1))!;
+  // Same options, descriptions not yet painted — signature must be identical.
+  const withoutDescriptions = extractClaudeQuestion(
+    [
+      'Which color do you prefer?',
+      '',
+      '❯ 1. Red',
+      '  2. Green',
+      '  3. Blue',
+      '  4. Type something.',
+      '  5. Chat about this',
+      '',
+      'Enter to select · ↑/↓ to navigate · Esc to cancel',
+    ].join('\n'),
+  )!;
+  assert.equal(withDescriptions.signature, withoutDescriptions.signature);
 });
 
 test('AskUserQuestion box: signature stable as the cursor moves across the separator', () => {
@@ -129,6 +161,169 @@ test('AskUserQuestion box: signature stable as the cursor moves across the separ
   const onChat = extractClaudeQuestion(askUserQuestionBox(5))!;
   assert.equal(onRed.signature, onChat.signature);
   assert.match(onChat.text, /❯ 5\. Chat about this/);
+});
+
+// ── Side-by-side AskUserQuestion (options WITH previews) — bug #9 ──
+//
+// The REAL frame captured live 2026-06-10 (Claude Code v2.1.170, raw
+// `tmux capture-pane -e -p` through `cleanOutput`; source fixture:
+// agent/tmp/askuserquestion-preview-raw[-ansi].txt). Options sit in a left
+// column; each option's `preview` snippet renders in a box on the right.
+// Two scrape-breaking artifacts ride this layout:
+//  1. every option line carries right-column box fragments (`┌`/`│` + preview
+//     text) that polluted labels and signature;
+//  2. `cleanOutput`'s ANSI-bold→`*…*` conversion renders the ❯-highlighted
+//     label as `❯ 1.*winston*` (NO space after the dot), so the option regex
+//     missed it, no cursor was found, extraction returned null and the frame
+//     leaked half-eaten through the plain-output chrome filter — the live
+//     zero-options message (msg 23990).
+const buildSideBySideFrame = (optionLines: string[]) =>
+  [
+    ' ☐ Logger',
+    '',
+    '*Which logging approach should we use?*',
+    '',
+    ...optionLines,
+    '                                  │ const logger = winston.createLogger({                      │',
+    "                                  │   level: 'info',                                           │",
+    '                                  │   format: winston.format.json(),                           │',
+    '                                  │   transports: [new winston.transports.Console()],          │',
+    '                                  │ });                                                        │',
+    '                                  └────────────────────────────────────────────────────────────┘',
+    '',
+    '                                  Notes: press n to add notes',
+    '',
+    '────────────────────────────────────────────────────────────────────────────',
+    '  Chat about this',
+    '',
+    'Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel',
+  ].join('\n');
+
+// Verbatim option rows from the captured frame (cursor on option 1, with the
+// ANSI-bold artifact on the highlighted label).
+const sideBySideCursorOn1 = buildSideBySideFrame([
+  '❯ 1.*winston*                      ┌────────────────────────────────────────────────────────────┐',
+  "  2. pino                         │ import winston from 'winston';                             │",
+  '  3. console                      │                                                            │',
+]);
+
+// Cursor moved to option 2 (the bold artifact rides the highlighted row).
+const sideBySideCursorOn2 = buildSideBySideFrame([
+  '  1. winston                      ┌────────────────────────────────────────────────────────────┐',
+  "❯ 2.*pino*                        │ import winston from 'winston';                             │",
+  '  3. console                      │                                                            │',
+]);
+
+// Cursor moved DOWN onto the unnumbered "Chat about this" meta-row: no
+// numbered option is highlighted, and the preview pane pushes the footer
+// beyond the normal hint lookahead.
+const sideBySideCursorOnChat = buildSideBySideFrame([
+  '  1. winston                      ┌────────────────────────────────────────────────────────────┐',
+  "  2. pino                         │ import winston from 'winston';                             │",
+  '  3. console                      │                                                            │',
+]).replace('  Chat about this', '❯ Chat about this');
+
+test('side-by-side preview frame: exactly the 3 left-column options, clean labels', () => {
+  const q = extractClaudeQuestion(sideBySideCursorOn1)!;
+  assert.ok(q);
+  assert.match(q.text, /Which logging approach should we use\?/);
+  // Exact rendering: highlighted=1, clean labels, nothing else.
+  assert.equal(q.signature, '1.winston|2.pino|3.console');
+  assert.match(q.text, /❯ 1\. winston\n  2\. pino\n  3\. console/);
+  // No box glyphs or preview-pane content in the relayed question (the
+  // preview body is deliberately TUI-only).
+  assert.doesNotMatch(q.text, /[┌┐└┘├┤┬┴┼│┃]/);
+  assert.doesNotMatch(q.text, /import winston|createLogger|transports/);
+  // Layout chrome must not leak into the question text.
+  assert.doesNotMatch(q.text, /Notes: press n|Chat about this|Enter to select/);
+  // The `☐ <tab>` header line is skipped cleanly (not relayed).
+  assert.doesNotMatch(q.text, /☐/);
+});
+
+test('side-by-side preview frame: signature stable across cursor moves (de-dup holds)', () => {
+  const on1 = extractClaudeQuestion(sideBySideCursorOn1)!;
+  const on2 = extractClaudeQuestion(sideBySideCursorOn2)!;
+  assert.equal(on1.signature, on2.signature);
+  assert.match(on2.text, /❯ 2\. pino/);
+});
+
+test('side-by-side: cursor on the unnumbered "Chat about this" row still extracts', () => {
+  // No numbered option is highlighted; only the strong `Enter to select`
+  // footer (beyond the normal lookahead, behind the preview pane) proves the
+  // frame is interactive. Extraction must hold so `isQuestionPending` stays
+  // armed and a digit reply keeps driving the selector.
+  const q = extractClaudeQuestion(sideBySideCursorOnChat)!;
+  assert.ok(q);
+  assert.equal(q.signature, '1.winston|2.pino|3.console');
+  assert.doesNotMatch(q.text, /❯/);
+});
+
+test('side-by-side: plain (no ANSI-bold artifact) capture variant also extracts', () => {
+  // The same frame as captured WITHOUT `-e` (agent/tmp/askuserquestion-
+  // preview-raw.txt): highlighted label keeps its space, no `*…*` markers.
+  const plain = buildSideBySideFrame([
+    '❯ 1. winston                      ┌────────────────────────────────────────────────────────────┐',
+    "  2. pino                         │ import winston from 'winston';                             │",
+    '  3. console                      │                                                            │',
+  ]).replace('*Which logging approach should we use?*', 'Which logging approach should we use?');
+  const q = extractClaudeQuestion(plain)!;
+  assert.ok(q);
+  assert.equal(q.signature, '1.winston|2.pino|3.console');
+  assert.match(q.text, /❯ 1\. winston/);
+});
+
+test('side-by-side: a description sub-line keeps only its left-column part', () => {
+  // Derived shape (no live capture of side-by-side WITH descriptions yet):
+  // a description row would carry a right-column preview fragment like the
+  // option rows do — the fragment must be cut, the description kept.
+  const withDescriptions = buildSideBySideFrame([
+    '❯ 1.*winston*                     ┌────────────────────────────────────────────────────────────┐',
+    "     Structured JSON logging      │ import winston from 'winston';                             │",
+    '  2. pino                         │                                                            │',
+  ]);
+  const q = extractClaudeQuestion(withDescriptions)!;
+  assert.ok(q);
+  assert.equal(q.signature, '1.winston|2.pino');
+  assert.match(q.text, /❯ 1\. winston\n   Structured JSON logging\n  2\. pino/);
+  assert.doesNotMatch(q.text, /[│┌┐└┘]|import winston/);
+});
+
+test('a sharp-cornered table with "N." rows is NOT a question (no cursor, no footer)', () => {
+  // Box fragments on numbered lines positively identify a side-by-side
+  // layout, which unlocks the EXTENDED footer window — a table must still be
+  // rejected because nothing below it says "Enter to select".
+  const tablePane = [
+    'Here is the rollout order:',
+    '┌───────────────────────────────────────────────────────────┬──────────┐',
+    '│ 1. Read the existing configuration and back it up         │ done     │',
+    '│ 2. Edit the function to accept the new parameter          │ pending  │',
+    '└───────────────────────────────────────────────────────────┴──────────┘',
+  ].join('\n');
+  assert.equal(extractClaudeQuestion(tablePane), null);
+  assert.equal(checkIsClaudeQuestionBlock(tablePane), false);
+});
+
+// The output-path guard: if a selector frame ever falls through to the plain
+// OUTPUT path again (e.g. mid-paint), the side-by-side chrome must not leak
+// as naked text — that was the visible half of live msg 23990.
+test('stripTuiElements drops the side-by-side question chrome lines', () => {
+  const stripped = stripTuiElements(sideBySideCursorOn1);
+  assert.doesNotMatch(stripped, /Notes: press n to add notes/);
+  assert.doesNotMatch(stripped, /Chat about this/);
+  assert.doesNotMatch(stripped, /Enter to select/);
+  // No half-eaten option/preview fragments either.
+  assert.doesNotMatch(stripped, /import winston|createLogger/);
+});
+
+test('prose MENTIONING the side-by-side chrome phrases survives stripTuiElements', () => {
+  // The drops are anchored whole-line; these prose lines must not be eaten.
+  const prose = [
+    'The TUI shows "Notes: press n to add notes" under the preview box.',
+    'Users can always chat about this in the topic instead.',
+  ].join('\n');
+  const stripped = stripTuiElements(prose);
+  assert.match(stripped, /Notes: press n to add notes/);
+  assert.match(stripped, /chat about this in the topic/);
 });
 
 test('takes the LAST option group when the pane has prose above it', () => {

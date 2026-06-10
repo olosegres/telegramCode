@@ -137,9 +137,12 @@ export function checkShouldLogDrop(
  * `ancestorSessionId`, or `null` if the ancestor is not on the chain. A
  * visited-set guards against a corrupt cyclic chain. Returns `null` (not 0) for
  * an equal id — a *direct* match is handled separately in `getEventOwnerKey` so
- * it always wins over descent.
+ * it always wins over descent. Exported (besides the routing internals) for the
+ * adapter's busy tracking, which must verify a STRICT descendant before
+ * recording a busy child — a dir-fallback-routed foreign sibling must never
+ * count.
  */
-function getLineageDepthToAncestor(
+export function getLineageDepthToAncestor(
   eventSessionId: string,
   ancestorSessionId: string,
   childToParent: ReadonlyMap<string, string>,

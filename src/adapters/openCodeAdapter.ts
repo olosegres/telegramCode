@@ -13,6 +13,7 @@ import {
   checkIsEventForSession,
   checkShouldLogDrop,
   getEventOwnerKey,
+  getLineageDepthToAncestor,
   resolveOwnerByDirectoryFallback as resolveOwnerByDirectoryFallbackPure,
   touchLineageOnUse,
   updateSessionLineage,
@@ -538,6 +539,10 @@ const sseDropLogThrottleMs = 60_000;
 /** Bound on the drop-throttle map so an unbounded run of distinct orphan
  * sessions can't grow it without limit (matches the lineage-map discipline). */
 const maxSseDropThrottleEntries = 500;
+/** Synthetic "event type" namespacing the throttle key for ignored foreign
+ * busy=true status events, so they share the drop-throttle map without
+ * colliding with real `session.status` drop entries. */
+const foreignBusyIgnoredLogType = 'busy-ignored';
 
 /**
  * SSE event types whose loss makes a turn silently hang — diag-logged on drop.
@@ -602,23 +607,35 @@ export interface OpenCodeBusyTracking {
 /**
  * @description Apply a busy/idle transition (from `session.status` or
  * `session.idle`) to a session's busy-tracking state. The own session's status
- * drives `isBusy`; a routed CHILD (sub-agent) session's status maintains
- * `busyChildSessionIds` — a child going idle must NOT clear the parent's
- * `isBusy`. Pure + exported so the own-vs-child routing is unit-testable.
+ * drives `isBusy`; a lineage-VERIFIED descendant's (sub-agent child session's)
+ * status maintains `busyChildSessionIds` — a child going idle must NOT clear
+ * the parent's `isBusy`. A foreign non-descendant id (e.g. a wedged sibling
+ * top-level session routed in via the directory fallback) is never recorded:
+ * its busy=true is ignored — recording it would pin the thread busy forever,
+ * since a wedged session never goes idle (live incident 2026-06-10) — while
+ * its busy=false still deletes, self-healing ids that slipped in before
+ * verification existed. Pure + exported so the routing is unit-testable.
+ *
+ * @returns `true` when a foreign non-descendant busy=true was ignored, so the
+ * caller can diag-log it (throttled — never per event).
  */
 export function applyOpenCodeStatusEvent(
   tracking: OpenCodeBusyTracking,
   ownSessionId: string,
   eventSessionId: string | null,
   isBusy: boolean,
-): void {
+  isVerifiedDescendant: boolean,
+): boolean {
   if (!eventSessionId || eventSessionId === ownSessionId) {
     tracking.isBusy = isBusy;
-  } else if (isBusy) {
+  } else if (!isBusy) {
+    tracking.busyChildSessionIds.delete(eventSessionId);
+  } else if (isVerifiedDescendant) {
     tracking.busyChildSessionIds.add(eventSessionId);
   } else {
-    tracking.busyChildSessionIds.delete(eventSessionId);
+    return true;
   }
+  return false;
 }
 
 /**
@@ -3186,7 +3203,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // (the `.ended` / `session.compacted` event may be lost) — without this the
     // latched flag would force every later prompt down the queue path.
     if (!sessionId || sessionId === session.sessionId) session.isCompacting = false;
-    applyOpenCodeStatusEvent(session, session.sessionId, sessionId ?? null, false);
+    applyOpenCodeStatusEvent(
+      session,
+      session.sessionId,
+      sessionId ?? null,
+      false,
+      this.checkIsVerifiedDescendant(sessionId ?? null, session.sessionId),
+    );
 
     console.log(`[OpenCode] Session idle`);
     // The turn just ended: mark this flush final so the bot delivers the last
@@ -3196,9 +3219,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   /**
    * @description Track live busy/idle from `session.status`. The own session's
-   * status drives {@link OpenCodeSession.isBusy}; a routed child (sub-agent)
-   * status maintains {@link OpenCodeSession.busyChildSessionIds} so a new
-   * prompt never aborts a running sub-agent.
+   * status drives {@link OpenCodeSession.isBusy}; a lineage-verified child
+   * (sub-agent) status maintains {@link OpenCodeSession.busyChildSessionIds}
+   * so a new prompt never aborts a running sub-agent. A foreign non-descendant
+   * session's busy=true (dir-fallback-routed wedged sibling) is ignored —
+   * see {@link applyOpenCodeStatusEvent}.
    */
   private handleSessionStatus(
     key: ThreadKey,
@@ -3209,7 +3234,49 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!session?.isActive) return;
 
     const status = properties.status as { type?: string } | undefined;
-    applyOpenCodeStatusEvent(session, session.sessionId, eventSessionId, status?.type === 'busy');
+    const wasForeignBusyIgnored = applyOpenCodeStatusEvent(
+      session,
+      session.sessionId,
+      eventSessionId,
+      status?.type === 'busy',
+      this.checkIsVerifiedDescendant(eventSessionId, session.sessionId),
+    );
+    if (wasForeignBusyIgnored && eventSessionId) {
+      this.logForeignBusyIgnoredOncePerWindow(eventSessionId, session.sessionId);
+    }
+  }
+
+  /**
+   * @description Strict-descendant verification for busy tracking: `true` only
+   * when `eventSessionId` walks up the lineage map to `ownSessionId` — never
+   * for the own id itself or a foreign sibling. Distinct from
+   * {@link checkIsEventForSession} (own-or-descendant), which routing uses.
+   */
+  private checkIsVerifiedDescendant(eventSessionId: string | null, ownSessionId: string): boolean {
+    return (
+      eventSessionId !== null &&
+      getLineageDepthToAncestor(eventSessionId, ownSessionId, this.sessionLineage) !== null
+    );
+  }
+
+  /**
+   * @description Diag-log one "busy-ignored" line for a foreign non-descendant
+   * busy=true that busy tracking refused to record, throttled per session id
+   * like {@link logSseDropOncePerWindow} — a wedged sibling re-emits
+   * `session.status` every ~30 s and would otherwise flood the diag log.
+   */
+  private logForeignBusyIgnoredOncePerWindow(eventSessionId: string, ownSessionId: string): void {
+    const shouldLog = checkShouldLogDrop(
+      this.sseDropLogThrottle,
+      foreignBusyIgnoredLogType,
+      eventSessionId,
+      Date.now(),
+      sseDropLogThrottleMs,
+      maxSseDropThrottleEntries,
+    );
+    if (shouldLog) {
+      appendDiagLog(`sse busy-ignored foreign es=${eventSessionId} own=${ownSessionId}`);
+    }
   }
 
   /**

@@ -275,6 +275,7 @@ const dict: Record<Lang, Record<string, string>> = {
     // full-mode chunk; `fallback_title` fills in when the delegation carried
     // no title/description. 2-state by design — no `hide` (user-locked).
     'subagent.status_live': '🤖 суб-агент: {title} …',
+    'subagent.delegating_status': '🤖 Делегирую: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
     'subagent.fallback_title': 'суб-агент',
     'subagent.choose': '🤖 Текущий режим суб-агентов: {current}\nВыбери режим:',
@@ -658,6 +659,7 @@ const dict: Record<Lang, Record<string, string>> = {
     // full-mode chunk; `fallback_title` fills in when the delegation carried
     // no title/description. 2-state by design — no `hide` (user-locked).
     'subagent.status_live': '🤖 sub-agent: {title} …',
+    'subagent.delegating_status': '🤖 Delegating: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
     'subagent.fallback_title': 'sub-agent',
     'subagent.choose': '🤖 Current sub-agent mode: {current}\nPick a mode:',

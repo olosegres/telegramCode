@@ -14,6 +14,7 @@ import {
   subagentModeOptions,
   fallbackSubagentMode,
   buildSubagentStatusText,
+  buildDelegatingStatusText,
   buildSubagentOutputPrefix,
 } from '../utils/subagentRender';
 
@@ -77,6 +78,28 @@ describe('buildSubagentStatusText — compact-mode rolling status line', () => {
     assert.ok(!status.includes('null'));
     assert.ok(status.includes('🤖'));
     assert.ok(status.length > '🤖 '.length, 'fallback label is non-empty');
+  });
+});
+
+describe('buildDelegatingStatusText — parent-side "Delegating" activity status (S5)', () => {
+  it('embeds the delegation title and the sub-agent marker', () => {
+    const status = buildDelegatingStatusText('Count TS files in src/utils');
+    assert.ok(status.includes('Count TS files in src/utils'), 'title embedded');
+    assert.ok(status.includes('🤖'), 'sub-agent marker present');
+  });
+
+  it('null title falls back to a non-empty generic label (never "null")', () => {
+    const status = buildDelegatingStatusText(null);
+    assert.ok(!status.includes('null'));
+    assert.ok(status.includes('🤖'));
+    assert.ok(status.length > '🤖 '.length, 'fallback label is non-empty');
+  });
+
+  it('is distinct from the compact sub-agent status for the same title', () => {
+    // The two statuses cover different phases (parent's task tool in flight vs
+    // child streaming) — identical strings would mean the dedicated
+    // "Delegating" label silently collapsed into the generic one.
+    assert.notEqual(buildDelegatingStatusText('t'), buildSubagentStatusText('t'));
   });
 });
 

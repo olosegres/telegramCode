@@ -33,6 +33,7 @@ import {
   type DirectoryBoundSession,
 } from '../utils/sseStreamLifecycle';
 import {
+  buildDelegatingStatusText,
   buildSubagentStatusText,
   fallbackSubagentMode,
   getSubagentPartAction,
@@ -2914,6 +2915,28 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description Is this part the delegation (`task`) tool still in flight
+   * (pending/running)? Drives both the delegation-title tracking and the
+   * dedicated "🤖 Delegating: <title> …" activity status (S5) — once the
+   * delegation completes/errors the generic ✅/❌ status forms take over.
+   */
+  private checkIsDelegationInFlight(part: OpenCodePart, toolState: OpenCodeToolState): boolean {
+    return part.tool === delegationToolName
+      && (toolState.status === 'pending' || toolState.status === 'running');
+  }
+
+  /**
+   * @description Read the delegation's title off a `task` tool part's state:
+   * the explicit `title` when present, else the prompt `description` from the
+   * tool input. `null` when the part carries neither (the status builders fall
+   * back to a localized generic label).
+   */
+  private getDelegationTitle(toolState: OpenCodeToolState): string | null {
+    const inputDescription = typeof toolState.input?.description === 'string' ? toolState.input.description : null;
+    return toolState.title || inputDescription;
+  }
+
+  /**
    * @description Record / clear the CURRENT delegation's title from the
    * PARENT's `task` tool part: stored while the delegation is pending/running
    * (feeds the compact-mode sub-agent status; S5's "Delegating" activity
@@ -2923,12 +2946,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    */
   private trackDelegationTitle(session: OpenCodeSession, part: OpenCodePart, toolState: OpenCodeToolState): void {
     if (part.tool !== delegationToolName) return;
-    if (toolState.status === 'pending' || toolState.status === 'running') {
-      const inputDescription = typeof toolState.input?.description === 'string' ? toolState.input.description : null;
-      session.activeSubagentTitle = toolState.title || inputDescription;
-      return;
-    }
-    session.activeSubagentTitle = null;
+    session.activeSubagentTitle = this.checkIsDelegationInFlight(part, toolState)
+      ? this.getDelegationTitle(toolState)
+      : null;
   }
 
   /**
@@ -2958,22 +2978,31 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
 
     let statusText: string;
-    switch (state.status) {
-      case 'pending':
-        statusText = `🔄 ${toolName}...`;
-        break;
-      case 'running':
-        statusText = `🔧 ${state.title || toolName}...`;
-        break;
-      case 'completed':
-        statusText = `✅ ${state.title || toolName}`;
-        break;
-      case 'error':
-        statusText = `❌ ${toolName}: ${state.error || 'failed'}`;
-        break;
-      default:
-        statusText = `🔧 ${toolName}`;
-        break;
+    if (this.checkIsDelegationInFlight(part, state)) {
+      // An in-flight delegation mirrors the terminal's "~ Delegating…" line
+      // instead of the generic 🔄/🔧 forms (S5) — the parent-side counterpart
+      // of the compact "🤖 sub-agent: …" status, same style. The title comes
+      // off THIS part's state, so a child's own nested `task` (full mode)
+      // renders its own title, never the parent's tracked one.
+      statusText = buildDelegatingStatusText(this.getDelegationTitle(state));
+    } else {
+      switch (state.status) {
+        case 'pending':
+          statusText = `🔄 ${toolName}...`;
+          break;
+        case 'running':
+          statusText = `🔧 ${state.title || toolName}...`;
+          break;
+        case 'completed':
+          statusText = `✅ ${state.title || toolName}`;
+          break;
+        case 'error':
+          statusText = `❌ ${toolName}: ${state.error || 'failed'}`;
+          break;
+        default:
+          statusText = `🔧 ${toolName}`;
+          break;
+      }
     }
 
     this.emitStatus(key, session, statusText);

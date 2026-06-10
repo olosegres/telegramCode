@@ -83,6 +83,19 @@ export function buildSubagentStatusText(title: string | null): string {
 }
 
 /**
+ * @description Build the parent-side "Delegating" activity status
+ * ("🤖 Delegating: <title> …") rendered while the parent's delegation (`task`)
+ * tool part is pending/running (S5) — the counterpart of
+ * {@link buildSubagentStatusText} (which is driven by the CHILD's own text
+ * events), same compact style. `title` is the part's `state.title` falling
+ * back to its `input.description`; `null` (neither present) falls back to the
+ * same localized generic label.
+ */
+export function buildDelegatingStatusText(title: string | null): string {
+  return t('subagent.delegating_status', { title: title ?? t('subagent.fallback_title') });
+}
+
+/**
  * @description The marker prepended to every full-mode sub-agent chunk
  * ("🤖 ⤷") so a streamed child transcript is visually separated from the main
  * agent's reply.

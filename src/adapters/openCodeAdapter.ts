@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThinkingEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -181,6 +181,24 @@ interface OpenCodeSession {
   statusDebounceTimer: NodeJS.Timeout | null;
   /** Latest status text pending emission */
   pendingStatus: string | null;
+  /**
+   * Accumulated reasoning (chain-of-thought) text for the CURRENT response,
+   * kept strictly SEPARATE from {@link currentResponseText} so it never leaks
+   * into the answer (or its continuation accounting). Reset to `''` when a new
+   * reasoning stream starts or the response's reasoning ends.
+   */
+  reasoningText: string;
+  /**
+   * Epoch ms of the FIRST reasoning delta of the current response, or `null`
+   * when no reasoning is in flight. Drives the "thought for {N}s" duration on
+   * the `thinking` `done` emit; reset on reasoning end.
+   */
+  reasoningStartedAt: number | null;
+  /**
+   * Debounce timer for the live `thinking` emit — the reasoning delta stream is
+   * chatty, so live emits are coalesced the same way text deltas are.
+   */
+  reasoningTimer: NodeJS.Timeout | null;
   /** Pending question awaiting user's answer */
   pendingQuestion: OpenCodePendingQuestion | null;
   /**
@@ -1135,6 +1153,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           partTypes: new Map(),
           statusDebounceTimer: null,
           pendingStatus: null,
+          reasoningText: '',
+          reasoningStartedAt: null,
+          reasoningTimer: null,
           pendingQuestion: null,
           effortLevel: loadSavedEffort(key),
           isBusy: false,
@@ -1199,6 +1220,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (session.statusDebounceTimer) {
       clearTimeout(session.statusDebounceTimer);
       session.statusDebounceTimer = null;
+    }
+    // Same rationale: a live `thinking` debounce timer must not fire (emitting a
+    // stale "thinking …" frame) after the session announced `stopped`.
+    if (session.reasoningTimer) {
+      clearTimeout(session.reasoningTimer);
+      session.reasoningTimer = null;
     }
 
     // Tear down the directory's SSE stream if this was its last active session
@@ -1733,6 +1760,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         partTypes: new Map(),
         statusDebounceTimer: null,
         pendingStatus: null,
+        reasoningText: '',
+        reasoningStartedAt: null,
+        reasoningTimer: null,
         pendingQuestion: null,
         effortLevel: loadSavedEffort(key),
         isBusy: false,
@@ -2625,6 +2655,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Resolve the part type: from the part object or from our tracking map
     const partType = part?.type || (partId ? session.partTypes.get(partId) : undefined) || 'text';
 
+    // Reasoning end signal #1: the first NON-reasoning part after reasoning was
+    // streaming (the answer or a tool call begins). The most responsive of the
+    // three end signals; `endReasoning` is idempotent so the later
+    // `message.updated` finish / `session.idle` signals are harmless no-ops.
+    if (partType !== 'reasoning') this.endReasoning(key, session);
+
     switch (partType) {
       case 'text':
         this.handleTextDelta(key, session, delta, field);
@@ -2738,25 +2774,79 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     this.emitStatus(key, session, statusText);
   }
 
+  /** Debounce delay (ms) for live `thinking` emits — the reasoning delta
+   * stream is chatty, so live frames are coalesced like text deltas. */
+  private static readonly reasoningLiveEmitMs = 400;
+
   /**
-   * @description Handle reasoning (thinking) part — format and emit as 'status'.
+   * @description Handle a reasoning (chain-of-thought) part.
+   *
+   * Reasoning text is accumulated into {@link OpenCodeSession.reasoningText}
+   * — kept STRICTLY separate from `currentResponseText` so it never leaks into
+   * the answer — and surfaced through the DEDICATED `thinking` event (not the
+   * generic `status` coalescer), so the thinking indicator can persist
+   * independently of tool status. The adapter stays MODE-AGNOSTIC: it emits the
+   * raw accumulated text + phase, and the bot applies the per-thread mode.
+   *
+   * On the FIRST reasoning delta of a response we record `reasoningStartedAt`
+   * (drives the "thought for {N}s" duration on the eventual `done` emit). Live
+   * emits are debounced.
    */
   private handleReasoningPart(
     key: ThreadKey,
     session: OpenCodeSession,
     part: OpenCodePart | undefined,
     delta: string | undefined,
-    _field: string | undefined,
+    field: string | undefined,
   ): void {
-    // For deltas on reasoning parts, show a thinking indicator
+    // For message.part.delta only the reasoning `text` field carries content.
+    if (field && field !== 'text') return;
+
     const text = delta || part?.text || '';
     if (!text) return;
 
-    // Show thinking text preview — first line up to 300 chars
-    const preview = text.split('\n')[0].slice(0, 300);
-    const statusText = preview ? `💭 ${preview}${text.length > 300 ? '...' : ''}` : '💭 Thinking...';
+    if (session.reasoningStartedAt === null) {
+      session.reasoningStartedAt = Date.now();
+    }
+    session.reasoningText += text;
 
-    this.emitStatus(key, session, statusText);
+    // Debounce the live emit — newest accumulated text always wins.
+    if (session.reasoningTimer) clearTimeout(session.reasoningTimer);
+    session.reasoningTimer = setTimeout(() => {
+      session.reasoningTimer = null;
+      this.emitThinking(key, session, 'live');
+    }, OpenCodeAdapter.reasoningLiveEmitMs);
+  }
+
+  /**
+   * @description Emit the `thinking` event for the current phase. `live` carries
+   * the accumulated reasoning text so far; `done` adds the elapsed `durationMs`.
+   */
+  private emitThinking(key: ThreadKey, session: OpenCodeSession, phase: ThinkingEvent['phase']): void {
+    const payload: ThinkingEvent = { phase, text: session.reasoningText };
+    if (phase === 'done' && session.reasoningStartedAt !== null) {
+      payload.durationMs = Date.now() - session.reasoningStartedAt;
+    }
+    this.emit('thinking', key, payload);
+  }
+
+  /**
+   * @description End the current response's reasoning stream, if one is active.
+   * Flushes any pending live frame, emits the `thinking` `done` event (so the
+   * bot can collapse / persist per mode), and resets the per-response reasoning
+   * accumulator. Idempotent — a no-op when no reasoning is in flight, so it can
+   * be called from every "reasoning end" signal (first non-reasoning part,
+   * `message.updated` finish, `session.idle`) without double-emitting.
+   */
+  private endReasoning(key: ThreadKey, session: OpenCodeSession): void {
+    if (session.reasoningStartedAt === null) return;
+    if (session.reasoningTimer) {
+      clearTimeout(session.reasoningTimer);
+      session.reasoningTimer = null;
+    }
+    this.emitThinking(key, session, 'done');
+    session.reasoningText = '';
+    session.reasoningStartedAt = null;
   }
 
   /** Debounce delay (ms) for status updates to avoid Telegram rate limits */
@@ -3005,6 +3095,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.emit('status', key, session.pendingStatus);
       session.pendingStatus = null;
     }
+
+    // Reasoning end signals #2/#3: the turn flush fires from both the
+    // `message.updated` finish and `session.idle`. Idempotent — a no-op if a
+    // non-reasoning part already ended reasoning (signal #1).
+    this.endReasoning(key, session);
 
     this.emitResponseTail(key, session, isFinal);
 

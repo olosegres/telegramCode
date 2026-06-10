@@ -23,7 +23,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ThinkingEvent, ThinkingMode } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -71,7 +71,7 @@ import { formatPinnedStatus } from './pinnedStatus';
 import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
-import { splitMessage } from './messageSplit';
+import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
@@ -84,6 +84,13 @@ import {
 } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import {
+  getThinkingEventAction,
+  getThinkingAnswerStartAction,
+  formatThinkingDurationSeconds,
+  thinkingModeOptions,
+  checkIsThinkingMode,
+} from './utils/thinkingRender';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
@@ -384,6 +391,27 @@ interface ThreadMessageState {
   /** Transient status/spinner message id — replaced by permanent text. */
   statusMessageId: number | null;
   /**
+   * Thinking (chain-of-thought) message id — owned independently of
+   * {@link statusMessageId} so the live "☁️ thinking …" indicator can persist
+   * across tool-status churn. Lifecycle per {@link ThinkingMode}: edited live
+   * while reasoning, then (per mode) collapsed to "💭 thought for {N}s", left
+   * as-is, or deleted when the answer starts. `null` = no thinking message.
+   * The accumulated reasoning text mirrors what the adapter sent, so a
+   * `detailed`-mode live frame can re-render the full body on each edit.
+   */
+  thinkingMessageId: number | null;
+  /**
+   * Monotonic generation for the thinking-message lifecycle, bumped on every
+   * {@link clearThinkingMessage} (session end / question takeover). A create in
+   * flight captures it before its `await` and re-checks after: a clear that
+   * lands mid-create bumps the generation, so the just-created message is
+   * DELETED instead of resurrecting `thinkingMessageId` as an orphan under the
+   * "session ended" / question UI. (Mirror of {@link statusFrameGeneration} —
+   * the persist path `finishThinkingMessage` does NOT bump it, so a normal
+   * collapse/keep leaves the message in the chat.)
+   */
+  thinkingFrameGeneration: number;
+  /**
    * Monotonic generation for the status-frame lifecycle, bumped on every
    * `deleteStatusMessage`. `sendStatusFrame` captures it before creating a new
    * message and re-checks after the `await` (see `getStatusFrameStoreDecision`):
@@ -460,6 +488,33 @@ interface StatusCoalesceState {
   deferRetryTimer: NodeJS.Timeout | null;
 }
 
+/**
+ * @description Per-thread coalescer for the live "☁️ thinking …" indicator.
+ *
+ * The OpenCode reasoning stream is chatty: even after the adapter's 400 ms
+ * debounce, a long chain-of-thought emits many `live` frames. Routing each one
+ * into its own `editMessageText` would burn the chat-wide send budget that
+ * real output and interactive replies need. The coalescer enforces "at most one
+ * thinking edit in flight per thread" and "latest frame wins" (same shape as
+ * {@link StatusCoalesceState} but for the dedicated thinking message id).
+ */
+interface ThinkingCoalesceState {
+  /** Latest rendered thinking-frame HTML not yet sent. `null` = nothing pending. */
+  pendingHtml: string | null;
+  /** A `flushThinkingCoalescer` loop is currently running. */
+  inFlight: boolean;
+  /** Last frame that actually reached Telegram — skip an identical re-send. */
+  lastSentHtml: string | null;
+  /**
+   * When `true`, the pending frame is the response's FINAL one (the brief-mode
+   * "thought for {N}s" collapse). The flush loop edits it onto the SAME message,
+   * THEN detaches the tracked id (`finishThinkingMessage`) — doing the detach
+   * before the edit would make the collapse create a new message instead of
+   * replacing the live indicator in place.
+   */
+  detachAfterDrain: boolean;
+}
+
 const threadMessageStates = new Map<string, ThreadMessageState>();
 const outputQueues = new Map<string, OutputQueueState>();
 const pendingQuestions = new Map<string, PendingQuestionState>();
@@ -475,6 +530,7 @@ const pendingSurveys = new Map<string, { messageId: number; options: ClaudeSurve
 const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
+const thinkingCoalescers = new Map<string, ThinkingCoalesceState>();
 
 /**
  * @description Register/replace a thread's pending interactive question in BOTH
@@ -845,7 +901,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -882,6 +938,42 @@ function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
     statusCoalescers.set(k, s);
   }
   return s;
+}
+
+function getThinkingCoalesceState(key: ThreadKey): ThinkingCoalesceState {
+  const k = keyToString(key);
+  let s = thinkingCoalescers.get(k);
+  if (!s) {
+    s = { pendingHtml: null, inFlight: false, lastSentHtml: null, detachAfterDrain: false };
+    thinkingCoalescers.set(k, s);
+  }
+  return s;
+}
+
+/**
+ * @description Tear down a thread's thinking message + coalescer. Called on
+ * every session-end / takeover path (close, stop, question) so a live
+ * "☁️ thinking …" frame never lingers after the reasoning it described is gone
+ * (mirrors `deleteStatusMessage` for the dedicated thinking id). Best-effort:
+ * the delete is fire-and-forget; the in-memory id/coalescer are cleared
+ * synchronously so a racing emit can't resurrect a stale frame.
+ */
+function clearThinkingMessage(key: ThreadKey): void {
+  const s = getThreadMessageState(key);
+  const coalescer = thinkingCoalescers.get(keyToString(key));
+  if (coalescer) {
+    coalescer.pendingHtml = null;
+    coalescer.lastSentHtml = null;
+    coalescer.detachAfterDrain = false;
+  }
+  // Bump UNCONDITIONALLY (even with no id tracked): a `sendThinkingFrame` create
+  // may be mid-`await` with its id not yet stored. The bump tells that in-flight
+  // create to DISCARD its message instead of resurrecting an orphan.
+  s.thinkingFrameGeneration += 1;
+  if (s.thinkingMessageId === null) return;
+  const id = s.thinkingMessageId;
+  s.thinkingMessageId = null;
+  deleteThreadMessage(key, id, 'status').catch(() => {});
 }
 
 /**
@@ -3677,6 +3769,66 @@ command('effort', async (ctx, key) => {
   );
 });
 
+// ── /thinking — per-topic chain-of-thought verbosity (OpenCode only, S2) ─────
+
+/**
+ * @description Build the `/thinking` mode picker keyboard. One callback button
+ * per mode; the current mode carries a `✓` marker. Shared by the `/thinking`
+ * command (initial render) and the `think_<mode>` callback (re-render after a
+ * press), mirroring `buildEffortKeyboard` so the marker never drifts.
+ */
+function buildThinkingKeyboard(current: ThinkingMode) {
+  const buttons = thinkingModeOptions.map((mode) =>
+    Markup.button.callback(
+      mode === current ? `${t(`thinking.mode.${mode}`)} ✓` : t(`thinking.mode.${mode}`),
+      `think_${mode}`,
+    ),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: thinkingModeOptions.length });
+}
+
+/**
+ * @description Persist a new thinking mode for `key` and apply it best-effort to
+ * the live reasoning stream (it always governs the NEXT one). Shared by the
+ * `/thinking <mode>` direct form and the `think_<mode>` callback so the two
+ * paths can never diverge.
+ */
+async function applyThinkingMode(key: ThreadKey, mode: ThinkingMode): Promise<void> {
+  await state.setDisplayPref(key, 'thinking', mode);
+}
+
+command('thinking', async (ctx, key) => {
+  // OpenCode-only capability gate (like /effort on an unsupported backend):
+  // Claude renders its own thinking in the TUI pane, nothing for the bot to do.
+  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+    await replyToThread(key, t('thinking.opencode_only'));
+    return;
+  }
+
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+  const current = state.getDisplayPrefs(key).thinking;
+
+  if (arg) {
+    if (!checkIsThinkingMode(arg)) {
+      await replyToThread(key, t('thinking.invalid_mode', {
+        mode: arg,
+        valid: thinkingModeOptions.join(', '),
+      }));
+      return;
+    }
+    await applyThinkingMode(key, arg);
+    await replyToThread(key, t('thinking.set_success', { mode: t(`thinking.mode.${arg}`) }));
+    return;
+  }
+
+  // No arg: show current mode + a button per mode.
+  await replyToThread(
+    key,
+    t('thinking.choose', { current: t(`thinking.mode.${current}`) }),
+    buildThinkingKeyboard(current),
+  );
+});
+
 // Manually rename the CURRENT thread's session. Adapter-owned capability
 // (optional method, like /model): OpenCode renames via `PATCH /session/:id`;
 // Claude has no title concept and is told "not supported". Requires a live
@@ -4258,7 +4410,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
-  'doctor', 'mcp', 'rename_session', 'trace', 'schedule',
+  'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking',
 ]);
 
 /**
@@ -5277,6 +5429,44 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
   }
 });
 
+bot.action(/^think_(.+)$/, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  // Same OpenCode-only gate as the command — a stale button on a topic switched
+  // to Claude after the picker was shown must not silently set an unused pref.
+  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+    await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
+    return;
+  }
+  const picked = ctx.match[1];
+  if (!checkIsThinkingMode(picked)) {
+    await ctx.answerCbQuery(t('cb.thinking_error', { error: picked.slice(0, 50) }));
+    return;
+  }
+  await applyThinkingMode(key, picked);
+  await ctx.answerCbQuery(t('cb.thinking_set', { mode: t(`thinking.mode.${picked}`) }));
+
+  // Re-render the picker so the `✓` follows the new mode (mirrors effort_cb).
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  if (cbMsg) {
+    const keyboard = buildThinkingKeyboard(picked);
+    try {
+      await enqueueSend(
+        key,
+        () => bot.telegram.editMessageReplyMarkup(
+          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
+        ),
+        'interactive',
+      );
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+      if (!/message is not modified/i.test(desc)) {
+        console.warn('[think_cb] keyboard re-render failed:', desc || e);
+      }
+    }
+  }
+});
+
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
@@ -5483,6 +5673,15 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     // state instead of a growing wall of intermediate percentages.
     handleAgentStatus(key, collapseProgressChunk(output));
     return;
+  }
+
+  // The real answer is starting → resolve the thinking message per mode. Only
+  // `hide` removes its live indicator now (nothing should remain); `detailed` /
+  // `brief` leave their persisted message in place. No-op when no thinking
+  // message exists (non-OpenCode threads, or a turn without reasoning).
+  if (getThreadMessageState(key).thinkingMessageId !== null) {
+    const thinkingMode = state.getDisplayPrefs(key).thinking;
+    if (getThinkingAnswerStartAction(thinkingMode) === 'delete') clearThinkingMessage(key);
   }
 
   // Real output supersedes any not-yet-sent status frame. Without this,
@@ -5699,6 +5898,174 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
   return landed;
 }
 
+// ── Thinking (chain-of-thought) lifecycle — OpenCode (#1, #6) ────────────────
+//
+// SINGLE OWNER of the dedicated `thinkingMessageId`, kept separate from
+// `statusMessageId` so the live "☁️ thinking …" indicator persists across tool
+// status churn. The adapter emits a mode-AGNOSTIC `thinking` event; the bot
+// applies the per-thread mode (`state.getDisplayPrefs(key).thinking`). The live
+// indicator shows in ALL modes — the mode only controls what remains after
+// reasoning ends. See `utils/thinkingRender.ts` for the pure mode×phase matrix.
+
+/** Headroom (chars) reserved above the per-message cap for the rendered cloud
+ * header + the truncation marker when a long `detailed` reasoning body must be
+ * tail-trimmed to fit one editable message. */
+const thinkingDetailedHeaderHeadroom = 200;
+
+/**
+ * @description Render the thinking-frame body for a mode×phase, ready to pass to
+ * `renderAgentHtml`. Pure-ish (only reads i18n): the live label is identical in
+ * all modes; `detailed` appends the accumulated reasoning text (tail-trimmed to
+ * one message); `done` collapses to the "💭 thought for {N}s" line for `brief`.
+ */
+function buildThinkingFrameText(mode: ThinkingMode, payload: ThinkingEvent): string {
+  if (payload.phase === 'done') {
+    // Only `brief` collapses to a duration line here; `detailed` keeps its last
+    // live body (the caller does not re-render on `keep`).
+    const seconds = formatThinkingDurationSeconds(payload.durationMs ?? 0);
+    return t('thinking.thoughtForSeconds', { seconds: seconds.toString() });
+  }
+  const header = t('thinking.live');
+  if (mode !== 'detailed' || !payload.text.trim()) return header;
+  // Detailed: header + the accumulated reasoning. Keep the TAIL (the most
+  // recent reasoning, what is "currently" streaming) when it overflows one
+  // message, with a leading "…" so the trim is visible.
+  const bodyBudget = MAX_MESSAGE_LEN - thinkingDetailedHeaderHeadroom;
+  let body = payload.text;
+  if (body.length > bodyBudget) body = `…${body.slice(body.length - bodyBudget)}`;
+  return `${header}\n\n${body}`;
+}
+
+/**
+ * @description Adapter `thinking` event entry point. Reads the per-thread
+ * {@link ThinkingMode}, decides the action via the pure
+ * {@link getThinkingEventAction}, and drives the dedicated thinking message.
+ *
+ * - `editLiveLabel` / `editLiveDetailed` → coalesced live edit of one message.
+ * - `collapseToDuration` → final edit to "💭 thought for {N}s", then persist.
+ * - `keep` → leave the message as-is (detailed done), persist.
+ *
+ * "Persist" means clear `thinkingMessageId` so the NEXT response starts a fresh
+ * thinking message — the existing one stays in the chat untouched.
+ */
+function handleAgentThinking(key: ThreadKey, payload: ThinkingEvent): void {
+  traceAgentEmit('thinking', key, payload.text);
+  const mode = state.getDisplayPrefs(key).thinking;
+  const action = getThinkingEventAction(mode, payload.phase);
+
+  if (action === 'keep') {
+    // Detailed done: nothing to send — the last live frame already shows the
+    // full reasoning. Detach the id so the next response opens a fresh message.
+    finishThinkingMessage(key);
+    return;
+  }
+
+  if (action === 'holdForAnswer') {
+    // Hide done: leave the live indicator AND keep its id tracked so the
+    // answer-start trigger (`handleAgentOutput`) can delete it. Nothing to send.
+    return;
+  }
+
+  // `editLiveLabel` / `editLiveDetailed` (live) and `collapseToDuration` (brief
+  // done) all SEND a frame. The brief-done frame is terminal: the flush detaches
+  // the id only AFTER editing the collapse onto the same message.
+  const frameText = buildThinkingFrameText(mode, payload);
+  queueThinkingFrame(key, frameText, action === 'collapseToDuration');
+}
+
+/**
+ * @description Detach the tracked thinking message id WITHOUT deleting the
+ * message — it stays in the chat as the persisted reasoning record. The next
+ * response's first `thinking` frame then creates a brand-new message. The
+ * in-flight coalescer keeps the id it captured, so a frame still being sent
+ * finishes against the right message.
+ */
+function finishThinkingMessage(key: ThreadKey): void {
+  getThreadMessageState(key).thinkingMessageId = null;
+  const coalescer = thinkingCoalescers.get(keyToString(key));
+  // Drop the dedup baseline so the NEXT response's first frame is never skipped
+  // as "identical" against this response's last frame.
+  if (coalescer) coalescer.lastSentHtml = null;
+}
+
+/**
+ * @description Park the latest thinking frame in the coalescer and (re)start the
+ * single-flight flush loop. Newest frame always wins; at most one edit is in
+ * flight per thread. `isTerminal` marks the brief-mode collapse frame — after it
+ * drains, the flush detaches the tracked id so the next response is fresh.
+ */
+function queueThinkingFrame(key: ThreadKey, frameText: string, isTerminal: boolean): void {
+  const c = getThinkingCoalesceState(key);
+  c.pendingHtml = renderAgentHtml(frameText);
+  if (isTerminal) c.detachAfterDrain = true;
+  if (!c.inFlight) void flushThinkingCoalescer(key);
+}
+
+/**
+ * @description Drain the per-thread thinking coalescer: edit (or create) the
+ * single thinking message with the latest pending frame. Identical frames are
+ * skipped (no `400 "message is not modified"`); intermediate frames that arrive
+ * during a send are dropped (the loop only sees the latest on its next pass).
+ * When `detachAfterDrain` is armed (brief-mode collapse), the tracked id is
+ * detached only AFTER the final frame is edited onto the same message.
+ */
+async function flushThinkingCoalescer(key: ThreadKey): Promise<void> {
+  const c = getThinkingCoalesceState(key);
+  if (c.inFlight) return;
+  c.inFlight = true;
+  try {
+    while (c.pendingHtml !== null) {
+      const html = c.pendingHtml;
+      c.pendingHtml = null;
+      if (html === c.lastSentHtml) continue;
+      const sent = await sendThinkingFrame(key, html);
+      if (sent) c.lastSentHtml = html;
+    }
+    if (c.detachAfterDrain) {
+      c.detachAfterDrain = false;
+      finishThinkingMessage(key);
+    }
+  } finally {
+    c.inFlight = false;
+  }
+}
+
+/**
+ * @description Edit the thread's thinking message in place, or create it on the
+ * first frame. The frame is pre-rendered HTML (one message — `detailed` bodies
+ * are tail-trimmed to fit). Returns `true` when the frame reached Telegram.
+ */
+async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<boolean> {
+  const msgState = getThreadMessageState(key);
+  try {
+    if (msgState.thinkingMessageId !== null) {
+      const editId = msgState.thinkingMessageId;
+      const ok = await editThreadMessage(key, editId, renderedHtml, { parse_mode: 'HTML' }, 'status');
+      // A clear (session end / takeover) may have nulled the id mid-edit — only
+      // treat the edit as live if the id still points at the message we edited.
+      if (ok && msgState.thinkingMessageId === editId) return true;
+      if (!ok && msgState.thinkingMessageId === editId) msgState.thinkingMessageId = null;
+      return false;
+    }
+    // Create the first frame. Capture the generation BEFORE the send: a
+    // `clearThinkingMessage` racing this create bumps it, so we delete the
+    // just-created message instead of resurrecting it as an orphan under a
+    // "session ended" / question UI (the leftover-frame guard).
+    const generationAtStart = msgState.thinkingFrameGeneration;
+    const id = await replyChunkWithFallback(key, renderedHtml, renderedHtml, 'status');
+    if (id === null) return false;
+    if (msgState.thinkingFrameGeneration !== generationAtStart) {
+      await deleteThreadMessage(key, id, 'status');
+      return false;
+    }
+    msgState.thinkingMessageId = id;
+    return true;
+  } catch (err) {
+    console.error('[sendThinkingFrame] Failed:', err);
+    return false;
+  }
+}
+
 // ── Claude liveness loop (bug #11) ──────────────────────────────────────────
 //
 // SINGLE OWNER of the "recreate/keep-alive while busy" half of the
@@ -5837,6 +6204,9 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   stopClaudeLiveness(key);
   getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
+  // The question UI takes over — remove any live thinking frame so it doesn't
+  // sit above the prompt (it would otherwise persist past the answer).
+  clearThinkingMessage(key);
   deleteLoaderMessage(key).catch(() => {});
 
   // Audit S13 / #31: register the pending question BEFORE the async
@@ -5967,6 +6337,9 @@ function handleAgentClosed(key: ThreadKey): void {
   // the close (it would otherwise outlive the session via its self-re-arm).
   stopClaudeLiveness(key);
   deleteStatusMessage(key).catch(() => {});
+  // A closed session won't finish reasoning — remove a live thinking frame so it
+  // doesn't linger above the "session ended" notice.
+  clearThinkingMessage(key);
   clearPendingQuestion(key);
   pendingSurveys.delete(keyToString(key));
   // A closed session has nothing to resume — drop any armed retry silently.
@@ -5983,6 +6356,7 @@ function handleAgentError(key: ThreadKey, error: Error): void {
   stopClaudeLiveness(key);
   getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
+  clearThinkingMessage(key);
   clearPendingQuestion(key);
   replyToThread(key, `Error: ${error.message}`).catch(() => {});
 }
@@ -6012,6 +6386,9 @@ function handleAgentStopped(key: ThreadKey): void {
   // timer first prevents it from recreating the frame right after this delete.
   stopClaudeLiveness(key);
   deleteStatusMessage(key).catch(() => {});
+  // A stopped session is idle — a lingering "thinking …" frame would be a stuck
+  // indicator, same rationale as the status frame above.
+  clearThinkingMessage(key);
   // Session ended — a future session starts with empty context, so forget the
   // last-injected thread-context preamble; the next prompt re-carries it.
   clearThreadContextMarker(key);
@@ -6041,6 +6418,7 @@ const COMMANDS_MENU = [
   { command: 'clear_session', description: '🆕 Restart session (alias /new)' },
   { command: 'model', description: '🧠 Switch model' },
   { command: 'effort', description: '⚙️ Reasoning effort' },
+  { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
@@ -6447,6 +6825,7 @@ export async function startBot(): Promise<void> {
     onStatus: handleAdapterStatus,
     onQuestion: handleAgentQuestion,
     onSurvey: handleAgentSurvey,
+    onThinking: handleAgentThinking,
     onApiError: handleApiError,
     onClosed: handleAgentClosed,
     onStarted: handleAgentStarted,

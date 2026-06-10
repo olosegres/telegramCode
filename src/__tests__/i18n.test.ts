@@ -224,6 +224,30 @@ test('schedule.forwardPromptTemplate substitutes {text} verbatim (markdown + quo
   assert.ok(!out.includes('{text}'), `placeholder not substituted: "${out}"`);
 });
 
+test('thinking (/thinking) keys exist in every locale (S2)', () => {
+  for (const code of [
+    'thinking.live',
+    'thinking.thoughtForSeconds',
+    'thinking.choose',
+    'thinking.set_success',
+    'thinking.invalid_mode',
+    'thinking.opencode_only',
+    'thinking.mode.detailed',
+    'thinking.mode.brief',
+    'thinking.mode.hide',
+    'cb.thinking_set',
+    'cb.thinking_error',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('thinking.thoughtForSeconds substitutes the {seconds} count', () => {
+  const out = t('thinking.thoughtForSeconds', { seconds: 12 });
+  assert.ok(out.includes('12'), `expected the seconds in "${out}"`);
+  assert.ok(!out.includes('{seconds}'), `placeholder not substituted: "${out}"`);
+});
+
 test('t falls back to last code segment for unknown key', () => {
   const out = t('nonexistent.key.path');
   assert.equal(out, 'path');

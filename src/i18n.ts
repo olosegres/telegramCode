@@ -244,6 +244,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'effort.unsupported_backend': 'Управление effort не поддерживается для {label}.',
     'effort.no_session': 'Агент не запущен. Сначала /claude или /opencode.',
 
+    // ── /thinking (chain-of-thought verbosity, OpenCode only) ──
+    // Live indicator + collapsed line shown in the topic. Mode names are also
+    // used on the picker buttons. {seconds}=reasoning duration, {mode}=mode name.
+    'thinking.live': '☁️ думаю …',
+    'thinking.thoughtForSeconds': '💭 думал {seconds} с',
+    'thinking.choose': '☁️ Текущий режим размышлений: {current}\nВыбери режим:',
+    'thinking.set_success': '✅ Режим размышлений: {mode}',
+    'thinking.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
+    'thinking.opencode_only': 'ℹ️ /thinking доступен только для OpenCode (Claude показывает размышления в своём TUI).',
+    'thinking.mode.detailed': 'подробно',
+    'thinking.mode.brief': 'кратко',
+    'thinking.mode.hide': 'скрыть',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
     'model.start_agent_first': 'Нет активной сессии. Сначала запусти агента.',
@@ -317,6 +330,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.survey_answered': 'Отправлено: {label}',
     'cb.effort_set': 'Effort: {level}',
     'cb.effort_error': 'Ошибка: {error}',
+    'cb.thinking_set': 'Размышления: {mode}',
+    'cb.thinking_error': 'Ошибка: {error}',
 
     // ── session picker (/sessions, /resume). {label}=агент, {max}=кол-во, {error}=причина ──
     'session.list_header': 'Сессии для возобновления ({label}):',
@@ -581,6 +596,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'effort.unsupported_backend': 'Effort control is not supported for {label}.',
     'effort.no_session': 'No agent running. Start one with /claude or /opencode.',
 
+    // ── /thinking (chain-of-thought verbosity, OpenCode only) ──
+    // Live indicator + collapsed line shown in the topic. Mode names are also
+    // used on the picker buttons. {seconds}=reasoning duration, {mode}=mode name.
+    'thinking.live': '☁️ thinking …',
+    'thinking.thoughtForSeconds': '💭 thought for {seconds}s',
+    'thinking.choose': '☁️ Current thinking mode: {current}\nPick a mode:',
+    'thinking.set_success': '✅ Thinking mode: {mode}',
+    'thinking.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
+    'thinking.opencode_only': 'ℹ️ /thinking is OpenCode-only (Claude renders thinking in its own TUI).',
+    'thinking.mode.detailed': 'detailed',
+    'thinking.mode.brief': 'brief',
+    'thinking.mode.hide': 'hide',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Model saved: {model} — applies on next agent start.',
     'model.start_agent_first': 'No active session. Start an agent first.',
@@ -647,6 +675,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.survey_answered': 'Sent: {label}',
     'cb.effort_set': 'Effort: {level}',
     'cb.effort_error': 'Error: {error}',
+    'cb.thinking_set': 'Thinking: {mode}',
+    'cb.thinking_error': 'Error: {error}',
 
     // ── session picker (/sessions, /resume). {label}=agent, {max}=count, {error}=reason ──
     'session.list_header': 'Sessions to resume ({label}):',

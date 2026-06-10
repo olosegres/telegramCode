@@ -279,6 +279,43 @@ export interface OutputEventMeta {
 }
 
 /**
+ * @description Lifecycle phase of a {@link ThinkingEvent}.
+ *
+ * - `live` → the agent is actively reasoning; the bot shows the live
+ *   "thinking …" indicator (and, in `detailed` mode, the accumulated text).
+ * - `done` → reasoning ended for this response; `durationMs` is how long it
+ *   took, used to render the collapsed "thought for {N}s" line in `brief` mode.
+ */
+export type ThinkingPhase = 'live' | 'done';
+
+/**
+ * @description Payload of the adapter `thinking` event — a chain-of-thought
+ * lifecycle signal for ONE response. Emitted on a DEDICATED channel (not the
+ * generic `status` coalescer) so the thinking indicator can persist
+ * independently of transient tool status.
+ *
+ * The adapter stays MODE-AGNOSTIC: it emits the raw accumulated reasoning text
+ * and the phase, and the BOT applies the per-thread {@link ThinkingMode} (which
+ * controls only what remains AFTER reasoning ends). Reasoning text is kept
+ * SEPARATE from the answer accumulator and never leaks into `output`.
+ */
+export interface ThinkingEvent {
+  /** Lifecycle phase of this emit. */
+  phase: ThinkingPhase;
+  /**
+   * Reasoning text accumulated so far for this response. Grows across `live`
+   * emits; carried on `done` too so a late-arriving `detailed`-mode render has
+   * the full text. Empty until the first reasoning delta produces content.
+   */
+  text: string;
+  /**
+   * How long reasoning took, in ms. Present only on the `done` phase — the bot
+   * formats it into the collapsed "thought for {N}s" line for `brief` mode.
+   */
+  durationMs?: number;
+}
+
+/**
  * @description One option of a Claude CLI bare-digit survey (e.g. the periodic
  * session-feedback prompt: `1: Bad  2: Fine  3: Good  0: Dismiss`). The TUI
  * submits on the bare digit alone — no Enter — so `digit` is exactly the
@@ -327,6 +364,7 @@ export interface SendInputOptions {
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
  * - 'survey'   (key: ThreadKey, survey: ClaudeSurveyEvent) — Claude CLI bare-digit survey to render with answerable buttons
+ * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread {@link ThinkingMode}
  * - 'apiError' (key: ThreadKey, error: AgentApiErrorClass) — provider-side API error at the proxy boundary (auto-retry trigger; only when {@link AgentApiErrorClass} classification matched)
  * - 'started'  (key: ThreadKey)                  — session is up and ready
  * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)

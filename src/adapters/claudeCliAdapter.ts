@@ -29,6 +29,12 @@ import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
 import { getEffortStartupKeystroke } from '../utils/effortStartupKeystroke';
+import {
+  createRecentRelayWindow,
+  getRelayDedupedChunk,
+  normalizeForComparison,
+  type RecentRelayWindow,
+} from '../utils/recentRelayWindow';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -146,6 +152,20 @@ interface ClaudeSession {
    * process kept its in-TUI effort and may be mid-turn).
    */
   pendingEffortReapply: string | null;
+  /**
+   * Long-horizon dedup of lines already RELAYED to this topic (incident
+   * 2026-06-10: a TUI re-render of an hours-old ~1400-line diff re-relayed as
+   * a ~12-message flood — {@link getNewPaneContent} only knows the previous
+   * capture, so a redraw of old scrollback looks "new" to it). The poll loop
+   * filters every diff chunk through this window before emitting and records
+   * a chunk ONLY when it was emitted as permanent output (status frames roll
+   * in place; questions/surveys carry their own signature de-dup). Fresh per
+   * session object (start / resume / adopt), dies with the session on stop,
+   * and reset again when resume seeding ends — the window must start empty
+   * AFTER the restored transcript was swallowed. See
+   * `utils/recentRelayWindow.ts` for the locked drop-over-resend tradeoff.
+   */
+  recentRelayWindow: RecentRelayWindow;
 }
 
 /**
@@ -2259,14 +2279,9 @@ const CLAUDE_INTERRUPT_POLL_MS = 100;
  */
 const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
 
-/**
- * @description Normalise a pane line for the line-set diff: trim, drop a
- * leading status/tool glyph so a tool header is matched regardless of which
- * `●/○/⏳/✓` state it was last rendered in.
- */
-function normalizeForComparison(line: string): string {
-  return line.trim().replace(/^[●○⏳✓]\s*/, '');
-}
+// `normalizeForComparison` moved to `utils/recentRelayWindow.ts` (imported
+// above): the per-poll set diff below and the long-horizon relay window MUST
+// share one normalization domain, so the normalizer lives with the window.
 
 /**
  * @description Diff a freshly-captured pane against the last one and return
@@ -2406,6 +2421,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'currentPollDelayMs'
       | 'unchangedPollStreak'
       | 'pendingEffortReapply'
+      | 'recentRelayWindow'
     >,
   ): ClaudeSession {
     return {
@@ -2438,6 +2454,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S7: armed explicitly by `applyStoredEffortOnSpawn` after a fresh
       // start/resume spawn; adopt/reattach leaves it null (no re-apply).
       pendingEffortReapply: null,
+      // Every fresh session object (start / resume / adopt all flow through
+      // here) begins with an EMPTY relay window — this IS the "reset on
+      // session start"; stop deletes the session and the window with it.
+      recentRelayWindow: createRecentRelayWindow(),
     };
   }
 
@@ -3416,6 +3436,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       this.handleAutoLifecycle(session, content, getNewPaneContent('', content));
       if (!decision.keepSeeding) {
         session.resumeSeeding = false;
+        // The relay window must start EMPTY here: seeding SWALLOWED the
+        // restored transcript (it was never relayed this lifetime), and the
+        // window only ever suppresses content it actually relayed. Seeding
+        // emits no output so nothing was recorded — the reset keeps that
+        // invariant explicit rather than incidental.
+        session.recentRelayWindow.reset();
         console.log(`[Claude] resume seeding done after ${session.resumeSeedPolls} polls`);
       }
       return;
@@ -3490,39 +3516,57 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
             session.lastSurveySignature = '';
           }
 
-          // Thread the tool-result kind across polls: the owning `● Bash(…)`
-          // header of a slow command's output streamed in an earlier poll (the
-          // line-set diff drops it as a duplicate), so `session.openToolKind`
-          // carries it forward to fence the orphan `⎿` body (B2). Tracked via
-          // the clean deltas, not a scan of the racy live pane.
-          const stripped = stripTuiElementsWithContext(newPart, session.openToolKind);
-          session.openToolKind = stripped.toolKind;
-          const cleanedOutput = stripped.text;
-          if (cleanedOutput && checkIsInputEchoFrame(cleanedOutput)) {
-            // B7: the frame is just the input box echoing a typed draft —
-            // relaying it reads as a ghost message in the topic.
-            console.log(`[Claude] input-echo frame filtered`);
-          } else if (cleanedOutput) {
-            // S4: gated full body (see the RAW dump above for the rationale).
-            console.log(
-              isClaudeScrapeDebugEnabled
-                ? `[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`
-                : `[Claude] FILTERED output (${cleanedOutput.length} chars)`,
-            );
+          // Long-horizon re-render dedup (live incident 2026-06-10, plan
+          // 2026-06-10-claude-stale-rescrape-dedup): the per-poll diff above
+          // only knows the PREVIOUS capture, so when the TUI re-renders
+          // hours-old scrollback (full repaint / scroll-through / resize) the
+          // redrawn lines arrive here as "new" and would be re-relayed as a
+          // duplicate flood. Drop every line already relayed to this topic;
+          // when nothing survives, skip the poll's emit entirely.
+          const relayablePart = getRelayDedupedChunk(session.recentRelayWindow, newPart);
+          if (!relayablePart) {
+            console.log(`[Claude] already-relayed re-render suppressed (${newPart.length} chars)`);
+          } else {
+            // Thread the tool-result kind across polls: the owning `● Bash(…)`
+            // header of a slow command's output streamed in an earlier poll (the
+            // line-set diff drops it as a duplicate), so `session.openToolKind`
+            // carries it forward to fence the orphan `⎿` body (B2). Tracked via
+            // the clean deltas, not a scan of the racy live pane.
+            const stripped = stripTuiElementsWithContext(relayablePart, session.openToolKind);
+            session.openToolKind = stripped.toolKind;
+            const cleanedOutput = stripped.text;
+            if (cleanedOutput && checkIsInputEchoFrame(cleanedOutput)) {
+              // B7: the frame is just the input box echoing a typed draft —
+              // relaying it reads as a ghost message in the topic.
+              console.log(`[Claude] input-echo frame filtered`);
+            } else if (cleanedOutput) {
+              // S4: gated full body (see the RAW dump above for the rationale).
+              console.log(
+                isClaudeScrapeDebugEnabled
+                  ? `[Claude] FILTERED output (${cleanedOutput.length}):\n---\n${cleanedOutput}\n---`
+                  : `[Claude] FILTERED output (${cleanedOutput.length} chars)`,
+              );
 
-            if (checkIsStatusOutput(cleanedOutput)) {
-              // Deduplicate spinner updates: normalize spinner character and compare
-              const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
-              if (normalized !== session.lastStatusText) {
-                session.lastStatusText = normalized;
-                this.emit('status', key, cleanedOutput);
+              if (checkIsStatusOutput(cleanedOutput)) {
+                // Deduplicate spinner updates: normalize spinner character and compare
+                const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
+                if (normalized !== session.lastStatusText) {
+                  session.lastStatusText = normalized;
+                  this.emit('status', key, cleanedOutput);
+                }
+              } else {
+                session.lastStatusText = '';
+                // Record in the PANE-line domain (pre-strip): a future
+                // re-render arrives as pane lines, so the window must store
+                // the same shape the filter above queries. Permanent output
+                // only — status frames roll/are edited in place and never
+                // flood as separate messages.
+                session.recentRelayWindow.record(relayablePart);
+                this.emit('output', key, cleanedOutput);
               }
             } else {
-              session.lastStatusText = '';
-              this.emit('output', key, cleanedOutput);
+              console.log(`[Claude] Output filtered out completely`);
             }
-          } else {
-            console.log(`[Claude] Output filtered out completely`);
           }
         }
       }

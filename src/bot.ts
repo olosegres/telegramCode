@@ -104,6 +104,7 @@ import {
   subagentModeOptions,
   checkIsSubagentMode,
 } from './utils/subagentRender';
+import { createSerialQueue, type SerialQueue } from './utils/serialQueue';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
@@ -585,9 +586,40 @@ function clearPendingQuestion(key: ThreadKey): void {
 interface QuestionRepostState {
   wasLastSendTheQuestion: boolean;
   repostTimer: NodeJS.Timeout | null;
+  /**
+   * True while {@link postPendingQuestionAt} is between starting its send and
+   * storing the new `messageId`. The re-post path must not run in that window:
+   * it would read the PREVIOUS question's `messageId` and delete the wrong
+   * message (live race 2026-06-10 — answered-Q1 "✅" deleted, Q2 duplicated).
+   */
+  isPostInFlight: boolean;
 }
 
 const questionRepostStates = new Map<string, QuestionRepostState>();
+
+/**
+ * Per-thread serial queues for QUESTION-LIFECYCLE transitions (initial post,
+ * re-post-to-bottom, answer→advance→post-next). Each transition spans several
+ * awaited sends through the rate-limited send queue, so two transitions
+ * running concurrently interleave across SECONDS — live race 2026-06-10: a
+ * re-post armed by output below the question executed its delete AFTER the
+ * user had already answered, removing the message the answer path was about
+ * to ✅-edit ("message to edit not found") and orphaning/duplicating posts.
+ * Serializing the transitions makes each one see the other's COMPLETED state.
+ * Entries are tiny (an idle queue holds one resolved promise) and bounded by
+ * the number of topics, so they are never evicted.
+ */
+const questionLifecycleQueues = new Map<string, SerialQueue>();
+
+function runQuestionLifecycleOp<T>(key: ThreadKey, op: () => Promise<T>): Promise<T> {
+  const kStr = keyToString(key);
+  let queue = questionLifecycleQueues.get(kStr);
+  if (!queue) {
+    queue = createSerialQueue();
+    questionLifecycleQueues.set(kStr, queue);
+  }
+  return queue.run(op);
+}
 
 /**
  * Debounce window for the S3 re-post: a busy sub-agent streams many chunks back
@@ -600,7 +632,7 @@ function getQuestionRepostState(key: ThreadKey): QuestionRepostState {
   const kStr = keyToString(key);
   let s = questionRepostStates.get(kStr);
   if (!s) {
-    s = { wasLastSendTheQuestion: false, repostTimer: null };
+    s = { wasLastSendTheQuestion: false, repostTimer: null, isPostInFlight: false };
     questionRepostStates.set(kStr, s);
   }
   return s;
@@ -638,6 +670,7 @@ function onThreadActivityWhileQuestionPending(key: ThreadKey): void {
   if (!checkShouldRepostPendingQuestion({
     isQuestionPending: true,
     wasLastSendTheQuestion: s.wasLastSendTheQuestion,
+    isQuestionPostInFlight: s.isPostInFlight,
   })) {
     return;
   }
@@ -658,16 +691,25 @@ function onThreadActivityWhileQuestionPending(key: ThreadKey): void {
  * fire time, since the debounce window may have closed the gap).
  */
 async function repostPendingQuestionToBottom(key: ThreadKey): Promise<void> {
-  const kStr = keyToString(key);
-  const pending = pendingQuestions.get(kStr);
-  if (!pending) return;
-  const s = getQuestionRepostState(key);
-  if (s.wasLastSendTheQuestion) return; // already at the bottom — nothing to do
-  const oldMessageId = pending.messageId;
-  if (oldMessageId !== null) {
-    await deleteThreadMessage(key, oldMessageId);
-  }
-  await postPendingQuestionAt(key);
+  // Serialized with the other lifecycle transitions; all guards re-read state
+  // INSIDE the critical section, since the world may have moved on between
+  // the debounce arming and this op's turn in the queue.
+  await runQuestionLifecycleOp(key, async () => {
+    const kStr = keyToString(key);
+    const pending = pendingQuestions.get(kStr);
+    if (!pending) return;
+    const s = getQuestionRepostState(key);
+    if (s.wasLastSendTheQuestion) return; // already at the bottom — nothing to do
+    // A post that started during the debounce window owns `messageId` —
+    // deleting based on the stale value would remove the previous (answered)
+    // question's message (the live 2026-06-10 race).
+    if (s.isPostInFlight) return;
+    const oldMessageId = pending.messageId;
+    if (oldMessageId !== null) {
+      await deleteThreadMessage(key, oldMessageId);
+    }
+    await postPendingQuestionAt(key);
+  });
 }
 
 // ── auto-retry after a provider-side API error (plan S4/S5/S6) ──
@@ -5826,6 +5868,14 @@ bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
  * locally instead of closing the request on the first answer with empties.
  */
 async function applyQuestionAnswer(key: ThreadKey, answerForCurrent: string[]): Promise<void> {
+  // Serialized: an in-flight re-post (delete+re-send) must fully finish before
+  // the answer reads `messageId` for its ✅-edit — otherwise the edit targets
+  // a message the re-post just deleted (live 2026-06-10: "message to edit not
+  // found" + the next question never reached the topic).
+  await runQuestionLifecycleOp(key, () => applyQuestionAnswerInner(key, answerForCurrent));
+}
+
+async function applyQuestionAnswerInner(key: ThreadKey, answerForCurrent: string[]): Promise<void> {
   const kStr = keyToString(key);
   const pending = pendingQuestions.get(kStr);
   if (!pending) return;
@@ -6508,7 +6558,7 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
     currentIndex: 0,
   });
 
-  void postPendingQuestionAt(key);
+  void runQuestionLifecycleOp(key, () => postPendingQuestionAt(key));
 }
 
 /**
@@ -6534,6 +6584,19 @@ async function postPendingQuestionAt(key: ThreadKey): Promise<void> {
   const qIdx = pending.currentIndex;
   const question = pending.data.questions[qIdx];
   if (!question) return;
+
+  // Single owner of `messageId` per transition: this post is about to put the
+  // question at the bottom, so any armed re-post is moot — and a re-post that
+  // fired DURING our send would read the previous question's `messageId` and
+  // delete the wrong message (live race 2026-06-10: the answered-Q1 "✅"
+  // confirmation vanished and Q2 was posted twice). Cancel the timer and hold
+  // the in-flight flag until the new id is stored.
+  const repostState = getQuestionRepostState(key);
+  if (repostState.repostTimer) {
+    clearTimeout(repostState.repostTimer);
+    repostState.repostTimer = null;
+  }
+  repostState.isPostInFlight = true;
 
   const buttons = question.options.map((opt, optIdx) => {
     const label = opt.label.length > 40 ? opt.label.slice(0, 37) + '...' : opt.label;
@@ -6572,10 +6635,18 @@ async function postPendingQuestionAt(key: ThreadKey): Promise<void> {
         existing.messageId = messageId;
         setPendingQuestion(key, existing);
         markQuestionMessageSent(key, messageId);
+      } else {
+        // The question advanced / was answered while our send sat in the
+        // queue (a fast digit reply can beat the post — seen live 2026-06-10:
+        // a stale unanswered-looking "❓" landed and lingered). The message we
+        // just sent describes a question that no longer exists — remove it.
+        void deleteThreadMessage(key, messageId);
       }
     }
   } catch (err) {
     console.error('[postPendingQuestionAt] Failed:', err);
+  } finally {
+    repostState.isPostInFlight = false;
   }
 }
 

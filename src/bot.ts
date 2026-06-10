@@ -20,10 +20,11 @@ import {
   getAvailableAdapters,
   getDefaultAdapterName,
   registerAdapterEventHandlers,
+  registerSubagentModeReader,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ThinkingEvent, ThinkingMode, ToolResultEvent, ToolResultMode } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, SubagentMode, ThinkingEvent, ThinkingMode, ToolResultEvent, ToolResultMode } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -98,6 +99,11 @@ import {
   toolResultModeOptions,
   checkIsToolResultMode,
 } from './utils/toolResultRender';
+import {
+  buildSubagentOutputPrefix,
+  subagentModeOptions,
+  checkIsSubagentMode,
+} from './utils/subagentRender';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
@@ -3898,6 +3904,68 @@ command('tool_results', async (ctx, key) => {
   );
 });
 
+// ── /subagent — per-topic sub-agent transcript verbosity (OpenCode only, S4) ─
+// 2-state by design (compact|full) — NO hide mode: the user always wants the
+// "working" indicator visible (locked decision).
+
+/**
+ * @description Build the `/subagent` mode picker keyboard. One callback button
+ * per mode; the current mode carries a `✓` marker. Shared by the command
+ * (initial render) and the `subag_<mode>` callback (re-render after a press),
+ * mirroring `buildToolResultsKeyboard` so the marker never drifts.
+ */
+function buildSubagentKeyboard(current: SubagentMode) {
+  const buttons = subagentModeOptions.map((mode) =>
+    Markup.button.callback(
+      mode === current ? `${t(`subagent.mode.${mode}`)} ✓` : t(`subagent.mode.${mode}`),
+      `subag_${mode}`,
+    ),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: subagentModeOptions.length });
+}
+
+/**
+ * @description Persist a new sub-agent mode for `key` — the adapter reads it
+ * per child event (the injected reader), so a delegation already streaming
+ * picks the change up immediately. Shared by the `/subagent <mode>` direct
+ * form and the `subag_<mode>` callback so the two paths can never diverge.
+ */
+async function applySubagentMode(key: ThreadKey, mode: SubagentMode): Promise<void> {
+  await state.setDisplayPref(key, 'subagent', mode);
+}
+
+command('subagent', async (ctx, key) => {
+  // OpenCode-only capability gate (like /tool_results): Claude renders
+  // sub-agents in its own TUI pane, nothing for the bot to do.
+  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+    await replyToThread(key, t('subagent.opencode_only'));
+    return;
+  }
+
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+  const current = state.getDisplayPrefs(key).subagent;
+
+  if (arg) {
+    if (!checkIsSubagentMode(arg)) {
+      await replyToThread(key, t('subagent.invalid_mode', {
+        mode: arg,
+        valid: subagentModeOptions.join(', '),
+      }));
+      return;
+    }
+    await applySubagentMode(key, arg);
+    await replyToThread(key, t('subagent.set_success', { mode: t(`subagent.mode.${arg}`) }));
+    return;
+  }
+
+  // No arg: show current mode + a button per mode.
+  await replyToThread(
+    key,
+    t('subagent.choose', { current: t(`subagent.mode.${current}`) }),
+    buildSubagentKeyboard(current),
+  );
+});
+
 // Manually rename the CURRENT thread's session. Adapter-owned capability
 // (optional method, like /model): OpenCode renames via `PATCH /session/:id`;
 // Claude has no title concept and is told "not supported". Requires a live
@@ -4480,6 +4548,7 @@ const botCommands = new Set([
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
+  'subagent',
 ]);
 
 /**
@@ -5574,6 +5643,44 @@ bot.action(/^toolres_(.+)$/, async (ctx) => {
   }
 });
 
+bot.action(/^subag_(.+)$/, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  // Same OpenCode-only gate as the command — a stale button on a topic switched
+  // to Claude after the picker was shown must not silently set an unused pref.
+  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+    await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
+    return;
+  }
+  const picked = ctx.match[1];
+  if (!checkIsSubagentMode(picked)) {
+    await ctx.answerCbQuery(t('cb.subagent_error', { error: picked.slice(0, 50) }));
+    return;
+  }
+  await applySubagentMode(key, picked);
+  await ctx.answerCbQuery(t('cb.subagent_set', { mode: t(`subagent.mode.${picked}`) }));
+
+  // Re-render the picker so the `✓` follows the new mode (mirrors toolres_cb).
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  if (cbMsg) {
+    const keyboard = buildSubagentKeyboard(picked);
+    try {
+      await enqueueSend(
+        key,
+        () => bot.telegram.editMessageReplyMarkup(
+          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
+        ),
+        'interactive',
+      );
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+      if (!/message is not modified/i.test(desc)) {
+        console.warn('[subag_cb] keyboard re-render failed:', desc || e);
+      }
+    }
+  }
+});
+
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
@@ -5761,6 +5868,19 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
   console.log(`[Bot] output ${keyToString(key)} (${output.length}): ${output.slice(0, 100)}...`);
   if (!output.trim()) return;
   traceAgentEmit('output', key, output);
+
+  // Sub-agent chunk (`/subagent full`, S4): render it visibly marked and
+  // OUTSIDE the parent reply's edit-in-place continuation chain — it must
+  // never become `lastMessageId`/`lastMessageText` or flip `needsNewMessage`
+  // (a child transcript as the continuation base would corrupt the parent's
+  // accounting). Each flush is its own marked message (the prefix rides the
+  // first chunk of a long split) — acceptable v1, `full` mode is opt-in. It
+  // also deliberately does NOT delete the status frame: the parent is still
+  // mid-turn while its sub-agent streams.
+  if (meta?.isSubagent) {
+    void sendStandaloneAgentMessage(key, `${buildSubagentOutputPrefix()} ${output}`);
+    return;
+  }
 
   // Bot-side safety net for Claude-CLI "thinking" bursts that slip past
   // the adapter classifier (`checkIsStatusOutput`'s ≤200-char / ≤3-line
@@ -6201,26 +6321,28 @@ function handleAgentToolResult(key: ThreadKey, payload: ToolResultEvent): void {
 
   const header = payload.title ? `🔧 ${payload.tool} → ${payload.title}` : `🔧 ${payload.tool} →`;
   const footer = isTruncated ? `\n${t('toolResults.truncated_footer')}` : '';
-  void sendToolResultMessage(key, `${header}\n${buildFencedToolResultBody(text)}${footer}`);
+  void sendStandaloneAgentMessage(key, `${header}\n${buildFencedToolResultBody(text)}${footer}`);
 }
 
 /**
- * @description Send a tool-result message through the same render machinery
- * agent output uses: render-aware split (`splitMessage` re-balances the ```
- * fences across chunks — a `full` body can exceed Telegram's cap) +
- * `renderAgentHtml` with plain-text fallback. Unlike `sendOutputImmediate` it
- * deliberately never touches `lastMessageId` / `lastMessageText` /
- * `needsNewMessage`: a tool result is a one-off message that must not become
- * the base of the answer's edit-in-place continuation chain (the in-flight
- * reply keeps growing in its own message above it).
+ * @description Send a STANDALONE agent message — a tool-result body (S3) or a
+ * marked sub-agent chunk (S4) — through the same render machinery agent output
+ * uses: render-aware split (`splitMessage` re-balances the ``` fences across
+ * chunks — a `full` body can exceed Telegram's cap) + `renderAgentHtml` with
+ * plain-text fallback. Unlike `sendOutputImmediate` it deliberately never
+ * touches `lastMessageId` / `lastMessageText` / `needsNewMessage`: a
+ * standalone message must not become the base of the answer's edit-in-place
+ * continuation chain (the in-flight reply keeps growing in its own message
+ * above it).
  */
-async function sendToolResultMessage(key: ThreadKey, text: string): Promise<void> {
+async function sendStandaloneAgentMessage(key: ThreadKey, text: string): Promise<void> {
   const chunks = splitMessage(text, undefined, chunk => renderAgentHtml(chunk).length);
   for (const chunk of chunks) {
     await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk, 'output');
   }
-  // A tool result is "other output" that landed below any pending question —
-  // bring the question back to the bottom (debounced; no-op when none pending).
+  // A standalone message is "other output" that landed below any pending
+  // question — bring the question back to the bottom (debounced; no-op when
+  // none pending).
   onThreadActivityWhileQuestionPending(key);
 }
 
@@ -6578,6 +6700,7 @@ const COMMANDS_MENU = [
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
   { command: 'tool_results', description: '🔧 Tool-results verbosity (OpenCode)' },
+  { command: 'subagent', description: '🤖 Sub-agent verbosity (OpenCode)' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
@@ -6992,6 +7115,11 @@ export async function startBot(): Promise<void> {
     onStopped: handleAgentStopped,
     onError: handleAgentError,
   });
+  // S4: the OpenCode adapter branches on the per-thread `/subagent` mode while
+  // ACCUMULATING (compact = status, full = separate child stream) — the one
+  // display pref it cannot resolve at render time. Same late-wiring idiom as
+  // the event handlers above; before this line it falls back to `compact`.
+  registerSubagentModeReader((key) => state.getDisplayPrefs(key).subagent);
 
   // 3. Connect to Telegram and register commands menu before starting local
   // daemons. If getMe fails, we should not leave an orphan opencode server.

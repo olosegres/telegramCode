@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, SubagentMode, SubagentModeReader, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -32,6 +32,11 @@ import {
   getSseStreamTransition,
   type DirectoryBoundSession,
 } from '../utils/sseStreamLifecycle';
+import {
+  buildSubagentStatusText,
+  fallbackSubagentMode,
+  getSubagentPartAction,
+} from '../utils/subagentRender';
 
 const execAsync = promisify(exec);
 
@@ -169,6 +174,29 @@ interface OpenCodeSession {
   lastEmittedLength: number;
   /** Timer for batching SSE deltas before emitting output */
   outputTimer: NodeJS.Timeout | null;
+  /**
+   * Accumulated SUB-AGENT (child session) text for the current turn, streamed
+   * only in `/subagent full` mode. Kept strictly SEPARATE from
+   * {@link currentResponseText}: a child transcript must never advance the
+   * parent's emit cursor / continuation accounting. Reset wherever
+   * `currentResponseText` is reset.
+   */
+  childResponseText: string;
+  /** Emit cursor over {@link childResponseText} (same tail-emit discipline as
+   * {@link lastEmittedLength}). Reset alongside it. */
+  childLastEmittedLength: number;
+  /** Debounce timer for child text deltas — mirrors {@link outputTimer} but
+   * over the child accumulator, so the two streams never share a flush. */
+  childOutputTimer: NodeJS.Timeout | null;
+  /**
+   * Title of the delegation currently running in a child session, recorded
+   * from the parent's `task` tool part (`state.title` / `state.input.description`)
+   * while it is pending/running and cleared when it completes/errors. Drives
+   * the compact-mode "🤖 sub-agent: <title> …" status (S4) and is the field
+   * the S5 "Delegating" activity status will reuse. v1 tracks ONE delegation —
+   * parallel tasks are last-writer-wins and the first completion clears.
+   */
+  activeSubagentTitle: string | null;
   /** Whether model info has been shown to the user (shown once on first response) */
   isModelInfoShown: boolean;
   /** Model override for this session (passed with each prompt) */
@@ -465,6 +493,14 @@ interface OpenCodeSessionUpdatedInfo {
 
 /** Delay (ms) to batch SSE text deltas before emitting output event */
 const sseOutputBatchMs = 500;
+
+/**
+ * Name of OpenCode's delegation tool — the parent session invokes it to run a
+ * sub-agent in a CHILD session (verified live 2026-06-10: its tool part carries
+ * `state.title` + `state.input.{description, subagent_type, prompt}`, and the
+ * completed `state.output` embeds the child session id).
+ */
+const delegationToolName = 'task';
 
 /** Base delay (ms) for exponential backoff on SSE reconnect */
 const sseReconnectBaseDelayMs = 2000;
@@ -872,6 +908,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /** Whether a server restart is already in progress (prevents concurrent restart attempts) */
   private isServerRestarting = false;
 
+  /**
+   * Per-thread `/subagent` mode reader, injected by the bot at boot via
+   * `createAdapter.registerSubagentModeReader` (S4). DELIBERATE deviation from
+   * the S2/S3 "adapter stays mode-agnostic" pattern: the sub-agent branch
+   * decides WHAT to accumulate (compact = refresh a status, full = stream into
+   * the separate child accumulator), which cannot be deferred to the bot's
+   * render time. `null` until wired → reads fall back to the locked default.
+   */
+  private subagentModeReader: SubagentModeReader | null = null;
+
+  /** @description Inject the per-thread `/subagent` mode reader (see the field's JSDoc). */
+  setSubagentModeReader(reader: SubagentModeReader): void {
+    this.subagentModeReader = reader;
+  }
+
+  /** @description Resolve the thread's `/subagent` mode, defaulting to `compact`
+   * for any read that happens before the bot wires the reader at boot. */
+  private getSubagentMode(key: ThreadKey): SubagentMode {
+    return this.subagentModeReader?.(key) ?? fallbackSubagentMode;
+  }
+
   constructor() {
     super();
     // Audit S7 / #34: SSRF guard on OPENCODE_URL before any fetch runs.
@@ -1157,6 +1214,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           currentResponseText: '',
           lastEmittedLength: 0,
           outputTimer: null,
+          childResponseText: '',
+          childLastEmittedLength: 0,
+          childOutputTimer: null,
+          activeSubagentTitle: null,
           isModelInfoShown: false,
           modelOverride: null,
           currentModelLabel: null,
@@ -1224,6 +1285,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (session.outputTimer) {
       clearTimeout(session.outputTimer);
       session.outputTimer = null;
+    }
+    // Same teardown for the child (sub-agent) debounce — a late fire would
+    // emit a marked chunk to a thread that just announced `stopped`.
+    if (session.childOutputTimer) {
+      clearTimeout(session.childOutputTimer);
+      session.childOutputTimer = null;
     }
     // Audit S8 / #11: previously the status timer kept firing after
     // `stopSession`, emitting transient `status` events to a thread that
@@ -1301,6 +1368,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Reset accumulated response text for new message
     session.currentResponseText = '';
     session.lastEmittedLength = 0;
+    // The child (sub-agent) accumulator resets with the parent's — a new turn
+    // starts clean (a stale debounce firing later emits nothing: empty tail).
+    session.childResponseText = '';
+    session.childLastEmittedLength = 0;
     // New turn → previous turn's tool-result dedup ids can no longer matter
     // (see the field's JSDoc for why the turn flush is too early to clear).
     session.emittedToolResultPartIds.clear();
@@ -1768,6 +1839,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         currentResponseText: '',
         lastEmittedLength: 0,
         outputTimer: null,
+        childResponseText: '',
+        childLastEmittedLength: 0,
+        childOutputTimer: null,
+        activeSubagentTitle: null,
         isModelInfoShown: false,
         modelOverride: null,
         currentModelLabel: null,
@@ -2415,14 +2490,21 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const eventSessionId = this.getSessionIdFromEvent(event);
 
     const session = this.sessions.get(keyToString(key));
-    if (session?.isActive && eventSessionId && eventSessionId !== session.sessionId) {
+    // A routed event whose session id is NOT the owner's own id reached us via
+    // lineage descent → it belongs to a SUB-AGENT (child session). Computed
+    // ONCE here and threaded into the part handlers — they must never
+    // re-derive it (S4).
+    const isSubagentEvent = Boolean(
+      session?.isActive && eventSessionId && eventSessionId !== session.sessionId,
+    );
+    if (session && isSubagentEvent) {
       appendDiagLog(`sse route-descendant ${eventType} es=${eventSessionId} -> ${session.sessionId}`);
     }
 
     switch (eventType) {
       case 'message.part.updated':
       case 'message.part.delta':
-        this.handlePartUpdate(key, event.properties);
+        this.handlePartUpdate(key, event.properties, isSubagentEvent);
         break;
 
       case 'message.updated':
@@ -2558,6 +2640,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.outputTimer);
       session.outputTimer = null;
     }
+    if (session.childOutputTimer) {
+      clearTimeout(session.childOutputTimer);
+      session.childOutputTimer = null;
+    }
     if (session.statusDebounceTimer) {
       clearTimeout(session.statusDebounceTimer);
       session.statusDebounceTimer = null;
@@ -2652,8 +2738,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    *
    * Text parts are accumulated and emitted as 'output' (permanent messages).
    * Tool, reasoning, step-* parts are emitted as 'status' (transient messages).
+   *
+   * `isSubagent` (resolved ONCE in `dispatchSseEvent`) marks parts streamed by
+   * a CHILD session (sub-agent); they are routed per the
+   * {@link getSubagentPartAction} matrix instead of the parent's handlers, so
+   * a child transcript can never merge unmarked into the parent's reply (S4).
    */
-  private handlePartUpdate(key: ThreadKey, properties: Record<string, unknown>): void {
+  private handlePartUpdate(key: ThreadKey, properties: Record<string, unknown>, isSubagent: boolean): void {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
@@ -2674,16 +2765,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // streaming (the answer or a tool call begins). The most responsive of the
     // three end signals; `endReasoning` is idempotent so the later
     // `message.updated` finish / `session.idle` signals are harmless no-ops.
-    if (partType !== 'reasoning') this.endReasoning(key, session);
+    // Child parts are excluded: a sub-agent streaming must not collapse the
+    // PARENT's thinking indicator (its own first non-reasoning part — e.g. the
+    // `task` tool call — already ended it).
+    if (partType !== 'reasoning' && !isSubagent) this.endReasoning(key, session);
 
     switch (partType) {
       case 'text':
+        if (isSubagent) {
+          this.handleSubagentTextPart(key, session, delta, field);
+          break;
+        }
         this.handleTextDelta(key, session, delta, field);
         break;
       case 'tool':
-        this.handleToolPart(key, session, part);
+        this.handleToolPart(key, session, part, isSubagent);
         break;
       case 'reasoning':
+        // Child chain-of-thought is never rendered in ANY mode (locked
+        // decision — `getSubagentPartAction` returns 'ignore' for reasoning):
+        // it must not feed the parent's thinking channel.
+        if (isSubagent) break;
         this.handleReasoningPart(key, session, part, delta, field);
         break;
       case 'step-start':
@@ -2754,18 +2856,106 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description Handle a SUB-AGENT (child session) text part per the
+   * mode×kind matrix ({@link getSubagentPartAction}):
+   *
+   * - `compact` → never touch any accumulator; refresh the rolling
+   *   "🤖 sub-agent: <title> …" status instead (mirrors the terminal's single
+   *   "working" line). The status coalescer dedups identical frames, so the
+   *   repeated refresh costs no Telegram edits.
+   * - `full` → accumulate into the SEPARATE child accumulator and flush via
+   *   the same debounce discipline as {@link handleTextDelta} — never through
+   *   `currentResponseText` (a child transcript in the parent accumulator
+   *   would corrupt the parent reply's continuation accounting).
+   */
+  private handleSubagentTextPart(
+    key: ThreadKey,
+    session: OpenCodeSession,
+    delta: string | undefined,
+    field: string | undefined,
+  ): void {
+    if (field && field !== 'text') return;
+
+    const text = delta || '';
+    if (!text) return;
+
+    if (getSubagentPartAction(this.getSubagentMode(key), 'text') === 'status') {
+      this.emitStatus(key, session, buildSubagentStatusText(session.activeSubagentTitle));
+      return;
+    }
+
+    session.childResponseText += text;
+    if (session.childOutputTimer) {
+      clearTimeout(session.childOutputTimer);
+    }
+    session.childOutputTimer = setTimeout(() => {
+      session.childOutputTimer = null;
+      this.emitChildResponseTail(key, session);
+    }, sseOutputBatchMs);
+  }
+
+  /**
+   * @description Emit the unsent tail of the CHILD (sub-agent) accumulator as
+   * a marked `output` event (`meta.isSubagent`, `/subagent full` mode only).
+   * Mirrors {@link emitResponseTail} over the dedicated child fields so the
+   * parent's emit cursor is never advanced by child text. Carries NO
+   * `isContinuation`: the bot renders every sub-agent chunk as its own marked
+   * message outside the parent's edit-in-place chain (acceptable v1 — `full`
+   * is opt-in). The empty-string guard doubles as runtime tolerance for test
+   * fixtures that inject minimal session shapes.
+   */
+  private emitChildResponseTail(key: ThreadKey, session: OpenCodeSession): void {
+    if (!session.childResponseText) return;
+    const tail = session.childResponseText.slice(session.childLastEmittedLength);
+    if (!tail.trim()) return;
+    const meta: OutputEventMeta = { isSubagent: true };
+    this.emit('output', key, tail, meta);
+    session.childLastEmittedLength = session.childResponseText.length;
+  }
+
+  /**
+   * @description Record / clear the CURRENT delegation's title from the
+   * PARENT's `task` tool part: stored while the delegation is pending/running
+   * (feeds the compact-mode sub-agent status; S5's "Delegating" activity
+   * status reuses this field), cleared once it completes/errors. Only ever
+   * called for the parent's own parts — a child's nested `task` must not
+   * overwrite the parent-level title.
+   */
+  private trackDelegationTitle(session: OpenCodeSession, part: OpenCodePart, toolState: OpenCodeToolState): void {
+    if (part.tool !== delegationToolName) return;
+    if (toolState.status === 'pending' || toolState.status === 'running') {
+      const inputDescription = typeof toolState.input?.description === 'string' ? toolState.input.description : null;
+      session.activeSubagentTitle = toolState.title || inputDescription;
+      return;
+    }
+    session.activeSubagentTitle = null;
+  }
+
+  /**
    * @description Handle tool part — format and emit as 'status'.
    */
   private handleToolPart(
     key: ThreadKey,
     session: OpenCodeSession,
     part: OpenCodePart | undefined,
+    isSubagent = false,
   ): void {
     if (!part) return;
 
     const toolName = part.tool || 'tool';
     const state = part.state;
     if (!state) return;
+
+    if (isSubagent) {
+      // Child tool part: `ignore` in compact (a generic 🔧 status would
+      // overwrite the sub-agent status line); transient `status` in full.
+      // Child toolResult BODIES are suppressed in both modes (the return at
+      // the bottom never runs `maybeEmitToolResult` for a child): the
+      // parent's `task` output already carries the child's final result.
+      if (getSubagentPartAction(this.getSubagentMode(key), 'tool') === 'ignore') return;
+    } else {
+      this.trackDelegationTitle(session, part, state);
+    }
 
     let statusText: string;
     switch (state.status) {
@@ -2787,7 +2977,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
 
     this.emitStatus(key, session, statusText);
-    this.maybeEmitToolResult(key, session, part);
+    if (!isSubagent) this.maybeEmitToolResult(key, session, part);
   }
 
   /**
@@ -3141,10 +3331,22 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // non-reasoning part already ended reasoning (signal #1).
     this.endReasoning(key, session);
 
+    // Flush the CHILD (sub-agent) accumulator first (it streamed earlier than
+    // the parent's closing text): clear its debounce and emit any unsent
+    // marked tail before the reset below would drop it. The child idle event
+    // routes here too (lineage), so a finished sub-agent flushes promptly.
+    if (session.childOutputTimer) {
+      clearTimeout(session.childOutputTimer);
+      session.childOutputTimer = null;
+    }
+    this.emitChildResponseTail(key, session);
+
     this.emitResponseTail(key, session, isFinal);
 
     session.currentResponseText = '';
     session.lastEmittedLength = 0;
+    session.childResponseText = '';
+    session.childLastEmittedLength = 0;
     session.partTypes.clear();
   }
 }

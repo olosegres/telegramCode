@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, OutputEventMeta, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, OutputEventMeta, SubagentModeReader, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -44,6 +44,24 @@ let onClosed: ThreadKeyHandler | null = null;
 let onStarted: ThreadKeyHandler | null = null;
 let onStopped: ThreadKeyHandler | null = null;
 let onError: ErrorHandler | null = null;
+
+/** Per-thread `/subagent` mode reader for the OpenCode adapter (S4) — same
+ * late-wiring idiom as the event handlers above: registered once at bot boot,
+ * applied to the instance whether it exists already or is created later. */
+let subagentModeReader: SubagentModeReader | null = null;
+
+/**
+ * @description Register the reader the OpenCode adapter consults on its SSE
+ * hot path to branch a SUB-AGENT part (compact = status, full = separate
+ * streamed accumulator). Claude needs no reader — its TUI renders sub-agents
+ * itself. Until registered, the adapter falls back to the locked `compact`
+ * default.
+ */
+export function registerSubagentModeReader(reader: SubagentModeReader): void {
+  subagentModeReader = reader;
+  const existing = adapterInstances.get('opencode');
+  if (existing instanceof OpenCodeAdapter) existing.setSubagentModeReader(reader);
+}
 
 function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onOutput) adapter.on('output', onOutput);
@@ -111,6 +129,9 @@ export function getAdapter(name: string): AgentAdapter {
     adapter = factory();
     adapterInstances.set(name, adapter);
     wireAdapterEvents(adapter);
+    if (adapter instanceof OpenCodeAdapter && subagentModeReader) {
+      adapter.setSubagentModeReader(subagentModeReader);
+    }
   }
   return adapter;
 }

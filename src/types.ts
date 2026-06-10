@@ -228,6 +228,16 @@ export type ToolResultMode = 'full' | 'short' | 'hide';
 export type SubagentMode = 'compact' | 'full';
 
 /**
+ * @description Reader for a thread's persisted {@link SubagentMode}, injected
+ * into the OpenCode adapter at boot (`createAdapter.registerSubagentModeReader`).
+ * Unlike the thinking / tool-result modes (resolved by the BOT at render time,
+ * S2/S3), the sub-agent mode decides WHAT the adapter ACCUMULATES on its SSE
+ * hot path — compact refreshes a status, full streams into a separate child
+ * accumulator — so the adapter needs a live read instead of a render-time one.
+ */
+export type SubagentModeReader = (key: ThreadKey) => SubagentMode;
+
+/**
  * @description Per-thread bot-rendering preferences for OpenCode output
  * verbosity. Each field is optional: an absent field means "use the locked
  * default" (thinking=`brief`, toolResults=`short`, subagent=`compact`), so the
@@ -276,6 +286,14 @@ export interface OutputEventMeta {
    * unchanged.
    */
   isFinal?: boolean;
+  /**
+   * True when this text comes from a SUB-AGENT (OpenCode child session), only
+   * emitted in `/subagent full` mode (S4). The bot renders the chunk visibly
+   * marked ("🤖 ⤷ …") and OUTSIDE the parent reply's edit-in-place continuation
+   * chain — a child transcript must never become the base the parent's next
+   * continuation is appended to (it would corrupt the answer's accounting).
+   */
+  isSubagent?: boolean;
 }
 
 /**

@@ -269,6 +269,21 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.mode.hide': 'скрыть',
     'toolResults.truncated_footer': '… (обрезано, /tool_results full)',
 
+    // ── /subagent (sub-agent transcript verbosity, OpenCode only) ──
+    // Mode names are also used on the picker buttons. `status_live` is the
+    // rolling compact-mode status line; `chunk_prefix` marks each streamed
+    // full-mode chunk; `fallback_title` fills in when the delegation carried
+    // no title/description. 2-state by design — no `hide` (user-locked).
+    'subagent.status_live': '🤖 суб-агент: {title} …',
+    'subagent.chunk_prefix': '🤖 ⤷',
+    'subagent.fallback_title': 'суб-агент',
+    'subagent.choose': '🤖 Текущий режим суб-агентов: {current}\nВыбери режим:',
+    'subagent.set_success': '✅ Режим суб-агентов: {mode}',
+    'subagent.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
+    'subagent.opencode_only': 'ℹ️ /subagent доступен только для OpenCode (Claude показывает суб-агентов в своём TUI).',
+    'subagent.mode.compact': 'компактно',
+    'subagent.mode.full': 'полностью',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
     'model.start_agent_first': 'Нет активной сессии. Сначала запусти агента.',
@@ -346,6 +361,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.thinking_error': 'Ошибка: {error}',
     'cb.toolresults_set': 'Результаты инструментов: {mode}',
     'cb.toolresults_error': 'Ошибка: {error}',
+    'cb.subagent_set': 'Суб-агенты: {mode}',
+    'cb.subagent_error': 'Ошибка: {error}',
 
     // ── session picker (/sessions, /resume). {label}=агент, {max}=кол-во, {error}=причина ──
     'session.list_header': 'Сессии для возобновления ({label}):',
@@ -635,6 +652,21 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.mode.hide': 'hide',
     'toolResults.truncated_footer': '… (truncated, /tool_results full)',
 
+    // ── /subagent (sub-agent transcript verbosity, OpenCode only) ──
+    // Mode names are also used on the picker buttons. `status_live` is the
+    // rolling compact-mode status line; `chunk_prefix` marks each streamed
+    // full-mode chunk; `fallback_title` fills in when the delegation carried
+    // no title/description. 2-state by design — no `hide` (user-locked).
+    'subagent.status_live': '🤖 sub-agent: {title} …',
+    'subagent.chunk_prefix': '🤖 ⤷',
+    'subagent.fallback_title': 'sub-agent',
+    'subagent.choose': '🤖 Current sub-agent mode: {current}\nPick a mode:',
+    'subagent.set_success': '✅ Sub-agent mode: {mode}',
+    'subagent.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
+    'subagent.opencode_only': 'ℹ️ /subagent is OpenCode-only (Claude renders sub-agents in its own TUI).',
+    'subagent.mode.compact': 'compact',
+    'subagent.mode.full': 'full',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Model saved: {model} — applies on next agent start.',
     'model.start_agent_first': 'No active session. Start an agent first.',
@@ -705,6 +737,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.thinking_error': 'Error: {error}',
     'cb.toolresults_set': 'Tool results: {mode}',
     'cb.toolresults_error': 'Error: {error}',
+    'cb.subagent_set': 'Sub-agents: {mode}',
+    'cb.subagent_error': 'Error: {error}',
 
     // ── session picker (/sessions, /resume). {label}=agent, {max}=count, {error}=reason ──
     'session.list_header': 'Sessions to resume ({label}):',

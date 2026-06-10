@@ -199,6 +199,8 @@ config/variants, not a per-message API field).
 | `apiErrorRetry.ts` | Pure auto-retry decision layer for agent **API** errors: `classifyAgentApiError` (transient / usageLimit / null-for-auth; markers from the claude.exe strings), `parseResetAt`, `getRetryPlan` (backoff schedule), `decideRetryAction` (arm/ignore/giveUp + grace-window dedup). The `bot.ts` manager owns the timer + kick |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`) |
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
+| `utils/thinkingRender.ts` | Pure decision/format helpers for the OpenCode thinking (chain-of-thought) lifecycle behind `/thinking`: mode options + type guard (`checkIsThinkingMode`), the mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, and the "thought for {N}s" duration formatter |
+| `utils/toolResultRender.ts` | Pure helpers for tool-result rendering behind `/tool_results`: mode options + type guard (`checkIsToolResultMode`), mode→render action (`getToolResultRenderAction`), and the `short`-mode dual-cap truncation (`getTruncatedToolResult`, 15 lines / 1200 chars, line-boundary-preserving) |
 | `scheduler/recurrence.ts` | Pure schedule math on `croner`: `ScheduleSpec` (cron / once / N-times), validation (min fire interval 5 min), next-occurrence, human description, catch-up decision |
 | `scheduler/store.ts` | Schedule records: create path (slug ids, ≤30/thread cap, `isPinSilent`), persisted in `state.json` `schedules` (lifecycle-independent) |
 | `scheduler/engine.ts` | Timer engine: one unref'd timer per job, boot replay with one-catch-up-per-missed-run, no-overlap guard, N-times/once bookkeeping, `whenIdle` drain |
@@ -291,9 +293,9 @@ as a command in `bot.ts`.
     normal welcome stack. Invalid name → error, mode stays armed for retry.
     `/cancel` or any other command exits the mode. `/bind <subdir>` direct form
     is unchanged.
-- **Agent control (proxied):** `/model`, `/effort`, `/agent`, `/output`,
-  `/schedule`, and raw TUI keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`,
-  `/tab`
+- **Agent control (proxied):** `/model`, `/effort`, `/thinking`,
+  `/tool_results`, `/agent`, `/output`, `/schedule`, and raw TUI keys `/c`,
+  `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
   - `/schedule <free text>` is a **thin prompt wrapper** — the bot owns NO
     scheduling logic. It wraps the request in an agent-facing instruction
     (`schedule.forwardPromptTemplate`; bare `/schedule` →
@@ -342,6 +344,23 @@ as a command in `bot.ts`.
       serial tmux queue). NOT done on adopt/reattach (the surviving process
       keeps its in-TUI state). OpenCode seeds `effortLevel` from the same
       per-thread pref at session creation.
+  - `/thinking [detailed|brief|hide]` and `/tool_results [full|short|hide]`
+    set per-topic OpenCode-only DISPLAY modes (bot-rendering concerns, never
+    sent to the agent), persisted in `state.json` `displayPrefs` and
+    lifecycle-independent; a Claude-bound topic gets an "OpenCode only" reply
+    (its TUI renders both itself). Both offer inline mode buttons (✓ on
+    current) and work with no session running. **`/thinking`** (default
+    `brief`) controls what REMAINS of the chain-of-thought — the live
+    "☁️ thinking …" indicator shows in ALL modes: `detailed` keeps the full
+    streamed reasoning, `brief` collapses it to "💭 thought for {N}s", `hide`
+    deletes it when the answer starts. **`/tool_results`** (default `short`)
+    controls a completed tool call's OUTPUT, posted as its own
+    "🔧 <tool> →" + fenced message via a dedicated `toolResult` adapter event
+    (never mixed into the answer's continuation chain): `full` = whole body
+    (split over messages when long), `short` = capped at 15 lines / 1200 chars
+    with a "… (truncated, /tool_results full)" footer, `hide` = only the
+    transient 🔧 status (the pre-S3 behavior). Pure decision/format helpers:
+    `utils/thinkingRender.ts`, `utils/toolResultRender.ts`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
   `/doctor`, `/mcp`, `/trace`
   - `/trace on|off` toggles the output-trace recorder for THIS topic; `/trace

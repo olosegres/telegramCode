@@ -257,6 +257,18 @@ const dict: Record<Lang, Record<string, string>> = {
     'thinking.mode.brief': 'кратко',
     'thinking.mode.hide': 'скрыть',
 
+    // ── /tool_results (tool output verbosity, OpenCode only) ──
+    // Mode names are also used on the picker buttons. The truncated footer
+    // names the REAL command (`/tool_results full`) so it stays tappable.
+    'toolResults.choose': '🔧 Текущий режим результатов инструментов: {current}\nВыбери режим:',
+    'toolResults.set_success': '✅ Режим результатов инструментов: {mode}',
+    'toolResults.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
+    'toolResults.opencode_only': 'ℹ️ /tool_results доступен только для OpenCode (Claude показывает результаты инструментов в своём TUI).',
+    'toolResults.mode.full': 'полностью',
+    'toolResults.mode.short': 'кратко',
+    'toolResults.mode.hide': 'скрыть',
+    'toolResults.truncated_footer': '… (обрезано, /tool_results full)',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
     'model.start_agent_first': 'Нет активной сессии. Сначала запусти агента.',
@@ -332,6 +344,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.effort_error': 'Ошибка: {error}',
     'cb.thinking_set': 'Размышления: {mode}',
     'cb.thinking_error': 'Ошибка: {error}',
+    'cb.toolresults_set': 'Результаты инструментов: {mode}',
+    'cb.toolresults_error': 'Ошибка: {error}',
 
     // ── session picker (/sessions, /resume). {label}=агент, {max}=кол-во, {error}=причина ──
     'session.list_header': 'Сессии для возобновления ({label}):',
@@ -609,6 +623,18 @@ const dict: Record<Lang, Record<string, string>> = {
     'thinking.mode.brief': 'brief',
     'thinking.mode.hide': 'hide',
 
+    // ── /tool_results (tool output verbosity, OpenCode only) ──
+    // Mode names are also used on the picker buttons. The truncated footer
+    // names the REAL command (`/tool_results full`) so it stays tappable.
+    'toolResults.choose': '🔧 Current tool-results mode: {current}\nPick a mode:',
+    'toolResults.set_success': '✅ Tool-results mode: {mode}',
+    'toolResults.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
+    'toolResults.opencode_only': 'ℹ️ /tool_results is OpenCode-only (Claude renders tool results in its own TUI).',
+    'toolResults.mode.full': 'full',
+    'toolResults.mode.short': 'short',
+    'toolResults.mode.hide': 'hide',
+    'toolResults.truncated_footer': '… (truncated, /tool_results full)',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Model saved: {model} — applies on next agent start.',
     'model.start_agent_first': 'No active session. Start an agent first.',
@@ -677,6 +703,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.effort_error': 'Error: {error}',
     'cb.thinking_set': 'Thinking: {mode}',
     'cb.thinking_error': 'Error: {error}',
+    'cb.toolresults_set': 'Tool results: {mode}',
+    'cb.toolresults_error': 'Error: {error}',
 
     // ── session picker (/sessions, /resume). {label}=agent, {max}=count, {error}=reason ──
     'session.list_header': 'Sessions to resume ({label}):',

@@ -322,8 +322,8 @@ function checkIsRecvThreadTraced(chatId: number | undefined, threadId: number | 
   return tracedThreadKeys.has(keyToString({ chatId, threadId: threadId ?? GENERAL_THREAD_ID }));
 }
 
-/** Record an adapter `output`/`status`/`thinking` event entering the bot's send path. */
-export function traceAgentEmit(event: 'output' | 'status' | 'thinking', key: ThreadKey, text: string): void {
+/** Record an adapter `output`/`status`/`thinking`/`toolResult` event entering the bot's send path. */
+export function traceAgentEmit(event: 'output' | 'status' | 'thinking' | 'toolResult', key: ThreadKey, text: string): void {
   if (!checkIsThreadTraced(key)) return;
   appendTraceEntry('emit', {
     event,

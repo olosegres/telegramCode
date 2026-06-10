@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThinkingEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -199,6 +199,16 @@ interface OpenCodeSession {
    * chatty, so live emits are coalesced the same way text deltas are.
    */
   reasoningTimer: NodeJS.Timeout | null;
+  /**
+   * Part ids whose completed tool OUTPUT has already been emitted as a
+   * `toolResult` event — OpenCode re-sends a part on every state change (and
+   * may re-deliver the completed shape), so without this guard one result
+   * would reach the topic several times. Cleared on the NEXT prompt (not on
+   * the turn flush): part re-deliveries can straddle the finish/idle flush,
+   * and since part ids are unique a late clear can never suppress a genuine
+   * new result — while an early clear would re-open the double-emit window.
+   */
+  emittedToolResultPartIds: Set<string>;
   /** Pending question awaiting user's answer */
   pendingQuestion: OpenCodePendingQuestion | null;
   /**
@@ -1156,6 +1166,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           reasoningText: '',
           reasoningStartedAt: null,
           reasoningTimer: null,
+          emittedToolResultPartIds: new Set(),
           pendingQuestion: null,
           effortLevel: loadSavedEffort(key),
           isBusy: false,
@@ -1290,6 +1301,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Reset accumulated response text for new message
     session.currentResponseText = '';
     session.lastEmittedLength = 0;
+    // New turn → previous turn's tool-result dedup ids can no longer matter
+    // (see the field's JSDoc for why the turn flush is too early to clear).
+    session.emittedToolResultPartIds.clear();
     // Mark busy optimistically so an immediately-following message correctly
     // sees a turn in flight; the `session.status` stream corrects/confirms it.
     session.isBusy = true;
@@ -1763,6 +1777,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         reasoningText: '',
         reasoningStartedAt: null,
         reasoningTimer: null,
+        emittedToolResultPartIds: new Set(),
         pendingQuestion: null,
         effortLevel: loadSavedEffort(key),
         isBusy: false,
@@ -2772,6 +2787,31 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
 
     this.emitStatus(key, session, statusText);
+    this.maybeEmitToolResult(key, session, part);
+  }
+
+  /**
+   * @description Emit the dedicated MODE-AGNOSTIC `toolResult` event once a
+   * tool part reaches `completed` with a non-empty output (S3). The bot
+   * resolves the per-thread `ToolResultMode` (`hide` drops it there) — the
+   * adapter emits every result exactly once, guarded by
+   * {@link OpenCodeSession.emittedToolResultPartIds} against the re-sent part
+   * shapes. The output is kept strictly OUT of `currentResponseText` so it can
+   * never pollute the answer or its continuation accounting.
+   */
+  private maybeEmitToolResult(key: ThreadKey, session: OpenCodeSession, part: OpenCodePart): void {
+    const toolState = part.state;
+    if (toolState?.status !== 'completed') return;
+    if (typeof toolState.output !== 'string' || !toolState.output.trim()) return;
+    // A part id is required for the double-emit guard. Only full
+    // `message.part.updated` part objects reach handleToolPart, and those
+    // always carry an id — an id-less shape is safer dropped than duplicated.
+    if (!part.id || session.emittedToolResultPartIds.has(part.id)) return;
+    session.emittedToolResultPartIds.add(part.id);
+
+    const payload: ToolResultEvent = { tool: part.tool || 'tool', output: toolState.output };
+    if (toolState.title) payload.title = toolState.title;
+    this.emit('toolResult', key, payload);
   }
 
   /** Debounce delay (ms) for live `thinking` emits — the reasoning delta

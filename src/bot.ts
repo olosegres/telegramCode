@@ -23,7 +23,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ThinkingEvent, ThinkingMode } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ThinkingEvent, ThinkingMode, ToolResultEvent, ToolResultMode } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -91,6 +91,13 @@ import {
   thinkingModeOptions,
   checkIsThinkingMode,
 } from './utils/thinkingRender';
+import {
+  getToolResultRenderAction,
+  getTruncatedToolResult,
+  buildFencedToolResultBody,
+  toolResultModeOptions,
+  checkIsToolResultMode,
+} from './utils/toolResultRender';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
@@ -3829,6 +3836,68 @@ command('thinking', async (ctx, key) => {
   );
 });
 
+// ── /tool_results — per-topic tool-output verbosity (OpenCode only, S3) ──────
+// Telegram bot commands cannot contain '-', so the plan's "/tool-results" is
+// registered as `tool_results` (same convention as /rename_session).
+
+/**
+ * @description Build the `/tool_results` mode picker keyboard. One callback
+ * button per mode; the current mode carries a `✓` marker. Shared by the
+ * command (initial render) and the `toolres_<mode>` callback (re-render after
+ * a press), mirroring `buildThinkingKeyboard` so the marker never drifts.
+ */
+function buildToolResultsKeyboard(current: ToolResultMode) {
+  const buttons = toolResultModeOptions.map((mode) =>
+    Markup.button.callback(
+      mode === current ? `${t(`toolResults.mode.${mode}`)} ✓` : t(`toolResults.mode.${mode}`),
+      `toolres_${mode}`,
+    ),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: toolResultModeOptions.length });
+}
+
+/**
+ * @description Persist a new tool-results mode for `key` — it governs every
+ * `toolResult` event from now on (the mode is resolved per event, so a live
+ * turn picks it up immediately). Shared by the `/tool_results <mode>` direct
+ * form and the `toolres_<mode>` callback so the two paths can never diverge.
+ */
+async function applyToolResultMode(key: ThreadKey, mode: ToolResultMode): Promise<void> {
+  await state.setDisplayPref(key, 'toolResults', mode);
+}
+
+command('tool_results', async (ctx, key) => {
+  // OpenCode-only capability gate (like /thinking): Claude renders tool
+  // results in its own TUI pane, nothing for the bot to do.
+  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+    await replyToThread(key, t('toolResults.opencode_only'));
+    return;
+  }
+
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+  const current = state.getDisplayPrefs(key).toolResults;
+
+  if (arg) {
+    if (!checkIsToolResultMode(arg)) {
+      await replyToThread(key, t('toolResults.invalid_mode', {
+        mode: arg,
+        valid: toolResultModeOptions.join(', '),
+      }));
+      return;
+    }
+    await applyToolResultMode(key, arg);
+    await replyToThread(key, t('toolResults.set_success', { mode: t(`toolResults.mode.${arg}`) }));
+    return;
+  }
+
+  // No arg: show current mode + a button per mode.
+  await replyToThread(
+    key,
+    t('toolResults.choose', { current: t(`toolResults.mode.${current}`) }),
+    buildToolResultsKeyboard(current),
+  );
+});
+
 // Manually rename the CURRENT thread's session. Adapter-owned capability
 // (optional method, like /model): OpenCode renames via `PATCH /session/:id`;
 // Claude has no title concept and is told "not supported". Requires a live
@@ -4410,7 +4479,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
-  'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking',
+  'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
 ]);
 
 /**
@@ -5467,6 +5536,44 @@ bot.action(/^think_(.+)$/, async (ctx) => {
   }
 });
 
+bot.action(/^toolres_(.+)$/, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  // Same OpenCode-only gate as the command — a stale button on a topic switched
+  // to Claude after the picker was shown must not silently set an unused pref.
+  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+    await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
+    return;
+  }
+  const picked = ctx.match[1];
+  if (!checkIsToolResultMode(picked)) {
+    await ctx.answerCbQuery(t('cb.toolresults_error', { error: picked.slice(0, 50) }));
+    return;
+  }
+  await applyToolResultMode(key, picked);
+  await ctx.answerCbQuery(t('cb.toolresults_set', { mode: t(`toolResults.mode.${picked}`) }));
+
+  // Re-render the picker so the `✓` follows the new mode (mirrors think_cb).
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  if (cbMsg) {
+    const keyboard = buildToolResultsKeyboard(picked);
+    try {
+      await enqueueSend(
+        key,
+        () => bot.telegram.editMessageReplyMarkup(
+          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
+        ),
+        'interactive',
+      );
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+      if (!/message is not modified/i.test(desc)) {
+        console.warn('[toolres_cb] keyboard re-render failed:', desc || e);
+      }
+    }
+  }
+});
+
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
@@ -6066,6 +6173,57 @@ async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<
   }
 }
 
+// ── Tool results — OpenCode (#8, S3) ─────────────────────────────────────────
+//
+// The adapter emits a mode-AGNOSTIC `toolResult` event for every completed
+// tool call that produced output (the transient 🔧 status keeps flowing
+// independently in all modes). The bot resolves the per-thread
+// `ToolResultMode` here and renders the body as its OWN fresh message —
+// never edited into the answer's continuation chain. See
+// `utils/toolResultRender.ts` for the pure mode matrix + truncation caps.
+
+/**
+ * @description Adapter `toolResult` event entry point. `hide` drops the body
+ * (pre-S3 behavior — only the transient 🔧 status shows); `short` truncates
+ * via the pure caps and appends a "… (truncated, /tool_results full)" footer;
+ * `full` renders the whole body. The message is a header line `🔧 <tool> →`
+ * (+ the tool's title when present, matching the transient status) over a
+ * fenced code block.
+ */
+function handleAgentToolResult(key: ThreadKey, payload: ToolResultEvent): void {
+  traceAgentEmit('toolResult', key, payload.output);
+  const action = getToolResultRenderAction(state.getDisplayPrefs(key).toolResults);
+  if (action === 'drop') return;
+
+  const { text, isTruncated } = action === 'truncated'
+    ? getTruncatedToolResult(payload.output)
+    : { text: payload.output, isTruncated: false };
+
+  const header = payload.title ? `🔧 ${payload.tool} → ${payload.title}` : `🔧 ${payload.tool} →`;
+  const footer = isTruncated ? `\n${t('toolResults.truncated_footer')}` : '';
+  void sendToolResultMessage(key, `${header}\n${buildFencedToolResultBody(text)}${footer}`);
+}
+
+/**
+ * @description Send a tool-result message through the same render machinery
+ * agent output uses: render-aware split (`splitMessage` re-balances the ```
+ * fences across chunks — a `full` body can exceed Telegram's cap) +
+ * `renderAgentHtml` with plain-text fallback. Unlike `sendOutputImmediate` it
+ * deliberately never touches `lastMessageId` / `lastMessageText` /
+ * `needsNewMessage`: a tool result is a one-off message that must not become
+ * the base of the answer's edit-in-place continuation chain (the in-flight
+ * reply keeps growing in its own message above it).
+ */
+async function sendToolResultMessage(key: ThreadKey, text: string): Promise<void> {
+  const chunks = splitMessage(text, undefined, chunk => renderAgentHtml(chunk).length);
+  for (const chunk of chunks) {
+    await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk, 'output');
+  }
+  // A tool result is "other output" that landed below any pending question —
+  // bring the question back to the bottom (debounced; no-op when none pending).
+  onThreadActivityWhileQuestionPending(key);
+}
+
 // ── Claude liveness loop (bug #11) ──────────────────────────────────────────
 //
 // SINGLE OWNER of the "recreate/keep-alive while busy" half of the
@@ -6419,6 +6577,7 @@ const COMMANDS_MENU = [
   { command: 'model', description: '🧠 Switch model' },
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
+  { command: 'tool_results', description: '🔧 Tool-results verbosity (OpenCode)' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
@@ -6826,6 +6985,7 @@ export async function startBot(): Promise<void> {
     onQuestion: handleAgentQuestion,
     onSurvey: handleAgentSurvey,
     onThinking: handleAgentThinking,
+    onToolResult: handleAgentToolResult,
     onApiError: handleApiError,
     onClosed: handleAgentClosed,
     onStarted: handleAgentStarted,

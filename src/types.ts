@@ -316,6 +316,26 @@ export interface ThinkingEvent {
 }
 
 /**
+ * @description Payload of the adapter `toolResult` event — a completed tool
+ * call's OUTPUT for one response (S3). Emitted on a DEDICATED channel so the
+ * result is rendered as its own message and never pollutes the answer
+ * accumulator (`currentResponseText`) or its continuation accounting.
+ *
+ * The adapter stays MODE-AGNOSTIC: it emits every completed tool output once,
+ * and the BOT applies the per-thread {@link ToolResultMode} (`hide` drops it,
+ * `short` truncates, `full` renders the whole body).
+ */
+export interface ToolResultEvent {
+  /** Tool name as reported by the tool part (e.g. `bash`, `read`). */
+  tool: string;
+  /** Human-readable title from the tool state (e.g. the command description),
+   * when the backend provided one. */
+  title?: string;
+  /** The tool's output body, untruncated. Non-empty by adapter contract. */
+  output: string;
+}
+
+/**
  * @description One option of a Claude CLI bare-digit survey (e.g. the periodic
  * session-feedback prompt: `1: Bad  2: Fine  3: Good  0: Dismiss`). The TUI
  * submits on the bare digit alone — no Enter — so `digit` is exactly the
@@ -365,6 +385,7 @@ export interface SendInputOptions {
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
  * - 'survey'   (key: ThreadKey, survey: ClaudeSurveyEvent) — Claude CLI bare-digit survey to render with answerable buttons
  * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread {@link ThinkingMode}
+ * - 'toolResult' (key: ThreadKey, payload: ToolResultEvent) — a completed tool call's output (OpenCode); the bot applies the per-thread {@link ToolResultMode}
  * - 'apiError' (key: ThreadKey, error: AgentApiErrorClass) — provider-side API error at the proxy boundary (auto-retry trigger; only when {@link AgentApiErrorClass} classification matched)
  * - 'started'  (key: ThreadKey)                  — session is up and ready
  * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)

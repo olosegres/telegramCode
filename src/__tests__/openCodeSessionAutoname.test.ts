@@ -78,6 +78,7 @@ function injectSession(adapter: OpenCodeAdapter, key: ThreadKey, isAutoNamePendi
     partTypes: new Map(),
     statusDebounceTimer: null,
     pendingStatus: null,
+    emittedToolResultPartIds: new Set(),
     pendingQuestion: null,
     effortLevel: null,
     isBusy: false,

@@ -63,14 +63,18 @@
  *
  *   ^\s*                              leading whitespace (TUI indent)
  *   [✻✽✶✢·*●○]                       spinner glyph (full observed set)
- *   \s+\S[^()\n]*?…                   the activity text ending in U+2026
+ *   \s+\S(?:[^()\n]|\([^()\n]*\))*?…  the activity text ending in U+2026
  *                                     ellipsis. Originally a single verb
- *                                     token ("Smooshing…"), but the TUI now
- *                                     shows the active task title here too
- *                                     ("Fixing streaming output overwrite…"),
- *                                     so multiple words are allowed; `[^()]`
- *                                     keeps parens out so the stats group
- *                                     below stays the real anchor
+ *                                     token ("Smooshing…"), then the active
+ *                                     task title too ("Fixing streaming
+ *                                     output overwrite…"), and the TUI now
+ *                                     also puts parenthesised bits inside it
+ *                                     ("Fixing relations add flow
+ *                                     (sub-agent)…" — live flood 2026-06-11;
+ *                                     a task title can carry its own parens
+ *                                     too), so single-level `(…)` segments
+ *                                     are allowed; the end-anchored stats
+ *                                     group below stays the real anchor
  *   \s*\(                             stats parenthesis opens
  *   (?:\d+h\s+)?(?:\d+m\s+)?\d+s      elapsed time — "13s", "4m 35s",
  *                                     "1h 2m 3s" (a fresh tick has no
@@ -90,12 +94,14 @@
  *   \)\s*$                            stats parenthesis closes; line ends
  *
  * The activity text deliberately has no verb whitelist — Claude has shipped
- * Smooshing / Actioning / Coalescing / … and now task titles; the trailing
+ * Smooshing / Actioning / Coalescing / … then task titles, then parenthesised
+ * suffixes like "(sub-agent)" inside the title; the trailing end-anchored
  * `(time · tokens)` stats parenthesis is specific enough to carry the match
- * on its own, so loosening the text to multi-word is safe.
+ * on its own — the same safety argument that admitted multi-word titles
+ * (2026-06-05) covers the paren widening (2026-06-11).
  */
 export const PROGRESS_LINE_RE =
-  /^\s*[✻✽✶✢·*●○]\s+\S[^()\n]*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s\s*·\s*[↑↓]\s*[\d.]+k?\s*tokens(?:\s*·[^()]*)?\)\s*$/;
+  /^\s*[✻✽✶✢·*●○]\s+\S(?:[^()\n]|\([^()\n]*\))*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s\s*·\s*[↑↓]\s*[\d.]+k?\s*tokens(?:\s*·[^()]*)?\)\s*$/;
 
 /**
  * @description Verb line of Claude's `/compact` (and automatic context

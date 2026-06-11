@@ -591,15 +591,20 @@ export function checkIsStatusOutput(text: string): boolean {
  * a multi-word activity text since 2026-06-05 — the TUI now shows the
  * active task title there ("Fixing streaming output overwrite…"), and
  * the single-token `\S+…` let those ticks leak into permanent messages
- * (adapter side) / flood the topic (bot side). The trailing
- * `(<elapsed>[ · …])` parenthesis stays the load-bearing anchor.
+ * (adapter side) / flood the topic (bot side). Since 2026-06-11 both
+ * also accept single-level parenthesised segments inside the title —
+ * the TUI appends bits like "(sub-agent)" while a Task sub-agent runs
+ * ("Fixing relations add flow (sub-agent)…", the live topic flood), and
+ * a task title can carry its own parens. The trailing end-anchored
+ * `(<elapsed>[ · …])` parenthesis stays the load-bearing anchor — the
+ * same safety argument as the multi-word widening.
  *
  * The required text-with-ellipsis disambiguates this from a tool-call
  * header (`● Bash(ls -la)`), which starts with the same `●` glyph but
  * has no ellipsis.
  */
 const SPINNER_TICK_RE =
-  /^\s*[✻✽✶✢·*●○]\s+\S[^()\n]*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s(?:\s*·[^()]*)?\)\s*$/;
+  /^\s*[✻✽✶✢·*●○]\s+\S(?:[^()\n]|\([^()\n]*\))*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s(?:\s*·[^()]*)?\)\s*$/;
 
 /**
  * @description Post-thinking trailer line that Claude's TUI prints

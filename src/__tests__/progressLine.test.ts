@@ -44,6 +44,13 @@ const POSITIVE_LINES: ReadonlyArray<string> = [
   '✶ Fixing streaming output overwrite… (13s · ↓ 176 tokens · thinking with xhigh effort)',
   // Hours-long session tick.
   '· Reviewing the adapter contract… (1h 2m 3s · ↑ 49.0k tokens)',
+  // Parenthesised suffix INSIDE the activity title: the TUI appends
+  // "(sub-agent)" while a Task sub-agent runs (live flood repro 2026-06-11,
+  // topic 15812 — the old `[^()]` text part rejected these ticks, so every
+  // poll diff landed as a new permanent message for an hour).
+  '✽ Fixing relations add flow (sub-agent)… (59m 35s · ↓ 134.5k tokens)',
+  // A task title can carry its own parens too — same widening covers it.
+  '✻ Fix bug (part 2)… (4s · ↓ 14 tokens)',
 ];
 
 for (const line of POSITIVE_LINES) {
@@ -161,4 +168,18 @@ test('checkIsProgressChunk: nested parens inside the thinking-note', () => {
   const withNestedParen =
     '✽ Smooshing… (1m 49s · ↑ 3.3k tokens · (oops nested))';
   assert.equal(checkIsProgressChunk(withNestedParen), false);
+});
+
+test('checkIsProgressChunk: glyph-led prose with a parenthetical is NOT progress', () => {
+  // The 2026-06-11 paren widening must not admit real prose: no ellipsis
+  // and no trailing `(time · tokens)` stats anchor here.
+  assert.equal(checkIsProgressChunk('● Done (all tests pass).'), false);
+});
+
+test('checkIsProgressChunk: prose ending in ellipsis with a non-stats paren is NOT progress', () => {
+  // Carries a parenthetical AND ends in `…`, but the end-anchored stats
+  // parenthesis is missing — the widened title part must not stretch to
+  // admit it, with or without a leading glyph.
+  assert.equal(checkIsProgressChunk('Fixed the bug (see notes)…'), false);
+  assert.equal(checkIsProgressChunk('✻ Fixed the bug (see notes)…'), false);
 });

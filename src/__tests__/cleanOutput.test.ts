@@ -234,6 +234,21 @@ test('stripTuiElements: drops sub-minute tick "· Working… (7s · ↓ 222 toke
   assert.equal(stripTuiElements(input), 'Result.');
 });
 
+test('stripTuiElements: drops a "(sub-agent)"-suffixed tick inside a chunk', () => {
+  // 2026-06-11 live leak (msg 26645): while a Task sub-agent runs the tick
+  // carries a parenthesised suffix inside the activity title ("Fixing
+  // relations add flow (sub-agent)…"). The old paren-free `[^()]` title part
+  // of SPINNER_TICK_RE let those ticks ride into the permanent tool-output
+  // message; the real output around them must survive untouched.
+  const input =
+    '● Bash(grep -rn "addRelation" src)\n  ⎿  src/relations.ts:42: addRelation()\n✽ Fixing relations add flow (sub-agent)… (59m 35s · ↓ 134.5k tokens)';
+  const out = stripTuiElements(input);
+  assert.ok(!out.includes('Fixing relations add flow'), `tick leaked: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('addRelation()'), `real output lost: ${JSON.stringify(out)}`);
+  assert.ok(out.includes('● Bash') || out.includes('✓ Bash') || out.includes('⏳ Bash'),
+    `tool header lost: ${JSON.stringify(out)}`);
+});
+
 test('stripTuiElements: drops a MULTI-WORD task-title tick inside a chunk', () => {
   // Since ~2026-06 the tick shows the active task title instead of a single
   // verb. Live leak repro: the `● Agent(…)` permanent message carried

@@ -119,6 +119,33 @@ test('collapseProgressChunk: mixed flood → latest task frame + latest spinner 
   );
 });
 
+// ─── "(sub-agent)"-suffixed spinner + ◯ frames (the 2026-06-11 live flood) ──
+//
+// The TUI now renders a parenthesised suffix INSIDE the spinner activity
+// title while a Task sub-agent runs. The old paren-free `[^()]` title part
+// of PROGRESS_LINE_RE rejected those ticks, so every redraw of this exact
+// shape was misrouted as substantive output — one new Telegram message per
+// poll tick for an hour (topic 15812).
+
+const SUBAGENT_SUFFIX_FLOOD = [
+  '✽ Fixing relations add flow (sub-agent)… (59m 35s · ↓ 134.5k tokens)',
+  '  ◯ general-purpose  Implement relations add-flow fix        26m 9s',
+  '✻ Fixing relations add flow (sub-agent)… (59m 41s · ↓ 134.5k tokens)',
+  '  ◯ general-purpose  Implement relations add-flow fix        26m 15s',
+].join('\n');
+
+test('checkIsProgressChunk: "(sub-agent)"-suffixed ticks interleaved with ◯ frames ARE progress', () => {
+  assert.equal(checkIsProgressChunk(SUBAGENT_SUFFIX_FLOOD), true);
+});
+
+test('collapseProgressChunk: "(sub-agent)" flood → latest ◯ frame + latest tick', () => {
+  assert.equal(
+    collapseProgressChunk(SUBAGENT_SUFFIX_FLOOD),
+    '◯ general-purpose Implement relations add-flow fix 26m 15s\n' +
+      '✻ Fixing relations add flow (sub-agent)… (59m 41s · ↓ 134.5k tokens)',
+  );
+});
+
 // ─── collapseProgressChunk ─────────────────────────────────────────────
 
 test('collapseProgressChunk: single sub-agent → latest frame, padding squeezed', () => {

@@ -171,6 +171,7 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/agent` | Pick agent inline |
 | `/model` | Switch model |
 | `/effort` | Set reasoning effort (per-thread) via inline buttons. Claude: native `/effort` levels (`low…ultracode`). OpenCode: the current model's variants, applied per-prompt. No env configuration |
+| `/verbosity` | Output-verbosity macro (`minimal\|short\|full`): sets the thinking, tool-results and sub-agent display prefs at once; `/thinking`, `/tool_results`, `/subagent` point-override afterwards. Mixed prefs show as "custom" in the picker |
 | `/sessions` | List & resume previous sessions in this folder |
 | `/stop` | Kill current agent (tmux/server, brute) |
 | `/quit`, `/q` | Graceful exit — Claude: double Ctrl+C, OpenCode: `stopSession` |

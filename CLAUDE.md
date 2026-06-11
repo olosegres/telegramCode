@@ -200,6 +200,7 @@ config/variants, not a per-message API field).
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`), verify strict descent (`getLineageDepthToAncestor` — busy tracking records a busy CHILD only for a verified descendant, so a dir-fallback-routed foreign sibling's busy=true never pins the thread busy) |
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
 | `utils/displayVerbosity.ts` | THE shared display-verbosity vocabulary for `/thinking` / `/tool_results` / `/subagent`: option order (`displayVerbosityModeOptions`: minimal, short, full), the locked default (`defaultDisplayVerbosityMode` = `minimal`), the type guard (`checkIsDisplayVerbosityMode`), and the legacy-name normalization (`normalizeDisplayVerbosityMode`: `detailed`→`full`, `brief`→`short`, `hide`→`minimal`, `compact`→`short`; unknown→null) used both for old persisted values and old command/callback aliases |
+| `utils/verbosityRender.ts` | Pure decision helper for the `/verbosity` umbrella picker: `getUniformVerbosityLevel` returns the level all three display prefs share (✓ marker target) or `null` when mixed → rendered as "custom" with the three values spelled out. The macro's write path just reuses the per-command apply helpers in `bot.ts` |
 | `utils/thinkingRender.ts` | Pure decision/format helpers for the OpenCode thinking (chain-of-thought) lifecycle behind `/thinking`: the mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, and the "thought for {N}s" duration formatter |
 | `utils/toolResultRender.ts` | Pure helpers for tool-result rendering behind `/tool_results`: mode→render action (`getToolResultRenderAction`), and the `short`-mode dual-cap truncation (`getTruncatedToolResult`, 15 lines / 1200 chars, line-boundary-preserving) |
 | `utils/subagentRender.ts` | Sub-agent rendering helpers behind `/subagent`: the mode×part-kind matrix the adapter consults for child-session parts (`getSubagentPartAction`: text→status/stream, tool→ignore/status, reasoning→always ignore; `minimal` ≡ `short` here, v1), the status-only rolling status line (`buildSubagentStatusText`), the parent-side in-flight delegation status (`buildDelegatingStatusText`) and the full-mode chunk marker (`buildSubagentOutputPrefix`) |
@@ -300,9 +301,9 @@ as a command in `bot.ts`.
     normal welcome stack. Invalid name → error, mode stays armed for retry.
     `/cancel` or any other command exits the mode. `/bind <subdir>` direct form
     is unchanged.
-- **Agent control (proxied):** `/model`, `/effort`, `/thinking`,
-  `/tool_results`, `/agent`, `/output`, `/schedule`, and raw TUI keys `/c`,
-  `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
+- **Agent control (proxied):** `/model`, `/effort`, `/verbosity`, `/thinking`,
+  `/tool_results`, `/subagent`, `/agent`, `/output`, `/schedule`, and raw TUI
+  keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
   - `/schedule <free text>` is a **thin prompt wrapper** — the bot owns NO
     scheduling logic. It wraps the request in an agent-facing instruction
     (`schedule.forwardPromptTemplate`; bare `/schedule` →
@@ -351,6 +352,14 @@ as a command in `bot.ts`.
       serial tmux queue). NOT done on adopt/reattach (the surviving process
       keeps its in-TUI state). OpenCode seeds `effortLevel` from the same
       per-thread pref at session creation.
+  - `/verbosity [minimal|short|full]` is the umbrella macro over the three
+    display prefs below: it sets thinking + tool results + sub-agents to ONE
+    level at once (same store as the individual commands, so those keep
+    point-overriding afterwards — last write per pref wins). Both backends, no
+    session needed. Bare `/verbosity` shows a 3-button picker (`verb_<mode>`):
+    ✓ on a level IFF all three prefs equal it; mixed prefs render as "custom"
+    with the three current values spelled out (decision helper
+    `getUniformVerbosityLevel` in `utils/verbosityRender.ts`).
   - `/thinking [minimal|short|full]` and `/tool_results [minimal|short|full]`
     set per-topic OpenCode-only DISPLAY modes (bot-rendering concerns, never
     sent to the agent), persisted in `state.json` `displayPrefs` and

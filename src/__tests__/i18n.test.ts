@@ -244,13 +244,38 @@ test('thinking (/thinking) keys exist in every locale (S2)', () => {
 
 test('unified display-mode label keys exist in every locale (S1)', () => {
   // One label per unified mode per command group — the pickers of /thinking,
-  // /tool_results and /subagent all render minimal|short|full buttons.
-  for (const group of ['thinking', 'toolResults', 'subagent']) {
+  // /tool_results, /subagent and the /verbosity umbrella all render
+  // minimal|short|full buttons.
+  for (const group of ['thinking', 'toolResults', 'subagent', 'verbosity']) {
     for (const mode of ['minimal', 'short', 'full']) {
       const code = `${group}.mode.${mode}`;
       assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
     }
   }
+});
+
+test('verbosity (/verbosity umbrella) keys exist in every locale (S2)', () => {
+  for (const code of [
+    'verbosity.choose',
+    'verbosity.set_success',
+    'verbosity.invalid_mode',
+    'verbosity.custom',
+    'cb.verbosity_set',
+    'cb.verbosity_error',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('verbosity.custom substitutes all three per-pref placeholders (mixed state)', () => {
+  const out = t('verbosity.custom', {
+    thinking: 'кратко',
+    toolResults: 'минимум',
+    subagent: 'подробно',
+  });
+  assert.ok(out.includes('кратко') && out.includes('минимум') && out.includes('подробно'),
+    `expected all three values in "${out}"`);
+  assert.ok(!out.includes('{'), `placeholders not substituted: "${out}"`);
 });
 
 test('thinking.thoughtForSeconds substitutes the {seconds} count', () => {

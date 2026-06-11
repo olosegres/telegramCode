@@ -24,7 +24,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ThinkingEvent, ToolResultEvent } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, ThinkingEvent, ToolResultEvent } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -101,6 +101,7 @@ import {
   displayVerbosityModeOptions,
   normalizeDisplayVerbosityMode,
 } from './utils/displayVerbosity';
+import { getUniformVerbosityLevel } from './utils/verbosityRender';
 import { createSerialQueue, type SerialQueue } from './utils/serialQueue';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
@@ -4005,6 +4006,85 @@ command('subagent', async (ctx, key) => {
   );
 });
 
+// ── /verbosity — per-topic macro over ALL THREE display prefs ───────────────
+// Sets thinking + toolResults + subagent to one level at once; the individual
+// commands keep point-overriding afterwards (they all write the same store,
+// last write per pref wins — no extra mechanism). Like /subagent there is no
+// backend or session gate: the prefs are bot-side rendering state, valid on
+// both backends and with no session running.
+
+/**
+ * @description Build the `/verbosity` level picker keyboard. One callback
+ * button per unified mode; the `✓` marker shows ONLY when all three display
+ * prefs already equal that level (`matched` null = mixed → no marker
+ * anywhere). Shared by the command (initial render) and the `verb_<mode>`
+ * callback (re-render after a press), mirroring `buildSubagentKeyboard`.
+ */
+function buildVerbosityKeyboard(matched: DisplayVerbosityMode | null) {
+  const buttons = displayVerbosityModeOptions.map((mode) =>
+    Markup.button.callback(
+      mode === matched ? `${t(`verbosity.mode.${mode}`)} ✓` : t(`verbosity.mode.${mode}`),
+      `verb_${mode}`,
+    ),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
+}
+
+/**
+ * @description Render the picker's "current state" fragment: the shared mode
+ * label when all three prefs agree, else the i18n'd "custom" line spelling
+ * out each pref so the user sees WHAT is mixed.
+ */
+function formatVerbosityCurrent(prefs: ResolvedThreadDisplayPrefs): string {
+  const matched = getUniformVerbosityLevel(prefs);
+  if (matched) return t(`verbosity.mode.${matched}`);
+  return t('verbosity.custom', {
+    thinking: t(`verbosity.mode.${prefs.thinking}`),
+    toolResults: t(`verbosity.mode.${prefs.toolResults}`),
+    subagent: t(`verbosity.mode.${prefs.subagent}`),
+  });
+}
+
+/**
+ * @description Apply ONE level to all three display prefs (the `/verbosity`
+ * macro). Reuses the per-command apply helpers so the macro and the point
+ * commands can never write through different paths.
+ */
+async function applyVerbosityLevel(key: ThreadKey, mode: DisplayVerbosityMode): Promise<void> {
+  await applyThinkingMode(key, mode);
+  await applyToolResultMode(key, mode);
+  await applySubagentMode(key, mode);
+}
+
+command('verbosity', async (ctx, key) => {
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+
+  if (arg) {
+    // Normalization keeps the retired names (`detailed`/`brief`/`hide`/
+    // `compact`) working as hidden aliases; the reply always names the NEW mode.
+    const mode = normalizeDisplayVerbosityMode(arg);
+    if (!mode) {
+      await replyToThread(key, t('verbosity.invalid_mode', {
+        mode: arg,
+        valid: displayVerbosityModeOptions.join(', '),
+      }));
+      return;
+    }
+    await applyVerbosityLevel(key, mode);
+    await replyToThread(key, t('verbosity.set_success', { mode: t(`verbosity.mode.${mode}`) }));
+    return;
+  }
+
+  // No arg: show the current state (exact level, or "custom" with the three
+  // values spelled out) + a button per level.
+  const prefs = state.getDisplayPrefs(key);
+  await replyToThread(
+    key,
+    t('verbosity.choose', { current: formatVerbosityCurrent(prefs) }),
+    buildVerbosityKeyboard(getUniformVerbosityLevel(prefs)),
+  );
+});
+
 // Manually rename the CURRENT thread's session. Adapter-owned capability
 // (optional method, like /model): OpenCode renames via `PATCH /session/:id`;
 // Claude has no title concept and is told "not supported". Requires a live
@@ -5727,6 +5807,42 @@ bot.action(/^subag_(.+)$/, async (ctx) => {
   }
 });
 
+bot.action(/^verb_(.+)$/, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  // No backend gate (mirrors subag_): the macro writes bot-side display prefs
+  // only, valid on both backends. Normalize BEFORE validating — legacy mode
+  // names on stale buttons must keep working (see think_ callback).
+  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
+  if (!picked) {
+    await ctx.answerCbQuery(t('cb.verbosity_error', { error: ctx.match[1].slice(0, 50) }));
+    return;
+  }
+  await applyVerbosityLevel(key, picked);
+  await ctx.answerCbQuery(t('cb.verbosity_set', { mode: t(`verbosity.mode.${picked}`) }));
+
+  // Re-render the picker so the `✓` follows the new level (all three prefs
+  // now equal `picked`, so the keyboard always has an exact match here).
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  if (cbMsg) {
+    const keyboard = buildVerbosityKeyboard(picked);
+    try {
+      await enqueueSend(
+        key,
+        () => bot.telegram.editMessageReplyMarkup(
+          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
+        ),
+        'interactive',
+      );
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+      if (!/message is not modified/i.test(desc)) {
+        console.warn('[verb_cb] keyboard re-render failed:', desc || e);
+      }
+    }
+  }
+});
+
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
@@ -6773,6 +6889,7 @@ const COMMANDS_MENU = [
   { command: 'clear_session', description: '🆕 Restart session (alias /new)' },
   { command: 'model', description: '🧠 Switch model' },
   { command: 'effort', description: '⚙️ Reasoning effort' },
+  { command: 'verbosity', description: '🔊 Output verbosity (thinking+tools+sub-agents)' },
   { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
   { command: 'tool_results', description: '🔧 Tool-results verbosity (OpenCode)' },
   { command: 'subagent', description: '🤖 Sub-agent verbosity' },

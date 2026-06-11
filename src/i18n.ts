@@ -118,6 +118,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/new — перезапустить сессию (старая → /sessions)\n' +
       '/agent /model /sessions — выбор/переключение\n' +
       '/effort — уровень reasoning effort\n' +
+      '/verbosity — детализация вывода (размышления/инструменты/суб-агенты)\n' +
       '/stop /status /output — контроль\n' +
       '/compact — сжать контекст агента\n' +
       '/clear — удалить сообщения треда\n' +
@@ -286,6 +287,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'subagent.mode.short': 'кратко',
     'subagent.mode.full': 'подробно',
 
+    // ── /verbosity (umbrella over thinking + tool results + sub-agents) ──
+    // Sets all three display prefs at once; the individual commands keep
+    // point-overriding. `custom` renders the mixed state with each pref
+    // spelled out so the user sees what diverged. Mode labels stay identical
+    // to the per-command families (shared vocabulary).
+    'verbosity.choose': '🔊 Текущая детализация вывода: {current}\nВыбери уровень:',
+    'verbosity.set_success': '✅ Детализация вывода: {mode} (размышления, инструменты, суб-агенты)',
+    'verbosity.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
+    'verbosity.custom': 'смешанный (размышления: {thinking} · инструменты: {toolResults} · суб-агенты: {subagent})',
+    'verbosity.mode.minimal': 'минимум',
+    'verbosity.mode.short': 'кратко',
+    'verbosity.mode.full': 'подробно',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
     'model.start_agent_first': 'Нет активной сессии. Сначала запусти агента.',
@@ -365,6 +379,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.toolresults_error': 'Ошибка: {error}',
     'cb.subagent_set': 'Суб-агенты: {mode}',
     'cb.subagent_error': 'Ошибка: {error}',
+    'cb.verbosity_set': 'Детализация вывода: {mode}',
+    'cb.verbosity_error': 'Ошибка: {error}',
 
     // ── session picker (/sessions, /resume). {label}=агент, {max}=кол-во, {error}=причина ──
     'session.list_header': 'Сессии для возобновления ({label}):',
@@ -509,6 +525,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/new — restart the session (old one → /sessions)\n' +
       '/agent /model /sessions — choose/switch\n' +
       '/effort — reasoning-effort level\n' +
+      '/verbosity — output verbosity (thinking/tools/sub-agents)\n' +
       '/stop /status /output — control\n' +
       '/compact — compact agent context\n' +
       '/clear — delete thread messages\n' +
@@ -671,6 +688,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'subagent.mode.short': 'short',
     'subagent.mode.full': 'full',
 
+    // ── /verbosity (umbrella over thinking + tool results + sub-agents) ──
+    // Sets all three display prefs at once; the individual commands keep
+    // point-overriding. `custom` renders the mixed state with each pref
+    // spelled out so the user sees what diverged. Mode labels stay identical
+    // to the per-command families (shared vocabulary).
+    'verbosity.choose': '🔊 Current output verbosity: {current}\nPick a level:',
+    'verbosity.set_success': '✅ Output verbosity: {mode} (thinking, tool results, sub-agents)',
+    'verbosity.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
+    'verbosity.custom': 'custom (thinking: {thinking} · tools: {toolResults} · sub-agents: {subagent})',
+    'verbosity.mode.minimal': 'minimal',
+    'verbosity.mode.short': 'short',
+    'verbosity.mode.full': 'full',
+
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Model saved: {model} — applies on next agent start.',
     'model.start_agent_first': 'No active session. Start an agent first.',
@@ -743,6 +773,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'cb.toolresults_error': 'Error: {error}',
     'cb.subagent_set': 'Sub-agents: {mode}',
     'cb.subagent_error': 'Error: {error}',
+    'cb.verbosity_set': 'Output verbosity: {mode}',
+    'cb.verbosity_error': 'Error: {error}',
 
     // ── session picker (/sessions, /resume). {label}=agent, {max}=count, {error}=reason ──
     'session.list_header': 'Sessions to resume ({label}):',

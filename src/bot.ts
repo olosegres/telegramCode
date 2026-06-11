@@ -3940,9 +3940,12 @@ command('tool_results', async (ctx, key) => {
   );
 });
 
-// ── /subagent — per-topic sub-agent transcript verbosity (OpenCode only, S4) ─
+// ── /subagent — per-topic sub-agent transcript verbosity (both backends) ────
 // 2-state by design (compact|full) — NO hide mode: the user always wants the
-// "working" indicator visible (locked decision).
+// "working" indicator visible (locked decision). Unlike /thinking and
+// /tool_results (OpenCode-only render prefs), the pref is backend-agnostic:
+// OpenCode branches its child-session SSE parts on it, Claude tails the
+// on-disk sub-agent transcripts in `full` mode (plan 2026-06-11 S2/S3).
 
 /**
  * @description Build the `/subagent` mode picker keyboard. One callback button
@@ -3971,13 +3974,6 @@ async function applySubagentMode(key: ThreadKey, mode: SubagentMode): Promise<vo
 }
 
 command('subagent', async (ctx, key) => {
-  // OpenCode-only capability gate (like /tool_results): Claude renders
-  // sub-agents in its own TUI pane, nothing for the bot to do.
-  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
-    await replyToThread(key, t('subagent.opencode_only'));
-    return;
-  }
-
   const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   const current = state.getDisplayPrefs(key).subagent;
 
@@ -5686,12 +5682,8 @@ bot.action(/^toolres_(.+)$/, async (ctx) => {
 bot.action(/^subag_(.+)$/, async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // Same OpenCode-only gate as the command — a stale button on a topic switched
-  // to Claude after the picker was shown must not silently set an unused pref.
-  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
-    await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
-    return;
-  }
+  // No backend gate (unlike thinking/toolres callbacks): the pref drives both
+  // backends now — OpenCode's child SSE branch and Claude's transcript tail.
   const picked = ctx.match[1];
   if (!checkIsSubagentMode(picked)) {
     await ctx.answerCbQuery(t('cb.subagent_error', { error: picked.slice(0, 50) }));
@@ -6769,7 +6761,7 @@ const COMMANDS_MENU = [
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
   { command: 'tool_results', description: '🔧 Tool-results verbosity (OpenCode)' },
-  { command: 'subagent', description: '🤖 Sub-agent verbosity (OpenCode)' },
+  { command: 'subagent', description: '🤖 Sub-agent verbosity' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
@@ -7184,10 +7176,11 @@ export async function startBot(): Promise<void> {
     onStopped: handleAgentStopped,
     onError: handleAgentError,
   });
-  // S4: the OpenCode adapter branches on the per-thread `/subagent` mode while
-  // ACCUMULATING (compact = status, full = separate child stream) — the one
-  // display pref it cannot resolve at render time. Same late-wiring idiom as
-  // the event handlers above; before this line it falls back to `compact`.
+  // Both adapters branch on the per-thread `/subagent` mode while PRODUCING
+  // sub-agent output (OpenCode: child SSE parts; Claude: on-disk transcript
+  // tailing) — the one display pref they cannot resolve at render time. Same
+  // late-wiring idiom as the event handlers above; before this line they fall
+  // back to `compact`.
   registerSubagentModeReader((key) => state.getDisplayPrefs(key).subagent);
 
   // 3. Connect to Telegram and register commands menu before starting local

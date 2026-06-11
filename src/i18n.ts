@@ -269,7 +269,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.mode.hide': 'скрыть',
     'toolResults.truncated_footer': '… (обрезано, /tool_results full)',
 
-    // ── /subagent (sub-agent transcript verbosity, OpenCode only) ──
+    // ── /subagent (sub-agent transcript verbosity, both backends) ──
     // Mode names are also used on the picker buttons. `status_live` is the
     // rolling compact-mode status line; `chunk_prefix` marks each streamed
     // full-mode chunk; `fallback_title` fills in when the delegation carried
@@ -281,7 +281,6 @@ const dict: Record<Lang, Record<string, string>> = {
     'subagent.choose': '🤖 Текущий режим суб-агентов: {current}\nВыбери режим:',
     'subagent.set_success': '✅ Режим суб-агентов: {mode}',
     'subagent.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
-    'subagent.opencode_only': 'ℹ️ /subagent доступен только для OpenCode (Claude показывает суб-агентов в своём TUI).',
     'subagent.mode.compact': 'компактно',
     'subagent.mode.full': 'полностью',
 
@@ -653,7 +652,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.mode.hide': 'hide',
     'toolResults.truncated_footer': '… (truncated, /tool_results full)',
 
-    // ── /subagent (sub-agent transcript verbosity, OpenCode only) ──
+    // ── /subagent (sub-agent transcript verbosity, both backends) ──
     // Mode names are also used on the picker buttons. `status_live` is the
     // rolling compact-mode status line; `chunk_prefix` marks each streamed
     // full-mode chunk; `fallback_title` fills in when the delegation carried
@@ -665,7 +664,6 @@ const dict: Record<Lang, Record<string, string>> = {
     'subagent.choose': '🤖 Current sub-agent mode: {current}\nPick a mode:',
     'subagent.set_success': '✅ Sub-agent mode: {mode}',
     'subagent.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
-    'subagent.opencode_only': 'ℹ️ /subagent is OpenCode-only (Claude renders sub-agents in its own TUI).',
     'subagent.mode.compact': 'compact',
     'subagent.mode.full': 'full',
 

@@ -10,17 +10,25 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getSubagentPartAction,
-  checkIsSubagentMode,
-  subagentModeOptions,
-  fallbackSubagentMode,
   buildSubagentStatusText,
   buildDelegatingStatusText,
   buildSubagentOutputPrefix,
 } from '../utils/subagentRender';
+import { displayVerbosityModeOptions } from '../utils/displayVerbosity';
 
 describe('getSubagentPartAction — mode×part-kind matrix', () => {
-  it('compact + text → status (child text never streams, only the rolling status)', () => {
-    assert.equal(getSubagentPartAction('compact', 'text'), 'status');
+  it('short + text → status (child text never streams, only the rolling status)', () => {
+    assert.equal(getSubagentPartAction('short', 'text'), 'status');
+  });
+
+  it('minimal behaves EXACTLY like short (v1 equivalence: status-only, indicator never hidden)', () => {
+    for (const partKind of ['text', 'tool', 'reasoning'] as const) {
+      assert.equal(
+        getSubagentPartAction('minimal', partKind),
+        getSubagentPartAction('short', partKind),
+        `partKind=${partKind}`,
+      );
+    }
   });
 
   it('full + text → stream (marked output via the separate child accumulator)', () => {
@@ -28,13 +36,13 @@ describe('getSubagentPartAction — mode×part-kind matrix', () => {
   });
 
   it('reasoning → ignore in EVERY mode (child chain-of-thought is never rendered)', () => {
-    for (const mode of subagentModeOptions) {
+    for (const mode of displayVerbosityModeOptions) {
       assert.equal(getSubagentPartAction(mode, 'reasoning'), 'ignore', `mode=${mode}`);
     }
   });
 
-  it('compact + tool → ignore (a generic 🔧 status would overwrite the sub-agent status)', () => {
-    assert.equal(getSubagentPartAction('compact', 'tool'), 'ignore');
+  it('short + tool → ignore (a generic 🔧 status would overwrite the sub-agent status)', () => {
+    assert.equal(getSubagentPartAction('short', 'tool'), 'ignore');
   });
 
   it('full + tool → status (transient 🔧 flows; toolResult bodies stay suppressed elsewhere)', () => {
@@ -42,31 +50,7 @@ describe('getSubagentPartAction — mode×part-kind matrix', () => {
   });
 });
 
-describe('checkIsSubagentMode — narrows /subagent <arg> without a cast', () => {
-  it('accepts every valid mode', () => {
-    for (const mode of subagentModeOptions) {
-      assert.equal(checkIsSubagentMode(mode), true, `mode=${mode}`);
-    }
-  });
-
-  it('rejects unknown / empty / wrong-case input — incl. the locked-out "hide"', () => {
-    assert.equal(checkIsSubagentMode('hide'), false, '/subagent is 2-state by design');
-    assert.equal(checkIsSubagentMode(''), false);
-    assert.equal(checkIsSubagentMode('Compact'), false);
-  });
-});
-
-describe('mode options + fallback', () => {
-  it('exactly two modes, compact first (the default)', () => {
-    assert.deepEqual([...subagentModeOptions], ['compact', 'full']);
-  });
-
-  it('the pre-wiring fallback is the locked default (compact)', () => {
-    assert.equal(fallbackSubagentMode, 'compact');
-  });
-});
-
-describe('buildSubagentStatusText — compact-mode rolling status line', () => {
+describe('buildSubagentStatusText — status-only-mode rolling status line', () => {
   it('embeds the delegation title and the sub-agent marker', () => {
     const status = buildSubagentStatusText('Count TS files in src/utils');
     assert.ok(status.includes('Count TS files in src/utils'), 'title embedded');
@@ -95,7 +79,7 @@ describe('buildDelegatingStatusText — parent-side "Delegating" activity status
     assert.ok(status.length > '🤖 '.length, 'fallback label is non-empty');
   });
 
-  it('is distinct from the compact sub-agent status for the same title', () => {
+  it('is distinct from the status-only sub-agent status for the same title', () => {
     // The two statuses cover different phases (parent's task tool in flight vs
     // child streaming) — identical strings would mean the dedicated
     // "Delegating" label silently collapsed into the generic one.

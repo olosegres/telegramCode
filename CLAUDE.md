@@ -199,10 +199,11 @@ config/variants, not a per-message API field).
 | `apiErrorRetry.ts` | Pure auto-retry decision layer for agent **API** errors: `classifyAgentApiError` (transient / usageLimit / null-for-auth; markers from the claude.exe strings), `parseResetAt`, `getRetryPlan` (backoff schedule), `decideRetryAction` (arm/ignore/giveUp + grace-window dedup). The `bot.ts` manager owns the timer + kick |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`), verify strict descent (`getLineageDepthToAncestor` — busy tracking records a busy CHILD only for a verified descendant, so a dir-fallback-routed foreign sibling's busy=true never pins the thread busy) |
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
-| `utils/thinkingRender.ts` | Pure decision/format helpers for the OpenCode thinking (chain-of-thought) lifecycle behind `/thinking`: mode options + type guard (`checkIsThinkingMode`), the mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, and the "thought for {N}s" duration formatter |
-| `utils/toolResultRender.ts` | Pure helpers for tool-result rendering behind `/tool_results`: mode options + type guard (`checkIsToolResultMode`), mode→render action (`getToolResultRenderAction`), and the `short`-mode dual-cap truncation (`getTruncatedToolResult`, 15 lines / 1200 chars, line-boundary-preserving) |
-| `utils/subagentRender.ts` | Sub-agent rendering helpers behind `/subagent`: mode options + type guard (`checkIsSubagentMode`) and the `fallbackSubagentMode` default shared by BOTH backends; OpenCode-specific: the mode×part-kind matrix the adapter consults for child-session parts (`getSubagentPartAction`: text→status/stream, tool→ignore/status, reasoning→always ignore), the compact status line (`buildSubagentStatusText`), the parent-side in-flight delegation status (`buildDelegatingStatusText`) and the full-mode chunk marker (`buildSubagentOutputPrefix`) |
-| `utils/claudeSubagentTail.ts` | Pure decision logic for Claude's `/subagent full` transcript tailing: per-file tail state (byte offset + partial-line carry), the scan planner (`getSubagentTailReads`: first scan seeds offsets to EOF with no reads = no backlog replay; compact fast-forwards without reading; full returns `[offset..size)` ranges), the transcript filename filter (`checkIsSubagentTranscriptName`), and the extractor (`extractAppendedSubagentTexts`: assistant `text` blocks only — thinking/tool_use/user/attachment dropped, malformed JSONL lines skipped). The adapter's poll tick does the fs work |
+| `utils/displayVerbosity.ts` | THE shared display-verbosity vocabulary for `/thinking` / `/tool_results` / `/subagent`: option order (`displayVerbosityModeOptions`: minimal, short, full), the locked default (`defaultDisplayVerbosityMode` = `minimal`), the type guard (`checkIsDisplayVerbosityMode`), and the legacy-name normalization (`normalizeDisplayVerbosityMode`: `detailed`→`full`, `brief`→`short`, `hide`→`minimal`, `compact`→`short`; unknown→null) used both for old persisted values and old command/callback aliases |
+| `utils/thinkingRender.ts` | Pure decision/format helpers for the OpenCode thinking (chain-of-thought) lifecycle behind `/thinking`: the mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, and the "thought for {N}s" duration formatter |
+| `utils/toolResultRender.ts` | Pure helpers for tool-result rendering behind `/tool_results`: mode→render action (`getToolResultRenderAction`), and the `short`-mode dual-cap truncation (`getTruncatedToolResult`, 15 lines / 1200 chars, line-boundary-preserving) |
+| `utils/subagentRender.ts` | Sub-agent rendering helpers behind `/subagent`: the mode×part-kind matrix the adapter consults for child-session parts (`getSubagentPartAction`: text→status/stream, tool→ignore/status, reasoning→always ignore; `minimal` ≡ `short` here, v1), the status-only rolling status line (`buildSubagentStatusText`), the parent-side in-flight delegation status (`buildDelegatingStatusText`) and the full-mode chunk marker (`buildSubagentOutputPrefix`) |
+| `utils/claudeSubagentTail.ts` | Pure decision logic for Claude's `/subagent full` transcript tailing: per-file tail state (byte offset + partial-line carry), the scan planner (`getSubagentTailReads`: first scan seeds offsets to EOF with no reads = no backlog replay; non-`full` modes fast-forward without reading; full returns `[offset..size)` ranges), the transcript filename filter (`checkIsSubagentTranscriptName`), and the extractor (`extractAppendedSubagentTexts`: assistant `text` blocks only — thinking/tool_use/user/attachment dropped, malformed JSONL lines skipped). The adapter's poll tick does the fs work |
 | `scheduler/recurrence.ts` | Pure schedule math on `croner`: `ScheduleSpec` (cron / once / N-times), validation (min fire interval 5 min), next-occurrence, human description, catch-up decision |
 | `scheduler/store.ts` | Schedule records: create path (slug ids, ≤30/thread cap, `isPinSilent`), persisted in `state.json` `schedules` (lifecycle-independent) |
 | `scheduler/engine.ts` | Timer engine: one unref'd timer per job, boot replay with one-catch-up-per-missed-run, no-overlap guard, N-times/once bookkeeping, `whenIdle` drain |
@@ -350,50 +351,56 @@ as a command in `bot.ts`.
       serial tmux queue). NOT done on adopt/reattach (the surviving process
       keeps its in-TUI state). OpenCode seeds `effortLevel` from the same
       per-thread pref at session creation.
-  - `/thinking [detailed|brief|hide]` and `/tool_results [full|short|hide]`
+  - `/thinking [minimal|short|full]` and `/tool_results [minimal|short|full]`
     set per-topic OpenCode-only DISPLAY modes (bot-rendering concerns, never
     sent to the agent), persisted in `state.json` `displayPrefs` and
     lifecycle-independent; a Claude-bound topic gets an "OpenCode only" reply
-    (its TUI renders all of it itself). `/subagent [compact|full]` is the
-    same kind of persisted display pref but works on BOTH backends (see
-    below). All offer inline mode buttons (✓ on current) and work with no
-    session running. **`/thinking`** (default `brief`) controls what REMAINS
+    (its TUI renders all of it itself). `/subagent [minimal|short|full]` is
+    the same kind of persisted display pref but works on BOTH backends (see
+    below). All three commands share ONE unified mode vocabulary
+    (`minimal|short|full`, default `minimal`; old names
+    `detailed`/`brief`/`hide`/`compact` persist/parse as hidden aliases via
+    `utils/displayVerbosity.ts` — pickers and replies show only the new
+    names). All offer inline mode buttons (✓ on current) and work with no
+    session running. **`/thinking`** (default `minimal`) controls what REMAINS
     of the chain-of-thought — the live "☁️ thinking …" indicator shows in ALL
-    modes: `detailed` keeps the full streamed reasoning, `brief` collapses it
-    to "💭 thought for {N}s", `hide` deletes it when the answer starts.
-    **`/tool_results`** (default `short`) controls a completed tool call's
+    modes: `full` keeps the full streamed reasoning, `short` collapses it
+    to "💭 thought for {N}s", `minimal` deletes it when the answer starts.
+    **`/tool_results`** (default `minimal`) controls a completed tool call's
     OUTPUT, posted as its own "🔧 <tool> →" + fenced message via a dedicated
     `toolResult` adapter event (never mixed into the answer's continuation
     chain): `full` = whole body (split over messages when long), `short` =
     capped at 15 lines / 1200 chars with a "… (truncated, /tool_results full)"
-    footer, `hide` = only the transient 🔧 status (the pre-S3 behavior).
-    **`/subagent`** (default `compact`) controls a sub-agent's transcript on
-    BOTH backends — 2-state by design, NO hide (the "working" indicator must
-    stay visible). Shared parity rules: child reasoning is NEVER rendered and
+    footer, `minimal` = only the transient 🔧 status.
+    **`/subagent`** (default `minimal`) controls a sub-agent's transcript on
+    BOTH backends — `minimal` ≡ `short` here (v1): both are status-only, so
+    no mode ever hides the "working" indicator (locked decision). Shared
+    parity rules: child reasoning is NEVER rendered and
     child tool calls/results are never streamed (the parent's task result
     carries the final outcome); in `full` mode child TEXT streams as chunks
     marked "🤖 ⤷" OUTSIDE the parent's continuation chain
     (`OutputEventMeta.isSubagent`). **OpenCode** (child-session SSE events):
-    `compact` = the child transcript is NOT streamed, a single live
+    non-`full` = the child transcript is NOT streamed, a single live
     "🤖 sub-agent: <title> …" status mirrors the terminal (title from the
     parent's `task` tool part); `full` = a separate adapter-side child
     accumulator streams the text. While the parent's `task` tool part is
     pending/running its transient status renders as "🤖 Delegating: <title> …"
     (`buildDelegatingStatusText`) instead of the generic 🔄/🔧 form, in both
     modes (S5); completed/error keep the generic ✅/❌. **Claude** (no child
-    events — its TUI renders sub-agents itself): `compact` = nothing extra,
+    events — its TUI renders sub-agents itself): non-`full` = nothing extra,
     the TUI's ◯ task-panel line rolls inside the coalesced status frame;
     `full` = the poll loop ADDITIONALLY tails the on-disk sub-agent
     transcripts (`~/.claude/projects/<slug>/<sessionId>/subagents/
     agent-*.jsonl`) and streams the appended assistant `text` blocks — no
     backlog replay on resume/adopt (the first scan seeds offsets to EOF), and
-    mode flips take effect from that moment (compact ticks fast-forward the
+    mode flips take effect from that moment (non-`full` ticks fast-forward the
     offsets without reading). Unlike thinking/tool-results (bot resolves the
     mode at render time), the sub-agent mode is read BY the adapters via an
     injected reader (`registerSubagentModeReader` in `createAdapter.ts`) —
     the branch decides what is PRODUCED. Pure decision/format helpers:
-    `utils/thinkingRender.ts`, `utils/toolResultRender.ts`,
-    `utils/subagentRender.ts`, `utils/claudeSubagentTail.ts`.
+    `utils/displayVerbosity.ts`, `utils/thinkingRender.ts`,
+    `utils/toolResultRender.ts`, `utils/subagentRender.ts`,
+    `utils/claudeSubagentTail.ts`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
   `/doctor`, `/mcp`, `/trace`
   - `/trace on|off` toggles the output-trace recorder for THIS topic; `/trace

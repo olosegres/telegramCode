@@ -21,7 +21,7 @@
  *   (`thinking`) and `tool_use` blocks are never rendered (parity with the
  *   OpenCode sub-agent matrix in `subagentRender.ts`).
  */
-import type { SubagentMode } from '../types';
+import type { DisplayVerbosityMode } from '../types';
 
 /** Claude's sub-agent transcript filename shape (`agent-<agentId>.jsonl`).
  * The sibling `agent-<agentId>.meta.json` files must NOT match. */
@@ -108,7 +108,7 @@ function checkIsRecord(value: unknown): value is Record<string, unknown> {
 export function getSubagentTailReads(
   state: SubagentTailState,
   scannedFiles: readonly SubagentScanFile[],
-  mode: SubagentMode,
+  mode: DisplayVerbosityMode,
 ): SubagentTailRead[] {
   if (!state.isFirstScanDone) {
     state.isFirstScanDone = true;

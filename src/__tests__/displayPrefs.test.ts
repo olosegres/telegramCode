@@ -1,14 +1,17 @@
 /**
- * @description Plan `2026-06-09-opencode-output-verbosity.md` S1 — per-thread
- * display-preference infrastructure (thinking / tool-results / sub-agent).
+ * @description Per-thread display-preference infrastructure (thinking /
+ * tool-results / sub-agent) on the UNIFIED verbosity vocabulary
+ * (`minimal | short | full`, plan 2026-06-11 S1).
  *
  * Covers the getter/setter/default contract and the persistence round-trip:
- *   - an absent pref resolves to the locked DEFAULT (thinking=brief,
- *     toolResults=short, subagent=compact);
+ *   - an absent pref resolves to the locked DEFAULT (`minimal` for all three);
  *   - a set override is stored and resolved back;
  *   - setting a field back to its default CLEARS the override and leaves a
  *     clean `state.json` (no record, no map);
- *   - a saved record round-trips across a reload from disk (restart survival).
+ *   - a saved record round-trips across a reload from disk (restart survival);
+ *   - READ-TIME NORMALIZATION: legacy mode names persisted by older builds
+ *     (`detailed`/`brief`/`hide`/`compact`) resolve to the new vocabulary,
+ *     and an unrecognized value falls back to the default.
  *
  * Mirrors `state.test.ts`'s isolated-`dataDir` + fake-`HOME` harness so the
  * legacy-migration probe never touches the developer's real home.
@@ -47,25 +50,29 @@ function readRawState(): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
 }
 
-test('displayPrefs: absent record resolves to the locked defaults', async () => {
+function writeRawState(raw: Record<string, unknown>): void {
+  fs.writeFileSync(path.join(dataDir, 'state.json'), JSON.stringify(raw));
+}
+
+test('displayPrefs: absent record resolves to the locked default (minimal everywhere)', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
   assert.deepEqual(store.getDisplayPrefs(key1), {
-    thinking: 'brief',
-    toolResults: 'short',
-    subagent: 'compact',
+    thinking: 'minimal',
+    toolResults: 'minimal',
+    subagent: 'minimal',
   });
 });
 
 test('displayPrefs: a set override is stored and resolved back', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
-  await store.setDisplayPref(key1, 'thinking', 'detailed');
-  await store.setDisplayPref(key1, 'toolResults', 'full');
+  await store.setDisplayPref(key1, 'thinking', 'full');
+  await store.setDisplayPref(key1, 'toolResults', 'short');
   await store.setDisplayPref(key1, 'subagent', 'full');
   assert.deepEqual(store.getDisplayPrefs(key1), {
-    thinking: 'detailed',
-    toolResults: 'full',
+    thinking: 'full',
+    toolResults: 'short',
     subagent: 'full',
   });
 });
@@ -73,22 +80,22 @@ test('displayPrefs: a set override is stored and resolved back', async () => {
 test('displayPrefs: only the set field changes — the rest keep their defaults', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
-  await store.setDisplayPref(key1, 'toolResults', 'hide');
+  await store.setDisplayPref(key1, 'toolResults', 'full');
   // Load-bearing: prove ONLY toolResults moved off its default; thinking and
   // subagent must still resolve to their own (unset) defaults, not be wiped.
   assert.deepEqual(store.getDisplayPrefs(key1), {
-    thinking: 'brief',
-    toolResults: 'hide',
-    subagent: 'compact',
+    thinking: 'minimal',
+    toolResults: 'full',
+    subagent: 'minimal',
   });
 });
 
 test('displayPrefs: prefs are isolated per thread', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
-  await store.setDisplayPref(key1, 'thinking', 'detailed');
-  assert.equal(store.getDisplayPrefs(key1).thinking, 'detailed');
-  assert.equal(store.getDisplayPrefs(key2).thinking, 'brief', 'a sibling thread keeps the default');
+  await store.setDisplayPref(key1, 'thinking', 'full');
+  assert.equal(store.getDisplayPrefs(key1).thinking, 'full');
+  assert.equal(store.getDisplayPrefs(key2).thinking, 'minimal', 'a sibling thread keeps the default');
 });
 
 test('displayPrefs: a non-default override survives a reload from disk', async () => {
@@ -97,23 +104,61 @@ test('displayPrefs: a non-default override survives a reload from disk', async (
   // state.json and not just memory).
   const first = new StateStore(dataDir, { saveDebounceMs: 5 });
   await first.init();
-  await first.setDisplayPref(key1, 'thinking', 'hide');
+  await first.setDisplayPref(key1, 'thinking', 'short');
   await first.setDisplayPref(key1, 'toolResults', 'full');
   await first.flush();
 
   const second = new StateStore(dataDir, { saveDebounceMs: 5 });
   await second.init();
   assert.deepEqual(second.getDisplayPrefs(key1), {
-    thinking: 'hide',
+    thinking: 'short',
     toolResults: 'full',
-    subagent: 'compact',
+    subagent: 'minimal',
+  });
+});
+
+test('displayPrefs: legacy persisted names normalize at read time, unknown falls back to default', async () => {
+  // A state.json written BEFORE the vocabulary was unified still holds the old
+  // names. They must keep meaning what they meant — no migration pass, no
+  // surprise default. An unrecognized value (corrupt / future) → default.
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  // Seed a real record so the raw file carries the correct schema around it.
+  await first.setDisplayPref(key1, 'thinking', 'full');
+  await first.setDisplayPref(key2, 'thinking', 'full');
+  await first.flush();
+
+  const raw = readRawState();
+  const prefs = raw.displayPrefs as Record<string, Record<string, string>>;
+  prefs[`${key1.chatId}:${key1.threadId}`] = {
+    thinking: 'detailed', // legacy: keep streamed reasoning
+    toolResults: 'hide', //  legacy: nothing permanent
+    subagent: 'compact', //  legacy: status-only
+  };
+  prefs[`${key2.chatId}:${key2.threadId}`] = {
+    thinking: 'brief', //    legacy: collapse to "thought for {N}s"
+    toolResults: 'verbose', // unknown → default
+  };
+  writeRawState(raw);
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.deepEqual(second.getDisplayPrefs(key1), {
+    thinking: 'full',
+    toolResults: 'minimal',
+    subagent: 'short',
+  });
+  assert.deepEqual(second.getDisplayPrefs(key2), {
+    thinking: 'short',
+    toolResults: 'minimal',
+    subagent: 'minimal',
   });
 });
 
 test('displayPrefs: setting a field back to its default clears the override on disk', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
-  await store.setDisplayPref(key1, 'thinking', 'detailed');
+  await store.setDisplayPref(key1, 'thinking', 'full');
   await store.setDisplayPref(key1, 'toolResults', 'full');
   await store.flush();
 
@@ -123,11 +168,11 @@ test('displayPrefs: setting a field back to its default clears the override on d
   assert.equal(
     (raw.displayPrefs as Record<string, { thinking?: string }>)[`${key1.chatId}:${key1.threadId}`]
       ?.thinking,
-    'detailed',
+    'full',
   );
 
   // Reset thinking to its default — the field must vanish, but toolResults stays.
-  await store.setDisplayPref(key1, 'thinking', 'brief');
+  await store.setDisplayPref(key1, 'thinking', 'minimal');
   await store.flush();
   raw = readRawState();
   const record = (raw.displayPrefs as Record<string, Record<string, unknown>>)[
@@ -136,28 +181,28 @@ test('displayPrefs: setting a field back to its default clears the override on d
   assert.ok(record, 'record must survive while toolResults is still non-default');
   assert.equal('thinking' in record, false, 'defaulted field must be absent on disk');
   assert.equal(record.toolResults, 'full', 'the other override must remain');
-  assert.equal(store.getDisplayPrefs(key1).thinking, 'brief', 'resolves back to default');
+  assert.equal(store.getDisplayPrefs(key1).thinking, 'minimal', 'resolves back to default');
 });
 
 test('displayPrefs: resetting the last override drops the record and the map', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
   await store.setDisplayPref(key1, 'subagent', 'full');
-  await store.setDisplayPref(key1, 'subagent', 'compact'); // back to default
+  await store.setDisplayPref(key1, 'subagent', 'minimal'); // back to default
   await store.flush();
   const raw = readRawState();
   assert.equal('displayPrefs' in raw, false, 'an all-defaults state file must be clean');
   assert.deepEqual(store.getDisplayPrefs(key1), {
-    thinking: 'brief',
-    toolResults: 'short',
-    subagent: 'compact',
+    thinking: 'minimal',
+    toolResults: 'minimal',
+    subagent: 'minimal',
   });
 });
 
 test('displayPrefs: setting the default on an absent record is a clean no-op', async () => {
   const store = new StateStore(dataDir, { saveDebounceMs: 5 });
   await store.init();
-  await store.setDisplayPref(key1, 'thinking', 'brief'); // default, nothing stored yet
+  await store.setDisplayPref(key1, 'thinking', 'minimal'); // default, nothing stored yet
   await store.flush();
   const raw = readRawState();
   assert.equal('displayPrefs' in raw, false, 'must not create a record just to store a default');

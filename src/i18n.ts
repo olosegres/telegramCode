@@ -253,9 +253,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'thinking.set_success': '✅ Режим размышлений: {mode}',
     'thinking.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
     'thinking.opencode_only': 'ℹ️ /thinking доступен только для OpenCode (Claude показывает размышления в своём TUI).',
-    'thinking.mode.detailed': 'подробно',
-    'thinking.mode.brief': 'кратко',
-    'thinking.mode.hide': 'скрыть',
+    'thinking.mode.minimal': 'минимум',
+    'thinking.mode.short': 'кратко',
+    'thinking.mode.full': 'подробно',
 
     // ── /tool_results (tool output verbosity, OpenCode only) ──
     // Mode names are also used on the picker buttons. The truncated footer
@@ -264,16 +264,17 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.set_success': '✅ Режим результатов инструментов: {mode}',
     'toolResults.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
     'toolResults.opencode_only': 'ℹ️ /tool_results доступен только для OpenCode (Claude показывает результаты инструментов в своём TUI).',
-    'toolResults.mode.full': 'полностью',
+    'toolResults.mode.minimal': 'минимум',
     'toolResults.mode.short': 'кратко',
-    'toolResults.mode.hide': 'скрыть',
+    'toolResults.mode.full': 'подробно',
     'toolResults.truncated_footer': '… (обрезано, /tool_results full)',
 
     // ── /subagent (sub-agent transcript verbosity, both backends) ──
     // Mode names are also used on the picker buttons. `status_live` is the
-    // rolling compact-mode status line; `chunk_prefix` marks each streamed
+    // rolling status-only-mode status line; `chunk_prefix` marks each streamed
     // full-mode chunk; `fallback_title` fills in when the delegation carried
-    // no title/description. 2-state by design — no `hide` (user-locked).
+    // no title/description. `minimal` ≡ `short` (v1): both are status-only —
+    // the "working" indicator is never hidden (user-locked).
     'subagent.status_live': '🤖 суб-агент: {title} …',
     'subagent.delegating_status': '🤖 Делегирую: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
@@ -281,8 +282,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'subagent.choose': '🤖 Текущий режим суб-агентов: {current}\nВыбери режим:',
     'subagent.set_success': '✅ Режим суб-агентов: {mode}',
     'subagent.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
-    'subagent.mode.compact': 'компактно',
-    'subagent.mode.full': 'полностью',
+    'subagent.mode.minimal': 'минимум',
+    'subagent.mode.short': 'кратко',
+    'subagent.mode.full': 'подробно',
 
     // ── /model (model selection) ──
     'model.saved_for_next_start': 'Модель сохранена: {model} — применится при старте агента.',
@@ -636,9 +638,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'thinking.set_success': '✅ Thinking mode: {mode}',
     'thinking.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
     'thinking.opencode_only': 'ℹ️ /thinking is OpenCode-only (Claude renders thinking in its own TUI).',
-    'thinking.mode.detailed': 'detailed',
-    'thinking.mode.brief': 'brief',
-    'thinking.mode.hide': 'hide',
+    'thinking.mode.minimal': 'minimal',
+    'thinking.mode.short': 'short',
+    'thinking.mode.full': 'full',
 
     // ── /tool_results (tool output verbosity, OpenCode only) ──
     // Mode names are also used on the picker buttons. The truncated footer
@@ -647,16 +649,17 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.set_success': '✅ Tool-results mode: {mode}',
     'toolResults.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
     'toolResults.opencode_only': 'ℹ️ /tool_results is OpenCode-only (Claude renders tool results in its own TUI).',
-    'toolResults.mode.full': 'full',
+    'toolResults.mode.minimal': 'minimal',
     'toolResults.mode.short': 'short',
-    'toolResults.mode.hide': 'hide',
+    'toolResults.mode.full': 'full',
     'toolResults.truncated_footer': '… (truncated, /tool_results full)',
 
     // ── /subagent (sub-agent transcript verbosity, both backends) ──
     // Mode names are also used on the picker buttons. `status_live` is the
-    // rolling compact-mode status line; `chunk_prefix` marks each streamed
+    // rolling status-only-mode status line; `chunk_prefix` marks each streamed
     // full-mode chunk; `fallback_title` fills in when the delegation carried
-    // no title/description. 2-state by design — no `hide` (user-locked).
+    // no title/description. `minimal` ≡ `short` (v1): both are status-only —
+    // the "working" indicator is never hidden (user-locked).
     'subagent.status_live': '🤖 sub-agent: {title} …',
     'subagent.delegating_status': '🤖 Delegating: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
@@ -664,7 +667,8 @@ const dict: Record<Lang, Record<string, string>> = {
     'subagent.choose': '🤖 Current sub-agent mode: {current}\nPick a mode:',
     'subagent.set_success': '✅ Sub-agent mode: {mode}',
     'subagent.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
-    'subagent.mode.compact': 'compact',
+    'subagent.mode.minimal': 'minimal',
+    'subagent.mode.short': 'short',
     'subagent.mode.full': 'full',
 
     // ── /model (model selection) ──

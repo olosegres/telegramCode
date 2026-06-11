@@ -1,8 +1,7 @@
 /**
  * @description Decision + formatting helpers for sub-agent rendering behind
- * `/subagent` (S4). The mode options / type guard / fallback are shared by
- * BOTH backends (Claude's transcript-tail path lives in
- * `claudeSubagentTail.ts`); the mode×part-kind matrix
+ * `/subagent` (S4). Claude's transcript-tail path lives in
+ * `claudeSubagentTail.ts`; the mode×part-kind matrix
  * ({@link getSubagentPartAction}) and the status builders are OpenCode's
  * child-session SSE concerns. The matrix is consulted by the ADAPTER — unlike
  * the thinking / tool-result modes the sub-agent mode decides what is
@@ -10,32 +9,11 @@
  * deferred to the bot's render time. Extracted from the adapter so the matrix
  * is unit-testable without an SSE stream (same pattern as
  * `toolResultRender.ts`). The string builders are pure-ish (they only read
- * i18n), mirroring `buildThinkingFrameText`.
+ * i18n), mirroring `buildThinkingFrameText`. Mode options / type guard /
+ * default live in the shared `utils/displayVerbosity.ts`.
  */
 import { t } from '../i18n';
-import type { SubagentMode } from '../types';
-
-/** Every selectable sub-agent mode, in picker-button order. Single source of
- * truth for both the `/subagent` arg validation and the mode keyboard.
- * Deliberately 2-state — NO `hide`: the user always wants the "working"
- * indicator visible (locked decision). */
-export const subagentModeOptions: readonly SubagentMode[] = ['compact', 'full'];
-
-/**
- * @description Type guard: is `value` one of the {@link SubagentMode} options?
- * Narrows a free-form `/subagent <arg>` (or callback payload) to the enum
- * WITHOUT a cast (mirrors `checkIsToolResultMode`).
- */
-export function checkIsSubagentMode(value: string): value is SubagentMode {
-  return (subagentModeOptions as readonly string[]).includes(value);
-}
-
-/**
- * Locked default sub-agent mode — mirrors `state.ts`'s (unexported)
- * `defaultSubagentMode`. The adapters fall back to it only for reads that
- * happen before the bot injects its mode reader at boot.
- */
-export const fallbackSubagentMode: SubagentMode = 'compact';
+import type { DisplayVerbosityMode } from '../types';
 
 /** Part kinds a sub-agent (child session) event can carry that the adapter
  * must decide on. `step-start`/`step-finish`/unknown parts are skipped before
@@ -57,26 +35,29 @@ export type SubagentPartAction = 'status' | 'stream' | 'ignore';
 /**
  * @description The sub-agent mode×part-kind matrix:
  * ```
- *             compact    full
- * text        status     stream
- * tool        ignore     status
- * reasoning   ignore     ignore
+ *             minimal/short    full
+ * text        status           stream
+ * tool        ignore           status
+ * reasoning   ignore           ignore
  * ```
- * Reasoning is `ignore` in EVERY mode — child chain-of-thought is never
- * rendered (locked decision). Compact ignores child tool parts because their
- * generic 🔧 statuses would overwrite the single sub-agent status line. Child
- * toolResult bodies are suppressed in BOTH modes (handled by the adapter
- * outside this matrix): the parent's `task` tool output already carries the
- * child's final result.
+ * `minimal` and `short` are EQUIVALENT here (the v1 contract on the unified
+ * vocabulary): both are status-only, because the "working" indicator is never
+ * hidden (locked decision — see {@link DisplayVerbosityMode}). Reasoning is
+ * `ignore` in EVERY mode — child chain-of-thought is never rendered (locked
+ * decision). Non-`full` ignores child tool parts because their generic 🔧
+ * statuses would overwrite the single sub-agent status line. Child toolResult
+ * bodies are suppressed in ALL modes (handled by the adapter outside this
+ * matrix): the parent's `task` tool output already carries the child's final
+ * result.
  */
-export function getSubagentPartAction(mode: SubagentMode, partKind: SubagentPartKind): SubagentPartAction {
+export function getSubagentPartAction(mode: DisplayVerbosityMode, partKind: SubagentPartKind): SubagentPartAction {
   if (partKind === 'reasoning') return 'ignore';
   if (partKind === 'text') return mode === 'full' ? 'stream' : 'status';
   return mode === 'full' ? 'status' : 'ignore';
 }
 
 /**
- * @description Build the compact-mode rolling status line
+ * @description Build the status-only (`minimal`/`short`) rolling status line
  * ("🤖 sub-agent: <title> …"), mirroring the terminal's single "working"
  * indicator. `title` is the current delegation's title recorded from the
  * parent's `task` tool part; `null` (no title/description on the part) falls

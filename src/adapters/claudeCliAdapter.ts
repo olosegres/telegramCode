@@ -12,11 +12,11 @@ import type {
   AgentSession,
   ClaudeSurveyEvent,
   ClaudeSurveyOption,
+  DisplayVerbosityMode,
   OutputEventMeta,
   RecentTurn,
   ResumeSessionOptions,
   SendInputOptions,
-  SubagentMode,
   SubagentModeReader,
   ThreadKey,
 } from '../types';
@@ -32,7 +32,7 @@ import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
 import { getEffortStartupKeystroke } from '../utils/effortStartupKeystroke';
-import { fallbackSubagentMode } from '../utils/subagentRender';
+import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
 import {
   checkIsSubagentTranscriptName,
   createSubagentTailState,
@@ -2466,10 +2466,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   /**
    * Per-thread `/subagent` mode reader, injected by the bot at boot via
    * `createAdapter.registerSubagentModeReader` (same idiom as the OpenCode
-   * adapter). The poll loop's transcript scan consults it every tick: compact
-   * fast-forwards the tail offsets without reading, full reads the appended
-   * bytes and streams the child's text blocks. `null` until wired → reads
-   * fall back to the locked default.
+   * adapter). The poll loop's transcript scan consults it every tick: a
+   * non-`full` mode fast-forwards the tail offsets without reading, `full`
+   * reads the appended bytes and streams the child's text blocks. `null`
+   * until wired → reads fall back to the locked default.
    */
   private subagentModeReader: SubagentModeReader | null = null;
 
@@ -2478,10 +2478,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     this.subagentModeReader = reader;
   }
 
-  /** @description Resolve the thread's `/subagent` mode, defaulting to `compact`
+  /** @description Resolve the thread's `/subagent` mode, defaulting to `minimal`
    * for any read that happens before the bot wires the reader at boot. */
-  private getSubagentMode(key: ThreadKey): SubagentMode {
-    return this.subagentModeReader?.(key) ?? fallbackSubagentMode;
+  private getSubagentMode(key: ThreadKey): DisplayVerbosityMode {
+    return this.subagentModeReader?.(key) ?? defaultDisplayVerbosityMode;
   }
 
   private createSession(

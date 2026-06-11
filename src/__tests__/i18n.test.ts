@@ -232,13 +232,24 @@ test('thinking (/thinking) keys exist in every locale (S2)', () => {
     'thinking.set_success',
     'thinking.invalid_mode',
     'thinking.opencode_only',
-    'thinking.mode.detailed',
-    'thinking.mode.brief',
-    'thinking.mode.hide',
+    'thinking.mode.minimal',
+    'thinking.mode.short',
+    'thinking.mode.full',
     'cb.thinking_set',
     'cb.thinking_error',
   ]) {
     assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('unified display-mode label keys exist in every locale (S1)', () => {
+  // One label per unified mode per command group — the pickers of /thinking,
+  // /tool_results and /subagent all render minimal|short|full buttons.
+  for (const group of ['thinking', 'toolResults', 'subagent']) {
+    for (const mode of ['minimal', 'short', 'full']) {
+      const code = `${group}.mode.${mode}`;
+      assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+    }
   }
 });
 

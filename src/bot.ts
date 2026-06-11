@@ -24,7 +24,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, SubagentMode, ThinkingEvent, ThinkingMode, ToolResultEvent, ToolResultMode } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ThinkingEvent, ToolResultEvent } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -90,21 +90,17 @@ import {
   getThinkingEventAction,
   getThinkingAnswerStartAction,
   formatThinkingDurationSeconds,
-  thinkingModeOptions,
-  checkIsThinkingMode,
 } from './utils/thinkingRender';
 import {
   getToolResultRenderAction,
   getTruncatedToolResult,
   buildFencedToolResultBody,
-  toolResultModeOptions,
-  checkIsToolResultMode,
 } from './utils/toolResultRender';
+import { buildSubagentOutputPrefix } from './utils/subagentRender';
 import {
-  buildSubagentOutputPrefix,
-  subagentModeOptions,
-  checkIsSubagentMode,
-} from './utils/subagentRender';
+  displayVerbosityModeOptions,
+  normalizeDisplayVerbosityMode,
+} from './utils/displayVerbosity';
 import { createSerialQueue, type SerialQueue } from './utils/serialQueue';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
@@ -408,11 +404,12 @@ interface ThreadMessageState {
   /**
    * Thinking (chain-of-thought) message id — owned independently of
    * {@link statusMessageId} so the live "☁️ thinking …" indicator can persist
-   * across tool-status churn. Lifecycle per {@link ThinkingMode}: edited live
-   * while reasoning, then (per mode) collapsed to "💭 thought for {N}s", left
-   * as-is, or deleted when the answer starts. `null` = no thinking message.
-   * The accumulated reasoning text mirrors what the adapter sent, so a
-   * `detailed`-mode live frame can re-render the full body on each edit.
+   * across tool-status churn. Lifecycle per the thinking
+   * {@link DisplayVerbosityMode}: edited live while reasoning, then (per mode)
+   * collapsed to "💭 thought for {N}s", left as-is, or deleted when the answer
+   * starts. `null` = no thinking message. The accumulated reasoning text
+   * mirrors what the adapter sent, so a `full`-mode live frame can re-render
+   * the full body on each edit.
    */
   thinkingMessageId: number | null;
   /**
@@ -521,7 +518,7 @@ interface ThinkingCoalesceState {
   /** Last frame that actually reached Telegram — skip an identical re-send. */
   lastSentHtml: string | null;
   /**
-   * When `true`, the pending frame is the response's FINAL one (the brief-mode
+   * When `true`, the pending frame is the response's FINAL one (the short-mode
    * "thought for {N}s" collapse). The flush loop edits it onto the SAME message,
    * THEN detaches the tracked id (`finishThinkingMessage`) — doing the detach
    * before the edit would make the collapse create a new message instead of
@@ -3826,14 +3823,14 @@ command('effort', async (ctx, key) => {
  * command (initial render) and the `think_<mode>` callback (re-render after a
  * press), mirroring `buildEffortKeyboard` so the marker never drifts.
  */
-function buildThinkingKeyboard(current: ThinkingMode) {
-  const buttons = thinkingModeOptions.map((mode) =>
+function buildThinkingKeyboard(current: DisplayVerbosityMode) {
+  const buttons = displayVerbosityModeOptions.map((mode) =>
     Markup.button.callback(
       mode === current ? `${t(`thinking.mode.${mode}`)} ✓` : t(`thinking.mode.${mode}`),
       `think_${mode}`,
     ),
   );
-  return Markup.inlineKeyboard(buttons, { columns: thinkingModeOptions.length });
+  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
 }
 
 /**
@@ -3842,7 +3839,7 @@ function buildThinkingKeyboard(current: ThinkingMode) {
  * `/thinking <mode>` direct form and the `think_<mode>` callback so the two
  * paths can never diverge.
  */
-async function applyThinkingMode(key: ThreadKey, mode: ThinkingMode): Promise<void> {
+async function applyThinkingMode(key: ThreadKey, mode: DisplayVerbosityMode): Promise<void> {
   await state.setDisplayPref(key, 'thinking', mode);
 }
 
@@ -3858,15 +3855,18 @@ command('thinking', async (ctx, key) => {
   const current = state.getDisplayPrefs(key).thinking;
 
   if (arg) {
-    if (!checkIsThinkingMode(arg)) {
+    // Normalization keeps retired names (`detailed`/`brief`/`hide`) working as
+    // hidden aliases; the reply always names the NEW mode.
+    const mode = normalizeDisplayVerbosityMode(arg);
+    if (!mode) {
       await replyToThread(key, t('thinking.invalid_mode', {
         mode: arg,
-        valid: thinkingModeOptions.join(', '),
+        valid: displayVerbosityModeOptions.join(', '),
       }));
       return;
     }
-    await applyThinkingMode(key, arg);
-    await replyToThread(key, t('thinking.set_success', { mode: t(`thinking.mode.${arg}`) }));
+    await applyThinkingMode(key, mode);
+    await replyToThread(key, t('thinking.set_success', { mode: t(`thinking.mode.${mode}`) }));
     return;
   }
 
@@ -3888,14 +3888,14 @@ command('thinking', async (ctx, key) => {
  * command (initial render) and the `toolres_<mode>` callback (re-render after
  * a press), mirroring `buildThinkingKeyboard` so the marker never drifts.
  */
-function buildToolResultsKeyboard(current: ToolResultMode) {
-  const buttons = toolResultModeOptions.map((mode) =>
+function buildToolResultsKeyboard(current: DisplayVerbosityMode) {
+  const buttons = displayVerbosityModeOptions.map((mode) =>
     Markup.button.callback(
       mode === current ? `${t(`toolResults.mode.${mode}`)} ✓` : t(`toolResults.mode.${mode}`),
       `toolres_${mode}`,
     ),
   );
-  return Markup.inlineKeyboard(buttons, { columns: toolResultModeOptions.length });
+  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
 }
 
 /**
@@ -3904,7 +3904,7 @@ function buildToolResultsKeyboard(current: ToolResultMode) {
  * turn picks it up immediately). Shared by the `/tool_results <mode>` direct
  * form and the `toolres_<mode>` callback so the two paths can never diverge.
  */
-async function applyToolResultMode(key: ThreadKey, mode: ToolResultMode): Promise<void> {
+async function applyToolResultMode(key: ThreadKey, mode: DisplayVerbosityMode): Promise<void> {
   await state.setDisplayPref(key, 'toolResults', mode);
 }
 
@@ -3920,15 +3920,18 @@ command('tool_results', async (ctx, key) => {
   const current = state.getDisplayPrefs(key).toolResults;
 
   if (arg) {
-    if (!checkIsToolResultMode(arg)) {
+    // Normalization keeps the retired `hide` name working as a hidden alias;
+    // the reply always names the NEW mode.
+    const mode = normalizeDisplayVerbosityMode(arg);
+    if (!mode) {
       await replyToThread(key, t('toolResults.invalid_mode', {
         mode: arg,
-        valid: toolResultModeOptions.join(', '),
+        valid: displayVerbosityModeOptions.join(', '),
       }));
       return;
     }
-    await applyToolResultMode(key, arg);
-    await replyToThread(key, t('toolResults.set_success', { mode: t(`toolResults.mode.${arg}`) }));
+    await applyToolResultMode(key, mode);
+    await replyToThread(key, t('toolResults.set_success', { mode: t(`toolResults.mode.${mode}`) }));
     return;
   }
 
@@ -3941,11 +3944,12 @@ command('tool_results', async (ctx, key) => {
 });
 
 // ── /subagent — per-topic sub-agent transcript verbosity (both backends) ────
-// 2-state by design (compact|full) — NO hide mode: the user always wants the
-// "working" indicator visible (locked decision). Unlike /thinking and
-// /tool_results (OpenCode-only render prefs), the pref is backend-agnostic:
-// OpenCode branches its child-session SSE parts on it, Claude tails the
-// on-disk sub-agent transcripts in `full` mode (plan 2026-06-11 S2/S3).
+// `minimal` and `short` are equivalent here (v1): both are status-only — the
+// user always wants the "working" indicator visible (locked decision), so no
+// mode ever hides it. Unlike /thinking and /tool_results (OpenCode-only
+// render prefs), the pref is backend-agnostic: OpenCode branches its
+// child-session SSE parts on it, Claude tails the on-disk sub-agent
+// transcripts in `full` mode (plan 2026-06-11 S2/S3).
 
 /**
  * @description Build the `/subagent` mode picker keyboard. One callback button
@@ -3953,14 +3957,14 @@ command('tool_results', async (ctx, key) => {
  * (initial render) and the `subag_<mode>` callback (re-render after a press),
  * mirroring `buildToolResultsKeyboard` so the marker never drifts.
  */
-function buildSubagentKeyboard(current: SubagentMode) {
-  const buttons = subagentModeOptions.map((mode) =>
+function buildSubagentKeyboard(current: DisplayVerbosityMode) {
+  const buttons = displayVerbosityModeOptions.map((mode) =>
     Markup.button.callback(
       mode === current ? `${t(`subagent.mode.${mode}`)} ✓` : t(`subagent.mode.${mode}`),
       `subag_${mode}`,
     ),
   );
-  return Markup.inlineKeyboard(buttons, { columns: subagentModeOptions.length });
+  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
 }
 
 /**
@@ -3969,7 +3973,7 @@ function buildSubagentKeyboard(current: SubagentMode) {
  * picks the change up immediately. Shared by the `/subagent <mode>` direct
  * form and the `subag_<mode>` callback so the two paths can never diverge.
  */
-async function applySubagentMode(key: ThreadKey, mode: SubagentMode): Promise<void> {
+async function applySubagentMode(key: ThreadKey, mode: DisplayVerbosityMode): Promise<void> {
   await state.setDisplayPref(key, 'subagent', mode);
 }
 
@@ -3978,15 +3982,18 @@ command('subagent', async (ctx, key) => {
   const current = state.getDisplayPrefs(key).subagent;
 
   if (arg) {
-    if (!checkIsSubagentMode(arg)) {
+    // Normalization keeps the retired `compact` name working as a hidden
+    // alias (→ `short`); the reply always names the NEW mode.
+    const mode = normalizeDisplayVerbosityMode(arg);
+    if (!mode) {
       await replyToThread(key, t('subagent.invalid_mode', {
         mode: arg,
-        valid: subagentModeOptions.join(', '),
+        valid: displayVerbosityModeOptions.join(', '),
       }));
       return;
     }
-    await applySubagentMode(key, arg);
-    await replyToThread(key, t('subagent.set_success', { mode: t(`subagent.mode.${arg}`) }));
+    await applySubagentMode(key, mode);
+    await replyToThread(key, t('subagent.set_success', { mode: t(`subagent.mode.${mode}`) }));
     return;
   }
 
@@ -5612,9 +5619,12 @@ bot.action(/^think_(.+)$/, async (ctx) => {
     await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
     return;
   }
-  const picked = ctx.match[1];
-  if (!checkIsThinkingMode(picked)) {
-    await ctx.answerCbQuery(t('cb.thinking_error', { error: picked.slice(0, 50) }));
+  // Normalize BEFORE validating: picker messages posted before the vocabulary
+  // was unified still carry old mode names (`think_detailed` etc.) in their
+  // buttons — those must keep working, answering with the NEW name.
+  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
+  if (!picked) {
+    await ctx.answerCbQuery(t('cb.thinking_error', { error: ctx.match[1].slice(0, 50) }));
     return;
   }
   await applyThinkingMode(key, picked);
@@ -5650,9 +5660,11 @@ bot.action(/^toolres_(.+)$/, async (ctx) => {
     await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
     return;
   }
-  const picked = ctx.match[1];
-  if (!checkIsToolResultMode(picked)) {
-    await ctx.answerCbQuery(t('cb.toolresults_error', { error: picked.slice(0, 50) }));
+  // Normalize BEFORE validating — old picker buttons (`toolres_hide`) must
+  // keep working (see think_ callback).
+  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
+  if (!picked) {
+    await ctx.answerCbQuery(t('cb.toolresults_error', { error: ctx.match[1].slice(0, 50) }));
     return;
   }
   await applyToolResultMode(key, picked);
@@ -5684,9 +5696,11 @@ bot.action(/^subag_(.+)$/, async (ctx) => {
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   // No backend gate (unlike thinking/toolres callbacks): the pref drives both
   // backends now — OpenCode's child SSE branch and Claude's transcript tail.
-  const picked = ctx.match[1];
-  if (!checkIsSubagentMode(picked)) {
-    await ctx.answerCbQuery(t('cb.subagent_error', { error: picked.slice(0, 50) }));
+  // Normalize BEFORE validating — old picker buttons (`subag_compact`) must
+  // keep working (see think_ callback).
+  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
+  if (!picked) {
+    await ctx.answerCbQuery(t('cb.subagent_error', { error: ctx.match[1].slice(0, 50) }));
     return;
   }
   await applySubagentMode(key, picked);
@@ -5943,8 +5957,8 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
   }
 
   // The real answer is starting → resolve the thinking message per mode. Only
-  // `hide` removes its live indicator now (nothing should remain); `detailed` /
-  // `brief` leave their persisted message in place. No-op when no thinking
+  // `minimal` removes its live indicator now (nothing should remain); `full` /
+  // `short` leave their persisted message in place. No-op when no thinking
   // message exists (non-OpenCode threads, or a turn without reasoning).
   if (getThreadMessageState(key).thinkingMessageId !== null) {
     const thinkingMode = state.getDisplayPrefs(key).thinking;
@@ -6175,26 +6189,26 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
 // reasoning ends. See `utils/thinkingRender.ts` for the pure mode×phase matrix.
 
 /** Headroom (chars) reserved above the per-message cap for the rendered cloud
- * header + the truncation marker when a long `detailed` reasoning body must be
+ * header + the truncation marker when a long `full`-mode reasoning body must be
  * tail-trimmed to fit one editable message. */
 const thinkingDetailedHeaderHeadroom = 200;
 
 /**
  * @description Render the thinking-frame body for a mode×phase, ready to pass to
  * `renderAgentHtml`. Pure-ish (only reads i18n): the live label is identical in
- * all modes; `detailed` appends the accumulated reasoning text (tail-trimmed to
- * one message); `done` collapses to the "💭 thought for {N}s" line for `brief`.
+ * all modes; `full` appends the accumulated reasoning text (tail-trimmed to
+ * one message); `done` collapses to the "💭 thought for {N}s" line for `short`.
  */
-function buildThinkingFrameText(mode: ThinkingMode, payload: ThinkingEvent): string {
+function buildThinkingFrameText(mode: DisplayVerbosityMode, payload: ThinkingEvent): string {
   if (payload.phase === 'done') {
-    // Only `brief` collapses to a duration line here; `detailed` keeps its last
+    // Only `short` collapses to a duration line here; `full` keeps its last
     // live body (the caller does not re-render on `keep`).
     const seconds = formatThinkingDurationSeconds(payload.durationMs ?? 0);
     return t('thinking.thoughtForSeconds', { seconds: seconds.toString() });
   }
   const header = t('thinking.live');
-  if (mode !== 'detailed' || !payload.text.trim()) return header;
-  // Detailed: header + the accumulated reasoning. Keep the TAIL (the most
+  if (mode !== 'full' || !payload.text.trim()) return header;
+  // Full mode: header + the accumulated reasoning. Keep the TAIL (the most
   // recent reasoning, what is "currently" streaming) when it overflows one
   // message, with a leading "…" so the trim is visible.
   const bodyBudget = MAX_MESSAGE_LEN - thinkingDetailedHeaderHeadroom;
@@ -6205,12 +6219,12 @@ function buildThinkingFrameText(mode: ThinkingMode, payload: ThinkingEvent): str
 
 /**
  * @description Adapter `thinking` event entry point. Reads the per-thread
- * {@link ThinkingMode}, decides the action via the pure
+ * thinking {@link DisplayVerbosityMode}, decides the action via the pure
  * {@link getThinkingEventAction}, and drives the dedicated thinking message.
  *
  * - `editLiveLabel` / `editLiveDetailed` → coalesced live edit of one message.
  * - `collapseToDuration` → final edit to "💭 thought for {N}s", then persist.
- * - `keep` → leave the message as-is (detailed done), persist.
+ * - `keep` → leave the message as-is (full done), persist.
  *
  * "Persist" means clear `thinkingMessageId` so the NEXT response starts a fresh
  * thinking message — the existing one stays in the chat untouched.
@@ -6221,20 +6235,20 @@ function handleAgentThinking(key: ThreadKey, payload: ThinkingEvent): void {
   const action = getThinkingEventAction(mode, payload.phase);
 
   if (action === 'keep') {
-    // Detailed done: nothing to send — the last live frame already shows the
+    // Full done: nothing to send — the last live frame already shows the
     // full reasoning. Detach the id so the next response opens a fresh message.
     finishThinkingMessage(key);
     return;
   }
 
   if (action === 'holdForAnswer') {
-    // Hide done: leave the live indicator AND keep its id tracked so the
+    // Minimal done: leave the live indicator AND keep its id tracked so the
     // answer-start trigger (`handleAgentOutput`) can delete it. Nothing to send.
     return;
   }
 
-  // `editLiveLabel` / `editLiveDetailed` (live) and `collapseToDuration` (brief
-  // done) all SEND a frame. The brief-done frame is terminal: the flush detaches
+  // `editLiveLabel` / `editLiveDetailed` (live) and `collapseToDuration` (short
+  // done) all SEND a frame. The short-done frame is terminal: the flush detaches
   // the id only AFTER editing the collapse onto the same message.
   const frameText = buildThinkingFrameText(mode, payload);
   queueThinkingFrame(key, frameText, action === 'collapseToDuration');
@@ -6258,7 +6272,7 @@ function finishThinkingMessage(key: ThreadKey): void {
 /**
  * @description Park the latest thinking frame in the coalescer and (re)start the
  * single-flight flush loop. Newest frame always wins; at most one edit is in
- * flight per thread. `isTerminal` marks the brief-mode collapse frame — after it
+ * flight per thread. `isTerminal` marks the short-mode collapse frame — after it
  * drains, the flush detaches the tracked id so the next response is fresh.
  */
 function queueThinkingFrame(key: ThreadKey, frameText: string, isTerminal: boolean): void {
@@ -6273,7 +6287,7 @@ function queueThinkingFrame(key: ThreadKey, frameText: string, isTerminal: boole
  * single thinking message with the latest pending frame. Identical frames are
  * skipped (no `400 "message is not modified"`); intermediate frames that arrive
  * during a send are dropped (the loop only sees the latest on its next pass).
- * When `detachAfterDrain` is armed (brief-mode collapse), the tracked id is
+ * When `detachAfterDrain` is armed (short-mode collapse), the tracked id is
  * detached only AFTER the final frame is edited onto the same message.
  */
 async function flushThinkingCoalescer(key: ThreadKey): Promise<void> {
@@ -6299,7 +6313,7 @@ async function flushThinkingCoalescer(key: ThreadKey): Promise<void> {
 
 /**
  * @description Edit the thread's thinking message in place, or create it on the
- * first frame. The frame is pre-rendered HTML (one message — `detailed` bodies
+ * first frame. The frame is pre-rendered HTML (one message — `full`-mode bodies
  * are tail-trimmed to fit). Returns `true` when the frame reached Telegram.
  */
 async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<boolean> {
@@ -6337,14 +6351,14 @@ async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<
 //
 // The adapter emits a mode-AGNOSTIC `toolResult` event for every completed
 // tool call that produced output (the transient 🔧 status keeps flowing
-// independently in all modes). The bot resolves the per-thread
-// `ToolResultMode` here and renders the body as its OWN fresh message —
+// independently in all modes). The bot resolves the per-thread tool-results
+// `DisplayVerbosityMode` here and renders the body as its OWN fresh message —
 // never edited into the answer's continuation chain. See
 // `utils/toolResultRender.ts` for the pure mode matrix + truncation caps.
 
 /**
- * @description Adapter `toolResult` event entry point. `hide` drops the body
- * (pre-S3 behavior — only the transient 🔧 status shows); `short` truncates
+ * @description Adapter `toolResult` event entry point. `minimal` drops the body
+ * (only the transient 🔧 status shows); `short` truncates
  * via the pure caps and appends a "… (truncated, /tool_results full)" footer;
  * `full` renders the whole body. The message is a header line `🔧 <tool> →`
  * (+ the tool's title when present, matching the transient status) over a
@@ -7180,7 +7194,7 @@ export async function startBot(): Promise<void> {
   // sub-agent output (OpenCode: child SSE parts; Claude: on-disk transcript
   // tailing) — the one display pref they cannot resolve at render time. Same
   // late-wiring idiom as the event handlers above; before this line they fall
-  // back to `compact`.
+  // back to the locked default (`minimal`).
   registerSubagentModeReader((key) => state.getDisplayPrefs(key).subagent);
 
   // 3. Connect to Telegram and register commands menu before starting local

@@ -191,73 +191,72 @@ export interface ApiRetryState {
 }
 
 /**
- * @description How much of the agent's chain-of-thought stays in the topic.
- * Per-thread, persisted (see `state.ts` `displayPrefs`). A bot-RENDERING
- * concern only — it never changes what is sent to the agent.
+ * @description THE unified verbosity vocabulary for every per-thread display
+ * preference (`/thinking`, `/tool_results`, `/subagent`). Per-thread, persisted
+ * (see `state.ts` `displayPrefs`). A bot-RENDERING concern only — it never
+ * changes what is sent to the agent. Default for every pref is `minimal`.
  *
- * - `detailed` → the full reasoning text streams in and STAYS after the answer.
- * - `brief`    → live "thinking …" while reasoning, then collapses to a single
- *                "thought for {N}s" line that STAYS.
- * - `hide`     → live "thinking …" shown, but REMOVED once the answer starts.
+ * Per-command semantics (the live "working" indicators show in ALL modes;
+ * the mode only controls what REMAINS in the topic):
  *
- * The live indicator is shown in ALL modes; the mode only controls what
- * remains afterward.
+ * - thinking:
+ *   - `full`    → the full reasoning text streams in and STAYS after the answer.
+ *   - `short`   → live "thinking …" while reasoning, then collapses to a single
+ *                 "thought for {N}s" line that STAYS.
+ *   - `minimal` → live "thinking …" shown, but REMOVED once the answer starts.
+ * - toolResults:
+ *   - `full`    → the tool result is rendered in full, fenced.
+ *   - `short`   → the result is truncated to a cap (lines + chars) with a footer.
+ *   - `minimal` → only the transient "🔧 …" status, no result body.
+ * - subagent (OpenCode: child session; Claude: Task-tool child, tailed from its
+ *   on-disk transcript) — the "working" indicator is NEVER hidden (locked):
+ *   - `full`    → child TEXT is additionally streamed, each chunk marked as
+ *                 sub-agent.
+ *   - `short`   → child transcript is NOT streamed (OpenCode shows a single live
+ *                 "🤖 sub-agent: <title> …" status; Claude's own ◯ task-panel
+ *                 line rolls inside the coalesced status frame).
+ *   - `minimal` → v1: EXACTLY the same as `short` (status-only) — accepted so
+ *                 the vocabulary stays uniform across the three commands.
+ *
+ * Old persisted/typed names (`detailed`/`brief`/`hide`/`compact`) are mapped
+ * to this vocabulary at read/parse time — see
+ * `utils/displayVerbosity.normalizeDisplayVerbosityMode`.
  */
-export type ThinkingMode = 'detailed' | 'brief' | 'hide';
+export type DisplayVerbosityMode = 'minimal' | 'short' | 'full';
 
 /**
- * @description How much of a tool's OUTPUT is rendered in the topic. Per-thread,
- * persisted (`state.ts` `displayPrefs`). A bot-RENDERING concern only.
- *
- * - `full`  → the tool result is rendered in full, fenced.
- * - `short` → the result is truncated to a cap (lines + chars) with a footer.
- * - `hide`  → only the transient "🔧 …" status, no result body (legacy behavior).
- */
-export type ToolResultMode = 'full' | 'short' | 'hide';
-
-/**
- * @description How a sub-agent's transcript surfaces in the topic (OpenCode:
- * child session; Claude: Task-tool child, tailed from its on-disk transcript).
- * Per-thread, persisted (`state.ts` `displayPrefs`). A bot-RENDERING concern only.
- * Deliberately 2-state — there is NO `hide`: the user always wants the "working"
- * indicator visible.
- *
- * - `compact` → child transcript is NOT streamed (OpenCode shows a single live
- *               "🤖 sub-agent: <title> …" status; Claude's own ◯ task-panel
- *               line rolls inside the coalesced status frame).
- * - `full`    → child TEXT is additionally streamed, each chunk marked as
- *               sub-agent.
- */
-export type SubagentMode = 'compact' | 'full';
-
-/**
- * @description Reader for a thread's persisted {@link SubagentMode}, injected
+ * @description Reader for a thread's persisted `/subagent` display mode, injected
  * into BOTH adapters at boot (`createAdapter.registerSubagentModeReader`).
  * Unlike the thinking / tool-result modes (resolved by the BOT at render time,
  * S2/S3), the sub-agent mode decides what the adapter PRODUCES: OpenCode
  * branches a child part on its SSE hot path (compact refreshes a status, full
  * streams into a separate child accumulator); Claude's poll loop either
- * fast-forwards its transcript-tail offsets (compact) or reads + streams the
- * appended text blocks (full) — so both need a live read instead of a
+ * fast-forwards its transcript-tail offsets (non-`full`) or reads + streams the
+ * appended text blocks (`full`) — so both need a live read instead of a
  * render-time one.
  */
-export type SubagentModeReader = (key: ThreadKey) => SubagentMode;
+export type SubagentModeReader = (key: ThreadKey) => DisplayVerbosityMode;
 
 /**
- * @description Per-thread bot-rendering preferences for OpenCode output
+ * @description Per-thread bot-rendering preferences for agent output
  * verbosity. Each field is optional: an absent field means "use the locked
- * default" (thinking=`brief`, toolResults=`short`, subagent=`compact`), so the
- * persisted record only stores non-default overrides — keeping `state.json`
- * clean (same delete-when-default idiom as the `/trace` toggle).
+ * default" (`minimal` for all three), so the persisted record only stores
+ * non-default overrides — keeping `state.json` clean (same
+ * delete-when-default idiom as the `/trace` toggle).
+ *
+ * On disk a field may still hold a LEGACY mode name
+ * (`detailed`/`brief`/`hide`/`compact`) written before the vocabulary was
+ * unified; `state.ts`'s `getDisplayPrefs` normalizes those at read time, so
+ * the declared {@link DisplayVerbosityMode} type holds for every consumer.
  *
  * These are bot-side rendering concerns, NOT agent behavior: they live in
  * `state.json` per-thread (NOT the adapter pref files) and do not change what
- * is sent to OpenCode.
+ * is sent to the agent.
  */
 export interface ThreadDisplayPrefs {
-  thinking?: ThinkingMode;
-  toolResults?: ToolResultMode;
-  subagent?: SubagentMode;
+  thinking?: DisplayVerbosityMode;
+  toolResults?: DisplayVerbosityMode;
+  subagent?: DisplayVerbosityMode;
 }
 
 /**
@@ -267,9 +266,9 @@ export interface ThreadDisplayPrefs {
  * to re-apply defaults themselves.
  */
 export interface ResolvedThreadDisplayPrefs {
-  thinking: ThinkingMode;
-  toolResults: ToolResultMode;
-  subagent: SubagentMode;
+  thinking: DisplayVerbosityMode;
+  toolResults: DisplayVerbosityMode;
+  subagent: DisplayVerbosityMode;
 }
 
 /**
@@ -307,9 +306,9 @@ export interface OutputEventMeta {
  * @description Lifecycle phase of a {@link ThinkingEvent}.
  *
  * - `live` → the agent is actively reasoning; the bot shows the live
- *   "thinking …" indicator (and, in `detailed` mode, the accumulated text).
+ *   "thinking …" indicator (and, in `full` mode, the accumulated text).
  * - `done` → reasoning ended for this response; `durationMs` is how long it
- *   took, used to render the collapsed "thought for {N}s" line in `brief` mode.
+ *   took, used to render the collapsed "thought for {N}s" line in `short` mode.
  */
 export type ThinkingPhase = 'live' | 'done';
 
@@ -320,22 +319,23 @@ export type ThinkingPhase = 'live' | 'done';
  * independently of transient tool status.
  *
  * The adapter stays MODE-AGNOSTIC: it emits the raw accumulated reasoning text
- * and the phase, and the BOT applies the per-thread {@link ThinkingMode} (which
- * controls only what remains AFTER reasoning ends). Reasoning text is kept
- * SEPARATE from the answer accumulator and never leaks into `output`.
+ * and the phase, and the BOT applies the per-thread thinking
+ * {@link DisplayVerbosityMode} (which controls only what remains AFTER
+ * reasoning ends). Reasoning text is kept SEPARATE from the answer accumulator
+ * and never leaks into `output`.
  */
 export interface ThinkingEvent {
   /** Lifecycle phase of this emit. */
   phase: ThinkingPhase;
   /**
    * Reasoning text accumulated so far for this response. Grows across `live`
-   * emits; carried on `done` too so a late-arriving `detailed`-mode render has
+   * emits; carried on `done` too so a late-arriving `full`-mode render has
    * the full text. Empty until the first reasoning delta produces content.
    */
   text: string;
   /**
    * How long reasoning took, in ms. Present only on the `done` phase — the bot
-   * formats it into the collapsed "thought for {N}s" line for `brief` mode.
+   * formats it into the collapsed "thought for {N}s" line for `short` mode.
    */
   durationMs?: number;
 }
@@ -347,8 +347,8 @@ export interface ThinkingEvent {
  * accumulator (`currentResponseText`) or its continuation accounting.
  *
  * The adapter stays MODE-AGNOSTIC: it emits every completed tool output once,
- * and the BOT applies the per-thread {@link ToolResultMode} (`hide` drops it,
- * `short` truncates, `full` renders the whole body).
+ * and the BOT applies the per-thread tool-results {@link DisplayVerbosityMode}
+ * (`minimal` drops it, `short` truncates, `full` renders the whole body).
  */
 export interface ToolResultEvent {
   /** Tool name as reported by the tool part (e.g. `bash`, `read`). */
@@ -409,8 +409,8 @@ export interface SendInputOptions {
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
  * - 'survey'   (key: ThreadKey, survey: ClaudeSurveyEvent) — Claude CLI bare-digit survey to render with answerable buttons
- * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread {@link ThinkingMode}
- * - 'toolResult' (key: ThreadKey, payload: ToolResultEvent) — a completed tool call's output (OpenCode); the bot applies the per-thread {@link ToolResultMode}
+ * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread thinking {@link DisplayVerbosityMode}
+ * - 'toolResult' (key: ThreadKey, payload: ToolResultEvent) — a completed tool call's output (OpenCode); the bot applies the per-thread tool-results {@link DisplayVerbosityMode}
  * - 'apiError' (key: ThreadKey, error: AgentApiErrorClass) — provider-side API error at the proxy boundary (auto-retry trigger; only when {@link AgentApiErrorClass} classification matched)
  * - 'started'  (key: ThreadKey)                  — session is up and ready
  * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)

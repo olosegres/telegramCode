@@ -12,8 +12,6 @@ import {
   getToolResultRenderAction,
   getTruncatedToolResult,
   buildFencedToolResultBody,
-  checkIsToolResultMode,
-  toolResultModeOptions,
   toolResultMaxLines,
   toolResultMaxChars,
 } from '../utils/toolResultRender';
@@ -25,21 +23,8 @@ describe('getToolResultRenderAction — mode → action matrix', () => {
   it('short → truncated (caps + footer)', () => {
     assert.equal(getToolResultRenderAction('short'), 'truncated');
   });
-  it('hide → drop (pre-S3 behavior: only the transient 🔧 status)', () => {
-    assert.equal(getToolResultRenderAction('hide'), 'drop');
-  });
-});
-
-describe('checkIsToolResultMode — narrows /tool_results <arg> without a cast', () => {
-  it('accepts every valid mode', () => {
-    for (const mode of toolResultModeOptions) {
-      assert.equal(checkIsToolResultMode(mode), true, `mode=${mode}`);
-    }
-  });
-  it('rejects unknown / empty / wrong-case input', () => {
-    assert.equal(checkIsToolResultMode('verbose'), false);
-    assert.equal(checkIsToolResultMode(''), false);
-    assert.equal(checkIsToolResultMode('Full'), false);
+  it('minimal → drop (only the transient 🔧 status)', () => {
+    assert.equal(getToolResultRenderAction('minimal'), 'drop');
   });
 });
 

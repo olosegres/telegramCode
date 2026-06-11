@@ -6,14 +6,13 @@ import { randomBytes } from 'node:crypto';
 import {
   keyToString,
   type ApiRetryState,
+  type DisplayVerbosityMode,
   type PendingQuestionState,
   type ResolvedThreadDisplayPrefs,
-  type SubagentMode,
-  type ThinkingMode,
   type ThreadDisplayPrefs,
   type ThreadKey,
-  type ToolResultMode,
 } from './types';
+import { defaultDisplayVerbosityMode, normalizeDisplayVerbosityMode } from './utils/displayVerbosity';
 import type { ScheduleRecord } from './scheduler/types';
 
 /**
@@ -44,16 +43,9 @@ export const STATE_SCHEMA_VERSION = 1;
 /** Default debounce window (ms) for batched saves. Overridable via the store constructor for tests. */
 const DEFAULT_SAVE_DEBOUNCE_MS = 500;
 
-/**
- * @description Locked per-thread display-preference defaults (plan
- * §S1). Applied by {@link StateStore.getDisplayPrefs} whenever a field is
- * absent, so the persisted record only ever stores non-default overrides.
- * Centralised here so the three defaults live in exactly one place rather than
- * being scattered as literals across the getter and S2–S5 render paths.
- */
-const defaultThinkingMode: ThinkingMode = 'brief';
-const defaultToolResultMode: ToolResultMode = 'short';
-const defaultSubagentMode: SubagentMode = 'compact';
+// The locked display-preference default (`minimal` for all three prefs) lives
+// in `utils/displayVerbosity.ts` (`defaultDisplayVerbosityMode`) — one place
+// shared with the adapters' pre-wiring fallback.
 
 export interface BindingData {
   /** Subdirectory under `WORK_ROOT` this thread is attached to. */
@@ -911,16 +903,21 @@ export class StateStore {
 
   /**
    * @description Fully-resolved display preferences for `key`: every field is
-   * present because the locked default (thinking=`brief`, toolResults=`short`,
-   * subagent=`compact`) is applied wherever the persisted record omits it. The
-   * SSE hot path reads this, so it must never hand back an `undefined` field.
+   * present because the locked default (`minimal` for all three) is applied
+   * wherever the persisted record omits it. The SSE hot path reads this, so it
+   * must never hand back an `undefined` field.
+   *
+   * Read-time normalization: a `state.json` written before the vocabulary was
+   * unified may still hold legacy names (`detailed`/`brief`/`hide`/`compact`)
+   * — those map onto the new vocabulary here, and an unrecognized value falls
+   * back to the default, so old files keep working without a migration pass.
    */
   getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
     const stored = this.state.displayPrefs?.[keyToString(key)];
     return {
-      thinking: stored?.thinking ?? defaultThinkingMode,
-      toolResults: stored?.toolResults ?? defaultToolResultMode,
-      subagent: stored?.subagent ?? defaultSubagentMode,
+      thinking: normalizeDisplayVerbosityMode(stored?.thinking) ?? defaultDisplayVerbosityMode,
+      toolResults: normalizeDisplayVerbosityMode(stored?.toolResults) ?? defaultDisplayVerbosityMode,
+      subagent: normalizeDisplayVerbosityMode(stored?.subagent) ?? defaultDisplayVerbosityMode,
     };
   }
 
@@ -930,25 +927,18 @@ export class StateStore {
    * record / map once empty) so an all-defaults thread leaves a clean
    * `state.json` — same delete-when-default idiom as {@link setTraceConfig}.
    * Not crash-critical (a rendering preference), so it rides the debounced
-   * save loop rather than an immediate `flush()`.
-   *
-   * The overloads keep `field` and `value` type-linked so the compiler rejects
-   * e.g. `setDisplayPref(key, 'thinking', 'short')`.
+   * save loop rather than an immediate `flush()`. Callers pass an
+   * already-normalized {@link DisplayVerbosityMode} — legacy names never reach
+   * the store on the write path.
    */
-  setDisplayPref(key: ThreadKey, field: 'thinking', value: ThinkingMode): Promise<void>;
-  setDisplayPref(key: ThreadKey, field: 'toolResults', value: ToolResultMode): Promise<void>;
-  setDisplayPref(key: ThreadKey, field: 'subagent', value: SubagentMode): Promise<void>;
   async setDisplayPref(
     key: ThreadKey,
     field: keyof ThreadDisplayPrefs,
-    value: ThinkingMode | ToolResultMode | SubagentMode,
+    value: DisplayVerbosityMode,
   ): Promise<void> {
     const k = keyToString(key);
     await this.withLock(key, async () => {
-      const isDefault =
-        (field === 'thinking' && value === defaultThinkingMode) ||
-        (field === 'toolResults' && value === defaultToolResultMode) ||
-        (field === 'subagent' && value === defaultSubagentMode);
+      const isDefault = value === defaultDisplayVerbosityMode;
 
       const existing = this.state.displayPrefs?.[k];
 

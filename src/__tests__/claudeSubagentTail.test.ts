@@ -60,10 +60,10 @@ describe('getSubagentTailReads', () => {
 
   it('mode != full fast-forwards offsets WITHOUT asking the caller to read', () => {
     const state = createSubagentTailState();
-    getSubagentTailReads(state, [{ fileName: 'agent-a.jsonl', sizeBytes: 100 }], 'compact');
-    // File grew by 200 bytes while in compact mode — no read, offset jumps.
-    const compactReads = getSubagentTailReads(state, [{ fileName: 'agent-a.jsonl', sizeBytes: 300 }], 'compact');
-    assert.deepEqual(compactReads, []);
+    getSubagentTailReads(state, [{ fileName: 'agent-a.jsonl', sizeBytes: 100 }], 'short');
+    // File grew by 200 bytes while in short (status-only) mode — no read, offset jumps.
+    const statusOnlyReads = getSubagentTailReads(state, [{ fileName: 'agent-a.jsonl', sizeBytes: 300 }], 'short');
+    assert.deepEqual(statusOnlyReads, []);
     // Flip to full: only bytes appended AFTER the flip are read.
     const fullReads = getSubagentTailReads(state, [{ fileName: 'agent-a.jsonl', sizeBytes: 450 }], 'full');
     assert.deepEqual(fullReads, [{ fileName: 'agent-a.jsonl', startOffset: 300, endOffset: 450 }]);
@@ -76,10 +76,10 @@ describe('getSubagentTailReads', () => {
     assert.deepEqual(reads, [{ fileName: 'agent-new.jsonl', startOffset: 0, endOffset: 42 }]);
   });
 
-  it('a file first seen after the first scan in compact mode is fast-forwarded, not read', () => {
+  it('a file first seen after the first scan in minimal mode is fast-forwarded, not read', () => {
     const state = createSubagentTailState();
-    getSubagentTailReads(state, [], 'compact');
-    assert.deepEqual(getSubagentTailReads(state, [{ fileName: 'agent-new.jsonl', sizeBytes: 42 }], 'compact'), []);
+    getSubagentTailReads(state, [], 'minimal');
+    assert.deepEqual(getSubagentTailReads(state, [{ fileName: 'agent-new.jsonl', sizeBytes: 42 }], 'minimal'), []);
     // Its offset must sit at 42 now: flipping to full streams only new bytes.
     assert.deepEqual(getSubagentTailReads(state, [{ fileName: 'agent-new.jsonl', sizeBytes: 50 }], 'full'),
       [{ fileName: 'agent-new.jsonl', startOffset: 42, endOffset: 50 }]);

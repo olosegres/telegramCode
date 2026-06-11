@@ -2,27 +2,18 @@
  * @description Pure decision + formatting helpers for rendering a completed
  * tool call's OUTPUT (the OpenCode `toolResult` adapter event, S3). The
  * adapter emits a mode-AGNOSTIC {@link ToolResultEvent}; the bot's
- * `handleAgentToolResult` resolves the per-thread {@link ToolResultMode} and
+ * `handleAgentToolResult` resolves the per-thread tool-results
+ * {@link DisplayVerbosityMode} and
  * consults {@link getToolResultRenderAction} + {@link getTruncatedToolResult}.
  * Extracted from `bot.ts` so the mode matrix and the truncation caps are
  * unit-testable without the Telegraf machinery (same pattern as
  * `thinkingRender.ts`).
  */
-import type { ToolResultMode } from '../types';
+import type { DisplayVerbosityMode } from '../types';
 
-/** Every selectable tool-result mode, in picker-button order. Single source of
- * truth for both the `/tool_results` arg validation and the mode keyboard. */
-export const toolResultModeOptions: readonly ToolResultMode[] = ['full', 'short', 'hide'];
-
-/**
- * @description Type guard: is `value` one of the {@link ToolResultMode}
- * options? Narrows a free-form `/tool_results <arg>` (or callback payload) to
- * the enum WITHOUT a cast, so the command/callback never coerce a string into
- * the type (mirrors `checkIsThinkingMode`).
- */
-export function checkIsToolResultMode(value: string): value is ToolResultMode {
-  return (toolResultModeOptions as readonly string[]).includes(value);
-}
+// Mode options / type guard / normalization live in the shared
+// `utils/displayVerbosity.ts` — the vocabulary is unified across the three
+// display commands; this module owns only the tool-result-specific semantics.
 
 /** `short`-mode line cap — applied BEFORE the char cap. */
 export const toolResultMaxLines = 15;
@@ -38,18 +29,18 @@ export const toolResultMaxChars = 1200;
  * - `truncated` — render the body capped by {@link getTruncatedToolResult},
  *   with a "… (truncated, /tool_results full)" footer when the caps bit.
  * - `drop`      — render nothing (the transient 🔧 status already showed);
- *   this is the pre-S3 behavior.
+ *   the `minimal` mode.
  */
 export type ToolResultRenderAction = 'full' | 'truncated' | 'drop';
 
 /**
- * @description Map the per-thread {@link ToolResultMode} to a render action.
- * Pure — the matrix is one line per mode, but keeping it a named helper makes
- * it unit-testable and keeps `bot.ts` free of mode-string comparisons (same
- * shape as `getThinkingEventAction`).
+ * @description Map the per-thread tool-results {@link DisplayVerbosityMode} to
+ * a render action. Pure — the matrix is one line per mode, but keeping it a
+ * named helper makes it unit-testable and keeps `bot.ts` free of mode-string
+ * comparisons (same shape as `getThinkingEventAction`).
  */
-export function getToolResultRenderAction(mode: ToolResultMode): ToolResultRenderAction {
-  if (mode === 'hide') return 'drop';
+export function getToolResultRenderAction(mode: DisplayVerbosityMode): ToolResultRenderAction {
+  if (mode === 'minimal') return 'drop';
   return mode === 'short' ? 'truncated' : 'full';
 }
 

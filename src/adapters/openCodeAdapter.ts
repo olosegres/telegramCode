@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, SubagentMode, SubagentModeReader, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, SubagentModeReader, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -36,9 +36,9 @@ import {
 import {
   buildDelegatingStatusText,
   buildSubagentStatusText,
-  fallbackSubagentMode,
   getSubagentPartAction,
 } from '../utils/subagentRender';
+import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
 
 const execAsync = promisify(exec);
 
@@ -194,7 +194,7 @@ interface OpenCodeSession {
    * Title of the delegation currently running in a child session, recorded
    * from the parent's `task` tool part (`state.title` / `state.input.description`)
    * while it is pending/running and cleared when it completes/errors. Drives
-   * the compact-mode "🤖 sub-agent: <title> …" status (S4) and is the field
+   * the status-only-mode "🤖 sub-agent: <title> …" status (S4) and is the field
    * the S5 "Delegating" activity status will reuse. v1 tracks ONE delegation —
    * parallel tasks are last-writer-wins and the first completion clears.
    */
@@ -930,9 +930,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * Per-thread `/subagent` mode reader, injected by the bot at boot via
    * `createAdapter.registerSubagentModeReader` (S4). DELIBERATE deviation from
    * the S2/S3 "adapter stays mode-agnostic" pattern: the sub-agent branch
-   * decides WHAT to accumulate (compact = refresh a status, full = stream into
-   * the separate child accumulator), which cannot be deferred to the bot's
-   * render time. `null` until wired → reads fall back to the locked default.
+   * decides WHAT to accumulate (non-`full` = refresh a status, `full` = stream
+   * into the separate child accumulator), which cannot be deferred to the
+   * bot's render time. `null` until wired → reads fall back to the locked
+   * default.
    */
   private subagentModeReader: SubagentModeReader | null = null;
 
@@ -941,10 +942,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     this.subagentModeReader = reader;
   }
 
-  /** @description Resolve the thread's `/subagent` mode, defaulting to `compact`
+  /** @description Resolve the thread's `/subagent` mode, defaulting to `minimal`
    * for any read that happens before the bot wires the reader at boot. */
-  private getSubagentMode(key: ThreadKey): SubagentMode {
-    return this.subagentModeReader?.(key) ?? fallbackSubagentMode;
+  private getSubagentMode(key: ThreadKey): DisplayVerbosityMode {
+    return this.subagentModeReader?.(key) ?? defaultDisplayVerbosityMode;
   }
 
   constructor() {
@@ -3029,7 +3030,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /**
    * @description Emit the dedicated MODE-AGNOSTIC `toolResult` event once a
    * tool part reaches `completed` with a non-empty output (S3). The bot
-   * resolves the per-thread `ToolResultMode` (`hide` drops it there) — the
+   * resolves the per-thread tool-results mode (`minimal` drops it there) — the
    * adapter emits every result exactly once, guarded by
    * {@link OpenCodeSession.emittedToolResultPartIds} against the re-sent part
    * shapes. The output is kept strictly OUT of `currentResponseText` so it can

@@ -12,71 +12,55 @@ import {
   getThinkingEventAction,
   getThinkingAnswerStartAction,
   formatThinkingDurationSeconds,
-  checkIsThinkingMode,
-  thinkingModeOptions,
 } from '../utils/thinkingRender';
-import type { ThinkingMode } from '../types';
+import { displayVerbosityModeOptions } from '../utils/displayVerbosity';
 
 describe('getThinkingEventAction — mode × phase matrix', () => {
   // The live indicator is shown in ALL three modes while reasoning; the mode
   // only controls what remains after reasoning ends. These assertions are the
   // load-bearing proof of that contract.
 
-  it('detailed/live → editLiveDetailed (full reasoning text appended)', () => {
-    assert.equal(getThinkingEventAction('detailed', 'live'), 'editLiveDetailed');
+  it('full/live → editLiveDetailed (full reasoning text appended)', () => {
+    assert.equal(getThinkingEventAction('full', 'live'), 'editLiveDetailed');
   });
-  it('detailed/done → keep (message persists, id detaches)', () => {
-    assert.equal(getThinkingEventAction('detailed', 'done'), 'keep');
-  });
-
-  it('brief/live → editLiveLabel (label only, no body)', () => {
-    assert.equal(getThinkingEventAction('brief', 'live'), 'editLiveLabel');
-  });
-  it('brief/done → collapseToDuration ("thought for Ns")', () => {
-    assert.equal(getThinkingEventAction('brief', 'done'), 'collapseToDuration');
+  it('full/done → keep (message persists, id detaches)', () => {
+    assert.equal(getThinkingEventAction('full', 'done'), 'keep');
   });
 
-  it('hide/live → editLiveLabel (live indicator still shown, never suppressed)', () => {
-    assert.equal(getThinkingEventAction('hide', 'live'), 'editLiveLabel');
+  it('short/live → editLiveLabel (label only, no body)', () => {
+    assert.equal(getThinkingEventAction('short', 'live'), 'editLiveLabel');
   });
-  it('hide/done → holdForAnswer (indicator stays, id kept for answer-start delete)', () => {
-    // CRITICAL: hide+done must NOT collapse or detach — removal happens on the
-    // separate answer-start trigger. If this returned `keep`, the id would
+  it('short/done → collapseToDuration ("thought for Ns")', () => {
+    assert.equal(getThinkingEventAction('short', 'done'), 'collapseToDuration');
+  });
+
+  it('minimal/live → editLiveLabel (live indicator still shown, never suppressed)', () => {
+    assert.equal(getThinkingEventAction('minimal', 'live'), 'editLiveLabel');
+  });
+  it('minimal/done → holdForAnswer (indicator stays, id kept for answer-start delete)', () => {
+    // CRITICAL: minimal+done must NOT collapse or detach — removal happens on
+    // the separate answer-start trigger. If this returned `keep`, the id would
     // detach and the answer-start delete could never find the message.
-    assert.equal(getThinkingEventAction('hide', 'done'), 'holdForAnswer');
+    assert.equal(getThinkingEventAction('minimal', 'done'), 'holdForAnswer');
   });
 });
 
-describe('getThinkingAnswerStartAction — only hide removes the message', () => {
-  it('hide → delete (nothing remains once the answer starts)', () => {
-    assert.equal(getThinkingAnswerStartAction('hide'), 'delete');
+describe('getThinkingAnswerStartAction — only minimal removes the message', () => {
+  it('minimal → delete (nothing remains once the answer starts)', () => {
+    assert.equal(getThinkingAnswerStartAction('minimal'), 'delete');
   });
-  it('brief → noop (collapsed "thought for Ns" line persists)', () => {
-    assert.equal(getThinkingAnswerStartAction('brief'), 'noop');
+  it('short → noop (collapsed "thought for Ns" line persists)', () => {
+    assert.equal(getThinkingAnswerStartAction('short'), 'noop');
   });
-  it('detailed → noop (full reasoning persists)', () => {
-    assert.equal(getThinkingAnswerStartAction('detailed'), 'noop');
+  it('full → noop (full reasoning persists)', () => {
+    assert.equal(getThinkingAnswerStartAction('full'), 'noop');
   });
 
-  it('only hide ever deletes — exhaustive over all modes', () => {
-    const modes: ThinkingMode[] = ['detailed', 'brief', 'hide'];
-    for (const mode of modes) {
+  it('only minimal ever deletes — exhaustive over all modes', () => {
+    for (const mode of displayVerbosityModeOptions) {
       const action = getThinkingAnswerStartAction(mode);
-      assert.equal(action === 'delete', mode === 'hide', `mode=${mode}`);
+      assert.equal(action === 'delete', mode === 'minimal', `mode=${mode}`);
     }
-  });
-});
-
-describe('checkIsThinkingMode — narrows /thinking <arg> without a cast', () => {
-  it('accepts every valid mode', () => {
-    for (const mode of thinkingModeOptions) {
-      assert.equal(checkIsThinkingMode(mode), true, `mode=${mode}`);
-    }
-  });
-  it('rejects unknown / empty / wrong-case input', () => {
-    assert.equal(checkIsThinkingMode('verbose'), false);
-    assert.equal(checkIsThinkingMode(''), false);
-    assert.equal(checkIsThinkingMode('Brief'), false);
   });
 });
 

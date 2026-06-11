@@ -10,40 +10,31 @@
  * The mode only controls what REMAINS after reasoning ends — the live
  * "thinking …" indicator is shown in ALL three modes while the agent reasons.
  */
-import type { ThinkingMode, ThinkingPhase } from '../types';
+import type { DisplayVerbosityMode, ThinkingPhase } from '../types';
 
-/** Every selectable thinking mode, in picker-button order. Single source of
- * truth for both the `/thinking` arg validation and the mode keyboard. */
-export const thinkingModeOptions: readonly ThinkingMode[] = ['detailed', 'brief', 'hide'];
-
-/**
- * @description Type guard: is `value` one of the {@link ThinkingMode} options?
- * Narrows a free-form `/thinking <arg>` (or callback payload) to the enum
- * WITHOUT a cast, so the command/callback never coerce a string into the type.
- */
-export function checkIsThinkingMode(value: string): value is ThinkingMode {
-  return (thinkingModeOptions as readonly string[]).includes(value);
-}
+// Mode options / type guard / normalization live in the shared
+// `utils/displayVerbosity.ts` — the vocabulary is unified across the three
+// display commands; this module owns only the thinking-specific semantics.
 
 /**
  * @name ThinkingMessageAction
  * @description What the bot should do with the thread's thinking message.
  *
  * - `editLiveLabel`     — show / refresh the live "☁️ thinking …" indicator
- *   (label only, no reasoning body). Used by `brief` + `hide` while reasoning.
+ *   (label only, no reasoning body). Used by `short` + `minimal` while reasoning.
  * - `editLiveDetailed`  — show / refresh the live indicator WITH the full
- *   accumulated reasoning text appended under it. Used by `detailed` while
+ *   accumulated reasoning text appended under it. Used by `full` while
  *   reasoning.
  * - `collapseToDuration`— replace the body with the collapsed
- *   "💭 thought for {N}s" line and persist (clear the tracked id). `brief` done.
+ *   "💭 thought for {N}s" line and persist (clear the tracked id). `short` done.
  * - `keep`              — leave the message exactly as-is and persist (clear the
- *   tracked id so the next response starts a fresh message). `detailed` done.
+ *   tracked id so the next response starts a fresh message). `full` done.
  * - `holdForAnswer`     — leave the message as-is but KEEP tracking its id, so
- *   the answer-start trigger can delete it. `hide` done — the live indicator
+ *   the answer-start trigger can delete it. `minimal` done — the live indicator
  *   stays until the answer begins.
  * - `delete`            — remove the thinking message entirely (clear the id).
- *   `hide` when the answer starts.
- * - `noop`              — do nothing. (`detailed`/`brief` need no special
+ *   `minimal` when the answer starts.
+ * - `noop`              — do nothing. (`full`/`short` need no special
  *   handling when the answer starts — their message already persists.)
  */
 export type ThinkingMessageAction =
@@ -62,33 +53,33 @@ export type ThinkingMessageAction =
  * Matrix:
  * ```
  *            phase=live          phase=done
- * detailed   editLiveDetailed    keep
- * brief      editLiveLabel       collapseToDuration
- * hide       editLiveLabel       holdForAnswer
+ * full       editLiveDetailed    keep
+ * short      editLiveLabel       collapseToDuration
+ * minimal    editLiveLabel       holdForAnswer
  * ```
- * `hide`+done resolves to `holdForAnswer` (not `delete`): the live indicator
+ * `minimal`+done resolves to `holdForAnswer` (not `delete`): the live indicator
  * stays AND its id stays tracked until the ANSWER starts, which is a separate
  * trigger ({@link getThinkingAnswerStartAction}). If the answer never comes
  * (e.g. the turn ends with only reasoning), the held frame simply persists —
  * acceptable and rare.
  */
-export function getThinkingEventAction(mode: ThinkingMode, phase: ThinkingPhase): ThinkingMessageAction {
+export function getThinkingEventAction(mode: DisplayVerbosityMode, phase: ThinkingPhase): ThinkingMessageAction {
   if (phase === 'live') {
-    return mode === 'detailed' ? 'editLiveDetailed' : 'editLiveLabel';
+    return mode === 'full' ? 'editLiveDetailed' : 'editLiveLabel';
   }
   // phase === 'done'
-  if (mode === 'brief') return 'collapseToDuration';
-  if (mode === 'hide') return 'holdForAnswer';
+  if (mode === 'short') return 'collapseToDuration';
+  if (mode === 'minimal') return 'holdForAnswer';
   return 'keep';
 }
 
 /**
  * @description Decide what the bot does to the thinking message when the real
- * answer starts (first `output` of the response). Only `hide` removes it; the
- * other modes leave their persisted message in place.
+ * answer starts (first `output` of the response). Only `minimal` removes it;
+ * the other modes leave their persisted message in place.
  */
-export function getThinkingAnswerStartAction(mode: ThinkingMode): ThinkingMessageAction {
-  return mode === 'hide' ? 'delete' : 'noop';
+export function getThinkingAnswerStartAction(mode: DisplayVerbosityMode): ThinkingMessageAction {
+  return mode === 'minimal' ? 'delete' : 'noop';
 }
 
 /** Milliseconds in one second — for the "thought for {N}s" duration formatter. */

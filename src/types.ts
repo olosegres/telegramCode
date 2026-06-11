@@ -589,6 +589,19 @@ export interface AgentAdapter extends EventEmitter {
   /** Reply to a pending question with selected answers */
   answerQuestion?(key: ThreadKey, answers: string[][]): void;
 
+  /**
+   * @description Whether this session's turn is wedged behind an open
+   * interactive question (the agent's `question` tool is blocking the turn and
+   * the bot has no `pendingQuestions` entry to break out with). OpenCode-only:
+   * a queued `prompt_async` would sit behind the dead turn forever, so the bot
+   * aborts the turn before forwarding a fresh prompt. The check is strict —
+   * `true` only when the server reports an open question for THIS session, so a
+   * genuinely streaming turn / live sub-agent is never reported wedged (and the
+   * normal queue-and-pick-up behaviour is preserved). Async because the
+   * authoritative signal is `GET /question` on the owning instance.
+   */
+  checkIsWedgedOnQuestion?(key: ThreadKey): Promise<boolean>;
+
   // — Output mode —
 
   /**

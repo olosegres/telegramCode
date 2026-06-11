@@ -22,6 +22,7 @@ import {
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { stripThreadContextPreamble } from '../threadContextPreamble';
+import { getOpenQuestionForSession } from '../openCodeOpenQuestion';
 import { buildOpenCodeSchedulerMcpRegistration } from '../scheduler/injection';
 import {
   buildSessionTitleSnippet,
@@ -1889,6 +1890,15 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // notice. Session + SSE are live here.
       this.emit('started', key);
 
+      // Re-surface a question still open on the server (G1): this method runs on
+      // BOTH silent restart re-attach AND explicit /sessions resume, so an
+      // unanswered question is recovered in either case. Runs UNCONDITIONALLY
+      // (not gated on isWithRecentContext) because the silent reattach — the
+      // path that auto-unsticks a wedged topic after a hot rebuild — passes it
+      // false. Awaited so the buttons re-post before model resolution; it
+      // never throws (best-effort inside).
+      await this.restoreOpenQuestion(key, apiSession.id, workDir);
+
       // Post the short last-N-turn context block so a resume shows where the
       // conversation left off (parity with Claude — OpenCode has no flood, but
       // gets the same block). ONLY on the explicit user resume: this method
@@ -3359,6 +3369,76 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     // Emit question event for the bot to display to user
     this.emit('question', key, session.pendingQuestion);
+  }
+
+  /**
+   * @description Re-surface a question that was still open on the server when
+   * the bot lost track of it — the reattach/resume path rebuilds the session
+   * with `pendingQuestion: null`, so after ANY bot restart an unanswered
+   * question would otherwise be forgotten and the topic hangs forever (the
+   * break-out that turns a user message into the ANSWER never fires, and a
+   * fresh prompt just queues behind the still-blocked turn).
+   *
+   * `GET /question?directory=<workDir>` returns the instance's live open
+   * questions; we pick the entry owned by this session, rebuild
+   * `session.pendingQuestion`, and emit `question` so the existing bot handler
+   * re-posts the option buttons and repopulates (and persists) its pending map.
+   * Reply id is the entry's top-level `id` (`que_…`), resolved by the pure
+   * {@link getOpenQuestionForSession} helper.
+   *
+   * Best-effort: a read/parse failure is logged and swallowed — it must never
+   * throw out of reattach. Only meaningful on the resume/reattach path; a
+   * brand-new session (startSession) has no history and thus no open question,
+   * so it is deliberately NOT called there.
+   */
+  private async restoreOpenQuestion(key: ThreadKey, sessionId: string, workDir: string): Promise<void> {
+    try {
+      const response = await this.apiRequest<unknown>(
+        'GET',
+        buildDirectoryScopedPath('/question', workDir),
+      );
+      const restored = getOpenQuestionForSession(response, sessionId, workDir);
+      if (!restored) return;
+
+      // The session may have been stopped/replaced between the GET and now.
+      const session = this.sessions.get(keyToString(key));
+      if (!session?.isActive || session.sessionId !== sessionId) return;
+
+      session.pendingQuestion = restored;
+      console.log(`[OpenCode] Restored open question ${restored.requestId} for ${keyToString(key)} on reattach`);
+      this.emit('question', key, restored);
+    } catch (e) {
+      console.warn(`[OpenCode] restore open question failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  /**
+   * @description Backstop predicate (G2): is this session's turn wedged behind
+   * an open interactive question? The authoritative signal is the server's own
+   * `GET /question?directory=<workDir>` returning an entry for this session —
+   * a turn that is merely streaming text / running a normal tool / has a live
+   * sub-agent has NO open question, so it is never reported wedged (no
+   * regression: an arriving prompt still queues-and-is-picked-up for a healthy
+   * busy turn). The bot consults this only when a fresh prompt would otherwise
+   * queue behind a busy session with no known pending question; on `true` it
+   * aborts the dead turn before forwarding instead of queueing forever.
+   *
+   * Best-effort: a read/parse failure returns `false` (don't abort on doubt).
+   */
+  async checkIsWedgedOnQuestion(key: ThreadKey): Promise<boolean> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return false;
+
+    try {
+      const response = await this.apiRequest<unknown>(
+        'GET',
+        buildDirectoryScopedPath('/question', session.workDir),
+      );
+      return getOpenQuestionForSession(response, session.sessionId, session.workDir) !== null;
+    } catch (e) {
+      console.warn(`[OpenCode] wedged-question check failed:`, e instanceof Error ? e.message : e);
+      return false;
+    }
   }
 
   /**

@@ -227,6 +227,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.survey_hint': 'ℹ️ Нажми кнопку или ответь цифрой варианта — отправлю в Claude.',
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
+    'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
     'agent.workingIndicator': '{glyph} работаю…',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──
@@ -628,6 +629,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.survey_hint': 'ℹ️ Tap a button or reply with the option number — I will send it to Claude.',
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
+    'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
     'agent.workingIndicator': '{glyph} working…',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──

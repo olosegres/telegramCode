@@ -4914,6 +4914,19 @@ bot.on(message('text'), async (ctx) => {
         console.warn(`[file] purge on /clear failed for ${keyToString(key)}:`, e),
       );
     }
+    // Backstop (G2): we got here with NO pendingQuestions entry (the break-out
+    // above returned otherwise), yet an OpenCode turn can still be wedged
+    // behind an open question the bot lost track of (question.asked dropped at
+    // ask time, or a restore that couldn't run). Forwarding now would queue the
+    // prompt behind the dead turn forever, so if the adapter reports the
+    // session wedged, abort the turn and tell the user the previous question
+    // was cancelled — THEN forward. Strict check (open question for THIS
+    // session only), so a genuinely streaming turn / live sub-agent is never
+    // aborted. Claude has no such method → unchanged.
+    if (await adapter.checkIsWedgedOnQuestion?.(key)) {
+      adapter.sendSignal(key, 'SIGINT');
+      await replyToThread(key, t('agent.question_cancelled_for_prompt'));
+    }
     await forwardPromptToAgent(key, adapter, text);
     return;
   }
@@ -6648,6 +6661,19 @@ function stopClaudeLiveness(key: ThreadKey): void {
 
 function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuestion): void {
   console.log(`[Bot] question ${keyToString(key)} (${questionData.requestId}): ${questionData.questions.length}`);
+  // Idempotent across restart: this handler ALSO fires from the adapter's
+  // `restoreOpenQuestion` on reattach (the server still has the question open).
+  // If the SAME question (matched by requestId) is already persisted,
+  // `restorePendingQuestions` re-arms its original buttons + any local
+  // multi-question progress, and `restoreOpenQuestion` already re-set the
+  // adapter's own `session.pendingQuestion` BEFORE emitting — so re-posting
+  // here would only duplicate the question message in the topic. Skip it. A
+  // fresh LIVE question isn't persisted until this handler runs, so this never
+  // skips a genuinely new one.
+  const persistedQuestion = state.getPendingQuestions()[keyToString(key)];
+  if (persistedQuestion && persistedQuestion.data.requestId === questionData.requestId) {
+    return;
+  }
   // A pending status frame is now stale — the question UI replaces it. Stop the
   // liveness loop first so it can't recreate a frame under the question prompt
   // (Claude-only; a no-op for OpenCode threads, which never arm it).

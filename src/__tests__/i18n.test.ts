@@ -66,6 +66,16 @@ test('retired topic-creation keys are gone from both locales', () => {
   }
 });
 
+test('agent.question_cancelled_for_prompt exists in every locale (S2 wedged-question backstop)', () => {
+  assert.ok(
+    checkKeyInAllLangs('agent.question_cancelled_for_prompt'),
+    'agent.question_cancelled_for_prompt missing in some locale',
+  );
+  const out = t('agent.question_cancelled_for_prompt');
+  assert.ok(out.length > 0);
+  assert.ok(!out.includes('{'), `unexpected placeholder in "${out}"`);
+});
+
 test('file intake keys exist in every locale', () => {
   assert.ok(checkKeyInAllLangs('file.too_big'), 'file.too_big missing in some locale');
   assert.ok(checkKeyInAllLangs('file.download_failed'), 'file.download_failed missing in some locale');

@@ -26,6 +26,19 @@ import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
+import {
+  SPINNER_TICK_RE,
+  POST_THINKING_TRAILER_RE,
+  OUTPUT_TOOL_HEADER_RE,
+  FILE_TOOL_HEADER_RE,
+  TOOL_RESULT_MARKER_RE,
+  CODE_FENCE_LINE_RE,
+  PROGRESS_PASSTHROUGH_RE,
+  COLLAPSE_MARKER_RE,
+  COMPLETION_SUMMARY_RE,
+  TRANSIENT_TICK_RE,
+  type ToolResultKind,
+} from '../utils/claudeScrapeShapes';
 import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
@@ -599,74 +612,6 @@ export function checkIsStatusOutput(text: string): boolean {
 }
 
 /**
- * @description Active spinner tick, per-line shape used by Claude's TUI
- * while it is thinking or running a tool. Examples:
- *   `✽ Doing… (4s · ↓ 14 tokens)`
- *   `* Brewing… (1m 30s · ↑ 88 tokens · thought for 17s)`
- *   `· Working… (7s · ↓ 222 tokens)`
- *
- * Plan §2026-05-28 tg-output-readability / S4 (N1.b). Why a SECOND
- * regex on top of `PROGRESS_LINE_RE` (in `progressLine.ts`): different
- * job — this one strips tick lines that ride INSIDE a chunk that also
- * carries real output, while `PROGRESS_LINE_RE` classifies whole
- * pure-progress chunks bot-side. This regex does not require the token
- * counter (`(5s)` alone matches), `PROGRESS_LINE_RE` does. Both accept
- * a multi-word activity text since 2026-06-05 — the TUI now shows the
- * active task title there ("Fixing streaming output overwrite…"), and
- * the single-token `\S+…` let those ticks leak into permanent messages
- * (adapter side) / flood the topic (bot side). Since 2026-06-11 both
- * also accept single-level parenthesised segments inside the title —
- * the TUI appends bits like "(sub-agent)" while a Task sub-agent runs
- * ("Fixing relations add flow (sub-agent)…", the live topic flood), and
- * a task title can carry its own parens. The trailing end-anchored
- * `(<elapsed>[ · …])` parenthesis stays the load-bearing anchor — the
- * same safety argument as the multi-word widening.
- *
- * The required text-with-ellipsis disambiguates this from a tool-call
- * header (`● Bash(ls -la)`), which starts with the same `●` glyph but
- * has no ellipsis.
- */
-const SPINNER_TICK_RE =
-  /^\s*[✻✽✶✢·*●○]\s+\S(?:[^()\n]|\([^()\n]*\))*?…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s(?:\s*·[^()]*)?\)\s*$/;
-
-/**
- * @description Post-thinking trailer line that Claude's TUI prints
- * AFTER it has finished thinking (just before resuming the prompt
- * area). Examples observed in the live ExampleGroup debug session:
- *   `✻ Cooked for 27s`        (msg 1855, 1863)
- *   `✻ Cogitated for 20s`     (msg 1873)
- *   `✻ Crunched for 7s`       (msg 1869)
- *   `✻ Baked for 10s`         (msg 1837)
- *   `✻ Churned for 20s`       (msg 1897 — V3 iteration 1, 2026-05-28)
- *   `✻ Sautéed for 20s`       (msg 1909 — V3 iteration 2, 2026-05-28)
- *
- * Plan §2026-05-28 tg-output-readability / S3 (N1.a). The trailer
- * carries zero novel info — the same time was already streaming in
- * the active spinner that preceded it — so we drop it.
- *
- * Verb match is `\S+`, not an explicit list. The original plan called
- * for an explicit list of `-ed` forms (Cooked|Cogitated|...) on the
- * theory that a future Claude verb that IS real prose (e.g.
- * `✻ Ready for input`) could be silently swallowed. Two live V3
- * iterations on 2026-05-28 demonstrated the opposite failure mode:
- * Claude ships new spinner verbs faster than we'd realistically
- * extend the list (`Churned` and `Sautéed` both slipped through on
- * first encounter). The triple anchor `<glyph> <verb> for <N>s` is
- * shape-specific enough that real prose almost cannot satisfy it:
- *   - line must START with a spinner glyph (`✻✽✶✢·*●○`) — outside
- *     transient TUI status, Claude never emits these as the first
- *     non-whitespace char of a prose line;
- *   - line must END with `for \d+(?:m\s+\d+)?s` — a time literal,
- *     not a generic noun;
- *   - line has no other content (anchored `$`).
- * `\S+` is the minimal relaxation: one non-whitespace token between
- * the glyph and ` for `. Accepts `Sautéed`, `Churned`, future verbs,
- * and rejects anything containing whitespace or extra structure.
- */
-const POST_THINKING_TRAILER_RE =
-  /^[✻✽✶✢·*●○]\s+\S+\s+for\s+\d+(?:m\s+\d+)?s\s*$/;
-
-/**
  * @description A single interactive question Claude scraped from the pane,
  * rendered for durable delivery.
  */
@@ -1182,32 +1127,6 @@ export function getClaudeReplyRoute(input: {
 }
 
 /**
- * @description Code-producing tool headers whose `⎿` result is code / diff /
- * command output and should render as a monospaced Telegram code block. Two
- * classes, differing in what the `⎿` line itself holds:
- *
- *  - OUTPUT tools (`Bash`/`Grep`/`Glob`): the `⎿`-line content IS the first
- *    line of stdout, so it goes INSIDE the fence with the indented body;
- *  - FILE tools (`Read`/`Edit`/`Update`/`Write`/`MultiEdit`/`NotebookEdit`):
- *    the `⎿` line is a one-line summary (`Added N lines, removed M`) that
- *    stays as prose — only the deeper-indented diff/file body below it is
- *    fenced.
- *
- * Anchored on the tool NAME (optionally glyph-led and/or `*bold*` from the
- * ANSI-bold conversion), NEVER on body indent: Claude wraps long thinking
- * prose at the 300-col pane width into space-indented continuation lines
- * byte-identical in shape to a diff/output body, so only a known code header
- * may license fencing (a thinking block has no such header). Allowlist, not
- * blocklist — unknown shapes stay prose.
- */
-const OUTPUT_TOOL_HEADER_RE = /^\s*[●○⏳✓]?\s*\*?(?:Bash|Grep|Glob)\*?\s*\(/;
-const FILE_TOOL_HEADER_RE =
-  /^\s*[●○⏳✓]?\s*\*?(?:Read|Edit|Update|Write|MultiEdit|NotebookEdit)\*?\s*\(/;
-/** Tool RESULT marker line: `  ⎿  <summary or first output line>`. */
-const TOOL_RESULT_MARKER_RE = /^(\s*)⎿/;
-/** An agent-authored fenced code block delimiter, possibly indented. */
-const CODE_FENCE_LINE_RE = /^\s*```/;
-/**
  * A line-numbered diff row (`   88 + code`, `   90  context`, bare `   89`),
  * recognisable WITHOUT its tool header — the fallback for a diff that arrived
  * split from its header across two polls. Diff rows never occur in agent prose.
@@ -1215,17 +1134,6 @@ const CODE_FENCE_LINE_RE = /^\s*```/;
 const DIFF_ROW_RE = /^\s+\d+(?:\s|$)/;
 /** Min consecutive diff rows for the header-less fallback to fence them. */
 const DIFF_FALLBACK_MIN_ROWS = 2;
-
-/**
- * @description Lines the bot's progress-collapse owns and must receive
- * UN-fenced: a sub-agent task line (`◯`, optionally `❯`-cursor-led, U+25EF —
- * NOT the `○`/`●` glyphs) and a compaction progress bar (`▰▱`). They are
- * indented in the pane, so a stale `output` tool kind would otherwise route
- * them through the orphan-continuation fence; the resulting ```` ``` ````
- * delimiters then fail `checkIsProgressChunk` (progressLine.ts), so the burst
- * is NOT coalesced and the topic floods with one fenced tick per second.
- */
-const PROGRESS_PASSTHROUGH_RE = /^\s*(?:❯\s+)?◯\s|^\s*[▰▱]/;
 
 /**
  * @description Recognise the four line shapes of a markdown table that Claude's
@@ -1274,14 +1182,6 @@ function checkIsSharpTableLine(line: string): boolean {
   );
 }
 
-/**
- * @description Which tool a `⎿` result body belongs to, deciding how it is
- * fenced: `output` (Bash/Grep/Glob — the `⎿` line is stdout, fenced with the
- * body) vs `file` (Read/Edit/Update/Write — the `⎿` line is a prose summary,
- * only the body below is fenced).
- */
-type ToolResultKind = 'output' | 'file';
-
 function getLeadingSpaceCount(line: string): number {
   return line.match(/^(\s*)/)![1].length;
 }
@@ -1307,30 +1207,6 @@ function getFenced(bodyLines: string[]): string[] {
   );
   return ['```', ...safe, '```'];
 }
-
-/**
- * @description Transient activity tick the TUI paints INSIDE a tool-result
- * body while the command is still running (`Running…`, `Waiting…`), with no
- * elapsed-time paren. {@link SPINNER_TICK_RE} only catches the glyph-led
- * `(Ns)` form, so these bare words slip through and get fenced as if they
- * were stdout. They are ephemeral chrome, never command output: render plain,
- * and DROP entirely when real output supersedes them in the same body.
- */
-const TRANSIENT_TICK_RE = /^\s*(?:Running|Waiting)…\s*(?:\([^)]*\))?\s*$/;
-/**
- * @description The TUI's "output was collapsed" marker (`… +1 tool use`,
- * `… +33 lines`). Anchored to the literal `… +N tool use(s)/line(s)` shape so
- * a real one-line stdout that merely ends in `…` is never matched. Chrome, not
- * output → render plain, never fenced.
- */
-const COLLAPSE_MARKER_RE = /^\s*…\s*\+\d+\s+(?:tool use|line)s?\b.*$/;
-/**
- * @description Turn / sub-agent completion summary (`Done (14 tool uses ·
- * 66.9k tokens · 1m 55s)`). The `tokens` inside the paren is the load-bearing
- * anchor — a real `Done (…)` stdout line without token stats is not matched.
- * Chrome, not output → render plain, never fenced.
- */
-const COMPLETION_SUMMARY_RE = /^\s*Done\s*\([^)]*tokens[^)]*\)\s*$/;
 
 /**
  * @description A status / summary line the TUI paints inside a tool-result

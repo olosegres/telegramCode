@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResumeSessionOptions, SubagentModeReader, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -928,25 +928,36 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   private isServerRestarting = false;
 
   /**
-   * Per-thread `/subagent` mode reader, injected by the bot at boot via
-   * `createAdapter.registerSubagentModeReader` (S4). DELIBERATE deviation from
+   * Per-thread display-prefs reader, injected by the bot at boot via
+   * `createAdapter.registerDisplayPrefsReader` (S4). DELIBERATE deviation from
    * the S2/S3 "adapter stays mode-agnostic" pattern: the sub-agent branch
    * decides WHAT to accumulate (non-`full` = refresh a status, `full` = stream
    * into the separate child accumulator), which cannot be deferred to the
-   * bot's render time. `null` until wired → reads fall back to the locked
-   * default.
+   * bot's render time. `null` until wired → reads fall back to all-`minimal`.
    */
-  private subagentModeReader: SubagentModeReader | null = null;
+  private displayPrefsReader: DisplayPrefsReader | null = null;
 
-  /** @description Inject the per-thread `/subagent` mode reader (see the field's JSDoc). */
-  setSubagentModeReader(reader: SubagentModeReader): void {
-    this.subagentModeReader = reader;
+  /** @description Inject the per-thread display-prefs reader (see the field's JSDoc). */
+  setDisplayPrefsReader(reader: DisplayPrefsReader): void {
+    this.displayPrefsReader = reader;
   }
 
-  /** @description Resolve the thread's `/subagent` mode, defaulting to `minimal`
-   * for any read that happens before the bot wires the reader at boot. */
+  /** @description Resolve the thread's full display prefs, defaulting every
+   * field to `minimal` for any read before the bot wires the reader at boot. */
+  private getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
+    return (
+      this.displayPrefsReader?.(key) ?? {
+        thinking: defaultDisplayVerbosityMode,
+        toolResults: defaultDisplayVerbosityMode,
+        subagent: defaultDisplayVerbosityMode,
+      }
+    );
+  }
+
+  /** @description Resolve the thread's `/subagent` mode (the only pref the
+   * OpenCode adapter consults today), via the full prefs reader. */
   private getSubagentMode(key: ThreadKey): DisplayVerbosityMode {
-    return this.subagentModeReader?.(key) ?? defaultDisplayVerbosityMode;
+    return this.getDisplayPrefs(key).subagent;
   }
 
   constructor() {

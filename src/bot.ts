@@ -20,7 +20,7 @@ import {
   getAvailableAdapters,
   getDefaultAdapterName,
   registerAdapterEventHandlers,
-  registerSubagentModeReader,
+  registerDisplayPrefsReader,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
@@ -3819,16 +3819,27 @@ command('effort', async (ctx, key) => {
 // ── /thinking — per-topic chain-of-thought verbosity (OpenCode only, S2) ─────
 
 /**
- * @description Build the `/thinking` mode picker keyboard. One callback button
- * per mode; the current mode carries a `✓` marker. Shared by the `/thinking`
- * command (initial render) and the `think_<mode>` callback (re-render after a
- * press), mirroring `buildEffortKeyboard` so the marker never drifts.
+ * @description Build a display-mode picker keyboard shared by ALL FOUR mode
+ * commands (`/thinking`, `/tool_results`, `/subagent`, `/verbosity`): one
+ * callback button per unified mode, the `marked` mode (if any) carrying a `✓`.
+ * The four families differ only in their i18n label namespace and callback
+ * prefix, so one builder removes the four near-identical copies (S2 review
+ * note). `marked` is nullable for `/verbosity`'s mixed ("custom") state, where
+ * no single level matches — then no button is marked.
+ *
+ * @param i18nGroup the mode-label namespace (`thinking`/`toolResults`/`subagent`/`verbosity`).
+ * @param callbackPrefix the action prefix (`think`/`toolres`/`subag`/`verb`).
+ * @param marked the mode to mark with `✓`, or null for no mark.
  */
-function buildThinkingKeyboard(current: DisplayVerbosityMode) {
+function buildDisplayModeKeyboard(
+  i18nGroup: string,
+  callbackPrefix: string,
+  marked: DisplayVerbosityMode | null,
+) {
   const buttons = displayVerbosityModeOptions.map((mode) =>
     Markup.button.callback(
-      mode === current ? `${t(`thinking.mode.${mode}`)} ✓` : t(`thinking.mode.${mode}`),
-      `think_${mode}`,
+      mode === marked ? `${t(`${i18nGroup}.mode.${mode}`)} ✓` : t(`${i18nGroup}.mode.${mode}`),
+      `${callbackPrefix}_${mode}`,
     ),
   );
   return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
@@ -3875,29 +3886,13 @@ command('thinking', async (ctx, key) => {
   await replyToThread(
     key,
     t('thinking.choose', { current: t(`thinking.mode.${current}`) }),
-    buildThinkingKeyboard(current),
+    buildDisplayModeKeyboard('thinking', 'think', current),
   );
 });
 
 // ── /tool_results — per-topic tool-output verbosity (OpenCode only, S3) ──────
 // Telegram bot commands cannot contain '-', so the plan's "/tool-results" is
 // registered as `tool_results` (same convention as /rename_session).
-
-/**
- * @description Build the `/tool_results` mode picker keyboard. One callback
- * button per mode; the current mode carries a `✓` marker. Shared by the
- * command (initial render) and the `toolres_<mode>` callback (re-render after
- * a press), mirroring `buildThinkingKeyboard` so the marker never drifts.
- */
-function buildToolResultsKeyboard(current: DisplayVerbosityMode) {
-  const buttons = displayVerbosityModeOptions.map((mode) =>
-    Markup.button.callback(
-      mode === current ? `${t(`toolResults.mode.${mode}`)} ✓` : t(`toolResults.mode.${mode}`),
-      `toolres_${mode}`,
-    ),
-  );
-  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
-}
 
 /**
  * @description Persist a new tool-results mode for `key` — it governs every
@@ -3910,13 +3905,8 @@ async function applyToolResultMode(key: ThreadKey, mode: DisplayVerbosityMode): 
 }
 
 command('tool_results', async (ctx, key) => {
-  // OpenCode-only capability gate (like /thinking): Claude renders tool
-  // results in its own TUI pane, nothing for the bot to do.
-  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
-    await replyToThread(key, t('toolResults.opencode_only'));
-    return;
-  }
-
+  // No backend gate (un-gated in S4): the pref drives both backends now —
+  // OpenCode's `toolResult` SSE render and Claude's scrape-chunk relay routing.
   const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   const current = state.getDisplayPrefs(key).toolResults;
 
@@ -3940,7 +3930,7 @@ command('tool_results', async (ctx, key) => {
   await replyToThread(
     key,
     t('toolResults.choose', { current: t(`toolResults.mode.${current}`) }),
-    buildToolResultsKeyboard(current),
+    buildDisplayModeKeyboard('toolResults', 'toolres', current),
   );
 });
 
@@ -3951,22 +3941,6 @@ command('tool_results', async (ctx, key) => {
 // render prefs), the pref is backend-agnostic: OpenCode branches its
 // child-session SSE parts on it, Claude tails the on-disk sub-agent
 // transcripts in `full` mode (plan 2026-06-11 S2/S3).
-
-/**
- * @description Build the `/subagent` mode picker keyboard. One callback button
- * per mode; the current mode carries a `✓` marker. Shared by the command
- * (initial render) and the `subag_<mode>` callback (re-render after a press),
- * mirroring `buildToolResultsKeyboard` so the marker never drifts.
- */
-function buildSubagentKeyboard(current: DisplayVerbosityMode) {
-  const buttons = displayVerbosityModeOptions.map((mode) =>
-    Markup.button.callback(
-      mode === current ? `${t(`subagent.mode.${mode}`)} ✓` : t(`subagent.mode.${mode}`),
-      `subag_${mode}`,
-    ),
-  );
-  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
-}
 
 /**
  * @description Persist a new sub-agent mode for `key` — the adapter reads it
@@ -4002,7 +3976,7 @@ command('subagent', async (ctx, key) => {
   await replyToThread(
     key,
     t('subagent.choose', { current: t(`subagent.mode.${current}`) }),
-    buildSubagentKeyboard(current),
+    buildDisplayModeKeyboard('subagent', 'subag', current),
   );
 });
 
@@ -4012,23 +3986,6 @@ command('subagent', async (ctx, key) => {
 // last write per pref wins — no extra mechanism). Like /subagent there is no
 // backend or session gate: the prefs are bot-side rendering state, valid on
 // both backends and with no session running.
-
-/**
- * @description Build the `/verbosity` level picker keyboard. One callback
- * button per unified mode; the `✓` marker shows ONLY when all three display
- * prefs already equal that level (`matched` null = mixed → no marker
- * anywhere). Shared by the command (initial render) and the `verb_<mode>`
- * callback (re-render after a press), mirroring `buildSubagentKeyboard`.
- */
-function buildVerbosityKeyboard(matched: DisplayVerbosityMode | null) {
-  const buttons = displayVerbosityModeOptions.map((mode) =>
-    Markup.button.callback(
-      mode === matched ? `${t(`verbosity.mode.${mode}`)} ✓` : t(`verbosity.mode.${mode}`),
-      `verb_${mode}`,
-    ),
-  );
-  return Markup.inlineKeyboard(buttons, { columns: displayVerbosityModeOptions.length });
-}
 
 /**
  * @description Render the picker's "current state" fragment: the shared mode
@@ -4081,7 +4038,7 @@ command('verbosity', async (ctx, key) => {
   await replyToThread(
     key,
     t('verbosity.choose', { current: formatVerbosityCurrent(prefs) }),
-    buildVerbosityKeyboard(getUniformVerbosityLevel(prefs)),
+    buildDisplayModeKeyboard('verbosity', 'verb', getUniformVerbosityLevel(prefs)),
   );
 });
 
@@ -5703,30 +5660,65 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
   }
 });
 
-bot.action(/^think_(.+)$/, async (ctx) => {
+/**
+ * @description Per-family config for the ONE shared display-mode callback
+ * handler ({@link handleDisplayModeCallback}). The four mode-button callbacks
+ * (`think_`/`toolres_`/`subag_`/`verb_`) differ only in these fields, so the
+ * handler is written once (S2 review note — was four near-identical copies).
+ */
+interface DisplayModeCallbackConfig {
+  /** i18n mode-label namespace (`thinking`/`toolResults`/`subagent`/`verbosity`). */
+  i18nGroup: string;
+  /** Action prefix used for the re-rendered keyboard's callbacks. */
+  callbackPrefix: string;
+  /** `true` only for `/thinking` (still OpenCode-gated until S5). */
+  isOpenCodeOnly: boolean;
+  /** Persist the picked mode (the per-command apply helper). */
+  apply: (key: ThreadKey, mode: DisplayVerbosityMode) => Promise<void>;
+  /** cb-query i18n key for the bad-mode answer. */
+  errorCbKey: string;
+  /** cb-query i18n key for the success answer. */
+  setCbKey: string;
+  /** Short tag for the keyboard-re-render warning log. */
+  logTag: string;
+}
+
+/**
+ * @description Shared handler for a display-mode button press. Authorises,
+ * optionally gates to OpenCode (thinking only), normalizes the picked mode
+ * (legacy names on stale buttons keep working), persists it, answers the
+ * callback, and re-renders the picker so the `✓` follows the new mode. The
+ * re-render always marks `picked` because a single button press sets exactly
+ * that mode (for `/verbosity` all three prefs then equal it, so there is always
+ * an exact match).
+ */
+async function handleDisplayModeCallback(
+  ctx: Context & { match: RegExpExecArray },
+  config: DisplayModeCallbackConfig,
+): Promise<void> {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // Same OpenCode-only gate as the command — a stale button on a topic switched
-  // to Claude after the picker was shown must not silently set an unused pref.
-  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
+  // OpenCode-only gate (thinking only): a stale button on a topic switched to
+  // Claude after the picker was shown must not silently set an unused pref.
+  if (config.isOpenCodeOnly && !(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
     await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
     return;
   }
   // Normalize BEFORE validating: picker messages posted before the vocabulary
-  // was unified still carry old mode names (`think_detailed` etc.) in their
-  // buttons — those must keep working, answering with the NEW name.
+  // was unified still carry old mode names (`think_detailed`, `subag_compact`,
+  // `toolres_hide`) in their buttons — those must keep working.
   const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
   if (!picked) {
-    await ctx.answerCbQuery(t('cb.thinking_error', { error: ctx.match[1].slice(0, 50) }));
+    await ctx.answerCbQuery(t(config.errorCbKey, { error: ctx.match[1].slice(0, 50) }));
     return;
   }
-  await applyThinkingMode(key, picked);
-  await ctx.answerCbQuery(t('cb.thinking_set', { mode: t(`thinking.mode.${picked}`) }));
+  await config.apply(key, picked);
+  await ctx.answerCbQuery(t(config.setCbKey, { mode: t(`${config.i18nGroup}.mode.${picked}`) }));
 
   // Re-render the picker so the `✓` follows the new mode (mirrors effort_cb).
   const cbMsg = ctx.callbackQuery?.message as Message | undefined;
   if (cbMsg) {
-    const keyboard = buildThinkingKeyboard(picked);
+    const keyboard = buildDisplayModeKeyboard(config.i18nGroup, config.callbackPrefix, picked);
     try {
       await enqueueSend(
         key,
@@ -5738,123 +5730,33 @@ bot.action(/^think_(.+)$/, async (ctx) => {
     } catch (e) {
       const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
       if (!/message is not modified/i.test(desc)) {
-        console.warn('[think_cb] keyboard re-render failed:', desc || e);
+        console.warn(`[${config.logTag}] keyboard re-render failed:`, desc || e);
       }
     }
   }
-});
+}
 
-bot.action(/^toolres_(.+)$/, async (ctx) => {
-  const key = await authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // Same OpenCode-only gate as the command — a stale button on a topic switched
-  // to Claude after the picker was shown must not silently set an unused pref.
-  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
-    await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
-    return;
-  }
-  // Normalize BEFORE validating — old picker buttons (`toolres_hide`) must
-  // keep working (see think_ callback).
-  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
-  if (!picked) {
-    await ctx.answerCbQuery(t('cb.toolresults_error', { error: ctx.match[1].slice(0, 50) }));
-    return;
-  }
-  await applyToolResultMode(key, picked);
-  await ctx.answerCbQuery(t('cb.toolresults_set', { mode: t(`toolResults.mode.${picked}`) }));
+// /thinking stays OpenCode-gated (S5 un-gates it); the other three drive both
+// backends. Each is a one-line delegation to the shared handler above.
+bot.action(/^think_(.+)$/, (ctx) => handleDisplayModeCallback(ctx, {
+  i18nGroup: 'thinking', callbackPrefix: 'think', isOpenCodeOnly: true,
+  apply: applyThinkingMode, errorCbKey: 'cb.thinking_error', setCbKey: 'cb.thinking_set', logTag: 'think_cb',
+}));
 
-  // Re-render the picker so the `✓` follows the new mode (mirrors think_cb).
-  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
-  if (cbMsg) {
-    const keyboard = buildToolResultsKeyboard(picked);
-    try {
-      await enqueueSend(
-        key,
-        () => bot.telegram.editMessageReplyMarkup(
-          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
-        ),
-        'interactive',
-      );
-    } catch (e) {
-      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
-      if (!/message is not modified/i.test(desc)) {
-        console.warn('[toolres_cb] keyboard re-render failed:', desc || e);
-      }
-    }
-  }
-});
+bot.action(/^toolres_(.+)$/, (ctx) => handleDisplayModeCallback(ctx, {
+  i18nGroup: 'toolResults', callbackPrefix: 'toolres', isOpenCodeOnly: false,
+  apply: applyToolResultMode, errorCbKey: 'cb.toolresults_error', setCbKey: 'cb.toolresults_set', logTag: 'toolres_cb',
+}));
 
-bot.action(/^subag_(.+)$/, async (ctx) => {
-  const key = await authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // No backend gate (unlike thinking/toolres callbacks): the pref drives both
-  // backends now — OpenCode's child SSE branch and Claude's transcript tail.
-  // Normalize BEFORE validating — old picker buttons (`subag_compact`) must
-  // keep working (see think_ callback).
-  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
-  if (!picked) {
-    await ctx.answerCbQuery(t('cb.subagent_error', { error: ctx.match[1].slice(0, 50) }));
-    return;
-  }
-  await applySubagentMode(key, picked);
-  await ctx.answerCbQuery(t('cb.subagent_set', { mode: t(`subagent.mode.${picked}`) }));
+bot.action(/^subag_(.+)$/, (ctx) => handleDisplayModeCallback(ctx, {
+  i18nGroup: 'subagent', callbackPrefix: 'subag', isOpenCodeOnly: false,
+  apply: applySubagentMode, errorCbKey: 'cb.subagent_error', setCbKey: 'cb.subagent_set', logTag: 'subag_cb',
+}));
 
-  // Re-render the picker so the `✓` follows the new mode (mirrors toolres_cb).
-  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
-  if (cbMsg) {
-    const keyboard = buildSubagentKeyboard(picked);
-    try {
-      await enqueueSend(
-        key,
-        () => bot.telegram.editMessageReplyMarkup(
-          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
-        ),
-        'interactive',
-      );
-    } catch (e) {
-      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
-      if (!/message is not modified/i.test(desc)) {
-        console.warn('[subag_cb] keyboard re-render failed:', desc || e);
-      }
-    }
-  }
-});
-
-bot.action(/^verb_(.+)$/, async (ctx) => {
-  const key = await authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // No backend gate (mirrors subag_): the macro writes bot-side display prefs
-  // only, valid on both backends. Normalize BEFORE validating — legacy mode
-  // names on stale buttons must keep working (see think_ callback).
-  const picked = normalizeDisplayVerbosityMode(ctx.match[1]);
-  if (!picked) {
-    await ctx.answerCbQuery(t('cb.verbosity_error', { error: ctx.match[1].slice(0, 50) }));
-    return;
-  }
-  await applyVerbosityLevel(key, picked);
-  await ctx.answerCbQuery(t('cb.verbosity_set', { mode: t(`verbosity.mode.${picked}`) }));
-
-  // Re-render the picker so the `✓` follows the new level (all three prefs
-  // now equal `picked`, so the keyboard always has an exact match here).
-  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
-  if (cbMsg) {
-    const keyboard = buildVerbosityKeyboard(picked);
-    try {
-      await enqueueSend(
-        key,
-        () => bot.telegram.editMessageReplyMarkup(
-          key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
-        ),
-        'interactive',
-      );
-    } catch (e) {
-      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
-      if (!/message is not modified/i.test(desc)) {
-        console.warn('[verb_cb] keyboard re-render failed:', desc || e);
-      }
-    }
-  }
-});
+bot.action(/^verb_(.+)$/, (ctx) => handleDisplayModeCallback(ctx, {
+  i18nGroup: 'verbosity', callbackPrefix: 'verb', isOpenCodeOnly: false,
+  apply: applyVerbosityLevel, errorCbKey: 'cb.verbosity_error', setCbKey: 'cb.verbosity_set', logTag: 'verb_cb',
+}));
 
 bot.action(/^agent_(.+)$/, async (ctx) => {
   const key = await authoriseContext(ctx);
@@ -6917,7 +6819,7 @@ const COMMANDS_MENU = [
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'verbosity', description: '🔊 Output verbosity (thinking+tools+sub-agents)' },
   { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
-  { command: 'tool_results', description: '🔧 Tool-results verbosity (OpenCode)' },
+  { command: 'tool_results', description: '🔧 Tool-results verbosity' },
   { command: 'subagent', description: '🤖 Sub-agent verbosity' },
   { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
@@ -7333,12 +7235,12 @@ export async function startBot(): Promise<void> {
     onStopped: handleAgentStopped,
     onError: handleAgentError,
   });
-  // Both adapters branch on the per-thread `/subagent` mode while PRODUCING
-  // sub-agent output (OpenCode: child SSE parts; Claude: on-disk transcript
-  // tailing) — the one display pref they cannot resolve at render time. Same
-  // late-wiring idiom as the event handlers above; before this line they fall
-  // back to the locked default (`minimal`).
-  registerSubagentModeReader((key) => state.getDisplayPrefs(key).subagent);
+  // Both adapters branch on the per-thread display prefs while PRODUCING output
+  // (OpenCode: child SSE parts on `subagent`; Claude: scrape-chunk relay routing
+  // on `toolResults` + transcript tailing on `subagent`) — the prefs they cannot
+  // resolve at render time. Same late-wiring idiom as the event handlers above;
+  // before this line they fall back to all-fields-`minimal`.
+  registerDisplayPrefsReader((key) => state.getDisplayPrefs(key));
 
   // 3. Connect to Telegram and register commands menu before starting local
   // daemons. If getMe fails, we should not leave an orphan opencode server.

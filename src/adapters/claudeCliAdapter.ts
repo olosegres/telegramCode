@@ -12,12 +12,13 @@ import type {
   AgentSession,
   ClaudeSurveyEvent,
   ClaudeSurveyOption,
+  DisplayPrefsReader,
   DisplayVerbosityMode,
   OutputEventMeta,
   RecentTurn,
+  ResolvedThreadDisplayPrefs,
   ResumeSessionOptions,
   SendInputOptions,
-  SubagentModeReader,
   ThreadKey,
 } from '../types';
 import { keyToString } from '../types';
@@ -60,6 +61,15 @@ import {
   normalizeForComparison,
   type RecentRelayWindow,
 } from '../utils/recentRelayWindow';
+import {
+  classifyClaudeChunk,
+  createInitialChunkContext,
+  type ClaudeChunkContext,
+} from '../utils/claudeChunkClassifier';
+import {
+  checkIsClaudeRelayFastPath,
+  routeClaudeChunkSegments,
+} from '../utils/claudeRelayRouting';
 
 /**
  * @description Per-thread Claude CLI session state.
@@ -202,6 +212,16 @@ interface ClaudeSession {
    * resume/adopt — see {@link ClaudeCliAdapter.scanSubagentTranscripts}.
    */
   subagentTail: SubagentTailState;
+  /**
+   * Cross-poll classifier context for the verbosity relay (S4). A tool body /
+   * thinking block / sub-agent panel can span the boundary between two scraped
+   * chunks (Claude redraws the whole pane each poll; the diff emits only NEW
+   * lines, so a slow command's body arrives in a later poll without its
+   * header). {@link classifyClaudeChunk} threads this so the later chunk still
+   * tags those orphan lines correctly. Fresh per session object (start /
+   * resume / adopt all flow through `createSession`).
+   */
+  chunkContext: ClaudeChunkContext;
 }
 
 /**
@@ -2340,24 +2360,36 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   private sessions: Map<string, ClaudeSession> = new Map();
 
   /**
-   * Per-thread `/subagent` mode reader, injected by the bot at boot via
-   * `createAdapter.registerSubagentModeReader` (same idiom as the OpenCode
-   * adapter). The poll loop's transcript scan consults it every tick: a
-   * non-`full` mode fast-forwards the tail offsets without reading, `full`
-   * reads the appended bytes and streams the child's text blocks. `null`
-   * until wired → reads fall back to the locked default.
+   * Per-thread display-prefs reader, injected by the bot at boot via
+   * `createAdapter.registerDisplayPrefsReader` (S4; same idiom as the OpenCode
+   * adapter). Consulted on the poll hot path: the relay branches each chunk's
+   * tool / panel segments on `toolResults` (S4), and the transcript scan
+   * fast-forwards (non-`full` `subagent`) or streams (`full`). `null` until
+   * wired → reads fall back to all-fields-`minimal`.
    */
-  private subagentModeReader: SubagentModeReader | null = null;
+  private displayPrefsReader: DisplayPrefsReader | null = null;
 
-  /** @description Inject the per-thread `/subagent` mode reader (see the field's JSDoc). */
-  setSubagentModeReader(reader: SubagentModeReader): void {
-    this.subagentModeReader = reader;
+  /** @description Inject the per-thread display-prefs reader (see the field's JSDoc). */
+  setDisplayPrefsReader(reader: DisplayPrefsReader): void {
+    this.displayPrefsReader = reader;
   }
 
-  /** @description Resolve the thread's `/subagent` mode, defaulting to `minimal`
-   * for any read that happens before the bot wires the reader at boot. */
+  /** @description Resolve the thread's full display prefs, defaulting every
+   * field to `minimal` for any read before the bot wires the reader at boot. */
+  private getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
+    return (
+      this.displayPrefsReader?.(key) ?? {
+        thinking: defaultDisplayVerbosityMode,
+        toolResults: defaultDisplayVerbosityMode,
+        subagent: defaultDisplayVerbosityMode,
+      }
+    );
+  }
+
+  /** @description Resolve the thread's `/subagent` mode (consulted by the
+   * transcript-tail scan), via the full prefs reader. */
   private getSubagentMode(key: ThreadKey): DisplayVerbosityMode {
-    return this.subagentModeReader?.(key) ?? defaultDisplayVerbosityMode;
+    return this.getDisplayPrefs(key).subagent;
   }
 
   private createSession(
@@ -2384,6 +2416,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'pendingEffortReapply'
       | 'recentRelayWindow'
       | 'subagentTail'
+      | 'chunkContext'
     >,
   ): ClaudeSession {
     return {
@@ -2423,6 +2456,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S3: fresh tail state per session — its first scan seeds offsets to
       // EOF, so resume/adopt never replays an old sub-agent's transcript.
       subagentTail: createSubagentTailState(),
+      // S4: fresh cross-poll classifier context per session — the all-closed
+      // start, so a fresh session never inherits a prior session's open block.
+      chunkContext: createInitialChunkContext(),
     };
   }
 
@@ -3563,12 +3599,50 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           if (!relayablePart) {
             console.log(`[Claude] already-relayed re-render suppressed (${newPart.length} chars)`);
           } else {
+            // S4 verbosity relay: classify the chunk (pure, cheap), then route
+            // its tool / panel segments per the thread's `/tool_results` pref.
+            // The classifier threads fence/block context across polls (mirrors
+            // `session.openToolKind` for orphan bodies whose header streamed in
+            // an earlier poll). FAST PATH (regression anchor): all-`full`
+            // tool+thinking prefs AND no panel-preview segment → the pre-S4
+            // direct strip→emit runs BYTE-IDENTICALLY on the original chunk.
+            const prefs = this.getDisplayPrefs(key);
+            const classification = classifyClaudeChunk(relayablePart, session.chunkContext);
+            session.chunkContext = classification.outgoingContext;
+
+            const isFastPath = checkIsClaudeRelayFastPath(
+              classification.segments,
+              prefs.toolResults,
+              prefs.thinking,
+            );
+
+            let stripInput: string;
+            let activityLine: string | null = null;
+            if (isFastPath) {
+              // Pre-S4 path, unchanged: feed the ORIGINAL chunk to the stripper
+              // (it is the chrome/fence backstop). Provably byte-identical.
+              stripInput = relayablePart;
+            } else {
+              // QUIET PATH: keep prose + thinking verbatim, route tool bodies
+              // (full keep / short truncate / minimal fold) and ALWAYS fold a
+              // sub-agent panel preview into the rolling status frame.
+              const routed = routeClaudeChunkSegments(
+                classification.segments,
+                prefs.toolResults,
+                (toolLabel) => t('toolResults.activity_status', { tool: toolLabel || t('toolResults.activity_fallback') }),
+                () => t('subagent.panel_fold_status'),
+                t('toolResults.truncated_footer'),
+              );
+              stripInput = routed.keptText;
+              activityLine = routed.activityLine;
+            }
+
             // Thread the tool-result kind across polls: the owning `● Bash(…)`
             // header of a slow command's output streamed in an earlier poll (the
             // line-set diff drops it as a duplicate), so `session.openToolKind`
             // carries it forward to fence the orphan `⎿` body (B2). Tracked via
             // the clean deltas, not a scan of the racy live pane.
-            const stripped = stripTuiElementsWithContext(relayablePart, session.openToolKind);
+            const stripped = stripTuiElementsWithContext(stripInput, session.openToolKind);
             session.openToolKind = stripped.toolKind;
             const cleanedOutput = stripped.text;
             if (cleanedOutput && checkIsInputEchoFrame(cleanedOutput)) {
@@ -3599,6 +3673,15 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
                 // flood as separate messages.
                 session.recentRelayWindow.record(relayablePart);
                 this.emit('output', key, cleanedOutput);
+              }
+            } else if (activityLine) {
+              // Quiet path folded every routable segment into the status frame
+              // (e.g. `minimal` tool calls / a sub-agent panel preview) — keep
+              // the user informed with one rolling activity line, deduped like
+              // the spinner-status path above so the frame doesn't churn.
+              if (activityLine !== session.lastStatusText) {
+                session.lastStatusText = activityLine;
+                this.emit('status', key, activityLine);
               }
             } else {
               console.log(`[Claude] Output filtered out completely`);

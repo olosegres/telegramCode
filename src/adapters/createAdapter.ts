@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, OutputEventMeta, SubagentModeReader, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, DisplayPrefsReader, OutputEventMeta, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -45,27 +45,26 @@ let onStarted: ThreadKeyHandler | null = null;
 let onStopped: ThreadKeyHandler | null = null;
 let onError: ErrorHandler | null = null;
 
-/** Per-thread `/subagent` mode reader for BOTH adapters — same late-wiring
- * idiom as the event handlers above: registered once at bot boot, applied to
- * each instance whether it exists already or is created later. */
-let subagentModeReader: SubagentModeReader | null = null;
+/** Per-thread display-prefs reader for BOTH adapters — same late-wiring idiom
+ * as the event handlers above: registered once at bot boot, applied to each
+ * instance whether it exists already or is created later. */
+let displayPrefsReader: DisplayPrefsReader | null = null;
 
 /**
- * @description Register the per-thread `/subagent` mode reader both adapters
- * consult while PRODUCING sub-agent output (the one display pref that cannot
- * be resolved at the bot's render time): OpenCode branches a child-session
- * part on its SSE hot path (compact = status, full = separate streamed
- * accumulator); Claude's poll loop decides whether to read the on-disk
- * sub-agent transcripts (`full`) or just fast-forward its tail offsets
- * (`compact`). Until registered, both adapters fall back to the locked
- * `compact` default.
+ * @description Register the per-thread display-prefs reader both adapters
+ * consult while PRODUCING output (the prefs that cannot be resolved at the
+ * bot's render time): OpenCode branches a child-session part on its SSE hot
+ * path (compact = status, full = separate streamed accumulator) and Claude's
+ * relay classifies each scraped chunk and routes tool / panel / sub-agent
+ * segments per the `toolResults` and `subagent` prefs (S4). Until registered,
+ * both adapters fall back to all-fields-`minimal`.
  */
-export function registerSubagentModeReader(reader: SubagentModeReader): void {
-  subagentModeReader = reader;
+export function registerDisplayPrefsReader(reader: DisplayPrefsReader): void {
+  displayPrefsReader = reader;
   const existingOpenCode = adapterInstances.get('opencode');
-  if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setSubagentModeReader(reader);
+  if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setDisplayPrefsReader(reader);
   const existingClaude = adapterInstances.get('claude');
-  if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setSubagentModeReader(reader);
+  if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setDisplayPrefsReader(reader);
 }
 
 function wireAdapterEvents(adapter: AgentAdapter): void {
@@ -134,8 +133,8 @@ export function getAdapter(name: string): AgentAdapter {
     adapter = factory();
     adapterInstances.set(name, adapter);
     wireAdapterEvents(adapter);
-    if (subagentModeReader && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
-      adapter.setSubagentModeReader(subagentModeReader);
+    if (displayPrefsReader && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
+      adapter.setDisplayPrefsReader(displayPrefsReader);
     }
   }
   return adapter;

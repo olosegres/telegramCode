@@ -225,17 +225,22 @@ export interface ApiRetryState {
 export type DisplayVerbosityMode = 'minimal' | 'short' | 'full';
 
 /**
- * @description Reader for a thread's persisted `/subagent` display mode, injected
- * into BOTH adapters at boot (`createAdapter.registerSubagentModeReader`).
- * Unlike the thinking / tool-result modes (resolved by the BOT at render time,
- * S2/S3), the sub-agent mode decides what the adapter PRODUCES: OpenCode
- * branches a child part on its SSE hot path (compact refreshes a status, full
- * streams into a separate child accumulator); Claude's poll loop either
- * fast-forwards its transcript-tail offsets (non-`full`) or reads + streams the
- * appended text blocks (`full`) — so both need a live read instead of a
- * render-time one.
+ * @description Reader for a thread's FULL resolved display preferences, injected
+ * into BOTH adapters at boot (`createAdapter.registerDisplayPrefsReader`, S4).
+ * Generalises the former single-pref `SubagentModeReader`: the adapters now need
+ * more than the sub-agent mode at PRODUCE time — Claude's relay classifies each
+ * scraped chunk and routes tool / panel segments per the `toolResults` pref too
+ * (S4), so one reader returning every pref is wired instead of N parallel
+ * injections. The sub-agent branch still derives `.subagent` from it.
+ *
+ * Why a live read (not the bot's render-time resolution used for thinking /
+ * tool-result OpenCode events): OpenCode branches a child part on its SSE hot
+ * path (compact refreshes a status, full streams into a separate child
+ * accumulator) and Claude's poll loop decides whether to read + relay tool
+ * bodies — both are adapter-side decisions that cannot be deferred. Until
+ * registered, both adapters fall back to all-fields-`minimal`.
  */
-export type SubagentModeReader = (key: ThreadKey) => DisplayVerbosityMode;
+export type DisplayPrefsReader = (key: ThreadKey) => ResolvedThreadDisplayPrefs;
 
 /**
  * @description Per-thread bot-rendering preferences for agent output

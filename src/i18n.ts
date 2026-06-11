@@ -265,11 +265,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.choose': '🔧 Текущий режим результатов инструментов: {current}\nВыбери режим:',
     'toolResults.set_success': '✅ Режим результатов инструментов: {mode}',
     'toolResults.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
-    'toolResults.opencode_only': 'ℹ️ /tool_results доступен только для OpenCode (Claude показывает результаты инструментов в своём TUI).',
     'toolResults.mode.minimal': 'минимум',
     'toolResults.mode.short': 'кратко',
     'toolResults.mode.full': 'подробно',
     'toolResults.truncated_footer': '… (обрезано, /tool_results full)',
+    // S4 Claude `minimal` mode: a folded tool call rolls through the status
+    // frame as one activity line instead of a permanent message.
+    'toolResults.activity_status': '🔧 {tool} …',
+    'toolResults.activity_fallback': 'инструмент',
 
     // ── /subagent (sub-agent transcript verbosity, both backends) ──
     // Mode names are also used on the picker buttons. `status_live` is the
@@ -278,6 +281,7 @@ const dict: Record<Lang, Record<string, string>> = {
     // no title/description. `minimal` ≡ `short` (v1): both are status-only —
     // the "working" indicator is never hidden (user-locked).
     'subagent.status_live': '🤖 суб-агент: {title} …',
+    'subagent.panel_fold_status': '🤖 суб-агент работает …',
     'subagent.delegating_status': '🤖 Делегирую: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
     'subagent.fallback_title': 'суб-агент',
@@ -667,11 +671,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.choose': '🔧 Current tool-results mode: {current}\nPick a mode:',
     'toolResults.set_success': '✅ Tool-results mode: {mode}',
     'toolResults.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
-    'toolResults.opencode_only': 'ℹ️ /tool_results is OpenCode-only (Claude renders tool results in its own TUI).',
     'toolResults.mode.minimal': 'minimal',
     'toolResults.mode.short': 'short',
     'toolResults.mode.full': 'full',
     'toolResults.truncated_footer': '… (truncated, /tool_results full)',
+    // S4 Claude `minimal` mode: a folded tool call rolls through the status
+    // frame as one activity line instead of a permanent message.
+    'toolResults.activity_status': '🔧 {tool} …',
+    'toolResults.activity_fallback': 'tool',
 
     // ── /subagent (sub-agent transcript verbosity, both backends) ──
     // Mode names are also used on the picker buttons. `status_live` is the
@@ -680,6 +687,7 @@ const dict: Record<Lang, Record<string, string>> = {
     // no title/description. `minimal` ≡ `short` (v1): both are status-only —
     // the "working" indicator is never hidden (user-locked).
     'subagent.status_live': '🤖 sub-agent: {title} …',
+    'subagent.panel_fold_status': '🤖 sub-agent working …',
     'subagent.delegating_status': '🤖 Delegating: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
     'subagent.fallback_title': 'sub-agent',

@@ -216,24 +216,30 @@ export type ThinkingMode = 'detailed' | 'brief' | 'hide';
 export type ToolResultMode = 'full' | 'short' | 'hide';
 
 /**
- * @description How a sub-agent (child session) transcript surfaces in the topic.
+ * @description How a sub-agent's transcript surfaces in the topic (OpenCode:
+ * child session; Claude: Task-tool child, tailed from its on-disk transcript).
  * Per-thread, persisted (`state.ts` `displayPrefs`). A bot-RENDERING concern only.
  * Deliberately 2-state — there is NO `hide`: the user always wants the "working"
  * indicator visible.
  *
- * - `compact` → child transcript is NOT streamed; a single live
- *               "🤖 sub-agent: <title> …" status mirrors the terminal.
- * - `full`    → child transcript IS streamed, each chunk marked as sub-agent.
+ * - `compact` → child transcript is NOT streamed (OpenCode shows a single live
+ *               "🤖 sub-agent: <title> …" status; Claude's own ◯ task-panel
+ *               line rolls inside the coalesced status frame).
+ * - `full`    → child TEXT is additionally streamed, each chunk marked as
+ *               sub-agent.
  */
 export type SubagentMode = 'compact' | 'full';
 
 /**
  * @description Reader for a thread's persisted {@link SubagentMode}, injected
- * into the OpenCode adapter at boot (`createAdapter.registerSubagentModeReader`).
+ * into BOTH adapters at boot (`createAdapter.registerSubagentModeReader`).
  * Unlike the thinking / tool-result modes (resolved by the BOT at render time,
- * S2/S3), the sub-agent mode decides WHAT the adapter ACCUMULATES on its SSE
- * hot path — compact refreshes a status, full streams into a separate child
- * accumulator — so the adapter needs a live read instead of a render-time one.
+ * S2/S3), the sub-agent mode decides what the adapter PRODUCES: OpenCode
+ * branches a child part on its SSE hot path (compact refreshes a status, full
+ * streams into a separate child accumulator); Claude's poll loop either
+ * fast-forwards its transcript-tail offsets (compact) or reads + streams the
+ * appended text blocks (full) — so both need a live read instead of a
+ * render-time one.
  */
 export type SubagentModeReader = (key: ThreadKey) => SubagentMode;
 
@@ -287,11 +293,12 @@ export interface OutputEventMeta {
    */
   isFinal?: boolean;
   /**
-   * True when this text comes from a SUB-AGENT (OpenCode child session), only
-   * emitted in `/subagent full` mode (S4). The bot renders the chunk visibly
-   * marked ("🤖 ⤷ …") and OUTSIDE the parent reply's edit-in-place continuation
-   * chain — a child transcript must never become the base the parent's next
-   * continuation is appended to (it would corrupt the answer's accounting).
+   * True when this text comes from a SUB-AGENT (OpenCode: child session SSE;
+   * Claude: on-disk transcript tail), only emitted in `/subagent full` mode.
+   * The bot renders the chunk visibly marked ("🤖 ⤷ …") and OUTSIDE the parent
+   * reply's edit-in-place continuation chain — a child transcript must never
+   * become the base the parent's next continuation is appended to (it would
+   * corrupt the answer's accounting).
    */
   isSubagent?: boolean;
 }

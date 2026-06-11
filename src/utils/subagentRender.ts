@@ -1,12 +1,16 @@
 /**
- * @description Decision + formatting helpers for sub-agent (OpenCode child
- * session) rendering behind `/subagent` (S4). The mode×part-kind matrix
- * ({@link getSubagentPartAction}) is consulted by the ADAPTER — unlike the
- * thinking / tool-result modes the sub-agent mode decides what is ACCUMULATED
- * (status vs a separate streamed accumulator), which cannot be deferred to the
- * bot's render time. Extracted from the adapter so the matrix is unit-testable
- * without an SSE stream (same pattern as `toolResultRender.ts`). The string
- * builders are pure-ish (they only read i18n), mirroring `buildThinkingFrameText`.
+ * @description Decision + formatting helpers for sub-agent rendering behind
+ * `/subagent` (S4). The mode options / type guard / fallback are shared by
+ * BOTH backends (Claude's transcript-tail path lives in
+ * `claudeSubagentTail.ts`); the mode×part-kind matrix
+ * ({@link getSubagentPartAction}) and the status builders are OpenCode's
+ * child-session SSE concerns. The matrix is consulted by the ADAPTER — unlike
+ * the thinking / tool-result modes the sub-agent mode decides what is
+ * ACCUMULATED (status vs a separate streamed accumulator), which cannot be
+ * deferred to the bot's render time. Extracted from the adapter so the matrix
+ * is unit-testable without an SSE stream (same pattern as
+ * `toolResultRender.ts`). The string builders are pure-ish (they only read
+ * i18n), mirroring `buildThinkingFrameText`.
  */
 import { t } from '../i18n';
 import type { SubagentMode } from '../types';
@@ -28,7 +32,7 @@ export function checkIsSubagentMode(value: string): value is SubagentMode {
 
 /**
  * Locked default sub-agent mode — mirrors `state.ts`'s (unexported)
- * `defaultSubagentMode`. The adapter falls back to it only for reads that
+ * `defaultSubagentMode`. The adapters fall back to it only for reads that
  * happen before the bot injects its mode reader at boot.
  */
 export const fallbackSubagentMode: SubagentMode = 'compact';

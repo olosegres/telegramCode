@@ -45,22 +45,27 @@ let onStarted: ThreadKeyHandler | null = null;
 let onStopped: ThreadKeyHandler | null = null;
 let onError: ErrorHandler | null = null;
 
-/** Per-thread `/subagent` mode reader for the OpenCode adapter (S4) — same
- * late-wiring idiom as the event handlers above: registered once at bot boot,
- * applied to the instance whether it exists already or is created later. */
+/** Per-thread `/subagent` mode reader for BOTH adapters — same late-wiring
+ * idiom as the event handlers above: registered once at bot boot, applied to
+ * each instance whether it exists already or is created later. */
 let subagentModeReader: SubagentModeReader | null = null;
 
 /**
- * @description Register the reader the OpenCode adapter consults on its SSE
- * hot path to branch a SUB-AGENT part (compact = status, full = separate
- * streamed accumulator). Claude needs no reader — its TUI renders sub-agents
- * itself. Until registered, the adapter falls back to the locked `compact`
- * default.
+ * @description Register the per-thread `/subagent` mode reader both adapters
+ * consult while PRODUCING sub-agent output (the one display pref that cannot
+ * be resolved at the bot's render time): OpenCode branches a child-session
+ * part on its SSE hot path (compact = status, full = separate streamed
+ * accumulator); Claude's poll loop decides whether to read the on-disk
+ * sub-agent transcripts (`full`) or just fast-forward its tail offsets
+ * (`compact`). Until registered, both adapters fall back to the locked
+ * `compact` default.
  */
 export function registerSubagentModeReader(reader: SubagentModeReader): void {
   subagentModeReader = reader;
-  const existing = adapterInstances.get('opencode');
-  if (existing instanceof OpenCodeAdapter) existing.setSubagentModeReader(reader);
+  const existingOpenCode = adapterInstances.get('opencode');
+  if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setSubagentModeReader(reader);
+  const existingClaude = adapterInstances.get('claude');
+  if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setSubagentModeReader(reader);
 }
 
 function wireAdapterEvents(adapter: AgentAdapter): void {
@@ -129,7 +134,7 @@ export function getAdapter(name: string): AgentAdapter {
     adapter = factory();
     adapterInstances.set(name, adapter);
     wireAdapterEvents(adapter);
-    if (adapter instanceof OpenCodeAdapter && subagentModeReader) {
+    if (subagentModeReader && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
       adapter.setSubagentModeReader(subagentModeReader);
     }
   }

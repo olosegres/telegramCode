@@ -12,9 +12,12 @@ import type {
   AgentSession,
   ClaudeSurveyEvent,
   ClaudeSurveyOption,
+  OutputEventMeta,
   RecentTurn,
   ResumeSessionOptions,
   SendInputOptions,
+  SubagentMode,
+  SubagentModeReader,
   ThreadKey,
 } from '../types';
 import { keyToString } from '../types';
@@ -29,6 +32,15 @@ import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
 import { getEffortStartupKeystroke } from '../utils/effortStartupKeystroke';
+import { fallbackSubagentMode } from '../utils/subagentRender';
+import {
+  checkIsSubagentTranscriptName,
+  createSubagentTailState,
+  extractAppendedSubagentTexts,
+  getSubagentTailReads,
+  type SubagentScanFile,
+  type SubagentTailState,
+} from '../utils/claudeSubagentTail';
 import {
   createRecentRelayWindow,
   getRelayDedupedChunk,
@@ -166,6 +178,17 @@ interface ClaudeSession {
    * `utils/recentRelayWindow.ts` for the locked drop-over-resend tradeoff.
    */
   recentRelayWindow: RecentRelayWindow;
+  /**
+   * Sub-agent transcript tail state (`/subagent full` on Claude, plan
+   * 2026-06-11 S3). The poll loop scans
+   * `<projectsRoot>/<slug>/<claudeSessionId>/subagents/` every tick and feeds
+   * file sizes / appended bytes into the pure `claudeSubagentTail` helpers;
+   * this holds the per-file byte offsets + partial-line carries. Fresh per
+   * session object (start / resume / adopt all flow through `createSession`),
+   * so the helper's first-scan EOF seeding kills backlog replay on
+   * resume/adopt — see {@link ClaudeCliAdapter.scanSubagentTranscripts}.
+   */
+  subagentTail: SubagentTailState;
 }
 
 /**
@@ -1734,6 +1757,42 @@ function getClaudeProjectSlug(workDir: string): string {
 }
 
 /**
+ * @description Root of Claude's on-disk transcript store
+ * (`~/.claude/projects`). Single source for every path built from it —
+ * session listing, resume-context reads, and the sub-agent transcript scan.
+ */
+function getClaudeProjectsRoot(): string {
+  return path.join(os.homedir(), '.claude', 'projects');
+}
+
+/**
+ * @description Read the byte range `[startOffset..endOffset)` of a file as
+ * UTF-8. The sub-agent transcript tail uses it to fetch only the bytes
+ * appended since the previous poll instead of re-reading whole files. A short
+ * read (file truncated between stat and read) returns just the bytes
+ * available — the JSONL line parser skips any torn tail.
+ */
+async function readFileSlice(filePath: string, startOffset: number, endOffset: number): Promise<string> {
+  const fileHandle = await fs.promises.open(filePath, 'r');
+  try {
+    const length = endOffset - startOffset;
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await fileHandle.read(buffer, 0, length, startOffset);
+    return buffer.subarray(0, bytesRead).toString('utf-8');
+  } finally {
+    await fileHandle.close();
+  }
+}
+
+/**
+ * @description Is this fs error a plain "path does not exist" (`ENOENT`)?
+ * Cast-free narrowing via the same record guard the JSONL parsers use.
+ */
+function checkIsMissingPathError(error: unknown): boolean {
+  return checkIsRecord(error) && error.code === 'ENOENT';
+}
+
+/**
  * @description One transcript's distilled metadata, collected by streaming
  * its `.jsonl` lines. All fields optional — a partially-written or
  * unexpected transcript still yields whatever was found.
@@ -2404,6 +2463,27 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    */
   private sessions: Map<string, ClaudeSession> = new Map();
 
+  /**
+   * Per-thread `/subagent` mode reader, injected by the bot at boot via
+   * `createAdapter.registerSubagentModeReader` (same idiom as the OpenCode
+   * adapter). The poll loop's transcript scan consults it every tick: compact
+   * fast-forwards the tail offsets without reading, full reads the appended
+   * bytes and streams the child's text blocks. `null` until wired → reads
+   * fall back to the locked default.
+   */
+  private subagentModeReader: SubagentModeReader | null = null;
+
+  /** @description Inject the per-thread `/subagent` mode reader (see the field's JSDoc). */
+  setSubagentModeReader(reader: SubagentModeReader): void {
+    this.subagentModeReader = reader;
+  }
+
+  /** @description Resolve the thread's `/subagent` mode, defaulting to `compact`
+   * for any read that happens before the bot wires the reader at boot. */
+  private getSubagentMode(key: ThreadKey): SubagentMode {
+    return this.subagentModeReader?.(key) ?? fallbackSubagentMode;
+  }
+
   private createSession(
     params: Omit<
       ClaudeSession,
@@ -2427,6 +2507,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'unchangedPollStreak'
       | 'pendingEffortReapply'
       | 'recentRelayWindow'
+      | 'subagentTail'
     >,
   ): ClaudeSession {
     return {
@@ -2463,6 +2544,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // here) begins with an EMPTY relay window — this IS the "reset on
       // session start"; stop deletes the session and the window with it.
       recentRelayWindow: createRecentRelayWindow(),
+      // S3: fresh tail state per session — its first scan seeds offsets to
+      // EOF, so resume/adopt never replays an old sub-agent's transcript.
+      subagentTail: createSubagentTailState(),
     };
   }
 
@@ -2534,12 +2618,85 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         session.isPolling = true;
         try {
           await this.pollOutput(key);
+          // S3: tail the session's on-disk sub-agent transcripts on the same
+          // tick cadence. Self-guarding (catches everything internally), so a
+          // scan problem can never break the pane polling.
+          await this.scanSubagentTranscripts(key, session);
         } finally {
           session.isPolling = false;
           this.schedulePoll(key, session);
         }
       })();
     }, session.currentPollDelayMs);
+  }
+
+  /**
+   * @description Per-poll-tick scan of the session's on-disk sub-agent
+   * transcripts (`/subagent` on Claude, plan 2026-06-11 S3). Claude writes
+   * each Task-tool child transcript to
+   * `<projectsRoot>/<slug>/<claudeSessionId>/subagents/agent-<agentId>.jsonl`;
+   * the pure `claudeSubagentTail` helpers own all decisions — first-scan EOF
+   * seeding (no backlog replay on resume/adopt), compact-mode fast-forward
+   * without reading, and assistant-text-block extraction (child thinking /
+   * tool_use never rendered). In `full` mode every appended text block is
+   * emitted as a marked output (`meta.isSubagent`) which the bot renders as a
+   * standalone "🤖 ⤷" message outside the parent's continuation chain.
+   *
+   * A missing dir (`ENOENT` — no sub-agent yet, or an older claude version)
+   * short-circuits cheaply but still runs the empty scan, so the first-scan
+   * flag flips and a transcript created later streams from byte 0. Any other
+   * error is logged and swallowed here — this method must never reject, or
+   * the rejection would escape `schedulePoll`'s void'd poll chain.
+   */
+  private async scanSubagentTranscripts(key: ThreadKey, session: ClaudeSession): Promise<void> {
+    try {
+      const subagentsDir = path.join(
+        getClaudeProjectsRoot(),
+        getClaudeProjectSlug(session.workDir),
+        session.claudeSessionId,
+        'subagents',
+      );
+      let entries: string[] = [];
+      try {
+        entries = await fs.promises.readdir(subagentsDir);
+      } catch (e) {
+        if (!checkIsMissingPathError(e)) throw e;
+      }
+      const scannedFiles: SubagentScanFile[] = [];
+      for (const fileName of entries.filter(checkIsSubagentTranscriptName).sort()) {
+        try {
+          const stats = await fs.promises.stat(path.join(subagentsDir, fileName));
+          scannedFiles.push({ fileName, sizeBytes: stats.size });
+        } catch {
+          // File vanished between readdir and stat — picked up next tick.
+        }
+      }
+      const reads = getSubagentTailReads(session.subagentTail, scannedFiles, this.getSubagentMode(key));
+      for (const read of reads) {
+        if (!session.isActive) return;
+        // Per-read guard: one file's failed read (vanished mid-read) loses only
+        // ITS already-advanced range (drop-over-resend), not the sibling files'
+        // ranges the outer catch would otherwise abort with it.
+        try {
+          const appendedText = await readFileSlice(
+            path.join(subagentsDir, read.fileName),
+            read.startOffset,
+            read.endOffset,
+          );
+          for (const text of extractAppendedSubagentTexts(session.subagentTail, read.fileName, appendedText)) {
+            const meta: OutputEventMeta = { isSubagent: true };
+            this.emit('output', key, text, meta);
+          }
+        } catch (e) {
+          console.warn(
+            `[Claude] sub-agent transcript read failed (${read.fileName}):`,
+            e instanceof Error ? e.message : e,
+          );
+        }
+      }
+    } catch (e) {
+      console.warn(`[Claude] sub-agent transcript scan failed:`, e instanceof Error ? e.message : e);
+    }
   }
 
   /**
@@ -3078,8 +3235,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   // on the laptop in `workDir` resumable from the bound Telegram thread.
   // `key` is unused: Claude scopes transcripts by folder, not by thread.
   async getSessions(_key: ThreadKey, workDir: string): Promise<AgentSession[]> {
-    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
-    return listClaudeSessionsForWorkDir(projectsRoot, workDir);
+    return listClaudeSessionsForWorkDir(getClaudeProjectsRoot(), workDir);
   }
 
   /**
@@ -3091,8 +3247,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * (unknown / pruned UUID) yields `[]`, so the caller posts no context block.
    */
   async getRecentTurns(_key: ThreadKey, workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]> {
-    const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
-    const filePath = path.join(projectsRoot, getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
     return readRecentClaudeTurns(filePath, limit);
   }
 

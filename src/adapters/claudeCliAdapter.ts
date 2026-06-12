@@ -236,6 +236,27 @@ const resumeSeedMaxPolls = 40;
 const claudePath = resolveClaudeBinary();
 
 /**
+ * @description Permission flags for EVERY bot-launched Claude session (start
+ * AND resume), forcing allow-all so the user never gets permission prompts.
+ *
+ * `--dangerously-skip-permissions` only sets bypass as the INITIAL mode and
+ * suppresses the "enter bypass?" confirm — it is NOT a runtime lock (shift+tab
+ * cycles bypass → auto → default). A live session ended up in a prompting,
+ * non-bypass mode despite the flag (thread 15812, 2026-06-12); the bot never
+ * sends shift+tab itself, so the drift comes from Claude's own mode state, not
+ * the bot. `--permission-mode bypassPermissions` is the documented per-session
+ * override (verified present in v2.1.175 `--help`); passing it on every launch
+ * re-asserts bypass on each fresh start and resume — verified to land in
+ * "bypass permissions on" for both. Residual circuit-breakers (claude always
+ * asks for `rm -rf /` or `rm -rf ~`) are intentional and out of scope.
+ */
+const claudePermissionArgs = [
+  '--dangerously-skip-permissions',
+  '--permission-mode',
+  'bypassPermissions',
+];
+
+/**
  * @description When set (`CLAUDE_SCRAPE_DEBUG=1`), the poll loop logs the FULL
  * RAW and FILTERED chunk bodies — a forensic dump useful when debugging the
  * scrape pipeline. Default OFF: those two sync stdout writes per changed poll
@@ -2751,7 +2772,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const mcpFlagsArr = await prepareMcpFlags({ key, dataDir: resolveDataDir() });
     const claudeArgv: string[] = [
       claudePath,
-      '--dangerously-skip-permissions',
+      ...claudePermissionArgs,
       '--session-id', claudeSessionId,
       ...mcpFlagsArr,
       ...(args ? [args] : []),
@@ -3265,7 +3286,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const mcpFlagsArr = await prepareMcpFlags({ key, dataDir: resolveDataDir() });
     const claudeArgv: string[] = [
       claudePath,
-      '--dangerously-skip-permissions',
+      ...claudePermissionArgs,
       '--resume', sessionId,
       ...mcpFlagsArr,
     ];

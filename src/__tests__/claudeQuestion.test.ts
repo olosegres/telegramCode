@@ -437,3 +437,109 @@ test('free-form text is NOT a control reply → breaks out of the selector', () 
   assert.equal(checkIsSelectorControlReply('123'), false); // 3+ digits: not an option index
   assert.equal(checkIsSelectorControlReply(''), false);
 });
+
+// ── Permission prompt: relay the action context, not just the tail ──
+//
+// The CURRENT Claude TUI (v2.1.175) renders a permission prompt WITHOUT a box:
+// a full-width `────` divider, then `Bash command` + the command + a one-line
+// description, a blank line, then `Do you want to proceed?` + options. The
+// header walk used to stop at that blank line, so Telegram got only
+// `Do you want to proceed?` and the user couldn't tell WHAT was being approved
+// (live thread 15812 "overview 2", 2026-06-12). The walk must span the blank
+// and climb to the `────` divider.
+const bashPermissionPrompt = [
+  '────────────────────────────────────────────────────────────────────────────',
+  ' Bash command',
+  '',
+  '   rm -f agent/tmp/probeScope.mjs && rm -rf agent/tmp/probe-scope-userdata && \\',
+  '   projects/overviewDesktop/e2e/results/* 2>/dev/null; echo "cleaned"; git status --short',
+  '   Clean probe scripts, temp dirs, e2e results',
+  '',
+  ' Do you want to proceed?',
+  ' ❯ 1. Yes',
+  "   2. Yes, and don't ask again for similar commands in /home/user/src/overview",
+  '   3. No',
+  '',
+  ' Esc to cancel · Tab to amend · ctrl+e to explain',
+].join('\n');
+
+test('permission prompt (divider layout): relays the command box, not just the question', () => {
+  const q = extractClaudeQuestion(bashPermissionPrompt)!;
+  assert.ok(q);
+  // The action context that used to be lost.
+  assert.match(q.text, /Bash command/);
+  assert.match(q.text, /rm -f agent\/tmp\/probeScope\.mjs/);
+  assert.match(q.text, /Clean probe scripts, temp dirs, e2e results/);
+  // The question line + every option still present.
+  assert.match(q.text, /Do you want to proceed\?/);
+  assert.match(q.text, /❯ 1\. Yes/);
+  assert.match(q.text, /3\. No/);
+  // The full-width `────` divider bounds the box and is NOT relayed.
+  assert.doesNotMatch(q.text, /────/);
+  // Signature is options-only → de-dup unaffected by the richer header.
+  assert.equal(
+    q.signature,
+    "1.Yes|2.Yes, and don't ask again for similar commands in /home/user/src/overview|3.No",
+  );
+});
+
+test('permission prompt (Edit, bordered): box top bounds the header, inner diff kept', () => {
+  const editPrompt = [
+    'Some transcript prose above the box.',
+    '',
+    '╭──────────────────────────────────────────────╮',
+    '│ Edit file src/foo.ts                          │',
+    '│                                               │',
+    '│   - const value = 1;                          │',
+    '│   + const value = 2;                          │',
+    '│                                               │',
+    '│ Do you want to make this edit?                │',
+    '│ ❯ 1. Yes                                      │',
+    '│   2. No                                       │',
+    '│                                               │',
+    '│ Enter to select · Esc to cancel               │',
+    '╰──────────────────────────────────────────────╯',
+  ].join('\n');
+  const q = extractClaudeQuestion(editPrompt)!;
+  assert.ok(q);
+  assert.match(q.text, /Edit file src\/foo\.ts/);
+  assert.match(q.text, /\+ const value = 2;/);
+  assert.match(q.text, /Do you want to make this edit\?/);
+  // The `╭──╮` box top bounds the walk — transcript prose above it stays out.
+  assert.doesNotMatch(q.text, /transcript prose/);
+});
+
+test('permission prompt: an oversized box is truncated (head + tail kept, middle dropped)', () => {
+  const diffLines = Array.from({ length: 40 }, (_, i) => `   + line ${i + 1} of the diff`);
+  const oversized = [
+    '────────────────────────────────────────────────────────────────────────────',
+    ' Edit file big.ts',
+    '',
+    ...diffLines,
+    '',
+    ' Do you want to proceed?',
+    ' ❯ 1. Yes',
+    '   2. No',
+    '',
+    ' Esc to cancel',
+  ].join('\n');
+  const q = extractClaudeQuestion(oversized)!;
+  assert.ok(q);
+  // Identifying top kept.
+  assert.match(q.text, /Edit file big\.ts/);
+  assert.match(q.text, /\+ line 1 of the diff/);
+  // Question line (bottom of the header) kept.
+  assert.match(q.text, /Do you want to proceed\?/);
+  // A middle line is dropped behind the truncation marker.
+  assert.match(q.text, /truncated/);
+  assert.doesNotMatch(q.text, /\+ line 25 of the diff/);
+});
+
+test('permission prompt: the AskUserQuestion `☐` tab still never leaks into the header', () => {
+  // Spanning blanks must not drag the category tab in (the existing
+  // side-by-side `☐` no-leak guard, re-asserted against the new walk).
+  const q = extractClaudeQuestion(askUserQuestionBox(1))!;
+  assert.ok(q);
+  assert.match(q.text, /Which color do you prefer\?/);
+  assert.doesNotMatch(q.text, /☐/); // the " ☐ Color" tab label stays out
+});

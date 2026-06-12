@@ -758,8 +758,49 @@ const QUESTION_DESCRIPTION_MIN_INDENT = 4;
 /** How far below the LAST option to collect its trailing description sub-lines. */
 const QUESTION_DESCRIPTION_TRAILING_LOOKAHEAD = 3;
 
+/**
+ * Header walk caps. A permission prompt's action box (`Bash command` + the
+ * command + a one-line description, or `Edit file …` + a diff) sits above the
+ * question line; the header walk now climbs through it (spanning blank lines)
+ * up to the box boundary. SCAN_LIMIT bounds the upward climb itself (runaway
+ * guard on a malformed pane); MAX_LINES/MAX_CHARS bound the RELAYED text — over
+ * the cap, {@link truncateQuestionHeader} keeps the identifying TOP and the
+ * question line at the BOTTOM and drops the middle. A Bash command is well
+ * under the cap → never truncated.
+ */
+const QUESTION_HEADER_SCAN_LIMIT = 200;
+const QUESTION_HEADER_MAX_LINES = 26;
+const QUESTION_HEADER_MAX_CHARS = 2000;
+const QUESTION_HEADER_HEAD_LINES = 16;
+const QUESTION_HEADER_TAIL_LINES = 6;
+const QUESTION_HEADER_TRUNCATION_MARKER = '… (truncated — see terminal)';
+/**
+ * AskUserQuestion category tab marker (`☐ Foo` / `☑ Bar`) — chrome that sits
+ * above the question line; a boundary for the header walk so it is never
+ * relayed (the side-by-side `☐` no-leak test). Anchored at line start.
+ */
+const QUESTION_TAB_MARKER_REGEX = /^[☐☑]/;
+
 function stripQuestionBoxBorder(line: string): string {
   return line.replace(QUESTION_BORDER_REGEX, '');
+}
+
+/**
+ * Bound an over-long captured header (an oversized Edit/Write diff box): keep
+ * the head (title + first lines — the most identifying part) and the tail (the
+ * question line sits at the bottom of the header), drop the middle behind one
+ * marker. A within-budget header passes through unchanged.
+ */
+function truncateQuestionHeader(headerLines: string[]): string[] {
+  const totalChars = headerLines.reduce((sum, line) => sum + line.length + 1, 0);
+  if (headerLines.length <= QUESTION_HEADER_MAX_LINES && totalChars <= QUESTION_HEADER_MAX_CHARS) {
+    return headerLines;
+  }
+  return [
+    ...headerLines.slice(0, QUESTION_HEADER_HEAD_LINES),
+    QUESTION_HEADER_TRUNCATION_MARKER,
+    ...headerLines.slice(-QUESTION_HEADER_TAIL_LINES),
+  ];
 }
 
 /**
@@ -941,17 +982,37 @@ export function extractClaudeQuestion(text: string): ClaudeQuestion | null {
     }
   }
 
-  // Header: skip the blank/border gap above the options, then collect the
-  // contiguous prose line(s) above that.
+  // Header: skip the blank gap directly above the options, then climb to the
+  // box boundary collecting every prose line. A permission prompt's action box
+  // (`Bash command` + the command + a one-line description) sits ABOVE a blank
+  // line that separates it from `Do you want to proceed?`, so the walk must
+  // SPAN whitespace-only chrome (kept as a blank separator) and stop only at
+  // NON-blank chrome — the full-width `────` divider (current layout) or a
+  // `╭│` box border (Edit/older layout) — which bounds the box and keeps the
+  // transcript prose above it out (regression-guarded by the `codebase` /
+  // `alpha.ts` no-leak tests). Bounded by QUESTION_HEADER_MAX_LINES so a
+  // malformed pane can't climb the whole scrollback.
   let h = start - 1;
   while (h >= 0 && checkIsQuestionChrome(lines[h])) h--;
   const headerLines: string[] = [];
-  while (h >= 0 && !checkIsOptionLine(lines[h]) && !checkIsQuestionChrome(lines[h])) {
-    headerLines.unshift(lines[h]);
+  while (h >= 0 && !checkIsOptionLine(lines[h]) && headerLines.length < QUESTION_HEADER_SCAN_LIMIT) {
+    const line = lines[h];
+    // AskUserQuestion category tab (`☐ Foo`) is chrome above the question — a
+    // boundary, never relayed.
+    if (QUESTION_TAB_MARKER_REGEX.test(line)) break;
+    if (checkIsQuestionChrome(line)) {
+      // Non-blank chrome (divider / box border / nav hint) is the box edge.
+      if (line !== '') break;
+      // Blank line inside the box — keep it as a separator and keep climbing.
+      headerLines.unshift(line);
+      h--;
+      continue;
+    }
+    headerLines.unshift(line);
     h--;
   }
 
-  const header = headerLines.join('\n').trim();
+  const header = truncateQuestionHeader(headerLines).join('\n').trim();
   // Descriptions render indented under their option label, mirroring the
   // OpenCode question body (`buildQuestionBodyLines`).
   const renderedOptions = options

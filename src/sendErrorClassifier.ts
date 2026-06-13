@@ -17,7 +17,7 @@
 
 /** Shape of the bits we read out of a Telegram API error object. */
 export interface TelegramApiErrorLike {
-  response?: { error_code?: number; description?: string };
+  response?: { error_code?: number; description?: string; parameters?: { retry_after?: number } };
   description?: string;
 }
 
@@ -40,6 +40,15 @@ export function getErrorCode(e: TelegramApiErrorLike): number | undefined {
 
 export function getErrorDescription(e: TelegramApiErrorLike): string {
   return (e.response?.description ?? e.description ?? '').toString();
+}
+
+/**
+ * @description The `retry_after` (seconds) Telegram attaches to a 429, or
+ * `undefined` when absent. Callers fall back to their own default backoff when
+ * this is missing.
+ */
+export function getErrorRetryAfterSeconds(e: TelegramApiErrorLike): number | undefined {
+  return e.response?.parameters?.retry_after;
 }
 
 /**

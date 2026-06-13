@@ -80,6 +80,7 @@ import {
   checkIsApiError,
   getErrorCode,
   getErrorDescription,
+  getErrorRetryAfterSeconds,
 } from './sendErrorClassifier';
 import { formatPinnedStatus } from './pinnedStatus';
 import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
@@ -88,6 +89,15 @@ import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
+import { getOutputDebounceMs as resolveOutputDebounceMs } from './utils/outputDebounce';
+import { nextDraftId } from './utils/draftId';
+import {
+  getDraftPaceAction,
+  checkShouldKeepaliveDraft,
+  DRAFT_MIN_INTERVAL_MS,
+  DRAFT_KEEPALIVE_MS,
+  DRAFT_DEFAULT_BACKOFF_MS,
+} from './utils/draftPacer';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import {
   flushTraceBufferSyncOnExit,
@@ -404,8 +414,17 @@ bot.use(async (ctx, next) => {
  * booting Telegraf). Plan §4.3 point 3 / R2.
  */
 
-/** Debounce window for output batching. Telegram tolerates ~1 msg/sec/chat. */
-const OUTPUT_DEBOUNCE_MS = 1000;
+/**
+ * @description The output debounce window in effect for this process. DM mode
+ * uses the longer `OUTPUT_DEBOUNCE_MS_DM` (drafts carry the live UX); group mode
+ * keeps `OUTPUT_DEBOUNCE_MS` byte-for-byte. The selection rule + both constants
+ * live in the pure `utils/outputDebounce` module so they are unit-testable
+ * without booting Telegraf; the pure timing helper `getOutputFlushTiming` just
+ * receives this value as its `normalDebounceMs`.
+ */
+function getOutputDebounceMs(): number {
+  return resolveOutputDebounceMs(checkIsDmMode());
+}
 
 /**
  * Tick cadence of the Claude liveness loop (bug #11). Re-checks `checkIsBusy`
@@ -646,6 +665,40 @@ interface ThinkingCoalesceState {
   detachAfterDrain: boolean;
 }
 
+/**
+ * @description Per-thread live-draft stream state (DM mode only, P3).
+ *
+ * Mirrors the per-response lifecycle of the native `sendMessageDraft` animation:
+ * one stable {@link draftId} is held for the whole of an in-flight response (so
+ * every update animates the same draft) and a fresh id is allocated when a new
+ * response begins. {@link accumulatedText} is the FULL pre-render text of the
+ * in-flight response (maintained with the SAME concat rule the persist path
+ * uses, via `appendPendingOutput`), so the draft mirrors exactly what the
+ * persisted message will hold.
+ *
+ * The draft channel is independent of the message rate-limiter: its 429 cooldown
+ * ({@link backoffUntilMs}) and pacing timer ({@link pacerTimer}) never touch the
+ * per-chat TokenBucket, so a draft 429 can never starve a real `sendMessage`.
+ * Everything here is best-effort — a failed draft call is logged and dropped,
+ * never surfaced, never blocking the persist path.
+ */
+interface DraftStreamState {
+  /** Current response's stable draft id (S1). Reused for every update of it. */
+  draftId: number;
+  /** Full pre-render text of the in-flight response (drives the draft body). */
+  accumulatedText: string;
+  /** Last text actually drafted, or null (nothing sent yet this turn). */
+  lastSentText: string | null;
+  /** When the last draft actually went out, ms, or null. */
+  lastSentAtMs: number | null;
+  /** Draft-channel 429 cooldown end, ms (`0` = none). Separate from rateLimiter. */
+  backoffUntilMs: number;
+  /** Timer to flush a deferred update / fire a keepalive. `null` = none armed. */
+  pacerTimer: NodeJS.Timeout | null;
+  /** Is a draft turn currently active (a response is streaming)? */
+  active: boolean;
+}
+
 const threadMessageStates = new Map<string, ThreadMessageState>();
 const outputQueues = new Map<string, OutputQueueState>();
 const pendingQuestions = new Map<string, PendingQuestionState>();
@@ -662,6 +715,8 @@ const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
 const thinkingCoalescers = new Map<string, ThinkingCoalesceState>();
+/** Per-thread live-draft streams (DM mode only, P3). See {@link DraftStreamState}. */
+const draftStreams = new Map<string, DraftStreamState>();
 
 /**
  * @description Register/replace a thread's pending interactive question in BOTH
@@ -1112,6 +1167,24 @@ function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
   return s;
 }
 
+function getDraftStreamState(key: ThreadKey): DraftStreamState {
+  const k = keyToString(key);
+  let s = draftStreams.get(k);
+  if (!s) {
+    s = {
+      draftId: 0,
+      accumulatedText: '',
+      lastSentText: null,
+      lastSentAtMs: null,
+      backoffUntilMs: 0,
+      pacerTimer: null,
+      active: false,
+    };
+    draftStreams.set(k, s);
+  }
+  return s;
+}
+
 function getThinkingCoalesceState(key: ThreadKey): ThinkingCoalesceState {
   const k = keyToString(key);
   let s = thinkingCoalescers.get(k);
@@ -1159,6 +1232,11 @@ function clearThinkingMessage(key: ThreadKey): void {
 function clearThreadQueues(key: ThreadKey): void {
   const k = keyToString(key);
   clearThreadOutputQueues(outputQueues.get(k), statusCoalescers.get(k));
+  // DM-only (P3): a teardown that clears queued output must also abort the live
+  // draft so no orphan preview lingers. This is the convergence point for
+  // `/stop` release, session `closed`/`stopped`, `/unbind`, and topic-delete —
+  // all route through here. Group mode never opens a draft, so this is a no-op.
+  if (checkIsDmMode()) abortDraftTurn(key);
 }
 
 function markNeedsNewMessage(key: ThreadKey): void {
@@ -1394,6 +1472,9 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   awaitingFolderName.delete(k);
   pinnedStatusTextCache.delete(k);
   statusCoalescers.delete(k);
+  // The draft timer was already cleared by `clearThreadQueues` → `abortDraftTurn`
+  // above; drop the now-dead map entry so it doesn't leak across a rebind.
+  draftStreams.delete(k);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1972,13 +2053,14 @@ function escapeMarkdown(text: string): string {
  * so it never returns `'now'`).
  */
 function getOutputDelay(chatId: number): number {
+  const normalDebounceMs = getOutputDebounceMs();
   const timing = getOutputFlushTiming({
     isFinal: false,
     isRateLimited: checkIsRateLimited(chatId),
-    normalDebounceMs: OUTPUT_DEBOUNCE_MS,
+    normalDebounceMs,
   });
   // Non-final input can only yield a numeric delay, never `'now'`.
-  return timing === 'now' ? OUTPUT_DEBOUNCE_MS : timing;
+  return timing === 'now' ? normalDebounceMs : timing;
 }
 
 /**
@@ -1999,7 +2081,7 @@ function queueOutput(key: ThreadKey, output: string, isContinuation = false, isF
   const timing = getOutputFlushTiming({
     isFinal,
     isRateLimited: checkIsRateLimited(key.chatId),
-    normalDebounceMs: OUTPUT_DEBOUNCE_MS,
+    normalDebounceMs: getOutputDebounceMs(),
   });
   if (timing === 'now') {
     // Final frame: flush immediately. `processOutputQueue` already guards
@@ -2113,6 +2195,239 @@ async function replyChunkWithFallback(
   const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' }, priority);
   if (id) return id;
   return replyToThread(key, plainFallback, {}, priority);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Live-draft stream (DM mode only, P3) — native `sendMessageDraft` animation
+//
+//  In DM mode the LIVE phase of a streamed reply is shown as a native Telegram
+//  draft (the "bot is typing this message" animation) rather than by editing a
+//  real message in place. The persist path (`queueOutput` → `sendOutputImmediate`)
+//  is UNCHANGED and still lands the final, permanent message; this is a parallel,
+//  best-effort preview channel that runs OFF the message rate-limiter so a draft
+//  429 can never delay a real send. Every function here is gated by the DM branch
+//  of `handleAgentOutput` — group mode never reaches them.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * `sendMessageDraft` is a real Bot API method but is absent from this telegraf /
+ * typegram version's `Telegram` type, so `callApi('sendMessageDraft', …)` won't
+ * typecheck against the `M extends keyof Telegram` signature. We narrow a
+ * локализованный untyped view of `callApi` here (the `deleteMessages` precedent
+ * at the top of this file is typed; this one genuinely isn't in the vendored
+ * types). Payload is the locked shape from the P0/P0.5 live probes.
+ */
+type SendMessageDraftCall = (
+  method: 'sendMessageDraft',
+  payload: Record<string, unknown>,
+) => Promise<unknown>;
+
+const callSendMessageDraft = bot.telegram.callApi.bind(
+  bot.telegram,
+) as unknown as SendMessageDraftCall;
+
+/**
+ * @description Render the draft body for `accumulatedText`, cap-windowed to the
+ * Telegram limit. A draft is a single message preview and cannot itself split,
+ * so when the accumulated text outgrows the cap the draft shows the LAST
+ * cap-sized window (the persisted finalize still splits into N messages). Reuses
+ * the same render-aware splitter the persist path uses, then renders the tail
+ * chunk to HTML.
+ */
+function renderDraftBody(accumulatedText: string): string {
+  const chunks = splitMessage(
+    accumulatedText,
+    MAX_MESSAGE_LEN,
+    chunk => renderAgentHtml(chunk).length,
+  );
+  const tail = chunks[chunks.length - 1] ?? accumulatedText;
+  return renderAgentHtml(tail);
+}
+
+/**
+ * @description Fire ONE draft update for the thread's current accumulated text,
+ * reusing the turn's stable draft id. Best-effort: a 429 arms the draft-channel
+ * backoff (read from `retry_after` when present, else {@link
+ * DRAFT_DEFAULT_BACKOFF_MS}) and re-arms the pacer; any other failure is logged
+ * and dropped. Never throws, never touches the message rate-limiter.
+ */
+async function sendDraftNow(key: ThreadKey, draft: DraftStreamState): Promise<void> {
+  const text = renderDraftBody(draft.accumulatedText);
+  const payload: Record<string, unknown> = {
+    chat_id: key.chatId,
+    draft_id: draft.draftId,
+    text,
+    parse_mode: 'HTML',
+  };
+  // Mirror `buildSendExtra`'s General handling: omit `message_thread_id` for the
+  // DM General thread (`DM_GENERAL_THREAD_ID = 0`).
+  if (!checkIsGeneral(key)) payload.message_thread_id = key.threadId;
+
+  // Record what we are ABOUT to show + when, before the await, so a concurrent
+  // feed paces against this attempt (and a failure below only adjusts backoff).
+  draft.lastSentText = draft.accumulatedText;
+  draft.lastSentAtMs = Date.now();
+  try {
+    await callSendMessageDraft('sendMessageDraft', payload);
+  } catch (e) {
+    const code = checkIsApiError(e) ? getErrorCode(e) : undefined;
+    if (code === 429) {
+      const retryAfterSec = checkIsApiError(e) ? getErrorRetryAfterSeconds(e) : undefined;
+      const backoffMs = retryAfterSec ? retryAfterSec * 1000 : DRAFT_DEFAULT_BACKOFF_MS;
+      draft.backoffUntilMs = Date.now() + backoffMs;
+      console.warn(`[draft] ${keyToString(key)} draft 429 — backing off ${backoffMs}ms`);
+      armDraftPacerTimer(key, draft);
+      return;
+    }
+    console.warn(
+      `[draft] ${keyToString(key)} draft update failed (best-effort, ignored):`,
+      e instanceof Error ? e.message : e,
+    );
+  }
+}
+
+/**
+ * @description Arm (replacing any existing) the draft pacer timer. It fires after
+ * the soonest of: the draft-channel backoff remainder, the min-interval
+ * remainder since the last send, or the keepalive boundary — then re-runs the
+ * pacer. While a turn is active and idle (no new text), the keepalive re-sends
+ * the current text on the same draft id before the ~30s native expiry.
+ */
+function armDraftPacerTimer(key: ThreadKey, draft: DraftStreamState): void {
+  if (draft.pacerTimer) clearTimeout(draft.pacerTimer);
+  const now = Date.now();
+  const backoffRemainder = Math.max(0, draft.backoffUntilMs - now);
+  const intervalRemainder =
+    draft.lastSentAtMs === null
+      ? 0
+      : Math.max(0, draft.lastSentAtMs + DRAFT_MIN_INTERVAL_MS - now);
+  const keepaliveRemainder =
+    draft.lastSentAtMs === null
+      ? DRAFT_KEEPALIVE_MS
+      : Math.max(0, draft.lastSentAtMs + DRAFT_KEEPALIVE_MS - now);
+  // The pacer can only `send` once both the backoff and the interval clear; the
+  // keepalive is a separate ceiling so a silent gap still refreshes the draft.
+  const delay = Math.min(Math.max(backoffRemainder, intervalRemainder), keepaliveRemainder);
+  draft.pacerTimer = setTimeout(() => {
+    draft.pacerTimer = null;
+    void runDraftPacer(key);
+  }, Math.max(delay, 0));
+  draft.pacerTimer.unref?.();
+}
+
+/**
+ * @description Re-evaluate the pacer for the thread's current accumulated text
+ * and act: `send` fires a draft now; `skip`/`defer` re-arm the timer; a keepalive
+ * past the boundary re-sends the current text even when the pacer would `skip`.
+ * No-op once the turn is inactive (a teardown cleared it).
+ */
+async function runDraftPacer(key: ThreadKey): Promise<void> {
+  const draft = draftStreams.get(keyToString(key));
+  if (!draft || !draft.active) return;
+  const now = Date.now();
+  const action = getDraftPaceAction({
+    nextText: draft.accumulatedText,
+    lastSentText: draft.lastSentText,
+    nowMs: now,
+    lastSentAtMs: draft.lastSentAtMs,
+    minIntervalMs: DRAFT_MIN_INTERVAL_MS,
+    backoffUntilMs: draft.backoffUntilMs,
+  });
+  if (action === 'send') {
+    await sendDraftNow(key, draft);
+    // After a send a turn may still be active with no further text; arm the
+    // keepalive so a subsequent silent gap refreshes the draft.
+    if (draft.active) armDraftPacerTimer(key, draft);
+    return;
+  }
+  // `skip` (no change) but the keepalive boundary passed → refresh the same text
+  // so the draft doesn't expire during a long silent gap. Outside the backoff.
+  if (
+    now >= draft.backoffUntilMs &&
+    checkShouldKeepaliveDraft(now, draft.lastSentAtMs, DRAFT_KEEPALIVE_MS)
+  ) {
+    await sendDraftNow(key, draft);
+    if (draft.active) armDraftPacerTimer(key, draft);
+    return;
+  }
+  // `skip` / `defer` → re-arm for the remaining interval / backoff / keepalive.
+  armDraftPacerTimer(key, draft);
+}
+
+/**
+ * @description Begin a fresh draft turn: allocate a new stable draft id (so this
+ * response animates separately from the previous one), reset the accumulator,
+ * clear pacing state, and mark active. Called when a non-continuation output
+ * begins or `needsNewMessage` was set.
+ */
+function startDraftTurn(key: ThreadKey): void {
+  const draft = getDraftStreamState(key);
+  if (draft.pacerTimer) {
+    clearTimeout(draft.pacerTimer);
+    draft.pacerTimer = null;
+  }
+  draft.draftId = nextDraftId(draft.draftId);
+  draft.accumulatedText = '';
+  draft.lastSentText = null;
+  draft.lastSentAtMs = null;
+  draft.backoffUntilMs = 0;
+  draft.active = true;
+}
+
+/**
+ * @description Feed the live draft with the FULL accumulated response text so
+ * far. Maintains {@link DraftStreamState.accumulatedText} with the SAME
+ * `appendPendingOutput` concat rule the persist path uses (so the draft mirrors
+ * the eventual message), then runs the pacer. Lazily opens a turn if none is
+ * active (a defensive start — `handleAgentOutput` normally calls
+ * `startDraftTurn` first).
+ */
+function feedDraft(key: ThreadKey, output: string, isContinuation: boolean): void {
+  const draft = getDraftStreamState(key);
+  if (!draft.active) startDraftTurn(key);
+  draft.accumulatedText = appendPendingOutput(
+    draft.accumulatedText === '' ? null : draft.accumulatedText,
+    output,
+    isContinuation,
+  );
+  void runDraftPacer(key);
+}
+
+/**
+ * @description End the active draft turn after its final text has been persisted
+ * by the normal output path. Clears the pacer timer and marks inactive; the
+ * native draft is left to expire (~30s) and is superseded by the persisted
+ * message, so no explicit clear call is made (P3 keeps the surface minimal).
+ */
+function endDraftTurn(key: ThreadKey): void {
+  const draft = draftStreams.get(keyToString(key));
+  if (!draft) return;
+  if (draft.pacerTimer) {
+    clearTimeout(draft.pacerTimer);
+    draft.pacerTimer = null;
+  }
+  draft.active = false;
+  draft.accumulatedText = '';
+}
+
+/**
+ * @description Abort the active draft turn on a teardown (`/stop`, session
+ * close/stop, question takeover, queue clear) WITHOUT persisting — the normal
+ * output path persists independently. Clears the pacer timer + state so no orphan
+ * preview lingers. Idempotent and safe in group mode (no-op when no draft exists).
+ */
+function abortDraftTurn(key: ThreadKey): void {
+  const draft = draftStreams.get(keyToString(key));
+  if (!draft) return;
+  if (draft.pacerTimer) {
+    clearTimeout(draft.pacerTimer);
+    draft.pacerTimer = null;
+  }
+  draft.active = false;
+  draft.accumulatedText = '';
+  draft.lastSentText = null;
+  draft.lastSentAtMs = null;
+  draft.backoffUntilMs = 0;
 }
 
 async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
@@ -6162,7 +6477,31 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
   // orphan under the freshly-arrived output (the leftover-spinner half of #11).
   // When no id is tracked it's a cheap no-op delete that still bumps the gen.
   void deleteStatusMessage(key).catch(() => {});
-  queueOutput(key, output, meta?.isContinuation === true, meta?.isFinal === true);
+
+  const isContinuation = meta?.isContinuation === true;
+  const isFinal = meta?.isFinal === true;
+
+  // DM-only (P3): drive the LIVE native-draft preview from the accumulating
+  // response text, IN PARALLEL with — and never replacing — the persist path
+  // below. Group mode never enters this branch, so its edit-in-place streaming
+  // stays byte-for-byte. A fresh response (non-continuation, or a forced
+  // new-message boundary) starts a new draft turn (fresh draft id); a
+  // continuation extends the in-flight draft. Sub-agent chunks were already
+  // returned above, so the `!isSubagent` part of the gate is implicit here.
+  if (checkIsDmMode()) {
+    const startOfResponse = !isContinuation || msgState.needsNewMessage;
+    if (startOfResponse) startDraftTurn(key);
+    feedDraft(key, output, isContinuation);
+  }
+
+  // Persistence path — UNCHANGED. `queueOutput` still produces the correct
+  // final message (append + split + spill); P3 only ADDED the live draft above.
+  queueOutput(key, output, isContinuation, isFinal);
+
+  // DM-only (P3): the persisted `isFinal` frame is what the user keeps, so end
+  // the draft turn here — the native draft then expires (~30s) and is superseded
+  // by the persisted message. (Gated by the same DM check.)
+  if (checkIsDmMode() && isFinal) endDraftTurn(key);
 
   // Bug #11: the agent may KEEP working after this chunk (which just deleted the
   // status frame). Arm the liveness loop so that once output streaming pauses
@@ -6864,6 +7203,10 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   clearThinkingMessage(key);
   // A question UI supersedes the sub-agent "working" line — remove it too.
   clearSubagentStatus(key);
+  // DM-only (P3): the question UI takes over mid-stream — abort the live draft so
+  // no orphan preview lingers above the prompt. The normal output path persists
+  // any already-arrived text independently. No-op in group mode.
+  if (checkIsDmMode()) abortDraftTurn(key);
   deleteLoaderMessage(key).catch(() => {});
 
   // Audit S13 / #31: register the pending question BEFORE the async

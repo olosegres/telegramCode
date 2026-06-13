@@ -3816,7 +3816,7 @@ command('effort', async (ctx, key) => {
   );
 });
 
-// ── /thinking — per-topic chain-of-thought verbosity (OpenCode only, S2) ─────
+// ── /thinking — per-topic chain-of-thought verbosity (both backends, S5) ─────
 
 /**
  * @description Build a display-mode picker keyboard shared by ALL FOUR mode
@@ -3856,13 +3856,8 @@ async function applyThinkingMode(key: ThreadKey, mode: DisplayVerbosityMode): Pr
 }
 
 command('thinking', async (ctx, key) => {
-  // OpenCode-only capability gate (like /effort on an unsupported backend):
-  // Claude renders its own thinking in the TUI pane, nothing for the bot to do.
-  if (!(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
-    await replyToThread(key, t('thinking.opencode_only'));
-    return;
-  }
-
+  // No backend gate (un-gated in S5): the pref drives both backends now —
+  // OpenCode's thinking SSE render and Claude's scrape-chunk relay routing.
   const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   const current = state.getDisplayPrefs(key).thinking;
 
@@ -5683,7 +5678,9 @@ interface DisplayModeCallbackConfig {
   i18nGroup: string;
   /** Action prefix used for the re-rendered keyboard's callbacks. */
   callbackPrefix: string;
-  /** `true` only for `/thinking` (still OpenCode-gated until S5). */
+  /** `true` to gate the callback to OpenCode-bound topics. All four families
+   * drive both backends now (S5 un-gated `/thinking`), so this is `false` for
+   * every config — kept as a field for the rare future per-backend display pref. */
   isOpenCodeOnly: boolean;
   /** Persist the picked mode (the per-command apply helper). */
   apply: (key: ThreadKey, mode: DisplayVerbosityMode) => Promise<void>;
@@ -5697,7 +5694,8 @@ interface DisplayModeCallbackConfig {
 
 /**
  * @description Shared handler for a display-mode button press. Authorises,
- * optionally gates to OpenCode (thinking only), normalizes the picked mode
+ * optionally gates to OpenCode (no family does today; see {@link
+ * DisplayModeCallbackConfig.isOpenCodeOnly}), normalizes the picked mode
  * (legacy names on stale buttons keep working), persists it, answers the
  * callback, and re-renders the picker so the `✓` follows the new mode. The
  * re-render always marks `picked` because a single button press sets exactly
@@ -5710,8 +5708,10 @@ async function handleDisplayModeCallback(
 ): Promise<void> {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  // OpenCode-only gate (thinking only): a stale button on a topic switched to
-  // Claude after the picker was shown must not silently set an unused pref.
+  // Optional OpenCode-only gate (no family uses it today — see
+  // `DisplayModeCallbackConfig.isOpenCodeOnly`): a stale button on a topic
+  // switched to Claude after the picker was shown must not silently set an
+  // unused pref.
   if (config.isOpenCodeOnly && !(getThreadAdapter(key) instanceof OpenCodeAdapter)) {
     await ctx.answerCbQuery(t('cb.not_supported', { label: getThreadAdapter(key).label }));
     return;
@@ -5748,10 +5748,10 @@ async function handleDisplayModeCallback(
   }
 }
 
-// /thinking stays OpenCode-gated (S5 un-gates it); the other three drive both
-// backends. Each is a one-line delegation to the shared handler above.
+// All four mode callbacks drive both backends (S5 un-gated /thinking). Each is a
+// one-line delegation to the shared handler above.
 bot.action(/^think_(.+)$/, (ctx) => handleDisplayModeCallback(ctx, {
-  i18nGroup: 'thinking', callbackPrefix: 'think', isOpenCodeOnly: true,
+  i18nGroup: 'thinking', callbackPrefix: 'think', isOpenCodeOnly: false,
   apply: applyThinkingMode, errorCbKey: 'cb.thinking_error', setCbKey: 'cb.thinking_set', logTag: 'think_cb',
 }));
 

@@ -3745,8 +3745,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
               const routed = routeClaudeChunkSegments(
                 classification.segments,
                 prefs.toolResults,
+                prefs.thinking,
                 (toolLabel) => t('toolResults.activity_status', { tool: toolLabel || t('toolResults.activity_fallback') }),
                 () => t('subagent.panel_fold_status'),
+                () => t('thinking.live'),
+                (seconds) => t('thinking.thoughtForSeconds', { seconds }),
                 t('toolResults.truncated_footer'),
               );
               stripInput = routed.keptText;

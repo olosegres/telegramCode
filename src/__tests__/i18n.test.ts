@@ -241,7 +241,6 @@ test('thinking (/thinking) keys exist in every locale (S2)', () => {
     'thinking.choose',
     'thinking.set_success',
     'thinking.invalid_mode',
-    'thinking.opencode_only',
     'thinking.mode.minimal',
     'thinking.mode.short',
     'thinking.mode.full',

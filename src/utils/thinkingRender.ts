@@ -94,3 +94,36 @@ export function formatThinkingDurationSeconds(durationMs: number): number {
   if (!Number.isFinite(durationMs) || durationMs <= 0) return 1;
   return Math.max(1, Math.round(durationMs / millisecondsPerSecond));
 }
+
+const secondsPerMinute = 60;
+const secondsPerHour = 3600;
+
+/**
+ * @description Extract the FIRST `for <Nh Nm Ns>` duration clause anywhere in a
+ * scraped Claude thinking block — the `Thinking for *1m 6s*…` header
+ * (`THINKING_HEADER_RE`) or the `✻ Cooked for 1m 6s` trailer
+ * (`POST_THINKING_TRAILER_RE`). Tolerates the ANSI-bold `*…*` wraps and the
+ * trailing U+2026 ellipsis around the duration. Each of h/m/s is optional but
+ * at least one must be present for a match.
+ */
+const THINKING_DURATION_CLAUSE_RE =
+  /\bfor\s+\*?(?:(\d+)h\s+)?(?:(\d+)m\s+)?(?:(\d+)s)\*?/;
+
+/**
+ * @description Parse the whole-second reasoning duration out of a scraped Claude
+ * thinking block, or null when no duration clause is present. The Claude backend
+ * has no millisecond timestamps like OpenCode — the only signal is the duration
+ * the TUI renders as text in the block's header / trailer, so this scrapes it
+ * from {@link THINKING_DURATION_CLAUSE_RE} (the first line that carries one).
+ */
+export function parseThinkingDurationSeconds(blockText: string): number | null {
+  for (const line of blockText.split('\n')) {
+    const match = line.match(THINKING_DURATION_CLAUSE_RE);
+    if (!match) continue;
+    const hours = match[1] ? Number(match[1]) : 0;
+    const minutes = match[2] ? Number(match[2]) : 0;
+    const seconds = match[3] ? Number(match[3]) : 0;
+    return hours * secondsPerHour + minutes * secondsPerMinute + seconds;
+  }
+  return null;
+}

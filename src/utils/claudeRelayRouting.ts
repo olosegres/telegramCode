@@ -12,9 +12,11 @@
  * `keptText` through `stripTuiElementsWithContext` exactly as the pre-S4 path
  * did (the stripper stays the chrome/fence backstop).
  *
- * S4 scope: only the TOOL and PANEL-PREVIEW segments branch on a pref.
- *  - `thinkingBlock` is KEPT verbatim (S5 wires `/thinking`; S4 must not change
- *    thinking behavior — kept segments flow through as prose-equivalent).
+ * Scope: the TOOL, THINKING and PANEL-PREVIEW segments branch on a pref.
+ *  - `thinkingBlock` follows the `/thinking` pref (S5): full keeps it verbatim;
+ *    short collapses to one `💭 thought for {N}s` when a duration is parseable
+ *    from the block, else folds the live `☁️ thinking …` into status; minimal
+ *    always folds the live status, nothing permanent.
  *  - `subagentPanelPreview` is ALWAYS folded to status (the overview-2 flood;
  *    S6 formalises, doing it here is part of killing the flood).
  *  - `prose` is ALWAYS kept (the agent's answer is never swallowed).
@@ -23,6 +25,7 @@
 
 import { ClaudeChunkTag, type ClaudeChunkSegment } from './claudeChunkClassifier';
 import { getTruncatedToolResult } from './toolResultRender';
+import { parseThinkingDurationSeconds } from './thinkingRender';
 import type { DisplayVerbosityMode } from '../types';
 
 /** Tool names Claude's known headers carry, used to derive a compact activity
@@ -35,8 +38,9 @@ export interface ClaudeRelayRouting {
   /** The lines to relay as PERMANENT output (reassembled, NL-joined). May be
    * empty when every routable segment folded to status. */
   keptText: string;
-  /** The LATEST folded activity (a `minimal` tool header or a panel preview)
-   * to show in the rolling status frame, or null when nothing folded. */
+  /** The LATEST folded activity (a `minimal` tool header, a panel preview, or a
+   * folded `☁️ thinking …` status) to show in the rolling status frame, or null
+   * when nothing folded. */
   activityLine: string | null;
 }
 
@@ -61,7 +65,10 @@ export function getToolActivityLabel(headerText: string): string {
  *
  * Per tag:
  *  - `prose`                → keep verbatim (always).
- *  - `thinkingBlock`        → keep verbatim (S4 leaves thinking to S5).
+ *  - `thinkingBlock`        → full: keep verbatim; short: collapse to one
+ *                             `💭 thought for {N}s` when a duration is parseable,
+ *                             else fold the live `☁️ thinking …`; minimal: always
+ *                             fold the live status, nothing permanent.
  *  - `toolHeader`/`toolBody`→ full: keep; short: keep header, truncate body;
  *                             minimal: drop, fold a `🔧 <tool> …` activity from
  *                             the latest header (built by the caller via i18n).
@@ -70,9 +77,14 @@ export function getToolActivityLabel(headerText: string): string {
  *
  * @param segments classified segments, original order.
  * @param toolResultsMode the thread's `/tool_results` pref.
+ * @param thinkingMode the thread's `/thinking` pref (S5).
  * @param buildToolActivity caller-supplied builder turning a tool label into a
  *   user-facing activity line (keeps i18n in `bot.ts`/`i18n.ts`, not here).
  * @param buildPanelActivity caller-supplied builder for a folded panel preview.
+ * @param buildThinkingActivity caller-supplied builder for the folded live
+ *   `☁️ thinking …` status line (short with no duration / minimal).
+ * @param buildThoughtCollapsed caller-supplied builder turning a parsed duration
+ *   into the permanent `💭 thought for {N}s` line (short with a duration).
  * @param truncationFooter the i18n "… (truncated, /tool_results full)" line
  *   appended to a `short`-mode body that was actually capped — parity with the
  *   OpenCode short path so a Claude user also learns `full` reveals the rest.
@@ -80,8 +92,11 @@ export function getToolActivityLabel(headerText: string): string {
 export function routeClaudeChunkSegments(
   segments: ClaudeChunkSegment[],
   toolResultsMode: DisplayVerbosityMode,
+  thinkingMode: DisplayVerbosityMode,
   buildToolActivity: (toolLabel: string) => string,
   buildPanelActivity: () => string,
+  buildThinkingActivity: () => string,
+  buildThoughtCollapsed: (seconds: number) => string,
   truncationFooter: string,
 ): ClaudeRelayRouting {
   const keptLines: string[] = [];
@@ -93,9 +108,25 @@ export function routeClaudeChunkSegments(
   for (const segment of segments) {
     switch (segment.tag) {
       case ClaudeChunkTag.Prose:
-      case ClaudeChunkTag.ThinkingBlock:
         keptLines.push(segment.text);
         break;
+
+      case ClaudeChunkTag.ThinkingBlock: {
+        if (thinkingMode === 'full') {
+          keptLines.push(segment.text);
+        } else {
+          // short/minimal: collapse to a permanent "💭 thought for {N}s" only
+          // when short AND a duration is parseable from the scraped block;
+          // otherwise fold the live "☁️ thinking …" into the status frame.
+          const seconds = parseThinkingDurationSeconds(segment.text);
+          if (thinkingMode === 'short' && seconds !== null) {
+            keptLines.push(buildThoughtCollapsed(seconds));
+          } else {
+            activityLine = buildThinkingActivity();
+          }
+        }
+        break;
+      }
 
       case ClaudeChunkTag.ToolHeader: {
         latestToolLabel = getToolActivityLabel(segment.text);

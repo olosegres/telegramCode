@@ -17,6 +17,8 @@ import assert from 'node:assert/strict';
 import {
   classifyClaudeChunk,
   createInitialChunkContext,
+  ClaudeChunkTag,
+  type ClaudeChunkSegment,
 } from '../utils/claudeChunkClassifier';
 import {
   routeClaudeChunkSegments,
@@ -31,13 +33,40 @@ import type { DisplayVerbosityMode } from '../types';
  * distinctive so the assertions can detect them in the routed output. */
 const buildToolActivity = (label: string): string => `ACTIVITY:${label || 'TOOL'}`;
 const buildPanelActivity = (): string => 'PANEL_ACTIVITY';
+const buildThinkingActivity = (): string => 'THINKING_ACTIVITY';
+const buildThoughtCollapsed = (seconds: number): string => `THOUGHT:${seconds}`;
 /** Stand-in for the i18n `toolResults.truncated_footer` the live relay passes. */
 const truncationFooter = 'TRUNCATED_FOOTER';
 
-/** Classify a chunk from a fresh context and route it at the given mode. */
-function routeAtMode(chunkText: string, mode: DisplayVerbosityMode) {
+/** Classify a chunk from a fresh context and route it at the given mode. The
+ * tool-results and thinking prefs default to the SAME mode unless overridden,
+ * matching the macro `/verbosity` behavior the existing tests assume. */
+function routeAtMode(
+  chunkText: string,
+  mode: DisplayVerbosityMode,
+  thinkingMode: DisplayVerbosityMode = mode,
+) {
   const { segments } = classifyClaudeChunk(chunkText, createInitialChunkContext());
-  return routeClaudeChunkSegments(segments, mode, buildToolActivity, buildPanelActivity, truncationFooter);
+  return routeSegmentsAtMode(segments, mode, thinkingMode);
+}
+
+/** Route an explicit segment array (for cases the classifier can't synthesise
+ * from a single chunk, e.g. a thinking body whose header streamed earlier). */
+function routeSegmentsAtMode(
+  segments: ClaudeChunkSegment[],
+  mode: DisplayVerbosityMode,
+  thinkingMode: DisplayVerbosityMode = mode,
+) {
+  return routeClaudeChunkSegments(
+    segments,
+    mode,
+    thinkingMode,
+    buildToolActivity,
+    buildPanelActivity,
+    buildThinkingActivity,
+    buildThoughtCollapsed,
+    truncationFooter,
+  );
 }
 
 const toolHeader = '● *Bash*(yarn test)';
@@ -88,7 +117,16 @@ describe('routeClaudeChunkSegments — tool body by mode', () => {
 
   it('short → body truncated via getTruncatedToolResult (15-line cap bites) + footer appended', () => {
     const { segments } = classifyClaudeChunk([toolHeader, toolBodyLong].join('\n'), createInitialChunkContext());
-    const routed = routeClaudeChunkSegments(segments, 'short', buildToolActivity, buildPanelActivity, truncationFooter);
+    const routed = routeClaudeChunkSegments(
+      segments,
+      'short',
+      'short',
+      buildToolActivity,
+      buildPanelActivity,
+      buildThinkingActivity,
+      buildThoughtCollapsed,
+      truncationFooter,
+    );
 
     // The body segment is what the helper truncates; prove the routed kept text
     // equals header + the helper's truncation of that exact body segment.
@@ -112,6 +150,46 @@ describe('routeClaudeChunkSegments — tool body by mode', () => {
     const routed = routeAtMode([toolHeader, toolBodyLong].join('\n'), 'minimal');
     assert.equal(routed.keptText, '', 'nothing permanent at minimal');
     assert.equal(routed.activityLine, 'ACTIVITY:Bash', 'the Bash header folded into the activity line');
+  });
+});
+
+describe('routeClaudeChunkSegments — thinking block by mode (S5)', () => {
+  // A finished reasoning block: the duration-bearing header + a `⎿` summary
+  // body, classified together into one ThinkingBlock segment.
+  const thinkingBlock = ['Thinking for *1m 6s*…', '  ⎿  Weighing the cache trade-offs'].join('\n');
+
+  it('full → the thinking block is kept verbatim, nothing folded', () => {
+    const routed = routeAtMode(thinkingBlock, 'full');
+    assert.ok(routed.keptText.includes('Thinking for'), 'thinking header kept at full');
+    assert.ok(routed.keptText.includes('Weighing the cache trade-offs'), 'thinking body kept at full');
+    assert.equal(routed.activityLine, null, 'nothing folded at full');
+  });
+
+  it('short WITH a parseable duration → single "💭 thought for {N}s" line, nothing folded', () => {
+    // tool-results mode 'full' so only the thinking pref drives the branch.
+    const routed = routeAtMode(thinkingBlock, 'full', 'short');
+    // 1m 6s = 66s → the builder stub renders `THOUGHT:66`.
+    assert.equal(routed.keptText, 'THOUGHT:66', 'collapsed to the single thought-for line');
+    assert.ok(!routed.keptText.includes('Weighing'), 'the reasoning body is dropped at short');
+    assert.equal(routed.activityLine, null, 'short-with-duration collapses permanently, folds nothing');
+  });
+
+  it('short WITHOUT a parseable duration → nothing permanent, live thinking folds to status', () => {
+    // A thinking block whose duration header streamed in a PRIOR poll, so this
+    // chunk carries only the reasoning body — no `for …s` clause to parse. short
+    // cannot collapse it, so it folds the live status instead of dropping it.
+    const bodyOnlyThinking: ClaudeChunkSegment[] = [
+      { tag: ClaudeChunkTag.ThinkingBlock, text: '  ⎿  Considering the cache trade-offs' },
+    ];
+    const routed = routeSegmentsAtMode(bodyOnlyThinking, 'full', 'short');
+    assert.equal(routed.keptText, '', 'nothing permanent when short cannot parse a duration');
+    assert.equal(routed.activityLine, 'THINKING_ACTIVITY', 'live thinking folded to status instead');
+  });
+
+  it('minimal (even WITH a duration) → nothing permanent, live thinking folds to status', () => {
+    const routed = routeAtMode(thinkingBlock, 'full', 'minimal');
+    assert.equal(routed.keptText, '', 'nothing permanent at minimal');
+    assert.equal(routed.activityLine, 'THINKING_ACTIVITY', 'live thinking folded to status at minimal');
   });
 });
 
@@ -188,7 +266,16 @@ describe('REGRESSION ANCHOR — full-prefs chunk emits byte-identically to pre-S
     // original. This proves the two paths converge here, not just that one call
     // equals itself.
     const directStrip = stripTuiElementsWithContext(chunk, null).text;
-    const routed = routeClaudeChunkSegments(segments, 'full', buildToolActivity, buildPanelActivity, truncationFooter);
+    const routed = routeClaudeChunkSegments(
+      segments,
+      'full',
+      'full',
+      buildToolActivity,
+      buildPanelActivity,
+      buildThinkingActivity,
+      buildThoughtCollapsed,
+      truncationFooter,
+    );
     const quietPathStrip = stripTuiElementsWithContext(routed.keptText, null).text;
     assert.equal(quietPathStrip, directStrip, 'full-prefs routed strip == pre-S4 direct strip (byte-identical)');
     assert.equal(routed.activityLine, null, 'no activity folded at full prefs');

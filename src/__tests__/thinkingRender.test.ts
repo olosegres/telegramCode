@@ -12,6 +12,7 @@ import {
   getThinkingEventAction,
   getThinkingAnswerStartAction,
   formatThinkingDurationSeconds,
+  parseThinkingDurationSeconds,
 } from '../utils/thinkingRender';
 import { displayVerbosityModeOptions } from '../utils/displayVerbosity';
 
@@ -80,5 +81,40 @@ describe('formatThinkingDurationSeconds — ms → whole seconds', () => {
     assert.equal(formatThinkingDurationSeconds(0), 1);
     assert.equal(formatThinkingDurationSeconds(-500), 1);
     assert.equal(formatThinkingDurationSeconds(Number.NaN), 1);
+  });
+});
+
+describe('parseThinkingDurationSeconds — scraped Claude thinking duration → seconds', () => {
+  // The Claude backend has no ms timestamps; the duration only exists as the
+  // text the TUI renders in a finished block's header / trailer. These cover
+  // both scraped shapes and the h/m/s arithmetic.
+
+  it('parses a bare-seconds header ("Thinking for 30s…")', () => {
+    assert.equal(parseThinkingDurationSeconds('Thinking for 30s…'), 30);
+  });
+
+  it('parses a bold-wrapped minutes+seconds header ("Thinking for *1m 6s*…")', () => {
+    assert.equal(parseThinkingDurationSeconds('Thinking for *1m 6s*…'), 66);
+  });
+
+  it('parses a "✻ Cooked for 2m 5s" trailer', () => {
+    assert.equal(parseThinkingDurationSeconds('✻ Cooked for 2m 5s'), 125);
+  });
+
+  it('parses an hours+minutes+seconds duration ("Thinking for 1h 2m 3s…")', () => {
+    assert.equal(parseThinkingDurationSeconds('Thinking for 1h 2m 3s…'), 3723);
+  });
+
+  it('returns null for a line carrying no duration clause', () => {
+    assert.equal(parseThinkingDurationSeconds('Let me think about this problem.'), null);
+  });
+
+  it('finds the duration in a multi-line block where only one line carries it', () => {
+    const block = [
+      '✻ Thinking…',
+      'Thinking for *45s*…',
+      '  ⎿  Considering the edge cases of the cache layer',
+    ].join('\n');
+    assert.equal(parseThinkingDurationSeconds(block), 45);
   });
 });

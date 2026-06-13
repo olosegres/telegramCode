@@ -247,7 +247,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'effort.unsupported_backend': 'Управление effort не поддерживается для {label}.',
     'effort.no_session': 'Агент не запущен. Сначала /claude или /opencode.',
 
-    // ── /thinking (chain-of-thought verbosity, OpenCode only) ──
+    // ── /thinking (chain-of-thought verbosity, both backends) ──
     // Live indicator + collapsed line shown in the topic. Mode names are also
     // used on the picker buttons. {seconds}=reasoning duration, {mode}=mode name.
     'thinking.live': '☁️ думаю …',
@@ -255,12 +255,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'thinking.choose': '☁️ Текущий режим размышлений: {current}\nВыбери режим:',
     'thinking.set_success': '✅ Режим размышлений: {mode}',
     'thinking.invalid_mode': '⚠️ Режим `{mode}` недопустим. Доступные: {valid}.',
-    'thinking.opencode_only': 'ℹ️ /thinking доступен только для OpenCode (Claude показывает размышления в своём TUI).',
     'thinking.mode.minimal': 'минимум',
     'thinking.mode.short': 'кратко',
     'thinking.mode.full': 'подробно',
 
-    // ── /tool_results (tool output verbosity, OpenCode only) ──
+    // ── /tool_results (tool output verbosity, both backends) ──
     // Mode names are also used on the picker buttons. The truncated footer
     // names the REAL command (`/tool_results full`) so it stays tappable.
     'toolResults.choose': '🔧 Текущий режим результатов инструментов: {current}\nВыбери режим:',
@@ -654,7 +653,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'effort.unsupported_backend': 'Effort control is not supported for {label}.',
     'effort.no_session': 'No agent running. Start one with /claude or /opencode.',
 
-    // ── /thinking (chain-of-thought verbosity, OpenCode only) ──
+    // ── /thinking (chain-of-thought verbosity, both backends) ──
     // Live indicator + collapsed line shown in the topic. Mode names are also
     // used on the picker buttons. {seconds}=reasoning duration, {mode}=mode name.
     'thinking.live': '☁️ thinking …',
@@ -662,12 +661,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'thinking.choose': '☁️ Current thinking mode: {current}\nPick a mode:',
     'thinking.set_success': '✅ Thinking mode: {mode}',
     'thinking.invalid_mode': '⚠️ Mode `{mode}` is not valid. Available: {valid}.',
-    'thinking.opencode_only': 'ℹ️ /thinking is OpenCode-only (Claude renders thinking in its own TUI).',
     'thinking.mode.minimal': 'minimal',
     'thinking.mode.short': 'short',
     'thinking.mode.full': 'full',
 
-    // ── /tool_results (tool output verbosity, OpenCode only) ──
+    // ── /tool_results (tool output verbosity, both backends) ──
     // Mode names are also used on the picker buttons. The truncated footer
     // names the REAL command (`/tool_results full`) so it stays tappable.
     'toolResults.choose': '🔧 Current tool-results mode: {current}\nPick a mode:',

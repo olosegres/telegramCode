@@ -460,7 +460,12 @@ group-gated `command()` wrapper in `bot.ts`, put user-facing text in `i18n.ts`,
 and (if it controls the agent) branch on the thread's adapter to drive Claude
 (keystrokes) vs OpenCode (HTTP) — **`/model` (`handleClaudeModel` /
 `setOpenCodeModel`) is the reference implementation** for a per-thread,
-per-backend, persisted agent setting.
+per-backend, persisted agent setting. **Also add the new command's name (and
+any alias) to the `botCommands` set in `bot.ts`** — it is the `message('text')`
+handler's guard that stops a bot-owned slash from ALSO being re-forwarded to the
+agent as a prompt; omit it and e.g. `/esc` reaches the agent verbatim. (A
+retired command is kept in the set on purpose so a stray `/where` is swallowed
+rather than typed into the agent.)
 
 ## Tests & build
 

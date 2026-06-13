@@ -36,7 +36,6 @@ import {
 } from '../utils/sseStreamLifecycle';
 import {
   buildDelegatingStatusText,
-  buildSubagentStatusText,
   getSubagentPartAction,
 } from '../utils/subagentRender';
 import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
@@ -2899,10 +2898,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Handle a SUB-AGENT (child session) text part per the
    * mode×kind matrix ({@link getSubagentPartAction}):
    *
-   * - `compact` → never touch any accumulator; refresh the rolling
-   *   "🤖 sub-agent: <title> …" status instead (mirrors the terminal's single
-   *   "working" line). The status coalescer dedups identical frames, so the
-   *   repeated refresh costs no Telegram edits.
+   * - `compact` → never touch any accumulator; signal the dedicated
+   *   `subagentStatus` event instead (the bot owns a single self-updating
+   *   "🤖 sub-agent: <title> · m:ss" message + elapsed timer). This replaced
+   *   the old shared-status refresh, whose lost single-message identity between
+   *   sparse bursts re-`sendMessage`d a new message each time (the flood bug).
    * - `full` → accumulate into the SEPARATE child accumulator and flush via
    *   the same debounce discipline as {@link handleTextDelta} — never through
    *   `currentResponseText` (a child transcript in the parent accumulator
@@ -2920,7 +2920,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!text) return;
 
     if (getSubagentPartAction(this.getSubagentMode(key), 'text') === 'status') {
-      this.emitStatus(key, session, buildSubagentStatusText(session.activeSubagentTitle));
+      // Dedicated channel (NOT the shared transient status): the bot keeps ONE
+      // self-updating message with a ticking elapsed counter, edited in place.
+      this.emit('subagentStatus', key, { active: true, title: session.activeSubagentTitle });
       return;
     }
 
@@ -2978,16 +2980,25 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /**
    * @description Record / clear the CURRENT delegation's title from the
    * PARENT's `task` tool part: stored while the delegation is pending/running
-   * (feeds the compact-mode sub-agent status; S5's "Delegating" activity
+   * (feeds the dedicated sub-agent status message; S5's "Delegating" activity
    * status reuses this field), cleared once it completes/errors. Only ever
    * called for the parent's own parts — a child's nested `task` must not
    * overwrite the parent-level title.
+   *
+   * The title is STICKY (D2 fix): while in-flight we only OVERWRITE it with a
+   * non-null title — a beat where the `task` part momentarily lacks
+   * title/description leaves the last known title intact, instead of clobbering
+   * it to `null` mid-run (which made the line read "sub-agent: sub-agent").
+   * It is cleared to `null` only on the terminal (completed/error) part.
    */
   private trackDelegationTitle(session: OpenCodeSession, part: OpenCodePart, toolState: OpenCodeToolState): void {
     if (part.tool !== delegationToolName) return;
-    session.activeSubagentTitle = this.checkIsDelegationInFlight(part, toolState)
-      ? this.getDelegationTitle(toolState)
-      : null;
+    if (this.checkIsDelegationInFlight(part, toolState)) {
+      const title = this.getDelegationTitle(toolState);
+      if (title) session.activeSubagentTitle = title;
+      return;
+    }
+    session.activeSubagentTitle = null;
   }
 
   /**
@@ -3005,6 +3016,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const state = part.state;
     if (!state) return;
 
+    // Whether THIS part is the PARENT's own in-flight delegation whose
+    // "working" indicator is owned by the dedicated `subagentStatus` message
+    // (minimal/short) — in that case the shared-status "Delegating…" emit below
+    // must be SUPPRESSED so the two lines don't compete. Full mode keeps the
+    // shared-status behaviour (the streamed child transcript is the indicator).
+    let suppressSharedDelegatingStatus = false;
+
     if (isSubagent) {
       // Child tool part: `ignore` in compact (a generic 🔧 status would
       // overwrite the sub-agent status line); transient `status` in full.
@@ -3014,6 +3032,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       if (getSubagentPartAction(this.getSubagentMode(key), 'tool') === 'ignore') return;
     } else {
       this.trackDelegationTitle(session, part, state);
+      // Parent's own `task` part drives the dedicated sub-agent status message
+      // (minimal/short modes): open/refresh while in flight, close on
+      // completed/error. Full mode keeps the old shared "Delegating…" status.
+      if (part.tool === delegationToolName && this.getSubagentMode(key) !== 'full') {
+        if (this.checkIsDelegationInFlight(part, state)) {
+          this.emit('subagentStatus', key, {
+            active: true,
+            title: this.getDelegationTitle(state) ?? session.activeSubagentTitle,
+          });
+          suppressSharedDelegatingStatus = true;
+        } else if (state.status === 'completed' || state.status === 'error') {
+          this.emit('subagentStatus', key, { active: false, title: null });
+        }
+      }
     }
 
     let statusText: string;
@@ -3022,7 +3054,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // instead of the generic 🔄/🔧 forms (S5) — the parent-side counterpart
       // of the compact "🤖 sub-agent: …" status, same style. The title comes
       // off THIS part's state, so a child's own nested `task` (full mode)
-      // renders its own title, never the parent's tracked one.
+      // renders its own title, never the parent's tracked one. In minimal/short
+      // the dedicated `subagentStatus` message already owns this indicator, so
+      // skip the competing shared-status emit.
+      if (suppressSharedDelegatingStatus) {
+        if (!isSubagent) this.maybeEmitToolResult(key, session, part);
+        return;
+      }
       statusText = buildDelegatingStatusText(this.getDelegationTitle(state));
     } else {
       switch (state.status) {
@@ -3198,6 +3236,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     // When assistant message completes (has finish reason), flush output
     if (info.finish && info.role === 'assistant') {
+      // A CHILD (sub-agent) assistant message finishing must NOT close the
+      // dedicated sub-agent status — the parent's delegation is still in flight.
+      // Only the PARENT's own finishing message ends the delegation defensively.
+      const isParentMessage = !info.sessionID || info.sessionID === session.sessionId;
+      if (isParentMessage) this.closeSubagentStatusOnParentTurnEnd(key);
       this.flushOutput(key);
     }
 
@@ -3232,6 +3275,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       false,
       this.checkIsVerifiedDescendant(sessionId ?? null, session.sessionId),
     );
+
+    // The PARENT going idle ends the turn → defensively close the sub-agent
+    // status. A CHILD (sub-agent) idle (routed here via lineage) must NOT close
+    // it — the delegation is still in flight, only the child finished a step.
+    if (!sessionId || sessionId === session.sessionId) {
+      this.closeSubagentStatusOnParentTurnEnd(key);
+    }
 
     console.log(`[OpenCode] Session idle`);
     // The turn just ended: mark this flush final so the bot delivers the last
@@ -3536,5 +3586,18 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.childResponseText = '';
     session.childLastEmittedLength = 0;
     session.partTypes.clear();
+  }
+
+  /**
+   * @description Defensive close of the dedicated sub-agent status when the
+   * PARENT's own turn ends (its assistant message finishes, or its session goes
+   * idle) so a dangling "working" indicator can't outlive the turn if the
+   * terminal `task` part was missed. Strictly parent-only: a CHILD (sub-agent)
+   * message finishing / going idle must NOT close it — the delegation is still
+   * in flight (its child events route here via lineage). The bot no-ops the
+   * close when nothing is open.
+   */
+  private closeSubagentStatusOnParentTurnEnd(key: ThreadKey): void {
+    this.emit('subagentStatus', key, { active: false, title: null });
   }
 }

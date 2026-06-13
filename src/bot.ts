@@ -24,7 +24,7 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, ThinkingEvent, ToolResultEvent } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -97,6 +97,10 @@ import {
   buildFencedToolResultBody,
 } from './utils/toolResultRender';
 import { buildSubagentOutputPrefix } from './utils/subagentRender';
+import {
+  buildSubagentElapsedText,
+  getSubagentStatusAction,
+} from './utils/subagentStatusRender';
 import {
   displayVerbosityModeOptions,
   normalizeDisplayVerbosityMode,
@@ -334,6 +338,14 @@ const OUTPUT_DEBOUNCE_MS = 1000;
 const CLAUDE_LIVENESS_TICK_MS = 1000;
 
 /**
+ * Cadence of the dedicated OpenCode sub-agent status message's elapsed-counter
+ * tick. One `editMessageText` per active delegation every 10 s — far under
+ * Telegram's ~1 edit/sec/chat budget, so the live "m:ss" counter never costs a
+ * 429. A failed edit just retries on the next tick.
+ */
+const subagentTickMs = 10_000;
+
+/**
  * Rotating spinner glyphs for the liveness frame's neutral fallback (used only
  * when no scraped activity line is available). Cycling them on each tick makes
  * the frame visibly alive even while the scrape is quiet. Mirrors the TUI's own
@@ -449,6 +461,32 @@ interface ThreadMessageState {
   livenessGlyphIndex: number;
   /** Last `checkIsBusy` reading, so the loop can detect a busy→idle edge. */
   wasBusy: boolean;
+  /**
+   * Dedicated OpenCode sub-agent (delegation) status message id, owned
+   * INDEPENDENTLY of {@link statusMessageId} (the fix for the flood bug — the
+   * shared status re-`sendMessage`d a new message on every child-text burst).
+   * The `minimal`/`short` `/subagent` "working" indicator: ONE message, edited
+   * in place with a ticking elapsed counter. `null` = none open. Created on
+   * delegation start, deleted on its end / session teardown / question takeover.
+   */
+  subagentStatusMessageId: number | null;
+  /**
+   * Epoch ms when the current sub-agent status message opened — the base for
+   * the elapsed `m:ss` counter. `null` when no message is open.
+   */
+  subagentStartedAt: number | null;
+  /**
+   * Sticky last non-null delegation title for the open sub-agent status
+   * message, re-rendered on every elapsed tick. `null` = the delegation never
+   * carried a title (falls back to the generic label at render time).
+   */
+  subagentTitle: string | null;
+  /**
+   * Self-re-arming unref'd timer that re-edits the sub-agent status message
+   * with the updated elapsed time every {@link subagentTickMs}. `null` = not
+   * armed (no message open). Mirrors {@link livenessTimer}'s lifecycle.
+   */
+  subagentTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface OutputQueueState {
@@ -955,7 +993,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -6556,6 +6594,138 @@ function stopClaudeLiveness(key: ThreadKey): void {
   state.wasBusy = false;
 }
 
+// ── Sub-agent status (OpenCode minimal/short) — dedicated self-updating message ─
+//
+// SINGLE OWNER of the dedicated `subagentStatusMessageId`, kept separate from
+// `statusMessageId` so the "🤖 sub-agent: <title> · m:ss" working indicator is
+// ONE message edited in place — not the flood the shared transient status
+// produced (a NEW `sendMessage` per child-text burst). The adapter emits a
+// mode-AGNOSTIC `subagentStatus` event; the bot resolves the lifecycle via the
+// pure `getSubagentStatusAction` and ticks an elapsed counter every
+// `subagentTickMs`. Only minimal/short produce this event (`/subagent full`
+// streams the child transcript as its own chunks — the stream IS the indicator).
+
+/**
+ * @description Edit the open sub-agent status message with the current elapsed
+ * time. Best-effort: a failed edit just retries on the next tick. No-op (and
+ * stops the timer) once the message is gone, so a racing teardown can't leave a
+ * self-re-arming timer running.
+ */
+async function refreshSubagentStatus(key: ThreadKey): Promise<void> {
+  const state = getThreadMessageState(key);
+  if (state.subagentStatusMessageId === null) return;
+  const elapsedMs = Date.now() - (state.subagentStartedAt ?? Date.now());
+  const text = buildSubagentElapsedText(state.subagentTitle, elapsedMs);
+  await editThreadMessage(
+    key,
+    state.subagentStatusMessageId,
+    renderAgentHtml(text),
+    { parse_mode: 'HTML' },
+    'status',
+  );
+}
+
+/**
+ * @description Arm (re-arm) the unref'd self-re-arming tick timer that re-edits
+ * the sub-agent status message with the updated elapsed time. Mirrors
+ * {@link armClaudeLivenessTimer}: clears any existing timer first (single armed
+ * timer), unref'd so it never holds the event loop open, and self-stops once
+ * the message is gone (the next tick sees a null id and returns).
+ */
+function armSubagentTimer(key: ThreadKey, state: ThreadMessageState): void {
+  if (state.subagentTimer) clearTimeout(state.subagentTimer);
+  state.subagentTimer = setTimeout(() => {
+    state.subagentTimer = null;
+    if (state.subagentStatusMessageId === null) return;
+    void refreshSubagentStatus(key).finally(() => {
+      // Re-arm only while the message is still open — a close that landed during
+      // the edit nulls the id, so we stop instead of resurrecting the loop.
+      if (state.subagentStatusMessageId !== null) armSubagentTimer(key, state);
+    });
+  }, subagentTickMs);
+  state.subagentTimer.unref?.();
+}
+
+/**
+ * @description Tear down a thread's sub-agent status message + timer. Called on
+ * the delegation's end (`active:false`) and on every hard teardown that already
+ * clears thinking/status (close, stop, error, question takeover) so the
+ * "working" indicator never lingers after the work it described is gone.
+ * Best-effort delete; the in-memory fields are nulled synchronously so a racing
+ * emit can't resurrect a stale frame.
+ */
+function clearSubagentStatus(key: ThreadKey): void {
+  const state = getThreadMessageState(key);
+  if (state.subagentTimer) {
+    clearTimeout(state.subagentTimer);
+    state.subagentTimer = null;
+  }
+  const id = state.subagentStatusMessageId;
+  state.subagentStatusMessageId = null;
+  state.subagentStartedAt = null;
+  state.subagentTitle = null;
+  if (id !== null) deleteThreadMessage(key, id, 'status').catch(() => {});
+}
+
+/**
+ * @description Adapter `subagentStatus` event entry point (OpenCode
+ * minimal/short). Drives the dedicated sub-agent status message via the pure
+ * {@link getSubagentStatusAction}:
+ *
+ * - `open`    — record start time + title, create the message, arm the tick timer.
+ * - `refresh` — update the sticky title (when the event carried one), re-edit
+ *   with the current elapsed time, keep the timer armed.
+ * - `close`   — {@link clearSubagentStatus} (stop timer + delete message).
+ * - `noop`    — a defensive `active:false` with nothing open; do nothing.
+ *
+ * Wrapped so async sends never throw back into the EventEmitter (mirrors
+ * `handleAgentSurvey`).
+ */
+function handleSubagentStatus(key: ThreadKey, payload: SubagentStatusEvent): void {
+  const state = getThreadMessageState(key);
+  // `subagentStartedAt` is set synchronously when an `open` begins (before its
+  // `await`), so a second `active:true` arriving while the first create is still
+  // in flight resolves to `refresh` (a harmless no-op until the id lands) rather
+  // than opening a SECOND message that orphans the first.
+  const hasMessage = state.subagentStatusMessageId !== null || state.subagentStartedAt !== null;
+  const action = getSubagentStatusAction({ hasMessage, eventActive: payload.active });
+
+  if (action === 'noop') return;
+  if (action === 'close') {
+    clearSubagentStatus(key);
+    return;
+  }
+
+  (async () => {
+    try {
+      if (action === 'open') {
+        state.subagentStartedAt = Date.now();
+        state.subagentTitle = payload.title;
+        const text = buildSubagentElapsedText(state.subagentTitle, 0);
+        const id = await replyToThread(key, renderAgentHtml(text), { parse_mode: 'HTML' }, 'status');
+        if (id === null) return;
+        // A close (teardown) may have landed during the create — don't leave the
+        // just-created message orphaned and untracked; remove it.
+        if (state.subagentStartedAt === null) {
+          deleteThreadMessage(key, id, 'status').catch(() => {});
+          return;
+        }
+        state.subagentStatusMessageId = id;
+        armSubagentTimer(key, state);
+        return;
+      }
+      // refresh: keep the sticky title (overwrite only with a non-null one).
+      if (payload.title !== null) state.subagentTitle = payload.title;
+      await refreshSubagentStatus(key);
+      if (state.subagentStatusMessageId !== null && state.subagentTimer === null) {
+        armSubagentTimer(key, state);
+      }
+    } catch (err) {
+      console.error('[handleSubagentStatus] Failed:', err);
+    }
+  })();
+}
+
 function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuestion): void {
   console.log(`[Bot] question ${keyToString(key)} (${questionData.requestId}): ${questionData.questions.length}`);
   // Idempotent across restart: this handler ALSO fires from the adapter's
@@ -6580,6 +6750,8 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   // The question UI takes over — remove any live thinking frame so it doesn't
   // sit above the prompt (it would otherwise persist past the answer).
   clearThinkingMessage(key);
+  // A question UI supersedes the sub-agent "working" line — remove it too.
+  clearSubagentStatus(key);
   deleteLoaderMessage(key).catch(() => {});
 
   // Audit S13 / #31: register the pending question BEFORE the async
@@ -6734,6 +6906,8 @@ function handleAgentClosed(key: ThreadKey): void {
   // A closed session won't finish reasoning — remove a live thinking frame so it
   // doesn't linger above the "session ended" notice.
   clearThinkingMessage(key);
+  // A closed session has no running delegation — remove the sub-agent status.
+  clearSubagentStatus(key);
   clearPendingQuestion(key);
   pendingSurveys.delete(keyToString(key));
   // A closed session has nothing to resume — drop any armed retry silently.
@@ -6751,6 +6925,7 @@ function handleAgentError(key: ThreadKey, error: Error): void {
   getStatusCoalesceState(key).pendingText = null;
   deleteStatusMessage(key).catch(() => {});
   clearThinkingMessage(key);
+  clearSubagentStatus(key);
   clearPendingQuestion(key);
   replyToThread(key, `Error: ${error.message}`).catch(() => {});
 }
@@ -6783,6 +6958,8 @@ function handleAgentStopped(key: ThreadKey): void {
   // A stopped session is idle — a lingering "thinking …" frame would be a stuck
   // indicator, same rationale as the status frame above.
   clearThinkingMessage(key);
+  // A stopped session has no running delegation — remove the sub-agent status.
+  clearSubagentStatus(key);
   // Session ended — a future session starts with empty context, so forget the
   // last-injected thread-context preamble; the next prompt re-carries it.
   clearThreadContextMarker(key);
@@ -7221,6 +7398,7 @@ export async function startBot(): Promise<void> {
     onSurvey: handleAgentSurvey,
     onThinking: handleAgentThinking,
     onToolResult: handleAgentToolResult,
+    onSubagentStatus: handleSubagentStatus,
     onApiError: handleApiError,
     onClosed: handleAgentClosed,
     onStarted: handleAgentStarted,

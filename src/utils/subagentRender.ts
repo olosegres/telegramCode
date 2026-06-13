@@ -57,22 +57,11 @@ export function getSubagentPartAction(mode: DisplayVerbosityMode, partKind: Suba
 }
 
 /**
- * @description Build the status-only (`minimal`/`short`) rolling status line
- * ("🤖 sub-agent: <title> …"), mirroring the terminal's single "working"
- * indicator. `title` is the current delegation's title recorded from the
- * parent's `task` tool part; `null` (no title/description on the part) falls
- * back to a localized generic label.
- */
-export function buildSubagentStatusText(title: string | null): string {
-  return t('subagent.status_live', { title: title ?? t('subagent.fallback_title') });
-}
-
-/**
  * @description Build the parent-side "Delegating" activity status
  * ("🤖 Delegating: <title> …") rendered while the parent's delegation (`task`)
- * tool part is pending/running (S5) — the counterpart of
- * {@link buildSubagentStatusText} (which is driven by the CHILD's own text
- * events), same compact style. `title` is the part's `state.title` falling
+ * tool part is pending/running (S5) — in `full` mode only (in `minimal`/`short`
+ * the dedicated self-updating sub-agent status message owns this indicator; see
+ * `utils/subagentStatusRender.ts`). `title` is the part's `state.title` falling
  * back to its `input.description`; `null` (neither present) falls back to the
  * same localized generic label.
  */

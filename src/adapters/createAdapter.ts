@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, DisplayPrefsReader, OutputEventMeta, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, DisplayPrefsReader, OutputEventMeta, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -29,6 +29,7 @@ type QuestionHandler = (key: ThreadKey, question: OpenCodePendingQuestion) => vo
 type SurveyHandler = (key: ThreadKey, survey: ClaudeSurveyEvent) => void;
 type ThinkingHandler = (key: ThreadKey, payload: ThinkingEvent) => void;
 type ToolResultHandler = (key: ThreadKey, payload: ToolResultEvent) => void;
+type SubagentStatusHandler = (key: ThreadKey, payload: SubagentStatusEvent) => void;
 type ApiErrorHandler = (key: ThreadKey, error: AgentApiErrorClass) => void;
 type ThreadKeyHandler = (key: ThreadKey) => void;
 type ErrorHandler = (key: ThreadKey, error: Error) => void;
@@ -39,6 +40,7 @@ let onQuestion: QuestionHandler | null = null;
 let onSurvey: SurveyHandler | null = null;
 let onThinking: ThinkingHandler | null = null;
 let onToolResult: ToolResultHandler | null = null;
+let onSubagentStatus: SubagentStatusHandler | null = null;
 let onApiError: ApiErrorHandler | null = null;
 let onClosed: ThreadKeyHandler | null = null;
 let onStarted: ThreadKeyHandler | null = null;
@@ -74,6 +76,7 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onSurvey) adapter.on('survey', onSurvey);
   if (onThinking) adapter.on('thinking', onThinking);
   if (onToolResult) adapter.on('toolResult', onToolResult);
+  if (onSubagentStatus) adapter.on('subagentStatus', onSubagentStatus);
   if (onApiError) adapter.on('apiError', onApiError);
   if (onClosed) adapter.on('closed', onClosed);
   if (onStarted) adapter.on('started', onStarted);
@@ -99,6 +102,7 @@ export function registerAdapterEventHandlers(handlers: {
   onSurvey?: SurveyHandler;
   onThinking?: ThinkingHandler;
   onToolResult?: ToolResultHandler;
+  onSubagentStatus?: SubagentStatusHandler;
   onApiError?: ApiErrorHandler;
   onClosed: ThreadKeyHandler;
   onStarted?: ThreadKeyHandler;
@@ -111,6 +115,7 @@ export function registerAdapterEventHandlers(handlers: {
   onSurvey = handlers.onSurvey ?? null;
   onThinking = handlers.onThinking ?? null;
   onToolResult = handlers.onToolResult ?? null;
+  onSubagentStatus = handlers.onSubagentStatus ?? null;
   onApiError = handlers.onApiError ?? null;
   onClosed = handlers.onClosed;
   onStarted = handlers.onStarted ?? null;

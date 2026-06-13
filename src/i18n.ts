@@ -268,12 +268,12 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.activity_fallback': 'инструмент',
 
     // ── /subagent (sub-agent transcript verbosity, both backends) ──
-    // Mode names are also used on the picker buttons. `status_live` is the
-    // rolling status-only-mode status line; `chunk_prefix` marks each streamed
-    // full-mode chunk; `fallback_title` fills in when the delegation carried
-    // no title/description. `minimal` ≡ `short` (v1): both are status-only —
-    // the "working" indicator is never hidden (user-locked).
-    'subagent.status_live': '🤖 суб-агент: {title} …',
+    // Mode names are also used on the picker buttons. `status_elapsed` is the
+    // dedicated self-updating sub-agent status line (title + ticking elapsed);
+    // `chunk_prefix` marks each streamed full-mode chunk; `fallback_title` fills
+    // in when the delegation carried no title/description. `minimal` ≡ `short`
+    // (v1): both are status-only — the "working" indicator is never hidden.
+    'subagent.status_elapsed': '🤖 суб-агент: {title} · {elapsed}',
     'subagent.panel_fold_status': '🤖 суб-агент работает …',
     'subagent.delegating_status': '🤖 Делегирую: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',
@@ -666,12 +666,12 @@ const dict: Record<Lang, Record<string, string>> = {
     'toolResults.activity_fallback': 'tool',
 
     // ── /subagent (sub-agent transcript verbosity, both backends) ──
-    // Mode names are also used on the picker buttons. `status_live` is the
-    // rolling status-only-mode status line; `chunk_prefix` marks each streamed
-    // full-mode chunk; `fallback_title` fills in when the delegation carried
-    // no title/description. `minimal` ≡ `short` (v1): both are status-only —
-    // the "working" indicator is never hidden (user-locked).
-    'subagent.status_live': '🤖 sub-agent: {title} …',
+    // Mode names are also used on the picker buttons. `status_elapsed` is the
+    // dedicated self-updating sub-agent status line (title + ticking elapsed);
+    // `chunk_prefix` marks each streamed full-mode chunk; `fallback_title` fills
+    // in when the delegation carried no title/description. `minimal` ≡ `short`
+    // (v1): both are status-only — the "working" indicator is never hidden.
+    'subagent.status_elapsed': '🤖 sub-agent: {title} · {elapsed}',
     'subagent.panel_fold_status': '🤖 sub-agent working …',
     'subagent.delegating_status': '🤖 Delegating: {title} …',
     'subagent.chunk_prefix': '🤖 ⤷',

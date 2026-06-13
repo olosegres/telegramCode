@@ -366,6 +366,35 @@ export interface ToolResultEvent {
 }
 
 /**
+ * @description Payload of the adapter `subagentStatus` event — the lifecycle of
+ * a single OpenCode delegation (sub-agent) for the `minimal`/`short`
+ * `/subagent` modes. Emitted on a DEDICATED channel (not the generic `status`
+ * coalescer) so the "working" indicator gets its OWN message + ticking elapsed
+ * timer in the bot, edited in place, instead of riding the shared transient
+ * status (which re-`sendMessage`d a new message on every child-text burst — the
+ * flood bug). `/subagent full` does NOT use this event (the streamed child
+ * transcript IS the indicator there).
+ *
+ * The adapter stays MODE-AGNOSTIC about presentation: it only signals whether a
+ * delegation is in flight (`active`) and the current sticky title; the BOT owns
+ * the message lifecycle and the elapsed counter.
+ */
+export interface SubagentStatusEvent {
+  /**
+   * `true` = a delegation is in flight (start / keep-alive / title refresh) →
+   * the bot opens or refreshes the dedicated status message.
+   * `false` = the delegation ended → the bot removes the message.
+   */
+  active: boolean;
+  /**
+   * The delegation's sticky title (last non-null one seen for this run), or
+   * `null` when the `task` part never carried a title/description — the bot
+   * falls back to the localized generic label.
+   */
+  title: string | null;
+}
+
+/**
  * @description One option of a Claude CLI bare-digit survey (e.g. the periodic
  * session-feedback prompt: `1: Bad  2: Fine  3: Good  0: Dismiss`). The TUI
  * submits on the bare digit alone — no Enter — so `digit` is exactly the
@@ -416,6 +445,7 @@ export interface SendInputOptions {
  * - 'survey'   (key: ThreadKey, survey: ClaudeSurveyEvent) — Claude CLI bare-digit survey to render with answerable buttons
  * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread thinking {@link DisplayVerbosityMode}
  * - 'toolResult' (key: ThreadKey, payload: ToolResultEvent) — a completed tool call's output (OpenCode); the bot applies the per-thread tool-results {@link DisplayVerbosityMode}
+ * - 'subagentStatus' (key: ThreadKey, payload: SubagentStatusEvent) — OpenCode delegation lifecycle for `minimal`/`short` `/subagent` modes; the bot owns a dedicated self-updating status message with a ticking elapsed timer
  * - 'apiError' (key: ThreadKey, error: AgentApiErrorClass) — provider-side API error at the proxy boundary (auto-retry trigger; only when {@link AgentApiErrorClass} classification matched)
  * - 'started'  (key: ThreadKey)                  — session is up and ready
  * - 'stopped'  (key: ThreadKey)                  — `stopSession` completed (explicit teardown)

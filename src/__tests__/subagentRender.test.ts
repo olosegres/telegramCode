@@ -10,7 +10,6 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getSubagentPartAction,
-  buildSubagentStatusText,
   buildDelegatingStatusText,
   buildSubagentOutputPrefix,
 } from '../utils/subagentRender';
@@ -50,21 +49,6 @@ describe('getSubagentPartAction — mode×part-kind matrix', () => {
   });
 });
 
-describe('buildSubagentStatusText — status-only-mode rolling status line', () => {
-  it('embeds the delegation title and the sub-agent marker', () => {
-    const status = buildSubagentStatusText('Count TS files in src/utils');
-    assert.ok(status.includes('Count TS files in src/utils'), 'title embedded');
-    assert.ok(status.includes('🤖'), 'sub-agent marker present');
-  });
-
-  it('null title falls back to a non-empty generic label (never "null")', () => {
-    const status = buildSubagentStatusText(null);
-    assert.ok(!status.includes('null'));
-    assert.ok(status.includes('🤖'));
-    assert.ok(status.length > '🤖 '.length, 'fallback label is non-empty');
-  });
-});
-
 describe('buildDelegatingStatusText — parent-side "Delegating" activity status (S5)', () => {
   it('embeds the delegation title and the sub-agent marker', () => {
     const status = buildDelegatingStatusText('Count TS files in src/utils');
@@ -77,13 +61,6 @@ describe('buildDelegatingStatusText — parent-side "Delegating" activity status
     assert.ok(!status.includes('null'));
     assert.ok(status.includes('🤖'));
     assert.ok(status.length > '🤖 '.length, 'fallback label is non-empty');
-  });
-
-  it('is distinct from the status-only sub-agent status for the same title', () => {
-    // The two statuses cover different phases (parent's task tool in flight vs
-    // child streaming) — identical strings would mean the dedicated
-    // "Delegating" label silently collapsed into the generic one.
-    assert.notEqual(buildDelegatingStatusText('t'), buildSubagentStatusText('t'));
   });
 });
 

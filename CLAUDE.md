@@ -206,6 +206,7 @@ config/variants, not a per-message API field).
 | `utils/thinkingRender.ts` | Pure decision/format helpers behind `/thinking`: the OpenCode mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, the ms→seconds formatter (`formatThinkingDurationSeconds`), and — for the Claude scrape path (no ms timestamps) — `parseThinkingDurationSeconds` (scrapes the duration out of the "Thinking for…" header / "✻ … for Ns" trailer) |
 | `utils/toolResultRender.ts` | Pure helpers for tool-result rendering behind `/tool_results`: mode→render action (`getToolResultRenderAction`), and the `short`-mode dual-cap truncation (`getTruncatedToolResult`, 15 lines / 1200 chars, line-boundary-preserving) |
 | `utils/subagentRender.ts` | Sub-agent rendering helpers behind `/subagent`: the mode×part-kind matrix the adapter consults for child-session parts (`getSubagentPartAction`: text→status/stream, tool→ignore/status, reasoning→always ignore; `minimal` ≡ `short` here, v1), the status-only rolling status line (`buildSubagentStatusText`), the parent-side in-flight delegation status (`buildDelegatingStatusText`) and the full-mode chunk marker (`buildSubagentOutputPrefix`) |
+| `utils/subagentStatusRender.ts` | Pure helpers behind the DEDICATED OpenCode sub-agent status message (non-`full`): `getSubagentStatusAction` (open/refresh/close/noop lifecycle from "message exists?" × "event active?"), `formatElapsed` (`m:ss`), `buildSubagentElapsedText` ("🤖 sub-agent: <title> · m:ss"). The bot's `handleSubagentStatus` owns the message id + the 10 s elapsed tick timer; replaces the flood-prone shared-status line |
 | `utils/claudeScrapeShapes.ts` | THE single source of truth for Claude TUI line-shape regexes (one definition per shape): tool headers (`ANY_TOOL_HEADER_RE` superset of `OUTPUT_TOOL_HEADER_RE`+`FILE_TOOL_HEADER_RE` — incl. `Update`, Claude's render of Edit), `⎿` result marker, thinking header/trailer, collapse markers (`COLLAPSE_MARKER_RE` "+N tool uses/lines"; `COLLAPSE_TOOLUSE_MARKER_RE` "+N tool uses" only, for the orphan-panel-chatter drop), spinner ticks, chrome |
 | `utils/claudeChunkClassifier.ts` | Pure classifier for the Claude relay (S3): segments a scraped pane chunk into tagged runs (`classifyClaudeChunk` → thinking / tool-header / tool-body / sub-agent-panel-preview / prose / chrome), threading fence/block context across polls. Conservative default-to-prose so the answer is never swallowed; an orphan "+N tool uses" wall → chrome |
 | `utils/claudeRelayRouting.ts` | Pure per-pref router for the classifier's segments (S4–S6): `routeClaudeChunkSegments` keeps prose always, applies `/tool_results` + `/thinking` per segment (full keep / short truncate-or-collapse / minimal fold), always folds sub-agent panel previews to status, and returns `keptText` (permanent) + the one rolling `activityLine`; `checkIsClaudeRelayFastPath` is the all-`full` byte-identical regression anchor |
@@ -426,13 +427,24 @@ as a command in `bot.ts`.
     carries the final outcome); in `full` mode child TEXT streams as chunks
     marked "🤖 ⤷" OUTSIDE the parent's continuation chain
     (`OutputEventMeta.isSubagent`). **OpenCode** (child-session SSE events):
-    non-`full` = the child transcript is NOT streamed, a single live
-    "🤖 sub-agent: <title> …" status mirrors the terminal (title from the
-    parent's `task` tool part); `full` = a separate adapter-side child
-    accumulator streams the text. While the parent's `task` tool part is
-    pending/running its transient status renders as "🤖 Delegating: <title> …"
-    (`buildDelegatingStatusText`) instead of the generic 🔄/🔧 form, in both
-    modes (S5); completed/error keep the generic ✅/❌. **Claude** (no child
+    non-`full` = the child transcript is NOT streamed; a DEDICATED
+    self-updating message "🤖 sub-agent: <title> · m:ss" (its own
+    `subagentStatusMessageId`, independent of the shared transient
+    `statusMessageId`) opens on delegation start, is edited in place every
+    `subagentTickMs` (10 s) with a ticking elapsed counter, and is deleted when
+    the delegation ends / the parent turn idles / the session stops (the
+    dedicated `subagentStatus` adapter event drives open/refresh/close). This
+    replaced the old shared-status line, whose lost single-message identity
+    re-`sendMessage`d a NEW message per sparse child-text burst — the flood the
+    user hit (one 14-min delegation → 14 identical posts). The title is sticky
+    (last non-null `task`-part title/description; upgrades from the "sub-agent"
+    fallback as soon as the parent's running `task` part carries it — a short
+    delegation that ends first stays on the fallback, by design). The competing
+    "Delegating…" shared status is suppressed in non-`full`. `full` = a separate
+    adapter-side child accumulator streams the text, and the parent's
+    pending/running `task` part keeps the generic "🤖 Delegating: <title> …"
+    shared status (`buildDelegatingStatusText`); completed/error keep the
+    generic ✅/❌. **Claude** (no child
     events — its TUI renders sub-agents itself): non-`full` = nothing extra,
     the TUI's ◯ task-panel line rolls inside the coalesced status frame;
     `full` = the poll loop ADDITIONALLY tails the on-disk sub-agent
@@ -446,7 +458,7 @@ as a command in `bot.ts`.
     the branch decides what is PRODUCED. Pure decision/format helpers:
     `utils/displayVerbosity.ts`, `utils/thinkingRender.ts`,
     `utils/toolResultRender.ts`, `utils/subagentRender.ts`,
-    `utils/claudeSubagentTail.ts`.
+    `utils/subagentStatusRender.ts`, `utils/claudeSubagentTail.ts`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
   `/doctor`, `/mcp`, `/trace`
   - `/trace on|off` toggles the output-trace recorder for THIS topic; `/trace

@@ -264,7 +264,16 @@ const scheduleCreateShape = {
     .positive()
     .optional()
     .describe('Total number of cron fires before the job auto-deletes (N-times). Only valid with cron.'),
-  prompt: z.string().min(1).max(maxPromptLength).describe('The prompt forwarded to the agent at fire time.'),
+  prompt: z
+    .string()
+    .min(1)
+    .max(maxPromptLength)
+    .describe(
+      'The prompt forwarded to the agent at fire time. Make it SELF-CONTAINED — the future run starts ' +
+        'with no memory of this conversation. Bake in everything it needs: the plan file path + scope, ' +
+        'whether to delegate to a sub-agent, and any constraints. Put the WORK in the prompt; do the ' +
+        'investigation later, when it fires.',
+    ),
   isPinSilent: z
     .boolean()
     .optional()
@@ -363,9 +372,14 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
     {
       title: 'Create a scheduled prompt',
       description:
-        'Schedule a prompt to be delivered to this topic. Provide a cron expression (recurring), ' +
+        'Schedule a prompt to be delivered to this topic later. Provide a cron expression (recurring), ' +
         'an ISO one-shot time, or a cron with repeatCount (N-times). The bot announces, pins, and ' +
-        'forwards the prompt to the agent at fire time.',
+        'forwards the prompt to the agent at fire time.\n\n' +
+        'USE THIS whenever the user asks to schedule execution of a plan or task for later ' +
+        "(e.g. \"schedule finishing plan X in 2h\", \"run this plan tomorrow morning\"). " +
+        'Schedule IMMEDIATELY: write the request straight into `prompt` and create the job FIRST — ' +
+        'do NOT read code, explore the repo, or deliberate before scheduling. Plan now, figure out the ' +
+        'details at fire time. The future run does the investigation, not this call.',
       inputSchema: scheduleCreateShape,
     },
     async (args) => {

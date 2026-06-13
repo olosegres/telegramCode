@@ -2253,24 +2253,41 @@ function listAvailableSubdirs(workRoot: string, limit = 200): string[] {
  * callback (folders disappeared since the keyboard was sent) just lands
  * on the last available page.
  *
- * The FIRST row is always a full-width «create new folder» button
- * (`bindCreateFolderCallback`) — its callback deliberately does NOT start
- * with `bind_`, so it can't be mistaken for a folder pick by the
- * `bind_<subdir>` action regex. It rides on every page so it's reachable
+ * When `isBound` the FIRST row is a full-width «leave current dir» button
+ * (`bindLeaveCurrentCallback`, the folded-in `/unbind`); the «create new folder»
+ * button (`bindCreateFolderCallback`) follows. Both callbacks deliberately do
+ * NOT start with `bind_`, so they can't be mistaken for a folder pick by the
+ * `bind_<subdir>` action regex. They ride on every page so they're reachable
  * regardless of pagination.
  */
 const bindCreateFolderCallback = 'bindCreateFolder';
 
-function buildBindKeyboard(
+/**
+ * «Leave current dir» button — the folded-in `/unbind`. Like
+ * `bindCreateFolderCallback`, the callback id deliberately does NOT start with
+ * `bind_`, so the `bind_<subdir>` action regex can't mistake it for a folder
+ * pick. Only rendered in a bound topic.
+ */
+const bindLeaveCurrentCallback = 'bindLeaveCurrent';
+
+export function buildBindKeyboard(
   subdirs: readonly string[],
   page: number = 0,
   pageSize: number = BIND_PAGE_SIZE,
+  isBound: boolean = false,
 ) {
   const { slice, currentPage, totalPages } = paginateBindList(subdirs, page, pageSize);
 
   const rows = [
     [Markup.button.callback(t('bind.create_button'), bindCreateFolderCallback)],
   ];
+  // A bound topic gets a full-width «leave current dir» row PREPENDED above the
+  // «create new folder» row — this is the folded-in `/unbind`. Its callback
+  // deliberately avoids the `bind_` prefix so the `bind_<subdir>` action regex
+  // can't catch it. The row is omitted when unbound (nothing to leave).
+  if (isBound) {
+    rows.unshift([Markup.button.callback(t('bind.leave_button'), bindLeaveCurrentCallback)]);
+  }
   for (let i = 0; i < slice.length; i += 2) {
     const row = [Markup.button.callback(`📁 ${slice[i]}`, `bind_${slice[i]}`)];
     if (slice[i + 1]) {
@@ -2690,18 +2707,13 @@ function command(
   name: string | string[],
   handler: (ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>, key: ThreadKey) => Promise<void> | void,
 ): void {
-  const names = Array.isArray(name) ? name : [name];
-  // `/cancel` owns its own exit + acknowledgement for the create-folder mode,
-  // so the wrapper must NOT clear the flag before it runs (it would otherwise
-  // see "nothing armed" and reply the no-op notice).
-  const ownsFolderModeExit = names.includes('cancel');
   bot.command(name, async (ctx) => {
     const key = await authoriseContext(ctx);
     if (!key) return;
-    // Running any other command exits the /bind create-folder await-name mode —
-    // the create flow only expects a plain folder-name message, never a command.
+    // Running ANY command exits the /bind create-folder await-name mode — the
+    // create flow only expects a plain folder-name message, never a command.
     // (The picker's create button re-arms it afterwards via its own callback.)
-    if (!ownsFolderModeExit) awaitingFolderName.delete(keyToString(key));
+    awaitingFolderName.delete(keyToString(key));
     await handler(ctx, key);
   });
 }
@@ -2969,8 +2981,9 @@ command('bind', async (ctx, key) => {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
     // Always show the keyboard — even with zero subdirs it carries the
     // «create new folder» button, which is the only way to bootstrap a folder
-    // from an empty WORK_ROOT without the slash form.
-    await replyToThread(key, usage, buildBindKeyboard(subdirs));
+    // from an empty WORK_ROOT without the slash form. When already bound it
+    // also carries the «leave current dir» button (the folded-in /unbind).
+    await replyToThread(key, usage, buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!binding));
     return;
   }
   const result = await applyBinding(key, arg);
@@ -2978,16 +2991,14 @@ command('bind', async (ctx, key) => {
   if (result.ok) await sendBindingWelcome(key, result.subdir);
 });
 
-command('unbind', async (_ctx, key) => {
-  if (checkIsGeneral(key)) {
-    await replyToThread(key, t('bind.in_general'));
-    return;
-  }
-  const binding = state.getBinding(key);
-  if (!binding) {
-    await replyToThread(key, t('thread.unbind_unbound'));
-    return;
-  }
+/**
+ * @description Unbind a thread from its folder: stop any live session, drop the
+ * pinned banner, release persisted session ids, pause the thread's schedules,
+ * then wipe the binding. Shared by the `/bind` picker's «leave current dir»
+ * button (the old `/unbind` command was folded into it). Safe to call only on a
+ * BOUND, non-General topic — the leave button only renders there.
+ */
+async function unbindThread(key: ThreadKey): Promise<void> {
   // Mark this thread as in-flight unbinding so the adapter's synchronous
   // `stopped` event doesn't race us and re-pin a stale "idle" banner over
   // the message we're about to delete.
@@ -3022,42 +3033,7 @@ command('unbind', async (_ctx, key) => {
   } finally {
     unbindingKeys.delete(kStr);
   }
-});
-
-command('where', async (_ctx, key) => {
-  if (checkIsGeneral(key)) {
-    const bindings = state.listBindings();
-    const active = bindings.filter(({ key: k }) => {
-      const a = state.getAgent(k);
-      if (!a) return false;
-      try { return getThreadAdapter(k).checkIsActive(k); } catch { return false; }
-    }).length;
-    await replyToThread(
-      key,
-      t('thread.where_root', {
-        workRoot: ENV.workRoot,
-        bindings: bindings.length,
-        active,
-      }),
-    );
-    return;
-  }
-  const binding = state.getBinding(key);
-  if (!binding) {
-    await replyToThread(key, t('thread.where_unbound'));
-    return;
-  }
-  const adapter = getThreadAdapter(key);
-  const isActive = adapter.checkIsActive(key);
-  await replyToThread(
-    key,
-    t('thread.where_bound', {
-      subdir: binding.subdir,
-      agent: adapter.label,
-      status: isActive ? 'running' : 'stopped',
-    }),
-  );
-});
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  /ls /list — General-scoped info (plan §11 Этап 4)
@@ -3303,7 +3279,7 @@ command('help', async (_ctx, key) => {
   const binding = state.getBinding(key);
   if (!binding) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = buildBindKeyboard(subdirs);
+    const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
     await replyToThread(key, t('help.thread_unbound'), {
       parse_mode: 'Markdown',
       ...(extra ?? {}),
@@ -3676,7 +3652,7 @@ async function handleStartCommand(
   // natural-language path in the text handler (plan §11 Этап 4).
   if (!state.getBinding(key)) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = buildBindKeyboard(subdirs);
+    const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
@@ -4067,12 +4043,13 @@ command('rename_session', async (ctx, key) => {
 });
 
 /**
- * @description Build the `/agent` picker keyboard.
+ * @description Build the agent-picker keyboard.
  *
  * One callback button per available adapter (2 per row); the adapter whose
- * name matches `currentName` carries a `✓` marker. Shared by the `/agent`
- * command (initial render) and the `agent_<name>` callback (re-render after
- * a press) so the marker can never drift between the two (B16, mirrors B12).
+ * name matches `currentName` carries a `✓` marker. Shared by the `/start` +
+ * post-bind welcome buttons (initial render) and the `agent_<name>` callback
+ * (re-render after a press) so the marker can never drift between the two
+ * (B16, mirrors B12).
  */
 function buildAgentKeyboard(
   available: ReadonlyArray<{ name: string; label: string }>,
@@ -4083,12 +4060,6 @@ function buildAgentKeyboard(
   );
   return Markup.inlineKeyboard(buttons, { columns: 2 });
 }
-
-command('agent', async (_ctx, key) => {
-  const available = getAvailableAdapters();
-  const currentName = getThreadAdapterName(key);
-  await replyToThread(key, 'Choose agent:', buildAgentKeyboard(available, currentName));
-});
 
 /** Max chars of a session title rendered on an inline resume button. */
 const sessionButtonTitleMaxLength = 40;
@@ -4110,7 +4081,7 @@ async function handleSessionsList(key: ThreadKey): Promise<void> {
   }
   if (!state.getBinding(key)) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = buildBindKeyboard(subdirs);
+    const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
@@ -4202,23 +4173,6 @@ async function resumeSessionByIndex(
 }
 
 command(['sessions', 'resume'], (_ctx, key) => handleSessionsList(key));
-
-// Exit session-pick mode without resuming. No-op (friendly notice) when the
-// thread wasn't armed, so a stray /cancel never looks broken.
-command('cancel', async (_ctx, key) => {
-  const kStr = keyToString(key);
-  if (awaitingFolderName.has(kStr)) {
-    awaitingFolderName.delete(kStr);
-    await replyToThread(key, t('bind.create_cancelled'));
-    return;
-  }
-  if (awaitingSessionSelection.has(kStr)) {
-    awaitingSessionSelection.delete(kStr);
-    await replyToThread(key, t('session.cancelled'));
-  } else {
-    await replyToThread(key, t('session.cancel_noop'));
-  }
-});
 
 command('stop', async (_ctx, key) => {
   // Sweep every adapter, not just the one the in-memory map currently
@@ -4398,6 +4352,16 @@ command('tab', async (_ctx, key) => {
   const adapter = getThreadAdapter(key);
   if (adapter.sendTab) adapter.sendTab(key);
   else await replyToThread(key, `Not supported for ${adapter.label}`);
+});
+
+command(['esc', 'escape'], async (_ctx, key) => {
+  const adapter = getThreadAdapter(key);
+  if (adapter.sendEscape) {
+    markNeedsNewMessage(key);
+    adapter.sendEscape(key);
+  } else {
+    await replyToThread(key, `Not supported for ${adapter.label}`);
+  }
 });
 
 command('output', async (_ctx, key) => {
@@ -4618,9 +4582,14 @@ command('clear_messages', async (ctx, key) => {
 //  Bot commands list (text vs slash) — known slash commands the bot handles
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Slash tokens the text handler must NOT forward to the agent. Covers every
+// bot-owned command (incl. the raw-key controls c/y/n/enter/up/down/tab/esc)
+// PLUS the retired commands (agent/cancel/unbind/where): their handlers were
+// removed, but keeping the tokens here makes a stray `/where` inert instead of
+// typing a meaningless "/where" prompt into the agent.
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
-  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'output', 'clear_messages',
+  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
   'subagent',
@@ -4791,7 +4760,7 @@ bot.on(message('text'), async (ctx) => {
       });
       if (!result.ok && result.reason === 'unbound') {
         const subdirs = listAvailableSubdirs(ENV.workRoot);
-        const extra = buildBindKeyboard(subdirs);
+        const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
@@ -4906,7 +4875,7 @@ bot.on(message('text'), async (ctx) => {
   const binding = state.getBinding(key);
   if (!binding) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = buildBindKeyboard(subdirs);
+    const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
@@ -4992,7 +4961,7 @@ bot.on(message('voice'), async (ctx) => {
         }
         if (!state.getBinding(key)) {
           const subdirs = listAvailableSubdirs(ENV.workRoot);
-          const extra = buildBindKeyboard(subdirs);
+          const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
           await replyToThread(key, t('thread.no_binding'), extra);
           return;
         }
@@ -5010,7 +4979,7 @@ bot.on(message('voice'), async (ctx) => {
       const binding = state.getBinding(key);
       if (!binding) {
         const subdirs = listAvailableSubdirs(ENV.workRoot);
-        const extra = buildBindKeyboard(subdirs);
+        const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
@@ -5076,7 +5045,7 @@ async function checkFileIntakeGatePassed(
   const binding = state.getBinding(key);
   if (!binding) {
     const subdirs = listAvailableSubdirs(ENV.workRoot);
-    const extra = buildBindKeyboard(subdirs);
+    const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
     await sendHint(t('thread.no_binding'), extra);
     return false;
   }
@@ -5437,7 +5406,7 @@ bot.on(message('forum_topic_created'), async (ctx) => {
     }
   }
 
-  const extra = buildBindKeyboard(subdirs);
+  const extra = buildBindKeyboard(subdirs, 0, BIND_PAGE_SIZE, !!state.getBinding(key));
   await replyToThread(key, t('thread.welcome_pick'), extra);
 });
 
@@ -5549,7 +5518,7 @@ bot.action(/^bind_page_(\d+)$/, async (ctx) => {
   }
   const page = parseInt(ctx.match[1], 10);
   const subdirs = listAvailableSubdirs(ENV.workRoot);
-  const keyboard = buildBindKeyboard(subdirs, page);
+  const keyboard = buildBindKeyboard(subdirs, page, BIND_PAGE_SIZE, !!state.getBinding(key));
   try {
     await ctx.editMessageReplyMarkup(keyboard.reply_markup);
   } catch (e) {
@@ -5580,6 +5549,20 @@ bot.action(bindCreateFolderCallback, async (ctx) => {
   await ctx.answerCbQuery(t('bind.create_cb'));
   armFolderCreation(key);
   await replyToThread(key, t('bind.create_prompt'));
+});
+
+// «Leave current dir» — the folded-in `/unbind`, shown only in a bound topic.
+// Callback id deliberately avoids the `bind_` prefix so it can't be matched by
+// the `bind_<subdir>` regex below.
+bot.action(bindLeaveCurrentCallback, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  if (checkIsGeneral(key)) {
+    await ctx.answerCbQuery(t('cb.bind_only_topical'));
+    return;
+  }
+  await ctx.answerCbQuery();
+  await unbindThread(key);
 });
 
 bot.action(/^bind_(.+)$/, async (ctx) => {
@@ -6818,8 +6801,6 @@ const COMMANDS_MENU = [
   { command: 'help', description: '❓ Context-aware help' },
   { command: 'doctor', description: '🔍 Self-diagnostics' },
   { command: 'bind', description: '📁 Bind thread to a subfolder' },
-  { command: 'unbind', description: '🚫 Remove binding' },
-  { command: 'where', description: '📍 Show current binding' },
   { command: 'ls', description: '📂 List WORK_ROOT subfolders' },
   { command: 'list', description: '🧵 List all bound threads' },
   { command: 'mcp', description: '🔌 List active MCP servers' },
@@ -6833,11 +6814,9 @@ const COMMANDS_MENU = [
   { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
   { command: 'tool_results', description: '🔧 Tool-results verbosity' },
   { command: 'subagent', description: '🤖 Sub-agent verbosity' },
-  { command: 'agent', description: '🔄 Choose agent' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
   { command: 'rename_session', description: '✏️ Rename the current session (OpenCode)' },
-  { command: 'cancel', description: '🚫 Cancel the session picker' },
   { command: 'stop', description: '⏹ Stop agent (hard kill)' },
   { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },
   { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
@@ -6852,6 +6831,7 @@ const COMMANDS_MENU = [
   { command: 'up', description: '⬆️ Arrow Up' },
   { command: 'down', description: '⬇️ Arrow Down' },
   { command: 'tab', description: '⇥ Tab' },
+  { command: 'esc', description: '⎋ Escape (interrupt / dismiss)' },
   { command: 'y', description: '✅ Send "y"' },
   { command: 'n', description: '❌ Send "n"' },
   { command: 'c', description: '🛑 Ctrl+C' },

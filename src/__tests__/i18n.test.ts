@@ -124,7 +124,6 @@ test('bind create-folder flow keys exist in every locale', () => {
     'bind.create_invalid_chars',
     'bind.create_exists',
     'bind.create_failed',
-    'bind.create_cancelled',
   ]) {
     assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
   }

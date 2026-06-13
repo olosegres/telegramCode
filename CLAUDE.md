@@ -74,9 +74,10 @@ config/variants, not a per-message API field).
   If the `opencode serve` process crashes, the bot auto-restarts the server
   and **restores** each active session by re-resuming its persisted id
   (sessions persist on opencode disk; the in-flight reply is lost). Explicit
-  `/stop`, `/stop-all`, `/quit`, `/unbind` instead **release** the persisted
-  session ids — so a later bot restart does NOT auto-reattach those sessions
-  (they stay reachable only via the `/sessions` picker).
+  `/stop`, `/stop-all`, `/quit`, and leaving a folder (the `/bind` «leave
+  current dir» button) instead **release** the persisted session ids — so a
+  later bot restart does NOT auto-reattach those sessions (they stay reachable
+  only via the `/sessions` picker).
 - **Startup-safe input.** A session has an async boot window (Claude tmux/pty,
   OpenCode server + `POST /session`). Prompts typed during it are buffered
   (`startupPromptBuffer.ts`) and replayed in order when ready — never dropped.
@@ -116,9 +117,10 @@ config/variants, not a per-message API field).
   (prompt wrapper) or by the agent itself (`schedule_create/list/cancel` MCP
   tools; cron / one-shot / N-times, min interval 5 min, ≤30 jobs per thread).
   Restart-safe: timers re-arm from `state.json` at boot and missed runs fire
-  ONE catch-up annotated with the missed time. `/unbind` pauses the thread's
-  jobs (one notice); `/bind` resumes them from now (an expired one-shot is
-  dropped). Run history: `DATA_DIR/scheduler-runs.jsonl`.
+  ONE catch-up annotated with the missed time. Leaving a folder (the `/bind`
+  «leave current dir» button) pauses the thread's jobs (one notice); `/bind`
+  resumes them from now (an expired one-shot is dropped). Run history:
+  `DATA_DIR/scheduler-runs.jsonl`.
 - **Thread-context preamble.** The bot prepends a `[Telegram thread context]`
   block (topic name, group title, `chatId:threadId`, bound folder) to the
   forwarded prompt so the agent knows WHERE it works. Built in
@@ -162,8 +164,8 @@ config/variants, not a per-message API field).
   nudges the still-live session with a neutral "continue" via
   `forwardPromptToAgent` (NEVER a wait-for-idle path — OpenCode's optimistic
   `isBusy` is not cleared on `session.error` and would stall the 10-min cap).
-  Any user message / `/stop` / `/new` / `/unbind` / `/quit` cancels a pending
-  retry; pending retries survive a bot restart (`state.json` `apiRetries`,
+  Any user message / `/stop` / `/new` / `/quit` / leaving a folder cancels a
+  pending retry; pending retries survive a bot restart (`state.json` `apiRetries`,
   re-armed after reattach). **⚠️ Known check (not yet verified live):** the
   Claude scrape-detection regex (`^\s*API Error:`, run over `cleanOutput(raw)`
   WITHOUT `stripTuiElements`) was never confirmed against a real raw TUI render
@@ -243,7 +245,7 @@ as a command in `bot.ts`.
 
 - **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/new`
   (`/clear_session`), `/stop`, `/stop-all`, `/quit` (`/q`), `/sessions`
-  (`/resume`), `/rename_session`, `/cancel`, `/clear_messages`, `/compact`
+  (`/resume`), `/rename_session`, `/clear_messages`, `/compact`
   - `/new` (alias `/clear_session`) stops the thread's current agent session
     and immediately starts a fresh one in the SAME topic with the SAME adapter.
     The old session is **released, not deleted** (its transcript stays on disk
@@ -263,7 +265,7 @@ as a command in `bot.ts`.
   - `/sessions` and its synonym `/resume` list resumable sessions for the
     thread's bound folder as numbered text **and** tappable inline buttons,
     then arm a per-thread pick mode: reply with a bare digit to resume that
-    session, `0` or `/cancel` to exit, out-of-range stays armed, any other
+    session, `0` to exit, out-of-range stays armed, any other
     text exits and is handled normally. A picked session is **persisted** as
     the thread's session id (`state.json`), so a bot restart (hot rebuild
     included) re-attaches to the pick — previously only fresh starts
@@ -293,20 +295,28 @@ as a command in `bot.ts`.
     has no title concept and does not implement the method → the bot replies
     "not supported". No args → usage hint; no active session → "start an agent
     first".
-- **Binding & navigation:** `/bind`, `/unbind`, `/where`, `/ls`, `/list`,
-  `/pair`
-  - `/bind` with no arg shows the folder picker; its FIRST inline button is
-    «create new folder» (`bindCreateFolder` callback). Tapping it arms a
+- **Binding & navigation:** `/bind`, `/ls`, `/list`, `/pair`
+  - `/bind` is the single binding hub — there is no `/unbind` or `/where`
+    command. The no-arg picker prints the current-binding line (replacing
+    `/where`'s per-topic output) and carries action rows ABOVE the folders:
+    when the topic is BOUND, the FIRST button is «leave current dir»
+    (`bindLeaveCurrent` callback → `unbindThread`: stop session, drop pin,
+    release ids, pause schedules, wipe binding — the folded-in `/unbind`);
+    next is «create new folder» (`bindCreateFolder` callback). An unbound topic
+    omits the leave row (nothing to leave). Tapping «create new folder» arms a
     per-thread await-folder-name mode (`awaitingFolderName`): the next text
     message is validated (`validateNewFolderName` in `folderName.ts` — no
     slashes/traversal/dots/control chars), `mkdir`'d under `WORK_ROOT`
     (already-exists → just bind to it), then bound via `applyBinding` with the
     normal welcome stack. Invalid name → error, mode stays armed for retry.
-    `/cancel` or any other command exits the mode. `/bind <subdir>` direct form
-    is unchanged.
+    Any command exits the mode. `/bind <subdir>` direct form is unchanged.
 - **Agent control (proxied):** `/model`, `/effort`, `/verbosity`, `/thinking`,
-  `/tool_results`, `/subagent`, `/agent`, `/output`, `/schedule`, and raw TUI
-  keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`
+  `/tool_results`, `/subagent`, `/output`, `/schedule`, and raw TUI
+  keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`, `/esc` (`/escape`)
+  - `/esc` (alias `/escape`) sends a raw Escape keystroke to the live agent
+    (Claude: interrupt the current turn / dismiss a selector via
+    `sendEscape` → `tmux send-keys Escape`, a fire-and-forget one-shot, NOT a
+    wait-for-idle interrupt; OpenCode: "not supported").
   - `/schedule <free text>` is a **thin prompt wrapper** — the bot owns NO
     scheduling logic. It wraps the request in an agent-facing instruction
     (`schedule.forwardPromptTemplate`; bare `/schedule` →

@@ -621,6 +621,7 @@ export interface AgentAdapter extends EventEmitter {
   sendEnter?(key: ThreadKey): void;
   sendArrow?(key: ThreadKey, direction: 'Up' | 'Down'): void;
   sendTab?(key: ThreadKey): void;
+  sendEscape?(key: ThreadKey): void;
 
   /**
    * @description Interrupt the current turn and resolve only once the agent is

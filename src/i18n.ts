@@ -46,11 +46,6 @@ const dict: Record<Lang, Record<string, string>> = {
       '📁 Сначала привяжи папку: /bind <subdir>. Агент запускается только в привязанной папке.',
     'thread.bound': '📁 Привязано к `{subdir}`.\nЗапусти /claude или /opencode.',
     'thread.unbound': '📁 Привязка снята.',
-    'thread.unbind_unbound': 'Тред и так не был привязан.',
-    'thread.where_unbound': 'Тред не привязан к папке.',
-    'thread.where_root':
-      '📁 `WORK_ROOT`: `{workRoot}`\n📊 Привязок: {bindings}\n🟢 Активных сессий: {active}',
-    'thread.where_bound': '📁 Папка: `{subdir}`\n🤖 Агент: {agent}\n🟢 Статус: {status}',
     'thread.general_no_agent':
       'General не привязан к папке — перейди в тематический тред для разговора с агентом.',
     'thread.welcome_bound':
@@ -74,18 +69,18 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.not_directory': '❌ `{subdir}` существует, но это не папка.',
 
     // ── /bind create-new-folder flow ──
+    'bind.leave_button': '⬅️ Покинуть текущую папку',
     'bind.create_button': '➕ Создать новую папку',
     'bind.create_prompt':
-      '✏️ Пришли название новой папки (будет создана в `WORK_ROOT`).\n/cancel — отмена.',
+      '✏️ Пришли название новой папки (будет создана в `WORK_ROOT`). Любая команда отменяет.',
     'bind.create_cb': 'Создаю новую папку…',
-    'bind.create_empty': '❌ Название пустое. Пришли название папки или /cancel.',
+    'bind.create_empty': '❌ Название пустое. Пришли название папки.',
     'bind.create_separator': '❌ Название не должно содержать `/` или `\\`. Пришли простое имя.',
     'bind.create_dot_segment': '❌ `.` и `..` нельзя использовать как имя папки.',
     'bind.create_hidden': '❌ Имя не должно начинаться с точки.',
     'bind.create_invalid_chars': '❌ В названии папки запрещены управляющие символы.',
     'bind.create_exists': '📁 Папка `{subdir}` уже существует — привязываю к ней.',
     'bind.create_failed': '❌ Не удалось создать папку: {error}',
-    'bind.create_cancelled': 'Отменено. Создание папки закрыто.',
 
     // ── /ls /list (General-scoped) ──
     'ls.header': '📁 Подпапки `{workRoot}`:',
@@ -102,7 +97,6 @@ const dict: Record<Lang, Record<string, string>> = {
       '*Команды в General:*\n' +
       '/ls — подпапки `WORK_ROOT`\n' +
       '/list — список тредов\n' +
-      '/where — общая сводка\n' +
       '/status — статус всех тредов\n' +
       '/stopall — остановить все агенты\n' +
       '/whoami /version — debug\n\n' +
@@ -110,20 +104,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_unbound':
       '*Тред не привязан к папке.*\n' +
       '/bind <subdir> — привязать (или выбери в списке)\n' +
-      '/where — показать состояние\n' +
       '/ls — подпапки `WORK_ROOT` (в General)',
     'help.thread_bound':
       '*Тред привязан к `{subdir}`.*\n' +
       '/claude /opencode — старт агента\n' +
       '/new — перезапустить сессию (старая → /sessions)\n' +
-      '/agent /model /sessions — выбор/переключение\n' +
+      '/model /sessions — переключение\n' +
       '/effort — уровень reasoning effort\n' +
       '/verbosity — детализация вывода (размышления/инструменты/суб-агенты)\n' +
       '/stop /status /output — контроль\n' +
       '/compact — сжать контекст агента\n' +
       '/clear — удалить сообщения треда\n' +
-      '/c /y /n /enter /up /down /tab — TUI-команды (Claude)\n' +
-      '/where /unbind — управление binding',
+      '/c /y /n /enter /up /down /tab /esc — TUI-команды (Claude)\n' +
+      '/bind — управление binding',
 
     // ── /doctor self-diagnostics ──
     'doctor.header': '🔍 *Telegram Code Doctor*',
@@ -216,7 +209,7 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── agent lifecycle ──
     'agent.ready': '{label} готов в `{subdir}`{argsSuffix}\nОтправь сообщение:',
-    'agent.no_session': 'Агент не запущен. /agent — выбрать, /claude или /opencode — старт.',
+    'agent.no_session': 'Агент не запущен. /claude или /opencode — старт.',
     'agent.session_ended': '{label}: сессия завершена',
     'agent.stopped': '{label} остановлен',
     'agent.exit_signal_sent': 'Послан двойной Ctrl+C — {label} завершает работу',
@@ -344,7 +337,7 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── error codes ──
     'error.workdir.gone':
-      '📁 Папка `{subdir}` исчезла с диска. Сделай /unbind или /bind <newdir>.',
+      '📁 Папка `{subdir}` исчезла с диска. Сделай /bind <newdir>.',
     'error.tg.thread.deleted':
       '⚠️ Тред удалён в Telegram, binding очищен.',
     'error.tg.thread.closed':
@@ -389,10 +382,9 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── session picker (/sessions, /resume). {label}=агент, {max}=кол-во, {error}=причина ──
     'session.list_header': 'Сессии для возобновления ({label}):',
-    'session.list_footer': 'Отправьте 1–{max} чтобы возобновить · 0 или /cancel для выхода',
+    'session.list_footer': 'Отправьте 1–{max} чтобы возобновить · 0 для выхода',
     'session.none': 'Нет сессий для возобновления в этой папке.',
     'session.cancelled': 'Отменено. Выбор сессии закрыт.',
-    'session.cancel_noop': 'Нечего отменять — выбор сессии не активен.',
     'session.invalid': 'Неверный номер. Введите число от 1 до {max}.',
     'session.resumed': 'Сессия возобновлена. Отправьте сообщение:',
     'session.resume_failed': 'Не удалось возобновить сессию: {error}',
@@ -458,11 +450,6 @@ const dict: Record<Lang, Record<string, string>> = {
       '📁 Bind a folder first: /bind <subdir>. The agent only ever runs inside the bound folder.',
     'thread.bound': '📁 Bound to `{subdir}`.\nRun /claude or /opencode.',
     'thread.unbound': '📁 Binding cleared.',
-    'thread.unbind_unbound': 'Thread had no binding to clear.',
-    'thread.where_unbound': 'Thread is not bound to a folder.',
-    'thread.where_root':
-      '📁 `WORK_ROOT`: `{workRoot}`\n📊 Bindings: {bindings}\n🟢 Active sessions: {active}',
-    'thread.where_bound': '📁 Folder: `{subdir}`\n🤖 Agent: {agent}\n🟢 Status: {status}',
     'thread.general_no_agent':
       'General is not bound to a folder — switch to a topical thread to talk to an agent.',
     'thread.welcome_bound':
@@ -486,18 +473,18 @@ const dict: Record<Lang, Record<string, string>> = {
     'bind.not_directory': '❌ `{subdir}` exists but is not a directory.',
 
     // ── /bind create-new-folder flow ──
+    'bind.leave_button': '⬅️ Leave current dir',
     'bind.create_button': '➕ Create new folder',
     'bind.create_prompt':
-      '✏️ Send the new folder name (it will be created under `WORK_ROOT`).\n/cancel to abort.',
+      '✏️ Send the new folder name (it will be created under `WORK_ROOT`). Any command cancels.',
     'bind.create_cb': 'Creating a new folder…',
-    'bind.create_empty': '❌ Name is empty. Send a folder name or /cancel.',
+    'bind.create_empty': '❌ Name is empty. Send a folder name.',
     'bind.create_separator': '❌ Name must not contain `/` or `\\`. Send a plain name.',
     'bind.create_dot_segment': '❌ `.` and `..` cannot be used as a folder name.',
     'bind.create_hidden': '❌ Name must not start with a dot.',
     'bind.create_invalid_chars': '❌ Folder name must not contain control characters.',
     'bind.create_exists': '📁 Folder `{subdir}` already exists — binding to it.',
     'bind.create_failed': '❌ Failed to create the folder: {error}',
-    'bind.create_cancelled': 'Cancelled. Folder creation closed.',
 
     // ── /ls /list (General-scoped) ──
     'ls.header': '📁 Subfolders of `{workRoot}`:',
@@ -514,7 +501,6 @@ const dict: Record<Lang, Record<string, string>> = {
       '*Commands in General:*\n' +
       '/ls — list `WORK_ROOT` subfolders\n' +
       '/list — list threads\n' +
-      '/where — global summary\n' +
       '/status — status of all threads\n' +
       '/stopall — stop every running agent\n' +
       '/whoami /version — debug\n\n' +
@@ -522,20 +508,19 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_unbound':
       '*Thread is not bound to a folder.*\n' +
       '/bind <subdir> — bind (or pick from the list)\n' +
-      '/where — show state\n' +
       '/ls — `WORK_ROOT` subfolders (in General)',
     'help.thread_bound':
       '*Thread bound to `{subdir}`.*\n' +
       '/claude /opencode — start an agent\n' +
       '/new — restart the session (old one → /sessions)\n' +
-      '/agent /model /sessions — choose/switch\n' +
+      '/model /sessions — switch\n' +
       '/effort — reasoning-effort level\n' +
       '/verbosity — output verbosity (thinking/tools/sub-agents)\n' +
       '/stop /status /output — control\n' +
       '/compact — compact agent context\n' +
       '/clear — delete thread messages\n' +
-      '/c /y /n /enter /up /down /tab — TUI keys (Claude)\n' +
-      '/where /unbind — manage binding',
+      '/c /y /n /enter /up /down /tab /esc — TUI keys (Claude)\n' +
+      '/bind — manage binding',
 
     // ── /doctor self-diagnostics ──
     'doctor.header': '🔍 *Telegram Code Doctor*',
@@ -622,7 +607,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'status.global_empty': '📊 No threads yet.',
 
     'agent.ready': '{label} ready in `{subdir}`{argsSuffix}\nSend a message:',
-    'agent.no_session': 'No agent running. /agent to pick, /claude or /opencode to start.',
+    'agent.no_session': 'No agent running. /claude or /opencode to start.',
     'agent.session_ended': '{label}: session ended',
     'agent.stopped': '{label} stopped',
     'agent.exit_signal_sent': 'Double Ctrl+C sent — {label} exiting',
@@ -745,7 +730,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'file.download_failed': '📎 Failed to download the file. Please try again.',
 
     'error.workdir.gone':
-      '📁 Folder `{subdir}` is gone from disk. Run /unbind or /bind <newdir>.',
+      '📁 Folder `{subdir}` is gone from disk. Run /bind <newdir>.',
     'error.tg.thread.deleted':
       '⚠️ Thread was deleted in Telegram; binding cleared.',
     'error.tg.thread.closed':
@@ -788,10 +773,9 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── session picker (/sessions, /resume). {label}=agent, {max}=count, {error}=reason ──
     'session.list_header': 'Sessions to resume ({label}):',
-    'session.list_footer': 'Send 1–{max} to resume · 0 or /cancel to exit',
+    'session.list_footer': 'Send 1–{max} to resume · 0 to exit',
     'session.none': 'No resumable sessions in this folder.',
     'session.cancelled': 'Cancelled. Session picker closed.',
-    'session.cancel_noop': 'Nothing to cancel — the session picker is not active.',
     'session.invalid': 'Invalid number. Enter a value from 1 to {max}.',
     'session.resumed': 'Session resumed. Send your message:',
     'session.resume_failed': 'Failed to resume session: {error}',

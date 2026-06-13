@@ -3022,6 +3022,21 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     });
   }
 
+  // Fire-and-forget single Escape keystroke (interrupt the current turn /
+  // dismiss a selector). Deliberately distinct from `interruptAndWaitIdle`:
+  // this is a raw one-shot key, NOT a wait-for-idle interrupt.
+  sendEscape(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return;
+
+    this.resetPollCadence(key, session);
+    console.log(`[Claude] sendEscape`);
+    this.enqueueTmuxBestEffort(session, async () => {
+      if (!session.isActive) return '';
+      return tmuxAsync('send-keys', '-t', session.sessionName, 'Escape');
+    });
+  }
+
   /**
    * @description Interrupt the current turn, then wait until Claude is
    * actually idle before resolving, so the caller can type a fresh prompt

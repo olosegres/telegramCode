@@ -31,6 +31,7 @@ import {
   ANY_TOOL_HEADER_RE,
   CODE_FENCE_LINE_RE,
   COLLAPSE_MARKER_RE,
+  COLLAPSE_TOOLUSE_MARKER_RE,
   COMPLETION_SUMMARY_RE,
   FILE_TOOL_HEADER_RE,
   OUTPUT_TOOL_HEADER_RE,
@@ -211,6 +212,16 @@ export function classifyClaudeChunk(
       ANY_TOOL_HEADER_RE.test(line)
     ) {
       push(ClaudeChunkTag.SubagentPanelPreview, line);
+      continue;
+    }
+
+    // An orphan "… +N tool uses" collapse wall (panel already closed / scrolled
+    // off, no open panel context above) is still sub-agent panel chrome — drop it
+    // rather than leak it as prose. The panel-OPEN case is handled above (folds to
+    // a sub-agent status activity); this catches the orphan tail. "+N lines" (a
+    // real tool-body summary) is deliberately NOT matched here.
+    if (COLLAPSE_TOOLUSE_MARKER_RE.test(line)) {
+      push(ClaudeChunkTag.Chrome, line);
       continue;
     }
 

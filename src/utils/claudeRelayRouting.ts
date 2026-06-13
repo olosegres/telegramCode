@@ -31,7 +31,7 @@ import type { DisplayVerbosityMode } from '../types';
 /** Tool names Claude's known headers carry, used to derive a compact activity
  * label (`Bash`, `Read`, …). Matches the set in `claudeScrapeShapes.ANY_TOOL_HEADER_RE`. */
 const TOOL_NAME_RE =
-  /\b(Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|TodoWrite|WebFetch|WebSearch)\b/;
+  /\b(Bash|Read|Write|Edit|Update|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|TodoWrite|WebFetch|WebSearch)\b/;
 
 /** Result of {@link routeClaudeChunkSegments}. */
 export interface ClaudeRelayRouting {

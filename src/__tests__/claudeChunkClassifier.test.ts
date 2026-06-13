@@ -57,6 +57,29 @@ test('a tool header + ⎿ body → toolHeader then toolBody, body text intact', 
   );
 });
 
+test('an Update(…) header (Claude TUI render of Edit) → toolHeader, not prose', () => {
+  // Live bug (all-minimal topic, 2026-06-13): `Update` was missing from
+  // ANY_TOOL_HEADER_RE though FILE_TOOL_HEADER_RE has it — so Claude's most
+  // common header (`● Update(file)`) leaked as prose, bypassing verbosity routing.
+  const chunk = ['● *Update*(src/foo.ts)', '  ⎿  Added 3 lines, removed 1'].join('\n');
+  const { segments } = classifyClaudeChunk(chunk, createInitialChunkContext());
+  assert.equal(segments[0]?.tag, ClaudeChunkTag.ToolHeader, 'Update header is a tool header');
+  assert.equal(findSegment(segments, ClaudeChunkTag.ToolHeader)?.text, '● *Update*(src/foo.ts)');
+});
+
+test('a sub-agent ⎿ Update(…) preview under a ◯ panel → subagentPanelPreview (folds)', () => {
+  // The Update-header gap also meant `⎿ Update(…)` previews under a running
+  // sub-agent panel did not fold (the ID 30447 leak). With Update recognised the
+  // preview is panel chatter again.
+  const chunk = [
+    '  ◯ general-purpose  Implement the fix                                          1m 2s',
+    '  ⎿  Update(src/utils/claudeChunkClassifier.ts)',
+  ].join('\n');
+  const tags = getTags(chunk);
+  assert.ok(tags.includes(ClaudeChunkTag.SubagentPanelPreview), 'the ⎿ Update(…) preview folds as panel chatter');
+  assert.ok(!tags.includes(ClaudeChunkTag.Prose), 'the preview must not leak as prose');
+});
+
 // ─── sub-agent panel preview flood (the overview-2 wall) ───────────────
 
 test('"… +N tool uses" + ⎿ Tool(…) previews under a ◯ panel → subagentPanelPreview', () => {
@@ -92,6 +115,21 @@ test('a bare "… +N tool uses" wall while a panel is open → subagentPanelPrev
   const ctx = { ...createInitialChunkContext(), isSubagentPanelOpen: true };
   const { segments } = classifyClaudeChunk('… +62 tool uses', ctx);
   assert.deepEqual(segments.map(s => s.tag), [ClaudeChunkTag.SubagentPanelPreview]);
+});
+
+test('an ORPHAN "… +N tool uses" wall (no open panel) → chrome, never prose', () => {
+  // S6 (a): the panel scrolled off / closed in a prior poll, so the collapse
+  // wall arrives with NO open panel context. Pre-fix it fell through to prose
+  // and re-introduced part of the overview-2 flood; now it is dropped as chrome.
+  assert.deepEqual(getTags('… +62 tool uses'), [ClaudeChunkTag.Chrome]);
+});
+
+test('an ORPHAN "… +N lines" summary (no open tool) is UNCHANGED — stays prose, not chrome', () => {
+  // Guards that the tool-use-only regex does NOT swallow the legitimate
+  // "+N lines" tool-body summary: with no open tool kind a fresh context still
+  // leaves it as the conservative prose default (its real handling is the
+  // ToolBody branch, which only fires under an open tool kind).
+  assert.deepEqual(getTags('… +5 lines'), [ClaudeChunkTag.Prose]);
 });
 
 // ─── thinking block ────────────────────────────────────────────────────

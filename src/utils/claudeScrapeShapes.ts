@@ -126,14 +126,18 @@ export const FILE_TOOL_HEADER_RE =
 
 /**
  * @description ANY tool-call header line (`● Bash(…)`, `✓ Read(…)`,
- * `● Task(…)`, `● TodoWrite(…)`, `● WebFetch(…)`). Superset of the two
- * fence-deciding headers above (which only cover code-producing tools): used
- * by the classifier to TAG a header line as `toolHeader` regardless of whether
- * its body would be fenced. Anchored on the tool NAME from Claude's known set,
- * optionally glyph-led and/or `*bold*`, followed by `(`.
+ * `● Update(…)`, `● Task(…)`, `● TodoWrite(…)`, `● WebFetch(…)`). MUST stay a
+ * superset of the two fence-deciding headers above (`OUTPUT_TOOL_HEADER_RE` +
+ * `FILE_TOOL_HEADER_RE`): used by the classifier to TAG a header line as
+ * `toolHeader` (and a sub-agent panel preview's `⎿ Tool(…)`) regardless of
+ * whether its body would be fenced. Anchored on the tool NAME from Claude's
+ * known set, optionally glyph-led and/or `*bold*`, followed by `(`.
+ * `Update` is Claude's TUI render of the Edit tool (`● Update(file)`) — the most
+ * common header; omitting it (live bug, all-minimal topic) let every Edit header
+ * and its sub-agent `⎿ Update(…)` previews bypass the verbosity routing and leak.
  */
 export const ANY_TOOL_HEADER_RE =
-  /^\s*[●○⏳✓]?\s*\*?(?:Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|TodoWrite|WebFetch|WebSearch)\*?\s*\(/;
+  /^\s*[●○⏳✓]?\s*\*?(?:Bash|Read|Write|Edit|Update|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|TodoWrite|WebFetch|WebSearch)\*?\s*\(/;
 
 /** Tool RESULT marker line: `  ⎿  <summary or first output line>`. */
 export const TOOL_RESULT_MARKER_RE = /^(\s*)⎿/;
@@ -169,6 +173,17 @@ export const TRANSIENT_TICK_RE = /^\s*(?:Running|Waiting)…\s*(?:\([^)]*\))?\s*
  * output → render plain, never fenced.
  */
 export const COLLAPSE_MARKER_RE = /^\s*…\s*\+\d+\s+(?:tool use|line)s?\b.*$/;
+
+/**
+ * @description The tool-use-only subset of {@link COLLAPSE_MARKER_RE}: matches
+ * `… +N tool use(s)` but NOT `… +N line(s)`. WHY a dedicated regex: the
+ * "+N tool uses" collapse wall is ALWAYS sub-agent panel chatter, whereas the
+ * "+N lines" form `COLLAPSE_MARKER_RE` also matches is a legitimate tool-body
+ * summary. The classifier uses this to drop an ORPHAN "+N tool uses" wall (panel
+ * already closed / scrolled off) as chrome instead of leaking it as prose,
+ * without ever swallowing a real "+N lines" tool-body summary.
+ */
+export const COLLAPSE_TOOLUSE_MARKER_RE = /^\s*…\s*\+\d+\s+tool uses?\b.*$/;
 
 /**
  * @description Turn / sub-agent completion summary (`Done (14 tool uses ·

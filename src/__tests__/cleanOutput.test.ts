@@ -383,6 +383,16 @@ test('checkIsStatusOutput: lone glyph/stat fragments stay status', () => {
   assert.equal(checkIsStatusOutput('◉ xhigh'), true);
 });
 
+test('checkIsStatusOutput: the 💭 thinking-short collapse line is permanent, NOT status', () => {
+  // S5 live bug: the router emits "💭 thought for {N}s" / "💭 думал {N} с" as a
+  // DELIBERATE permanent collapse line, but its short glyph-led shape (and the
+  // EN `thought for \d` rule) made checkIsStatusOutput fold it into the ephemeral
+  // status frame → it never reached the topic. The 💭 marker must read as real.
+  assert.equal(checkIsStatusOutput('💭 думал 6 с'), false);
+  assert.equal(checkIsStatusOutput('💭 thought for 6s'), false);
+  assert.equal(checkIsStatusOutput('💭 thought for 1m 6s'), false);
+});
+
 test('checkIsStatusOutput: substantial multi-line content is not status', () => {
   assert.equal(
     checkIsStatusOutput('Here is a fairly long answer paragraph that clearly is real content and exceeds the length and structure heuristics used to spot spinners.'),

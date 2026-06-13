@@ -626,6 +626,14 @@ function normalizeToolCallLine(line: string): string {
  * Status/progress is short, has few lines, and contains indicators like … or time/token stats.
  */
 export function checkIsStatusOutput(text: string): boolean {
+  // The thinking-`short` collapse line the router emits ("💭 thought for {N}s" /
+  // "💭 думал {N} с", S5) is a DELIBERATE permanent artifact. Its short,
+  // glyph-led, sentence-less shape otherwise trips the heuristics below (and the
+  // EN form the `thought for \d` rule), so a standalone collapse chunk would be
+  // folded into the ephemeral status frame and lost. The 💭 marker is the bot's
+  // own collapse glyph — treat it as real permanent content.
+  if (text.trimStart().startsWith('💭')) return false;
+
   // Real content is always substantial
   if (text.length > 200) return false;
 
@@ -3777,11 +3785,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
               );
 
               if (checkIsStatusOutput(cleanedOutput)) {
+                // S6 (c): when this same poll ALSO folded a verbosity activity
+                // (🔧 tool / 🤖 sub-agent / ☁️ thinking), that routed line is the
+                // INTENTIONAL minimal-mode indicator — prefer it over the
+                // incidental transient so the rolling status reads cleanly
+                // (the transient must not shadow the routed activity). Real
+                // permanent output is the `else` below and still always wins.
+                const statusText = activityLine ?? cleanedOutput;
                 // Deduplicate spinner updates: normalize spinner character and compare
-                const normalized = cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
-                if (normalized !== session.lastStatusText) {
-                  session.lastStatusText = normalized;
-                  this.emit('status', key, cleanedOutput);
+                const dedupKey = activityLine ?? cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
+                if (dedupKey !== session.lastStatusText) {
+                  session.lastStatusText = dedupKey;
+                  this.emit('status', key, statusText);
                 }
               } else {
                 session.lastStatusText = '';

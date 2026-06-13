@@ -23,13 +23,18 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   resolveThreadKey,
+  resolveDmThreadKey,
   resolvePairingCandidate,
   checkIsGeneralTopic,
+  checkIsChatMode,
   GENERAL_THREAD_ID,
+  DM_GENERAL_THREAD_ID,
 } from '../threadRouting';
 
 const ALLOWED = -1001234567890;
 const ALLOWED_USER = 555;
+/** In DM mode the owner's private-chat id IS the owner's user id. */
+const OWNER_USER_ID = 7000001;
 
 test('R2: GENERAL_THREAD_ID constant is 1 (Telegram contract)', () => {
   // The General topic id is baked into Telegram's protocol; if this
@@ -224,4 +229,91 @@ test('pair: undefined chat is rejected (defensive)', () => {
     isEnvLocked: false,
   });
   assert.equal(id, null);
+});
+
+// ─── DM-mode key resolution (P1+P2 foundation) ──────────────────────────
+//
+// `resolveDmThreadKey` is the owner-gated key resolver for the DM surface. It
+// is the load-bearing decision for DM access control: the SAME equality both
+// gates the chat (only the owner's private chat) and identifies the owner
+// (the private-chat id equals the owner user id). These tests prove a wrong
+// user / wrong chat type → null (no access), and the owner's DM → a key, plus
+// the DM "General" normalisation (no message_thread_id → 0).
+
+const ownerDmChat = { id: OWNER_USER_ID, type: 'private' };
+
+test('DM: owner private chat with a topic thread → key (chatId=ownerId)', () => {
+  const key = resolveDmThreadKey(
+    { chat: ownerDmChat, message: { message_thread_id: 500001 } },
+    OWNER_USER_ID,
+  );
+  assert.deepEqual(key, { chatId: OWNER_USER_ID, threadId: 500001 });
+});
+
+test('DM: owner private chat with NO message_thread_id → General (threadId=0)', () => {
+  const key = resolveDmThreadKey({ chat: ownerDmChat, message: {} }, OWNER_USER_ID);
+  assert.deepEqual(key, { chatId: OWNER_USER_ID, threadId: DM_GENERAL_THREAD_ID });
+  assert.equal(DM_GENERAL_THREAD_ID, 0);
+  assert.equal(checkIsGeneralTopic(key!, 'dm'), true);
+});
+
+test('DM: a DIFFERENT user’s private chat is rejected (owner gating)', () => {
+  // Any user can DM a bot — only the configured owner is allowed. The chat id
+  // of a non-owner DM is that user’s id, which must not equal OWNER_USER_ID.
+  const key = resolveDmThreadKey(
+    { chat: { id: 999, type: 'private' }, message: {} },
+    OWNER_USER_ID,
+  );
+  assert.equal(key, null);
+});
+
+test('DM: a supergroup update is rejected in DM mode (private-only)', () => {
+  const key = resolveDmThreadKey(
+    {
+      chat: { id: ALLOWED, type: 'supergroup', is_forum: true },
+      message: { message_thread_id: 42, is_topic_message: true },
+    },
+    OWNER_USER_ID,
+  );
+  assert.equal(key, null);
+});
+
+test('DM: undefined chat is rejected (defensive)', () => {
+  const key = resolveDmThreadKey({ chat: undefined, message: {} }, OWNER_USER_ID);
+  assert.equal(key, null);
+});
+
+test('DM: callback-query routes via callbackQueryMessage when ctx.message is absent', () => {
+  const key = resolveDmThreadKey(
+    {
+      chat: ownerDmChat,
+      message: undefined,
+      callbackQueryMessage: { message_thread_id: 500001 },
+    },
+    OWNER_USER_ID,
+  );
+  assert.deepEqual(key, { chatId: OWNER_USER_ID, threadId: 500001 });
+});
+
+// ─── mode-aware checkIsGeneralTopic ─────────────────────────────────────
+
+test('checkIsGeneralTopic: General marker is 1 in group mode, 0 in DM mode', () => {
+  // Group surface: threadId 1 is General, 0 is not.
+  assert.equal(checkIsGeneralTopic({ chatId: ALLOWED, threadId: 1 }, 'group'), true);
+  assert.equal(checkIsGeneralTopic({ chatId: ALLOWED, threadId: 0 }, 'group'), false);
+  // DM surface: threadId 0 is General, 1 is not.
+  assert.equal(checkIsGeneralTopic({ chatId: OWNER_USER_ID, threadId: 0 }, 'dm'), true);
+  assert.equal(checkIsGeneralTopic({ chatId: OWNER_USER_ID, threadId: 1 }, 'dm'), false);
+  // Default mode is group → unchanged for existing callers/tests.
+  assert.equal(checkIsGeneralTopic({ chatId: ALLOWED, threadId: 1 }), true);
+});
+
+// ─── CHAT_MODE validation guard ─────────────────────────────────────────
+
+test('checkIsChatMode accepts only the two known surfaces', () => {
+  assert.equal(checkIsChatMode('group'), true);
+  assert.equal(checkIsChatMode('dm'), true);
+  assert.equal(checkIsChatMode('supergroup'), false);
+  assert.equal(checkIsChatMode('DM'), false); // case-sensitive, mirrors env intent
+  assert.equal(checkIsChatMode(''), false);
 });

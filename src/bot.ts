@@ -63,7 +63,15 @@ import { classifyBoot } from './bootClassifier';
 import { t } from './i18n';
 import { validateSubdir, resolveBoundWorkDir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { validateNewFolderName, NewFolderNameError } from './folderName';
-import { resolveThreadKey, resolvePairingCandidate, GENERAL_THREAD_ID } from './threadRouting';
+import {
+  resolveThreadKey,
+  resolveDmThreadKey,
+  resolvePairingCandidate,
+  checkIsChatMode,
+  GENERAL_THREAD_ID,
+  DM_GENERAL_THREAD_ID,
+  type ChatMode,
+} from './threadRouting';
 import { AdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
 import { downloadFile } from './utils/download';
 import { stripCommandBotMention } from './utils';
@@ -178,6 +186,35 @@ function parseEnv() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) errors.push('TELEGRAM_BOT_TOKEN is required');
 
+  // CHAT_MODE selects the served surface: `group` (forum supergroup, the
+  // historical default) or `dm` (the owner's private chat with forum topics).
+  // Unset → `group`, so an existing deployment is byte-for-byte unchanged. An
+  // unknown value fails fast (same intent as the ALLOWED_GROUP_ID numeric gate).
+  const chatModeRaw = (process.env.CHAT_MODE ?? '').trim();
+  let chatMode: ChatMode = 'group';
+  if (chatModeRaw) {
+    if (checkIsChatMode(chatModeRaw)) {
+      chatMode = chatModeRaw;
+    } else {
+      errors.push(`CHAT_MODE must be "group" or "dm" (got "${chatModeRaw}")`);
+    }
+  }
+
+  // OWNER_USER_ID is the numeric Telegram user id allowed to use the bot in DM
+  // mode (the owner's private-chat id equals their user id). REQUIRED when
+  // CHAT_MODE=dm — without it the DM surface would have no access authority at
+  // all (any user can DM a bot). Ignored in group mode (admins gate there).
+  const ownerUserIdRaw = (process.env.OWNER_USER_ID ?? '').trim();
+  let ownerUserId = NaN;
+  if (ownerUserIdRaw) {
+    ownerUserId = Number(ownerUserIdRaw);
+    if (!Number.isFinite(ownerUserId)) {
+      errors.push('OWNER_USER_ID must be a numeric Telegram user id');
+    }
+  } else if (chatMode === 'dm') {
+    errors.push('OWNER_USER_ID is required when CHAT_MODE=dm (numeric Telegram user id)');
+  }
+
   // Access authority is fully runtime: the creator + administrators of the
   // served forum group (read live via getChatAdministrators, cached). There is
   // no static user allow-list env any more — the old ALLOWED_USERS is removed.
@@ -215,6 +252,8 @@ function parseEnv() {
 
   return {
     botToken: botToken!,
+    chatMode,
+    ownerUserId,
     allowedGroupId,
     workRoot,
     defaultAgent: process.env.DEFAULT_AGENT || 'claude',
@@ -241,6 +280,29 @@ let effectiveGroupId: number | null = isGroupLockedByEnv ? ENV.allowedGroupId : 
 /** The forum supergroup id currently in effect, or `null` while unpaired. */
 function getAllowedGroupId(): number | null {
   return effectiveGroupId;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Served-surface mode — group (forum supergroup) vs dm (owner private chat)
+//
+//  Selected at boot by CHAT_MODE; group is the default so an existing supergroup
+//  deployment is unchanged. In dm mode the only access authority is the
+//  configured OWNER_USER_ID (validated as present + numeric in parseEnv).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** The served surface in effect for this process (fixed at boot). */
+function getChatMode(): ChatMode {
+  return ENV.chatMode;
+}
+
+/** The owner's Telegram user id (DM mode access authority), or `NaN` in group mode. */
+function getOwnerUserId(): number {
+  return ENV.ownerUserId;
+}
+
+/** Convenience predicate — true iff the bot serves the owner's DM. */
+function checkIsDmMode(): boolean {
+  return getChatMode() === 'dm';
 }
 
 const telegramAgent = new https.Agent({
@@ -276,8 +338,14 @@ const adminCache = new AdminCache({
   ttlMs: ADMIN_CACHE_TTL_MS,
 });
 
-/** True iff `userId` is currently a creator/admin of the served group (cached). */
+/**
+ * True iff `userId` may use the bot. In DM mode that is exactly the configured
+ * owner; in group mode it is a creator/admin of the served group (cached).
+ */
 async function checkIsAllowedUser(userId: number): Promise<boolean> {
+  if (checkIsDmMode()) {
+    return userId === getOwnerUserId();
+  }
   const adminIds = await adminCache.getAdminIds();
   return adminIds.has(userId);
 }
@@ -1109,29 +1177,35 @@ function markNeedsNewMessage(key: ThreadKey): void {
 function getThreadKey(ctx: Context): ThreadKey | null {
   const msg = ctx.message as Message | undefined;
   const cbMsg = ctx.callbackQuery?.message as Message | undefined;
-  return resolveThreadKey(
-    {
-      chat: getRouteChat(ctx),
-      message: msg
-        ? {
-            message_thread_id: 'message_thread_id' in msg ? msg.message_thread_id : undefined,
-            is_topic_message: 'is_topic_message' in msg ? msg.is_topic_message : undefined,
-          }
-        : undefined,
-      callbackQueryMessage: cbMsg
-        ? {
-            message_thread_id: 'message_thread_id' in cbMsg ? cbMsg.message_thread_id : undefined,
-            is_topic_message: 'is_topic_message' in cbMsg ? cbMsg.is_topic_message : undefined,
-          }
-        : undefined,
-    },
-    getAllowedGroupId() ?? NaN,
-  );
+  const routeInput = {
+    chat: getRouteChat(ctx),
+    message: msg
+      ? {
+          message_thread_id: 'message_thread_id' in msg ? msg.message_thread_id : undefined,
+          is_topic_message: 'is_topic_message' in msg ? msg.is_topic_message : undefined,
+        }
+      : undefined,
+    callbackQueryMessage: cbMsg
+      ? {
+          message_thread_id: 'message_thread_id' in cbMsg ? cbMsg.message_thread_id : undefined,
+          is_topic_message: 'is_topic_message' in cbMsg ? cbMsg.is_topic_message : undefined,
+        }
+      : undefined,
+  };
+  if (checkIsDmMode()) {
+    return resolveDmThreadKey(routeInput, getOwnerUserId());
+  }
+  return resolveThreadKey(routeInput, getAllowedGroupId() ?? NaN);
 }
 
-/** Is this thread the General forum topic? */
+/**
+ * @description Is this thread the General topic? The General marker differs per
+ * surface — `1` in the supergroup, `0` (no `message_thread_id`) in the DM — so
+ * the check is mode-aware.
+ */
 function checkIsGeneral(key: ThreadKey): boolean {
-  return key.threadId === GENERAL_THREAD_ID;
+  const generalThreadId = checkIsDmMode() ? DM_GENERAL_THREAD_ID : GENERAL_THREAD_ID;
+  return key.threadId === generalThreadId;
 }
 
 /**
@@ -1153,6 +1227,10 @@ function getRouteChat(ctx: Context): { id: number; type: string; is_forum?: bool
  * id by hand. Re-pointing later is done explicitly via `/pair`.
  */
 async function tryAutoPair(ctx: Context): Promise<void> {
+  // Pairing is a group-mode concept (adopt a forum supergroup). In DM mode the
+  // served chat is fixed (the owner's DM) — nothing to pair, so this is inert.
+  if (checkIsDmMode()) return;
+
   const chat = getRouteChat(ctx);
 
   // While unpaired, log every incoming update so the operator can see
@@ -1211,17 +1289,17 @@ async function authoriseContext(ctx: Context): Promise<ThreadKey | null> {
   const key = getThreadKey(ctx);
   if (!key) {
     if (ctx.chat) {
-      console.warn(
-        `[security] ignored update from chat ${ctx.chat.id} (not the forum supergroup we listen to)`,
-      );
+      const surface = checkIsDmMode() ? "the owner's DM" : 'the forum supergroup we listen to';
+      console.warn(`[security] ignored update from chat ${ctx.chat.id} (not ${surface})`);
     }
     return null;
   }
-  // Refresh the group-title cache from this authorised update — group chats
-  // (supergroups) always carry `chat.title`. Feeds the thread-context
-  // preamble (S2). Cheap, idempotent, and the only place every accepted
-  // update funnels through.
-  if (ctx.chat && 'title' in ctx.chat && ctx.chat.title) {
+  // Refresh the group-title cache from this authorised update — supergroups
+  // always carry `chat.title`. Feeds the thread-context preamble (S2). Cheap,
+  // idempotent, and the only place every accepted update funnels through. A
+  // private chat has no `title`, so in DM mode there is nothing to cache (the
+  // preamble falls back to the bot name) — skip it explicitly.
+  if (!checkIsDmMode() && ctx.chat && 'title' in ctx.chat && ctx.chat.title) {
     groupTitleCache.set(ctx.chat.id, ctx.chat.title);
   }
   return key;
@@ -2659,6 +2737,20 @@ async function forwardPromptToAgent(
  * inject we record the preamble as the new marker so identical follow-up
  * prompts don't repeat it.
  */
+/**
+ * @description Resolve the `group:` label for the thread-context preamble.
+ * In group mode it's the cached supergroup title (empty until the first
+ * authorised update after a restart). A private chat has no title, so DM mode
+ * falls back to the bot's own display name — a stable, non-fatal label so the
+ * agent still gets a "where" even though there is no group.
+ */
+function getPreambleGroupTitle(chatId: number): string | undefined {
+  const cached = groupTitleCache.get(chatId);
+  if (cached) return cached;
+  if (checkIsDmMode()) return bot.botInfo?.username ?? bot.botInfo?.first_name;
+  return undefined;
+}
+
 function getPromptWithThreadContext(key: ThreadKey, text: string): string {
   if (checkShouldSkipPreambleForText(text)) return text;
 
@@ -2666,7 +2758,7 @@ function getPromptWithThreadContext(key: ThreadKey, text: string): string {
   const subdir = binding?.subdir ?? path.basename(ENV.workRoot);
   const preamble = buildThreadContextPreamble({
     topicName: binding?.topicName,
-    groupTitle: groupTitleCache.get(key.chatId),
+    groupTitle: getPreambleGroupTitle(key.chatId),
     key,
     subdir,
   });
@@ -3291,6 +3383,14 @@ command('whoami', async (ctx, key) => {
 bot.command('pair', async (ctx) => {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  // DM mode has no group to pair — there is exactly one served chat (the
+  // owner's DM). Reply only to the owner so foreign DMs stay silent.
+  if (checkIsDmMode()) {
+    const dmKey = getThreadKey(ctx);
+    if (dmKey) await replyToThread(dmKey, t('pair.dm')).catch(() => {});
+    return;
+  }
 
   const routeChat = getRouteChat(ctx);
   const fallbackThreadId =

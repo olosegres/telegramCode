@@ -196,6 +196,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'pair.only_forum': '❌ /pair работает только в forum-супергруппе (включи Topics).',
     'pair.not_admin': '❌ Привязать бота может только администратор или создатель группы.',
     'pair.not_paired': 'группа ещё не привязана (режим pairing)',
+    'pair.dm': 'ℹ️ /pair не нужен в режиме DM — бот работает в твоём личном чате.',
     'version.report':
       '*telegramCode {bot}*\n' +
       'Node: {node}\n' +
@@ -595,6 +596,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'pair.only_forum': '❌ /pair only works inside a forum supergroup (enable Topics).',
     'pair.not_admin': '❌ Only a group administrator or creator can pair the bot.',
     'pair.not_paired': 'group not paired yet (pairing mode)',
+    'pair.dm': "ℹ️ /pair isn't needed in DM mode — the bot serves your private chat.",
     'version.report':
       '*telegramCode {bot}*\n' +
       'Node: {node}\n' +

@@ -24,6 +24,31 @@ import type { ThreadKey } from './types';
 export const GENERAL_THREAD_ID = 1;
 
 /**
+ * @description "General" thread id in the owner-DM surface. A message posted to
+ * the DM's main thread carries NO `message_thread_id`; we normalise that to `0`
+ * (distinct from the supergroup's `1`) so the two surfaces never collide in a
+ * persisted `ThreadKey` and `checkIsGeneral` can stay mode-aware.
+ */
+export const DM_GENERAL_THREAD_ID = 0;
+
+/**
+ * @description Which Telegram surface the bot serves.
+ *
+ * - `group` — the historical forum supergroup (creator/admins gated, paired by
+ *   `ALLOWED_GROUP_ID`). DEFAULT; unchanged behaviour.
+ * - `dm` — the owner's 1:1 private chat with forum-topic mode (owner-id gated).
+ */
+export type ChatMode = 'group' | 'dm';
+
+/** The valid {@link ChatMode} values, for env validation. */
+export const chatModeValues: readonly ChatMode[] = ['group', 'dm'];
+
+/** Type guard: is `value` a valid {@link ChatMode}? */
+export function checkIsChatMode(value: string): value is ChatMode {
+  return (chatModeValues as readonly string[]).includes(value);
+}
+
+/**
  * @description Minimal shape of the bits of `ctx.chat` we read. We accept
  * `unknown` widths on optional fields so callers can pass a Telegraf
  * `Chat` union without casting.
@@ -90,12 +115,42 @@ export function resolveThreadKey(input: RouteInput, allowedGroupId: number): Thr
 }
 
 /**
+ * @description Compute the `ThreadKey` for an incoming update in DM mode, or
+ * `null` if the bot should ignore it.
+ *
+ * The DM surface accepts updates ONLY from the OWNER'S private chat — and the
+ * owner's private-chat id IS the owner's user id, so a single equality both
+ * gates the chat and identifies the owner:
+ *   1. `chat.type === 'private'` — any non-DM update is ignored here.
+ *   2. `chat.id === ownerUserId` — only the owner's DM, never another user's.
+ *
+ * The thread is the DM-topic's `message_thread_id`; a message in the DM's main
+ * thread carries none → normalised to {@link DM_GENERAL_THREAD_ID} (0). Unlike
+ * the supergroup path there is no `is_topic_message` gate: a private chat has no
+ * reply-thread/topic ambiguity to disambiguate.
+ */
+export function resolveDmThreadKey(input: RouteInput, ownerUserId: number): ThreadKey | null {
+  const chat = input.chat;
+  if (!chat || chat.type !== 'private') return null;
+  if (chat.id !== ownerUserId) return null;
+
+  const msg = input.message ?? input.callbackQueryMessage;
+  const threadId = msg?.message_thread_id ?? DM_GENERAL_THREAD_ID;
+  return { chatId: chat.id, threadId };
+}
+
+/**
  * @description Convenience: is this the General topic? Used by command
  * handlers that have different semantics in General vs. a thematic topic
  * (e.g. `/ls` is General-only, `/bind` is topic-only).
+ *
+ * Mode-aware: the supergroup surface marks General with `1`, the DM surface
+ * with `0` (no `message_thread_id`). Pass the active {@link ChatMode} so the
+ * right marker is checked.
  */
-export function checkIsGeneralTopic(key: ThreadKey): boolean {
-  return key.threadId === GENERAL_THREAD_ID;
+export function checkIsGeneralTopic(key: ThreadKey, mode: ChatMode = 'group'): boolean {
+  const generalThreadId = mode === 'dm' ? DM_GENERAL_THREAD_ID : GENERAL_THREAD_ID;
+  return key.threadId === generalThreadId;
 }
 
 /** Inputs for the auto-pairing decision (side-effect free). */

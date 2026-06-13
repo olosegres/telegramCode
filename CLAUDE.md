@@ -201,9 +201,12 @@ config/variants, not a per-message API field).
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
 | `utils/displayVerbosity.ts` | THE shared display-verbosity vocabulary for `/thinking` / `/tool_results` / `/subagent`: option order (`displayVerbosityModeOptions`: minimal, short, full), the locked default (`defaultDisplayVerbosityMode` = `minimal`), the type guard (`checkIsDisplayVerbosityMode`), and the legacy-name normalization (`normalizeDisplayVerbosityMode`: `detailed`→`full`, `brief`→`short`, `hide`→`minimal`, `compact`→`short`; unknown→null) used both for old persisted values and old command/callback aliases |
 | `utils/verbosityRender.ts` | Pure decision helper for the `/verbosity` umbrella picker: `getUniformVerbosityLevel` returns the level all three display prefs share (✓ marker target) or `null` when mixed → rendered as "custom" with the three values spelled out. The macro's write path just reuses the per-command apply helpers in `bot.ts` |
-| `utils/thinkingRender.ts` | Pure decision/format helpers for the OpenCode thinking (chain-of-thought) lifecycle behind `/thinking`: the mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, and the "thought for {N}s" duration formatter |
+| `utils/thinkingRender.ts` | Pure decision/format helpers behind `/thinking`: the OpenCode mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, the ms→seconds formatter (`formatThinkingDurationSeconds`), and — for the Claude scrape path (no ms timestamps) — `parseThinkingDurationSeconds` (scrapes the duration out of the "Thinking for…" header / "✻ … for Ns" trailer) |
 | `utils/toolResultRender.ts` | Pure helpers for tool-result rendering behind `/tool_results`: mode→render action (`getToolResultRenderAction`), and the `short`-mode dual-cap truncation (`getTruncatedToolResult`, 15 lines / 1200 chars, line-boundary-preserving) |
 | `utils/subagentRender.ts` | Sub-agent rendering helpers behind `/subagent`: the mode×part-kind matrix the adapter consults for child-session parts (`getSubagentPartAction`: text→status/stream, tool→ignore/status, reasoning→always ignore; `minimal` ≡ `short` here, v1), the status-only rolling status line (`buildSubagentStatusText`), the parent-side in-flight delegation status (`buildDelegatingStatusText`) and the full-mode chunk marker (`buildSubagentOutputPrefix`) |
+| `utils/claudeScrapeShapes.ts` | THE single source of truth for Claude TUI line-shape regexes (one definition per shape): tool headers (`ANY_TOOL_HEADER_RE` superset of `OUTPUT_TOOL_HEADER_RE`+`FILE_TOOL_HEADER_RE` — incl. `Update`, Claude's render of Edit), `⎿` result marker, thinking header/trailer, collapse markers (`COLLAPSE_MARKER_RE` "+N tool uses/lines"; `COLLAPSE_TOOLUSE_MARKER_RE` "+N tool uses" only, for the orphan-panel-chatter drop), spinner ticks, chrome |
+| `utils/claudeChunkClassifier.ts` | Pure classifier for the Claude relay (S3): segments a scraped pane chunk into tagged runs (`classifyClaudeChunk` → thinking / tool-header / tool-body / sub-agent-panel-preview / prose / chrome), threading fence/block context across polls. Conservative default-to-prose so the answer is never swallowed; an orphan "+N tool uses" wall → chrome |
+| `utils/claudeRelayRouting.ts` | Pure per-pref router for the classifier's segments (S4–S6): `routeClaudeChunkSegments` keeps prose always, applies `/tool_results` + `/thinking` per segment (full keep / short truncate-or-collapse / minimal fold), always folds sub-agent panel previews to status, and returns `keptText` (permanent) + the one rolling `activityLine`; `checkIsClaudeRelayFastPath` is the all-`full` byte-identical regression anchor |
 | `utils/claudeSubagentTail.ts` | Pure decision logic for Claude's `/subagent full` transcript tailing: per-file tail state (byte offset + partial-line carry), the scan planner (`getSubagentTailReads`: first scan seeds offsets to EOF with no reads = no backlog replay; non-`full` modes fast-forward without reading; full returns `[offset..size)` ranges), the transcript filename filter (`checkIsSubagentTranscriptName`), and the extractor (`extractAppendedSubagentTexts`: assistant `text` blocks only — thinking/tool_use/user/attachment dropped, malformed JSONL lines skipped). The adapter's poll tick does the fs work |
 | `scheduler/recurrence.ts` | Pure schedule math on `croner`: `ScheduleSpec` (cron / once / N-times), validation (min fire interval 5 min), next-occurrence, human description, catch-up decision |
 | `scheduler/store.ts` | Schedule records: create path (slug ids, ≤30/thread cap, `isPinSilent`), persisted in `state.json` `schedules` (lifecycle-independent) |
@@ -370,26 +373,41 @@ as a command in `bot.ts`.
     with the three current values spelled out (decision helper
     `getUniformVerbosityLevel` in `utils/verbosityRender.ts`).
   - `/thinking [minimal|short|full]` and `/tool_results [minimal|short|full]`
-    set per-topic OpenCode-only DISPLAY modes (bot-rendering concerns, never
-    sent to the agent), persisted in `state.json` `displayPrefs` and
-    lifecycle-independent; a Claude-bound topic gets an "OpenCode only" reply
-    (its TUI renders all of it itself). `/subagent [minimal|short|full]` is
-    the same kind of persisted display pref but works on BOTH backends (see
-    below). All three commands share ONE unified mode vocabulary
+    set per-topic DISPLAY modes (bot-rendering concerns, never sent to the
+    agent), persisted in `state.json` `displayPrefs` and lifecycle-independent.
+    They work on **BOTH backends** now (`/tool_results` un-gated in S4,
+    `/thinking` in S5) — like `/subagent`. The MECHANISM differs per backend:
+    OpenCode renders from its SSE events; Claude has no API, so the scraped pane
+    chunk runs through the classifier (`utils/claudeChunkClassifier.ts` — tags
+    each run of lines thinking / tool-header / tool-body / sub-agent-panel-
+    preview / prose / chrome, threading fence context across polls) and the
+    per-pref relay router (`utils/claudeRelayRouting.ts`) which keeps /
+    truncates / folds each segment. PROSE is ALWAYS kept (the answer is never
+    swallowed); a sub-agent panel preview (incl. orphan "… +N tool uses" walls)
+    and `minimal`-mode tool/thinking always fold into the ONE rolling status
+    frame — this is what keeps a `minimal` topic quiet under a long delegation.
+    (`Update`, Claude's TUI render of the Edit tool, is in the recognised header
+    set, so Edit headers + their `⎿ Update(…)` previews route like any other
+    tool.) All three commands share ONE unified mode vocabulary
     (`minimal|short|full`, default `minimal`; old names
     `detailed`/`brief`/`hide`/`compact` persist/parse as hidden aliases via
     `utils/displayVerbosity.ts` — pickers and replies show only the new
     names). All offer inline mode buttons (✓ on current) and work with no
     session running. **`/thinking`** (default `minimal`) controls what REMAINS
     of the chain-of-thought — the live "☁️ thinking …" indicator shows in ALL
-    modes: `full` keeps the full streamed reasoning, `short` collapses it
-    to "💭 thought for {N}s", `minimal` deletes it when the answer starts.
-    **`/tool_results`** (default `minimal`) controls a completed tool call's
-    OUTPUT, posted as its own "🔧 <tool> →" + fenced message via a dedicated
-    `toolResult` adapter event (never mixed into the answer's continuation
-    chain): `full` = whole body (split over messages when long), `short` =
-    capped at 15 lines / 1200 chars with a "… (truncated, /tool_results full)"
-    footer, `minimal` = only the transient 🔧 status.
+    modes: `full` keeps the full reasoning, `short` collapses it to "💭 thought
+    for {N}s" (OpenCode times it from ms; Claude scrapes the duration from the
+    "Thinking for…" header / "✻ … for Ns" trailer via
+    `parseThinkingDurationSeconds`, and the "💭" collapse line is force-kept past
+    the status-frame heuristic so it isn't mistaken for a transient), `minimal`
+    keeps nothing permanent (the live status stays / is deleted when the answer
+    starts). **`/tool_results`** (default `minimal`) controls a completed tool
+    call's OUTPUT: `full` = whole body, `short` = capped at 15 lines / 1200
+    chars + a "… (truncated, /tool_results full)" footer, `minimal` = only the
+    transient 🔧 status. OpenCode posts it as its own "🔧 <tool> →" fenced
+    message via a dedicated `toolResult` event (never mixed into the answer's
+    continuation chain); Claude routes the scraped `● Tool(…)` header + `⎿` body
+    segments through the same keep/truncate/fold matrix.
     **`/subagent`** (default `minimal`) controls a sub-agent's transcript on
     BOTH backends — `minimal` ≡ `short` here (v1): both are status-only, so
     no mode ever hides the "working" indicator (locked decision). Shared

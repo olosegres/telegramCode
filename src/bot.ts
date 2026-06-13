@@ -4978,7 +4978,7 @@ bot.on(message('voice'), async (ctx) => {
     }
     const transcript = result.text;
     console.log(`[Bot] voice transcribed: "${transcript}"`);
-    await replyToThread(key, t('voice.transcribed', { text: transcript }));
+    void replyToThread(key, t('voice.transcribed', { text: transcript }), {}, 'status').catch(() => {});
 
     // Session is mid-startup → buffer the transcript and replay it once ready.
     if (startupPromptBuffer.checkIsStarting(keyToString(key))) {

@@ -168,6 +168,16 @@ export interface SchedulerMcpDeps {
   getThreadsForDirectory: (directory: string) => string[];
   /** Last-used adapter name for a thread, for the `lastAdapterName` snapshot. */
   getThreadAdapterName: (threadKey: string) => string | undefined;
+  /**
+   * Send 1..10 files/images from the thread's bound folder back into the topic.
+   * Path-safety, type classification, and the album/size decision live in the
+   * bot's `sendFilesToThread` (it owns Telegraf); this surface only routes the
+   * resolved thread + args and relays the `{ ok }` summary/error to the agent.
+   */
+  sendFilesToThread: (
+    threadKey: string,
+    opts: { paths: string[]; caption?: string; asFile?: boolean },
+  ) => Promise<{ ok: true; summary: string } | { ok: false; error: string }>;
   getSecret: () => Promise<string>;
   /** Listen port; defaults to {@link getSchedulerMcpPort}. Tests pass `0` for ephemeral. */
   port?: number;
@@ -293,6 +303,30 @@ const scheduleListShape = {
 
 const scheduleCancelShape = {
   id: z.string().min(1).describe('The schedule id to cancel (from schedule_list).'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe('Target thread "<chatId>:<threadId>". Required when a directory scope has more than one bound thread.'),
+};
+
+const sendFileShape = {
+  paths: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(10)
+    .describe(
+      'Files to send, as 1..10 paths RELATIVE to this topic\'s bound folder (absolute paths are accepted ' +
+        'only if they resolve inside it). A path outside the folder is rejected and nothing is sent. ' +
+        '2..10 paths are delivered as ONE album.',
+    ),
+  caption: z
+    .string()
+    .optional()
+    .describe('Optional caption (Telegram caps it at 1024 chars; longer is trimmed). For an album it rides the first file.'),
+  as_file: z
+    .boolean()
+    .optional()
+    .describe('Force "send as document" (original quality, no inline preview) even for images and gifs.'),
   threadKey: z
     .string()
     .optional()
@@ -468,16 +502,53 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
   );
 }
 
+/**
+ * @description Register the agent→Telegram `send_file` tool onto a fresh
+ * {@link McpServer}. Kept separate from {@link registerSchedulerTools} so the
+ * scheduler tools stay cohesive. Like every tool here it resolves the target
+ * thread from `scope` first (scope isolation — the agent can never name another
+ * topic); the actual path-safety + Telegraf send live in `deps.sendFilesToThread`.
+ */
+function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: SchedulerScope): void {
+  server.registerTool(
+    'send_file',
+    {
+      title: 'Send a file or image to this topic',
+      description:
+        'Send one or more files/images from THIS topic\'s bound folder back to the user in the topic. ' +
+        'Use it to deliver a generated chart, screenshot, report, etc. Paths are relative to the bound ' +
+        'folder; a path outside it is rejected and nothing is sent. Images (.png/.jpg/.jpeg/.webp) preview ' +
+        'inline, .gif autoplays, everything else arrives as a document — pass as_file:true to force document ' +
+        '(full quality) even for images. 2..10 paths are delivered as one album (a mixed or gif-containing ' +
+        'album falls back to documents). Caption is optional (trimmed to 1024 chars; on the first album item).',
+      inputSchema: sendFileShape,
+    },
+    async (args) => {
+      const resolved = resolveTargetThreadKey(scope, args.threadKey, deps.getThreadsForDirectory);
+      if (!resolved.ok) return errorResult(resolved.error);
+
+      const result = await deps.sendFilesToThread(resolved.threadKey, {
+        paths: args.paths,
+        caption: args.caption,
+        asFile: args.as_file,
+      });
+      return result.ok ? textResult(result.summary) : errorResult(result.error);
+    },
+  );
+}
+
 // ─── server factory ──────────────────────────────────────────────────
 
 /**
  * @description Build a fresh {@link McpServer} for one request, registering the
- * three scope-bound tools. The SDK binds one server per transport per connection,
- * so a new instance is built (and closed) per request in the stateless flow.
+ * scope-bound scheduler tools plus the `send_file` tool. The SDK binds one server
+ * per transport per connection, so a new instance is built (and closed) per
+ * request in the stateless flow.
  */
 function buildRequestServer(deps: SchedulerMcpDeps, scope: SchedulerScope): McpServer {
   const server = new McpServer({ name: mcpServerName, version: mcpServerVersion });
   registerSchedulerTools(server, deps, scope);
+  registerFileSendTool(server, deps, scope);
   return server;
 }
 

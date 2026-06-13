@@ -1,6 +1,11 @@
 import { Telegraf, Markup, type Context, type NarrowedContext } from 'telegraf';
 import { message } from 'telegraf/filters';
-import type { Update, Message } from 'telegraf/typings/core/types/typegram';
+import type {
+  Update,
+  Message,
+  InputMediaPhoto,
+  InputMediaDocument,
+} from 'telegraf/typings/core/types/typegram';
 import * as fs from 'fs';
 import { promises as fsp } from 'fs';
 import * as os from 'os';
@@ -85,6 +90,13 @@ import {
 } from './outputTrace';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { persistAdapterSessionIds } from './utils/persistAdapterSessionIds';
+import {
+  resolveSendFileWithinDir,
+  classifyFileSendKind,
+  planFileSend,
+  trimCaption,
+  type FileSendItem,
+} from './utils/fileSendPlan';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import {
   getThinkingEventAction,
@@ -7255,6 +7267,89 @@ function restoreApiRetries(): void {
 }
 
 /**
+ * @description The bot side of the agent's `send_file` MCP tool: resolve the
+ * thread's bound folder, path-check each file against it, decide the send
+ * plan (single method / album / error), and dispatch through `enqueueSend`
+ * (per-thread FIFO + 429 retry + output trace). Returns a typed `{ ok }` the
+ * MCP surface relays to the agent — every failure mode is reported, never thrown
+ * past this boundary, so the agent learns when a send didn't happen.
+ */
+async function sendFilesToThread(
+  threadKeyStr: string,
+  opts: { paths: string[]; caption?: string; asFile?: boolean },
+): Promise<{ ok: true; summary: string } | { ok: false; error: string }> {
+  let key: ThreadKey;
+  try {
+    key = keyFromString(threadKeyStr);
+  } catch {
+    return { ok: false, error: `invalid threadKey "${threadKeyStr}"` };
+  }
+
+  const decision = getWorkDirStartDecision(key);
+  if (!decision.ok) return { ok: false, error: decision.message };
+  const { workDir } = decision;
+
+  const items: FileSendItem[] = [];
+  for (const rawPath of opts.paths) {
+    const resolved = resolveSendFileWithinDir(workDir, rawPath);
+    if (!resolved.ok) return { ok: false, error: resolved.error };
+    let sizeBytes: number;
+    try {
+      sizeBytes = fs.statSync(resolved.absPath).size;
+    } catch (e) {
+      return { ok: false, error: `cannot read ${rawPath}: ${(e as Error).message}` };
+    }
+    items.push({ absPath: resolved.absPath, sizeBytes, kind: classifyFileSendKind(resolved.absPath) });
+  }
+
+  const plan = planFileSend(items, opts.asFile ?? false);
+  if (plan.kind === 'error') return { ok: false, error: plan.error };
+
+  const caption = trimCaption(opts.caption);
+
+  try {
+    if (plan.kind === 'send') {
+      const source = { source: plan.item.absPath };
+      const extra = buildSendExtra(key, caption !== undefined ? { caption } : {});
+      switch (plan.mode) {
+        case 'photo':
+          await enqueueSend(key, () => bot.telegram.sendPhoto(key.chatId, source, extra));
+          break;
+        case 'animation':
+          await enqueueSend(key, () => bot.telegram.sendAnimation(key.chatId, source, extra));
+          break;
+        case 'document':
+          await enqueueSend(key, () => bot.telegram.sendDocument(key.chatId, source, extra));
+          break;
+      }
+    } else {
+      // Album: caption rides the first item only; the group extra just carries
+      // the thread routing (no caption field at the group level).
+      const groupExtra = buildSendExtra(key, {});
+      if (plan.mode === 'albumPhoto') {
+        const media: InputMediaPhoto[] = plan.items.map((it, index) => ({
+          type: 'photo',
+          media: { source: it.absPath },
+          ...(index === 0 && caption !== undefined ? { caption } : {}),
+        }));
+        await enqueueSend(key, () => bot.telegram.sendMediaGroup(key.chatId, media, groupExtra));
+      } else {
+        const media: InputMediaDocument[] = plan.items.map((it, index) => ({
+          type: 'document',
+          media: { source: it.absPath },
+          ...(index === 0 && caption !== undefined ? { caption } : {}),
+        }));
+        await enqueueSend(key, () => bot.telegram.sendMediaGroup(key.chatId, media, groupExtra));
+      }
+    }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+
+  return { ok: true, summary: `Sent ${items.length} file(s) to the topic.` };
+}
+
+/**
  * @description Construct the scheduler stack (S8): run ledger → delivery (thin
  * lambdas over the bot's existing send/session functions) → timer engine
  * (assigned to the module-level {@link schedulerEngine}) → the bot-owned MCP
@@ -7327,6 +7422,7 @@ function wireScheduler(): SchedulerMcpHandle {
       const key = keyFromString(threadKeyStr);
       return getThreadAdapterNameRaw(key) ?? state.getAgent(key)?.name;
     },
+    sendFilesToThread,
     getSecret: () => state.getSchedulerMcpSecret(),
   });
 }

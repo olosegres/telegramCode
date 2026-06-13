@@ -651,5 +651,14 @@ export interface AgentAdapter extends EventEmitter {
    */
   isSurveyPending?(key: ThreadKey): boolean;
 
+  /**
+   * @description Whether Claude's `/login` OAuth "Paste code here" box is on
+   * the TUI screen. While it is, the bot routes ANY text reply verbatim into
+   * the box (the pasted code is a long free-form string, not a control reply),
+   * skipping the prompt path whose Escape would cancel the login and whose
+   * preamble would corrupt the code. Only Claude implements it.
+   */
+  isLoginPastePending?(key: ThreadKey): boolean;
+
   getFullOutput?(key: ThreadKey, lines?: number): string | null;
 }

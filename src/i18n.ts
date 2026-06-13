@@ -228,6 +228,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
     'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
     'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
+    'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',
     'agent.workingIndicator': '{glyph} работаю…',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──
@@ -634,6 +635,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.start_failed': 'Failed to start {label}: {error}',
     'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
     'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
+    'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',
     'agent.workingIndicator': '{glyph} working…',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──

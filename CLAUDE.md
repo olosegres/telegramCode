@@ -324,6 +324,15 @@ as a command in `bot.ts`.
     interrupt Escape); any other text breaks out as a fresh prompt. Pre-fix
     the digit was forwarded as a prompt and its Escape cancelled the menu
     ("Login interrupted").
+  - **`/login` OAuth code paste.** The login flow's last step shows
+    `Paste code here if prompted >` (a plain `>` box, not `❯`/a selector).
+    While it is up (`isLoginPastePending`, `checkIsClaudeLoginPaste` off the
+    last pane) ANY text reply is typed VERBATIM via `sendInput` — no Escape, no
+    thread-context preamble — then the user's message is deleted from the topic
+    (the code is a single-use secret) and a `🔐 code relayed` confirmation is
+    posted. Pre-fix the long code fell to the prompt path, whose Escape
+    cancelled the login and whose preamble corrupted the code ("login can't be
+    done via the bot").
   - `/model` picked with NO running session persists as the thread pref and
     applies on the next agent start (OpenCode; Claude refuses — its model
     switch is a TUI keystroke with nothing to persist).

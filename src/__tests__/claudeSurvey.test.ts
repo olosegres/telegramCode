@@ -25,6 +25,7 @@ import {
   checkIsClaudeSurvey,
   getClaudeSendKeysPlan,
   getClaudeReplyRoute,
+  checkIsClaudeLoginPaste,
 } from '../adapters/claudeCliAdapter';
 
 // The real survey frame captured live (2026-06-09): the `● ` assistant bullet
@@ -153,17 +154,32 @@ test('default still appends a paste-race-verified Enter for a plain prompt — n
 test('a pending AskUserQuestion selector BEATS a survey for a digit reply', () => {
   // Both pending + a digit → the real question wins (it is the user's actual
   // decision); the survey must not hijack the keystroke.
-  const route = getClaudeReplyRoute({ isQuestionPending: true, isSurveyPending: true, text: '2' });
+  const route = getClaudeReplyRoute({
+    isQuestionPending: true,
+    isSurveyPending: true,
+    isLoginPastePending: false,
+    text: '2',
+  });
   assert.equal(route, 'selector');
 });
 
 test('a survey + a bare digit → answers the survey', () => {
-  const route = getClaudeReplyRoute({ isQuestionPending: false, isSurveyPending: true, text: '0' });
+  const route = getClaudeReplyRoute({
+    isQuestionPending: false,
+    isSurveyPending: true,
+    isLoginPastePending: false,
+    text: '0',
+  });
   assert.equal(route, 'survey');
 });
 
 test('a survey + a y/n reply → answers the survey', () => {
-  const route = getClaudeReplyRoute({ isQuestionPending: false, isSurveyPending: true, text: 'y' });
+  const route = getClaudeReplyRoute({
+    isQuestionPending: false,
+    isSurveyPending: true,
+    isLoginPastePending: false,
+    text: 'y',
+  });
   assert.equal(route, 'survey');
 });
 
@@ -171,12 +187,59 @@ test('a survey + free-form prose → breaks out as a normal prompt', () => {
   const route = getClaudeReplyRoute({
     isQuestionPending: false,
     isSurveyPending: true,
+    isLoginPastePending: false,
     text: 'actually, do something else',
   });
   assert.equal(route, 'prompt');
 });
 
 test('nothing pending + a digit → a normal prompt (a bare "1" is never hijacked)', () => {
-  const route = getClaudeReplyRoute({ isQuestionPending: false, isSurveyPending: false, text: '1' });
+  const route = getClaudeReplyRoute({
+    isQuestionPending: false,
+    isSurveyPending: false,
+    isLoginPastePending: false,
+    text: '1',
+  });
   assert.equal(route, 'prompt');
+});
+
+// ── /login OAuth code paste routing ──
+
+test('login paste box up + a pasted code → routes verbatim into the box', () => {
+  // The OAuth code is a long free-form string, NOT a control reply: without
+  // the loginPaste route it would fall to `prompt`, whose Escape cancels the
+  // login flow and whose preamble corrupts the code (the live "can't log in
+  // via the bot" bug).
+  const route = getClaudeReplyRoute({
+    isQuestionPending: false,
+    isSurveyPending: false,
+    isLoginPastePending: true,
+    text: 'abc123XYZ#def456-the-oauth-code',
+  });
+  assert.equal(route, 'loginPaste');
+});
+
+test('a real selector still beats the login-paste route for a control reply', () => {
+  // Defensive precedence: the screens are mutually exclusive, but if both
+  // flags were ever set a bare digit must still drive the selector.
+  const route = getClaudeReplyRoute({
+    isQuestionPending: true,
+    isSurveyPending: false,
+    isLoginPastePending: true,
+    text: '1',
+  });
+  assert.equal(route, 'selector');
+});
+
+test('checkIsClaudeLoginPaste matches the /login paste screen, not normal panes', () => {
+  const pasteScreen = [
+    'Browser didn’t open? Use the url below to sign in:',
+    'https://claude.ai/oauth/authorize?code=true&client_id=...',
+    '',
+    'Paste code here if prompted > ',
+  ].join('\n');
+  assert.equal(checkIsClaudeLoginPaste(pasteScreen), true);
+  assert.equal(checkIsClaudeLoginPaste('❯ normal input box'), false);
+  assert.equal(checkIsClaudeLoginPaste('Select login method:'), false);
+  assert.equal(checkIsClaudeLoginPaste(''), false);
 });

@@ -1202,7 +1202,7 @@ export function getClaudeSendKeysPlan(
 }
 
 /** Where a Claude text reply should be routed while a prompt may be on screen. */
-export type ClaudeReplyRoute = 'selector' | 'survey' | 'prompt';
+export type ClaudeReplyRoute = 'selector' | 'survey' | 'loginPaste' | 'prompt';
 
 /**
  * @description Decide how to route a user TEXT reply for a Claude thread,
@@ -1214,18 +1214,39 @@ export type ClaudeReplyRoute = 'selector' | 'survey' | 'prompt';
  *      (digit / y / n) → `'selector'` (drive the menu in place).
  *   2. Else a survey pending + a bare control reply → `'survey'`
  *      (answer the bare-digit survey).
- *   3. Else → `'prompt'` (a fresh turn; free-form prose breaks out of any
+ *   3. Else the `/login` "Paste code here" box is on screen → `'loginPaste'`:
+ *      the OAuth code is a long free-form string, so route it VERBATIM into
+ *      the box (see {@link checkIsClaudeLoginPaste}). Without this it falls to
+ *      `'prompt'`, whose Escape cancels the login flow and whose preamble
+ *      corrupts the code (live bug: "login can't be done via the bot").
+ *   4. Else → `'prompt'` (a fresh turn; free-form prose breaks out of any
  *      pending prompt, mirroring the existing selector break-out behavior).
  */
 export function getClaudeReplyRoute(input: {
   isQuestionPending: boolean;
   isSurveyPending: boolean;
+  isLoginPastePending: boolean;
   text: string;
 }): ClaudeReplyRoute {
   const isControlReply = checkIsSelectorControlReply(input.text);
   if (input.isQuestionPending && isControlReply) return 'selector';
   if (input.isSurveyPending && isControlReply) return 'survey';
+  if (input.isLoginPastePending) return 'loginPaste';
   return 'prompt';
+}
+
+/**
+ * @description Whether the captured pane shows Claude's `/login` OAuth
+ * "paste the code" step. After the user picks a login method Claude prints a
+ * sign-in URL and the input row `Paste code here if prompted >` (a plain `>`
+ * box, NOT the `❯` prompt or a numbered selector), then waits for the pasted
+ * `code#state` value. The marker string is stable (verified in the claude.exe
+ * string table, 2026-06-13). Used by {@link ClaudeCliAdapter.isLoginPastePending}
+ * so the bot routes the pasted code verbatim instead of as a fresh prompt.
+ */
+const CLAUDE_LOGIN_PASTE_RE = /Paste code here if prompted/;
+export function checkIsClaudeLoginPaste(paneText: string): boolean {
+  return CLAUDE_LOGIN_PASTE_RE.test(paneText);
 }
 
 /**
@@ -3063,6 +3084,19 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   isSurveyPending(key: ThreadKey): boolean {
     const session = this.sessions.get(keyToString(key));
     return Boolean(session?.isActive && session.lastSurveySignature);
+  }
+
+  /**
+   * @description Whether Claude's `/login` OAuth "paste the code" box is on
+   * screen right now, read live off the last captured pane ({@link checkIsClaudeLoginPaste}).
+   * No signature/de-dup is needed — nothing is emitted; this only answers
+   * "should the next text reply be typed verbatim into the paste box?" when a
+   * message arrives, so the bot skips the prompt path (Escape + preamble) that
+   * would otherwise cancel the login and corrupt the code.
+   */
+  isLoginPastePending(key: ThreadKey): boolean {
+    const session = this.sessions.get(keyToString(key));
+    return Boolean(session?.isActive && checkIsClaudeLoginPaste(session.lastContent));
   }
 
   /**

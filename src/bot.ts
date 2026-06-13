@@ -4838,6 +4838,7 @@ bot.on(message('text'), async (ctx) => {
   const replyRoute = getClaudeReplyRoute({
     isQuestionPending: adapter.isQuestionPending?.(key) ?? false,
     isSurveyPending: adapter.isSurveyPending?.(key) ?? false,
+    isLoginPastePending: adapter.isLoginPastePending?.(key) ?? false,
     text,
   });
   if (replyRoute === 'selector') {
@@ -4847,6 +4848,17 @@ bot.on(message('text'), async (ctx) => {
   }
   if (replyRoute === 'survey') {
     await answerClaudeSurvey(key, adapter, text.trim());
+    return;
+  }
+  // Claude `/login` OAuth code paste: type the code VERBATIM into the box (no
+  // Escape, no thread-context preamble — both would break the login flow). The
+  // code is a single-use secret, so delete the user's message from the topic
+  // and post a short confirmation instead of leaving the token in history.
+  if (replyRoute === 'loginPaste') {
+    markNeedsNewMessage(key);
+    adapter.sendInput(key, text);
+    await deleteThreadMessage(key, ctx.message.message_id);
+    await replyToThread(key, t('agent.login_code_relayed'));
     return;
   }
 

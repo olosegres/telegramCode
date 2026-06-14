@@ -318,6 +318,30 @@ export interface OutputEventMeta {
 }
 
 /**
+ * @description The per-surface output path, selected ONCE at boot from
+ * `CHAT_MODE` (mirroring the {@link AgentAdapter} pattern) instead of a
+ * `checkIsDmMode()` branch at every output site. The group impl is thin
+ * (`queueOutput` edit-in-place + a noop finalize); the DM impl owns the
+ * draft-cursor manager. Built by `createOutputTransport`.
+ */
+export interface OutputTransport {
+  /** Route one `output` event to its message path (the mode's own logic). */
+  deliverOutput(key: ThreadKey, output: string, meta?: OutputEventMeta): void;
+  /**
+   * Finalize any in-flight content for the thread (DM: the live draft → a
+   * permanent message; group: noop). The STATUS site awaits this so the status
+   * frame lands below content; the two TEARDOWN sites fire-and-forget.
+   */
+  finalizeInFlight(key: ThreadKey): Promise<void>;
+  /**
+   * Drop the thread's per-transport state on a full teardown (`/unbind`, topic
+   * deleted) so it doesn't leak across a rebind. DM drops the reset draft entry;
+   * group has nothing to drop (noop). Called AFTER `finalizeInFlight`.
+   */
+  disposeThread(key: ThreadKey): void;
+}
+
+/**
  * @description Lifecycle phase of a {@link ThinkingEvent}.
  *
  * - `live` → the agent is actively reasoning; the bot shows the live

@@ -92,6 +92,18 @@ config/variants, not a per-message API field).
   message — the old edit-in-place for fresh outputs silently replaced interim
   texts (live bug 2026-06-05). Claude's adapter never marks continuations, so
   its flushes stay one-message-each.
+- **Output transport seam (CHAT_MODE-selected).** HOW agent output reaches a topic
+  is chosen ONCE at boot by `CHAT_MODE` via `createOutputTransport` (`src/output/`),
+  mirroring the `AgentAdapter` factory — no per-call `checkIsDmMode()`. **Group** =
+  the `queueOutput` edit-in-place path above. **DM** (`src/output/dmOutputTransport.ts`)
+  = the live "cursor" draft: ONE accumulating native `sendMessageDraft` holds the
+  full current reply, FINALIZED to a permanent `sendMessage` on boundaries (idle
+  ~4s / 4096 overflow / isFinal / new-response / status / teardown); `isComplete`
+  one-shots post directly. Only OpenCode threads stream via drafts (it marks
+  `isContinuation`); **Claude DM falls through to the plain `queueOutput` baseline**
+  — its scrape never marks continuations, so a per-chunk draft floods/flickers (a
+  proper Claude DM live preview is deferred to a follow-up). `OutputTransport`
+  interface lives in `types.ts`.
 - **Two-instance ready.** A "pet" and a "work" instance can run on one host with
   isolated `DATA_DIR`, group, and OpenCode port.
 - **MCP hierarchy.** MCP servers merge across user / group / project / thread
@@ -244,6 +256,20 @@ controls (`setModel`, `getCurrentModel`, `sendInput`, `sendSignal`,
 `resumeSession`/`checkIsActive`) are optional methods; the bot checks for them
 before calling. New per-backend capabilities are added here first, then surfaced
 as a command in `bot.ts`.
+
+### Output transport (`src/output/`) — the per-mode output boundary
+
+| File | Responsibility |
+|------|----------------|
+| `createOutputTransport.ts` | Factory: pick the output transport by `CHAT_MODE` (the single mode decision); thin group impl inline (`queueOutput` + noop finalize), DM delegates to `createDmOutputTransport` |
+| `dmOutputTransport.ts` | The DM draft-cursor manager (relocated out of `bot.ts`): `deliverOutput` 3-way route (draft / `isComplete` one-shot / `queueOutput` baseline), `finalizeInFlight`, `disposeThread`, and the whole draft state + send/pace/idle machinery — built from injected `bot.ts` primitives |
+
+The `OutputTransport` interface (in `types.ts`) is the seam, selected once at boot
+(`registerOutputTransport`, mirroring `registerDisplayPrefsReader`). `queueOutput`
+and `sendAgentChunks` stay shared primitives in `bot.ts` (group + the DM Claude
+baseline / one-shot use them too). Thinking frames, sub-agent status, and pinned
+status are NOT part of this seam — they are mode-orthogonal (`displayPrefs` /
+OpenCode events / bindings).
 
 ## Commands (all registered in `bot.ts`)
 

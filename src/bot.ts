@@ -29,7 +29,8 @@ import {
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
+import { createOutputTransport } from './output/createOutputTransport';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
 // booting Telegraf (audit S19 / #25).
@@ -80,7 +81,6 @@ import {
   checkIsApiError,
   getErrorCode,
   getErrorDescription,
-  getErrorRetryAfterSeconds,
 } from './sendErrorClassifier';
 import { formatPinnedStatus } from './pinnedStatus';
 import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
@@ -90,18 +90,6 @@ import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { getOutputDebounceMs as resolveOutputDebounceMs } from './utils/outputDebounce';
-import { nextDraftId } from './utils/draftId';
-import {
-  getDraftPaceAction,
-  checkShouldStreamAsDraft,
-  DRAFT_MIN_INTERVAL_MS,
-  DRAFT_DEFAULT_BACKOFF_MS,
-} from './utils/draftPacer';
-import {
-  getDraftFeedAction,
-  checkShouldFinalizeOnIdle,
-  FINALIZE_IDLE_MS,
-} from './utils/draftFinalize';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import {
   flushTraceBufferSyncOnExit,
@@ -317,6 +305,27 @@ function getOwnerUserId(): number {
 /** Convenience predicate — true iff the bot serves the owner's DM. */
 function checkIsDmMode(): boolean {
   return getChatMode() === 'dm';
+}
+
+/**
+ * The per-surface output transport, selected once at boot from CHAT_MODE
+ * (`registerOutputTransport`, mirroring `registerDisplayPrefsReader`). The
+ * output / status / teardown sites route through it instead of branching on
+ * `checkIsDmMode()` themselves. Null until boot wires it.
+ */
+let outputTransport: OutputTransport | null = null;
+
+/** Wire the boot-selected output transport. Called once near the adapter wiring. */
+function registerOutputTransport(transport: OutputTransport): void {
+  outputTransport = transport;
+}
+
+/** The boot-selected output transport. Throws if read before boot wiring. */
+function getOutputTransport(): OutputTransport {
+  if (!outputTransport) {
+    throw new Error('outputTransport accessed before registerOutputTransport at boot');
+  }
+  return outputTransport;
 }
 
 const telegramAgent = new https.Agent({
@@ -669,48 +678,6 @@ interface ThinkingCoalesceState {
   detachAfterDrain: boolean;
 }
 
-/**
- * @description Per-thread live-draft stream state (DM mode only, P3).
- *
- * Mirrors the per-response lifecycle of the native `sendMessageDraft` animation:
- * one stable {@link draftId} is held for the whole of an in-flight response (so
- * every update animates the same draft) and a fresh id is allocated when a new
- * response begins. {@link accumulatedText} is the FULL pre-render text of the
- * in-flight response (maintained with the SAME concat rule the persist path
- * uses, via `appendPendingOutput`), so the draft mirrors exactly what the
- * persisted message will hold.
- *
- * The draft channel is independent of the message rate-limiter: its 429 cooldown
- * ({@link backoffUntilMs}) and pacing timer ({@link pacerTimer}) never touch the
- * per-chat TokenBucket, so a draft 429 can never starve a real `sendMessage`.
- * Everything here is best-effort — a failed draft call is logged and dropped,
- * never surfaced, never blocking the persist path.
- */
-interface DraftStreamState {
-  /** Current response's stable draft id (S1). Reused for every update of it. */
-  draftId: number;
-  /** Full pre-render text of the in-flight response (drives the draft body). */
-  accumulatedText: string;
-  /** Last text actually drafted, or null (nothing sent yet this turn). */
-  lastSentText: string | null;
-  /** When the last draft actually went out, ms, or null. */
-  lastSentAtMs: number | null;
-  /** Draft-channel 429 cooldown end, ms (`0` = none). Separate from rateLimiter. */
-  backoffUntilMs: number;
-  /** Timer to flush a deferred draft update. `null` = none armed. */
-  pacerTimer: NodeJS.Timeout | null;
-  /**
-   * Idle-finalize timer (DM streaming v2). Armed on every feed; when it fires
-   * with no newer output the accumulated draft is FINALIZED into a permanent
-   * message ({@link FINALIZE_IDLE_MS} after the last feed). `null` = none armed.
-   */
-  idleFinalizeTimer: NodeJS.Timeout | null;
-  /** When the draft was last fed new output, ms, or null. Drives the idle boundary. */
-  lastFedAtMs: number | null;
-  /** Is a draft turn currently active (a response is streaming)? */
-  active: boolean;
-}
-
 const threadMessageStates = new Map<string, ThreadMessageState>();
 const outputQueues = new Map<string, OutputQueueState>();
 const pendingQuestions = new Map<string, PendingQuestionState>();
@@ -727,8 +694,6 @@ const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
 const thinkingCoalescers = new Map<string, ThinkingCoalesceState>();
-/** Per-thread live-draft streams (DM mode only, P3). See {@link DraftStreamState}. */
-const draftStreams = new Map<string, DraftStreamState>();
 
 /**
  * @description Register/replace a thread's pending interactive question in BOTH
@@ -1179,26 +1144,6 @@ function getStatusCoalesceState(key: ThreadKey): StatusCoalesceState {
   return s;
 }
 
-function getDraftStreamState(key: ThreadKey): DraftStreamState {
-  const k = keyToString(key);
-  let s = draftStreams.get(k);
-  if (!s) {
-    s = {
-      draftId: 0,
-      accumulatedText: '',
-      lastSentText: null,
-      lastSentAtMs: null,
-      backoffUntilMs: 0,
-      pacerTimer: null,
-      idleFinalizeTimer: null,
-      lastFedAtMs: null,
-      active: false,
-    };
-    draftStreams.set(k, s);
-  }
-  return s;
-}
-
 function getThinkingCoalesceState(key: ThreadKey): ThinkingCoalesceState {
   const k = keyToString(key);
   let s = thinkingCoalescers.get(k);
@@ -1246,12 +1191,12 @@ function clearThinkingMessage(key: ThreadKey): void {
 function clearThreadQueues(key: ThreadKey): void {
   const k = keyToString(key);
   clearThreadOutputQueues(outputQueues.get(k), statusCoalescers.get(k));
-  // DM-only (P3): a teardown that clears queued output must also FINALIZE the live
-  // draft — its accumulated text lands as a permanent message (not dropped) and the
-  // turn resets. This is the convergence point for `/stop` release, session
-  // `closed`/`stopped`, `/unbind`, and topic-delete — all route through here.
-  // Group mode never opens a draft, so this is a no-op.
-  if (checkIsDmMode()) abortDraftTurn(key);
+  // A teardown that clears queued output must also FINALIZE any in-flight content
+  // (DM: the live draft → a permanent message, not dropped, then reset). This is
+  // the convergence point for `/stop` release, session `closed`/`stopped`,
+  // `/unbind`, and topic-delete — all route through here. Fire-and-forget,
+  // matching the old `void abortDraftTurn`; group mode's transport noops it.
+  void getOutputTransport().finalizeInFlight(key);
 }
 
 function markNeedsNewMessage(key: ThreadKey): void {
@@ -1487,10 +1432,11 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   awaitingFolderName.delete(k);
   pinnedStatusTextCache.delete(k);
   statusCoalescers.delete(k);
-  // `clearThreadQueues` → `abortDraftTurn` above already finalized any accumulated
+  // `clearThreadQueues` → `finalizeInFlight` above already finalized any accumulated
   // draft text (synchronously capturing it + clearing the timers); drop the now-
-  // reset map entry so it doesn't leak across a rebind.
-  draftStreams.delete(k);
+  // reset per-transport state so it doesn't leak across a rebind (DM: the draft map
+  // entry; group: noop).
+  getOutputTransport().disposeThread(key);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2222,15 +2168,14 @@ async function replyChunkWithFallback(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Live-draft stream (DM mode only, P3) — native `sendMessageDraft` animation
+//  Shared output send primitives + the DM draft channel's `sendMessageDraft` call
 //
-//  In DM mode the LIVE phase of a streamed reply is shown as a native Telegram
-//  draft (the "bot is typing this message" animation) rather than by editing a
-//  real message in place. The persist path (`queueOutput` → `sendOutputImmediate`)
-//  is UNCHANGED and still lands the final, permanent message; this is a parallel,
-//  best-effort preview channel that runs OFF the message rate-limiter so a draft
-//  429 can never delay a real send. Every function here is gated by the DM branch
-//  of `handleAgentOutput` — group mode never reaches them.
+//  The DM live-draft MANAGER moved to `output/dmOutputTransport.ts` (the
+//  OutputTransport seam). `callSendMessageDraft` and `sendAgentChunks` stay here
+//  because they are SHARED: `sendAgentChunks` lands permanent messages for the
+//  group path / the `isComplete` one-shot too, and the draft channel's untyped
+//  `callApi` view is injected into the DM transport. Both are passed in via the
+//  factory deps at boot.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -2251,32 +2196,6 @@ const callSendMessageDraft = bot.telegram.callApi.bind(
 ) as unknown as SendMessageDraftCall;
 
 /**
- * @description Render the FULL accumulated draft text to HTML (DM streaming v2).
- *
- * The draft is the live "cursor" holding the entire current reply, so it renders
- * the WHOLE `accumulatedText` — never a tail window. The overflow boundary
- * (`feedDraft` → `getDraftFeedAction`) keeps `accumulatedText` short enough that
- * its render stays under the Telegram cap, so a single draft never needs to
- * split; content past the cap is finalized to permanent messages and the cursor
- * continues in a fresh draft. The old tail-windowing made the start of a long
- * reply "disappear" from the live cursor — that is what this removes.
- */
-function renderDraftBody(accumulatedText: string): string {
-  return renderAgentHtml(accumulatedText);
-}
-
-/**
- * @description Rendered-HTML length of `text` — the measure the overflow boundary
- * compares against {@link MAX_MESSAGE_LEN}. A draft/message body is sized by its
- * RENDERED length (HTML escaping + tags inflate the source past the cap), so the
- * overflow decision must measure the same way `renderDraftBody` / the persist
- * splitter do, not the raw source length.
- */
-function measureDraftRenderedLength(text: string): number {
-  return renderAgentHtml(text).length;
-}
-
-/**
  * @description Send each already-split chunk as a permanent message, tracking the
  * last one as the thread's `lastMessageId`/`lastMessageText` so a later
  * continuation can append onto it. The shared send loop behind the DM finalize /
@@ -2292,318 +2211,6 @@ async function sendAgentChunks(key: ThreadKey, chunks: string[]): Promise<void> 
       msgState.needsNewMessage = false;
     }
   }
-}
-
-/** Clear both per-draft timers (pacer + idle-finalize) without touching state. */
-function clearDraftTimers(draft: DraftStreamState): void {
-  if (draft.pacerTimer) {
-    clearTimeout(draft.pacerTimer);
-    draft.pacerTimer = null;
-  }
-  if (draft.idleFinalizeTimer) {
-    clearTimeout(draft.idleFinalizeTimer);
-    draft.idleFinalizeTimer = null;
-  }
-}
-
-/**
- * @description Fire ONE draft update for the thread's current accumulated text,
- * reusing the turn's stable draft id. Best-effort: a 429 arms the draft-channel
- * backoff (read from `retry_after` when present, else {@link
- * DRAFT_DEFAULT_BACKOFF_MS}) and re-arms the pacer; any other failure is logged
- * and dropped. Never throws, never touches the message rate-limiter.
- */
-async function sendDraftNow(key: ThreadKey, draft: DraftStreamState): Promise<void> {
-  const text = renderDraftBody(draft.accumulatedText);
-  // The cursor invariant keeps `accumulatedText` under the cap; an over-cap
-  // render is the TRANSIENT pre-spill state at an overflow feed (the overflow
-  // boundary splits it into permanent messages on the same tick). Sending it
-  // would only earn `MESSAGE_TOO_LONG`, so skip — the spill carries the content.
-  if (text.length > MAX_MESSAGE_LEN) return;
-  const payload: Record<string, unknown> = {
-    chat_id: key.chatId,
-    draft_id: draft.draftId,
-    text,
-    parse_mode: 'HTML',
-  };
-  // Mirror `buildSendExtra`'s General handling: omit `message_thread_id` for the
-  // DM General thread (`DM_GENERAL_THREAD_ID = 0`).
-  if (!checkIsGeneral(key)) payload.message_thread_id = key.threadId;
-
-  // Record what we are ABOUT to show + when, before the await, so a concurrent
-  // feed paces against this attempt (and a failure below only adjusts backoff).
-  draft.lastSentText = draft.accumulatedText;
-  draft.lastSentAtMs = Date.now();
-  try {
-    await callSendMessageDraft('sendMessageDraft', payload);
-  } catch (e) {
-    const code = checkIsApiError(e) ? getErrorCode(e) : undefined;
-    if (code === 429) {
-      const retryAfterSec = checkIsApiError(e) ? getErrorRetryAfterSeconds(e) : undefined;
-      const backoffMs = retryAfterSec ? retryAfterSec * 1000 : DRAFT_DEFAULT_BACKOFF_MS;
-      draft.backoffUntilMs = Date.now() + backoffMs;
-      console.warn(`[draft] ${keyToString(key)} draft 429 — backing off ${backoffMs}ms`);
-      armDraftPacerTimer(key, draft);
-      return;
-    }
-    console.warn(
-      `[draft] ${keyToString(key)} draft update failed (best-effort, ignored):`,
-      e instanceof Error ? e.message : e,
-    );
-  }
-}
-
-/**
- * @description Arm (replacing any existing) the draft pacer timer. It fires after
- * the soonest the pacer could next `send`: the later of the draft-channel backoff
- * remainder and the min-interval remainder since the last send, then re-runs the
- * pacer. The draft keepalive is gone (DM streaming v2): a draft is either updated
- * within the idle window or FINALIZED to a permanent message at the idle
- * boundary, so it never needs to survive the ~30s native ephemerality.
- */
-function armDraftPacerTimer(key: ThreadKey, draft: DraftStreamState): void {
-  if (draft.pacerTimer) clearTimeout(draft.pacerTimer);
-  const now = Date.now();
-  const backoffRemainder = Math.max(0, draft.backoffUntilMs - now);
-  const intervalRemainder =
-    draft.lastSentAtMs === null
-      ? 0
-      : Math.max(0, draft.lastSentAtMs + DRAFT_MIN_INTERVAL_MS - now);
-  // The pacer can only `send` once both the backoff and the interval clear.
-  const delay = Math.max(backoffRemainder, intervalRemainder);
-  draft.pacerTimer = setTimeout(() => {
-    draft.pacerTimer = null;
-    void runDraftPacer(key);
-  }, Math.max(delay, 0));
-  draft.pacerTimer.unref?.();
-}
-
-/**
- * @description Re-evaluate the pacer for the thread's current accumulated text
- * and act: `send` fires a draft now; `skip`/`defer` re-arm the timer. No-op once
- * the turn is inactive (a teardown / finalize cleared it).
- */
-async function runDraftPacer(key: ThreadKey): Promise<void> {
-  const draft = draftStreams.get(keyToString(key));
-  if (!draft || !draft.active) return;
-  const now = Date.now();
-  const action = getDraftPaceAction({
-    nextText: draft.accumulatedText,
-    lastSentText: draft.lastSentText,
-    nowMs: now,
-    lastSentAtMs: draft.lastSentAtMs,
-    minIntervalMs: DRAFT_MIN_INTERVAL_MS,
-    backoffUntilMs: draft.backoffUntilMs,
-  });
-  if (action === 'send') {
-    await sendDraftNow(key, draft);
-    return;
-  }
-  // `skip` / `defer` → re-arm for the remaining interval / backoff.
-  armDraftPacerTimer(key, draft);
-}
-
-/**
- * @description Begin a fresh draft turn: allocate a new stable draft id (so this
- * response animates separately from the previous one), reset the accumulator and
- * pacing/idle state, and mark active. Called when a new response begins (a
- * non-continuation output, or a forced new-message break) — the previous turn,
- * if any, was finalized to a permanent message first.
- *
- * Opening the turn CONSUMES the `needsNewMessage` signal: the fresh draft IS the
- * new message, so subsequent continuation tails extend it instead of being
- * mis-read as another new response (in DM the draft path replaces the persist
- * path that used to clear this flag on send).
- */
-function startDraftTurn(key: ThreadKey): void {
-  const draft = getDraftStreamState(key);
-  clearDraftTimers(draft);
-  draft.draftId = nextDraftId(draft.draftId);
-  draft.accumulatedText = '';
-  draft.lastSentText = null;
-  draft.lastSentAtMs = null;
-  draft.lastFedAtMs = null;
-  draft.backoffUntilMs = 0;
-  draft.active = true;
-  getThreadMessageState(key).needsNewMessage = false;
-}
-
-/**
- * @description Reset a draft turn to fully idle: clear timers + accumulator +
- * pacing state and mark inactive. The shared tail of `finalizeDraft` (after the
- * permanent message is sent) and of a defensive teardown.
- */
-function resetDraftState(draft: DraftStreamState): void {
-  clearDraftTimers(draft);
-  draft.active = false;
-  draft.accumulatedText = '';
-  draft.lastSentText = null;
-  draft.lastSentAtMs = null;
-  draft.lastFedAtMs = null;
-  draft.backoffUntilMs = 0;
-}
-
-/**
- * @description Arm (replacing any existing) the idle-finalize timer. It fires
- * {@link FINALIZE_IDLE_MS} after this feed; if no newer output arrived in that
- * window the accumulated draft is FINALIZED into a permanent message (a pause is
- * a natural message boundary). Re-armed on every feed, so a steadily streaming
- * reply never trips it.
- */
-function armIdleFinalizeTimer(key: ThreadKey, draft: DraftStreamState): void {
-  if (draft.idleFinalizeTimer) clearTimeout(draft.idleFinalizeTimer);
-  draft.idleFinalizeTimer = setTimeout(() => {
-    draft.idleFinalizeTimer = null;
-    const live = draftStreams.get(keyToString(key));
-    if (!live) return;
-    if (!checkShouldFinalizeOnIdle(Date.now(), live.lastFedAtMs, live.active, FINALIZE_IDLE_MS)) {
-      return;
-    }
-    void finalizeDraft(key);
-  }, FINALIZE_IDLE_MS);
-  draft.idleFinalizeTimer.unref?.();
-}
-
-/**
- * @description Append `output` to the live draft's accumulator (S5 concat rule —
- * mirroring what the eventual message holds), then pace the draft update and
- * (re)arm the idle-finalize timer. The boundary router (`feedDraft`) calls this
- * for the `append`/`overflow`-remainder/post-`finalizeThenStart` cases.
- */
-function appendToDraft(key: ThreadKey, output: string, isContinuation: boolean): void {
-  const draft = getDraftStreamState(key);
-  draft.accumulatedText = appendPendingOutput(
-    draft.accumulatedText === '' ? null : draft.accumulatedText,
-    output,
-    isContinuation,
-  );
-  draft.lastFedAtMs = Date.now();
-  void runDraftPacer(key);
-  armIdleFinalizeTimer(key, draft);
-}
-
-/**
- * @description Finalize the active draft into a PERMANENT message and reset the
- * turn (DM streaming v2). The accumulated text is the live cursor's full body;
- * by construction (overflow boundary) it renders within one Telegram message,
- * but the render-aware splitter is reused defensively so an edge over the cap
- * still lands every chunk. After the message(s) are sent the draft state is
- * fully reset (inactive, empty, timers cleared) so the NEXT output opens a fresh
- * draft → a new message. Best-effort + idempotent: nothing accumulated, or no
- * draft at all, is a no-op.
- */
-async function finalizeDraft(key: ThreadKey): Promise<void> {
-  const draft = draftStreams.get(keyToString(key));
-  if (!draft) return;
-  const text = draft.accumulatedText;
-  // Reset BEFORE the await so a concurrent feed opens a clean fresh turn rather
-  // than appending onto text we are about to ship as a permanent message.
-  resetDraftState(draft);
-  if (!text.trim()) return;
-  await sendAgentChunks(key, splitMessage(text, MAX_MESSAGE_LEN, measureDraftRenderedLength));
-}
-
-/**
- * @description Spill an over-cap draft: split the accumulated text, finalize the
- * leading chunk(s) as permanent message(s), and carry the LAST chunk (the
- * remainder still under the cap) into a fresh draft so the live cursor continues
- * below the finalized content. Called by `feedDraft` on the `overflow` boundary.
- */
-async function spillDraftOverflow(key: ThreadKey): Promise<void> {
-  const draft = getDraftStreamState(key);
-  const chunks = splitMessage(draft.accumulatedText, MAX_MESSAGE_LEN, measureDraftRenderedLength);
-  // A single chunk means the render fit after all (e.g. an un-splittable token
-  // the splitter emitted whole) — nothing to spill, just keep streaming it.
-  if (chunks.length <= 1) {
-    void runDraftPacer(key);
-    armIdleFinalizeTimer(key, draft);
-    return;
-  }
-  // Move the cursor to the remainder SYNCHRONOUSLY before shipping the leading
-  // chunk(s): `leadingChunks` is captured in a local and a fresh draft holds only
-  // the remainder, so a concurrently-dispatched continuation appends onto the
-  // remainder draft (never onto text already being shipped). Without this, a feed
-  // arriving during the send below would re-read the un-reset accumulator and
-  // re-spill the same leading chunk (duplicate send) or be wiped (lost text).
-  // Same invariant as feedDraft: no draft-state mutation AFTER the await.
-  const leadingChunks = chunks.slice(0, -1);
-  const remainder = chunks[chunks.length - 1];
-  startDraftTurn(key);
-  appendToDraft(key, remainder, /* isContinuation */ true);
-  await sendAgentChunks(key, leadingChunks);
-}
-
-/**
- * @description Feed the live draft with one `output` event and route it through
- * the boundary decision ({@link getDraftFeedAction}):
- *
- *  - `finalizeThenStart` — a new response began while a draft was active:
- *    finalize the previous draft to a permanent message, then open a fresh turn
- *    for this output;
- *  - `finalize` — the turn's last frame (`isFinal`): append, then finalize and do
- *    NOT reopen a draft;
- *  - `overflow` — appending makes the render cross the cap: append, then spill
- *    the full chunk(s) to permanent message(s) and continue in a new draft;
- *  - `append` — ordinary streaming tail: grow the draft, pace it, re-arm idle.
- *
- * Async because a boundary may send a permanent message; the splice calls it
- * fire-and-forget. Lazily opens a turn if none is active.
- */
-async function feedDraft(
-  key: ThreadKey,
-  output: string,
-  isContinuation: boolean,
-  isFinal: boolean,
-): Promise<void> {
-  const draft = getDraftStreamState(key);
-  const needsNewMessage = getThreadMessageState(key).needsNewMessage;
-  // The text the draft WOULD hold after this output: for a continuation into a
-  // live draft it extends the accumulator (so the overflow check measures the
-  // real combined length); otherwise the new turn starts from just this output.
-  const isAppendingContinuation = draft.active && isContinuation && !needsNewMessage;
-  const prospective = isAppendingContinuation
-    ? appendPendingOutput(draft.accumulatedText || null, output, true)
-    : output;
-  const action = getDraftFeedAction({
-    isDraftActive: draft.active,
-    isContinuation,
-    needsNewMessage,
-    isFinal,
-    prospectiveRenderedLength: measureDraftRenderedLength(prospective),
-    renderedCap: MAX_MESSAGE_LEN,
-  });
-
-  if (action === 'finalizeThenStart') {
-    // SYNCHRONOUS reset→restart, no await between: finalizeDraft snapshots the old
-    // text and resets state synchronously BEFORE its network send (which then ships
-    // fire-and-forget, ordered by the per-thread send FIFO), so opening the new turn
-    // immediately runs in one stack. A concurrently-dispatched output event therefore
-    // cannot interleave at an await and be wiped by this startDraftTurn. Invariant for
-    // this whole family of functions: no draft-state mutation AFTER an await.
-    void finalizeDraft(key);
-    startDraftTurn(key);
-    appendToDraft(key, output, /* isContinuation */ false);
-    return;
-  }
-  if (!draft.active) startDraftTurn(key);
-  if (action === 'finalize') {
-    appendToDraft(key, output, isContinuation);
-    await finalizeDraft(key);
-    return;
-  }
-  appendToDraft(key, output, isContinuation);
-  if (action === 'overflow') await spillDraftOverflow(key);
-}
-
-/**
- * @description Finalize the active draft turn on a teardown (`/stop`, session
- * close/stop, question takeover, queue clear): the accumulated text is NOT lost —
- * it lands as a permanent message — then the turn resets. Idempotent and safe in
- * group mode (no-op when no draft exists / nothing accumulated). Replaces the
- * old bare-drop abort so a teardown mid-stream keeps the partial reply.
- */
-function abortDraftTurn(key: ThreadKey): void {
-  void finalizeDraft(key);
 }
 
 async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
@@ -6638,7 +6245,7 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     // percentages) down to its latest frame before it reaches the
     // coalescer, so the rolling status message shows only the current
     // state instead of a growing wall of intermediate percentages.
-    handleAgentStatus(key, collapseProgressChunk(output));
+    void handleAgentStatus(key, collapseProgressChunk(output));
     return;
   }
 
@@ -6673,35 +6280,12 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
   // When no id is tracked it's a cheap no-op delete that still bumps the gen.
   void deleteStatusMessage(key).catch(() => {});
 
-  const isContinuation = meta?.isContinuation === true;
-  const isFinal = meta?.isFinal === true;
-  const isComplete = meta?.isComplete === true;
-
-  // Output routing splits by surface (DM streaming v2):
-  //
-  //  • DM streaming tail (`checkShouldStreamAsDraft`: dm, not a one-shot, not a
-  //    sub-agent) → the draft manager is the SOLE output→message path. `feedDraft`
-  //    accumulates into the live cursor draft and FINALIZES it to a permanent
-  //    message at boundaries (idle / overflow / isFinal / new-response). NO
-  //    `queueOutput` — the old parallel persist path is gone in DM, which is what
-  //    removes the duplicate/disappearing/glued-together bugs.
-  //  • DM complete one-shot (`isComplete`, e.g. the resume context) → it is whole
-  //    at emit time, so it must NOT animate as a draft. Finalize any draft still
-  //    streaming above it first (keeps order), then post it straight as a real
-  //    message. (Sub-agent chunks already returned above.)
-  //  • Group / non-DM → the original `queueOutput` persist path, byte-for-byte.
-  if (checkShouldStreamAsDraft(checkIsDmMode(), meta) && checkAdapterSupportsDraftStreaming(key)) {
-    void feedDraft(key, output, isContinuation, isFinal);
-  } else if (checkIsDmMode() && isComplete) {
-    void (async () => {
-      await finalizeDraft(key);
-      await sendAgentChunks(key, splitMessage(output, MAX_MESSAGE_LEN, measureDraftRenderedLength));
-    })();
-  } else {
-    // Persistence path — UNCHANGED. Group mode streams the reply by editing the
-    // last message in place (append + split + spill) on the debounced queue.
-    queueOutput(key, output, isContinuation, isFinal, isComplete);
-  }
+  // Output routing is selected once at boot by CHAT_MODE (the OutputTransport
+  // seam). Group routes to the unchanged `queueOutput` edit-in-place persist
+  // path; DM owns the draft-cursor manager (streaming tail → draft, complete
+  // one-shot → finalize-then-post, Claude baseline → queueOutput). The 3-way
+  // DM split + the group thin path live in `createOutputTransport`.
+  getOutputTransport().deliverOutput(key, output, meta);
 
   // Bug #11: the agent may KEEP working after this chunk (which just deleted the
   // status frame). Arm the liveness loop so that once output streaming pauses
@@ -6727,7 +6311,7 @@ function handleAdapterStatus(key: ThreadKey, status: string): void {
       startClaudeLiveness(key);
     }
   }
-  handleAgentStatus(key, status);
+  void handleAgentStatus(key, status);
 }
 
 /**
@@ -6740,7 +6324,7 @@ function handleAdapterStatus(key: ThreadKey, status: string): void {
  * `editMessageText` operations on the rate-limiter FIFO, pushing real
  * `output` sends behind a wall of stale thinking frames.
  */
-function handleAgentStatus(key: ThreadKey, status: string): void {
+async function handleAgentStatus(key: ThreadKey, status: string): Promise<void> {
   if (!status.trim()) return;
   console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
   traceAgentEmit('status', key, status);
@@ -6752,11 +6336,8 @@ function handleAgentStatus(key: ThreadKey, status: string): void {
   // status frame posts BELOW the latest content (never stranded above it). The
   // delete-status-on-output in `handleAgentOutput` is the other half: when content
   // resumes the stale status is removed and the next status re-posts below again.
-  // Group mode never opens a draft, so this is a no-op there.
-  if (checkIsDmMode()) {
-    const draft = draftStreams.get(keyToString(key));
-    if (draft && draft.active) void finalizeDraft(key);
-  }
+  // Group mode's transport noops this, so it stays a no-op there.
+  await getOutputTransport().finalizeInFlight(key);
 
   const c = getStatusCoalesceState(key);
   c.pendingText = status;
@@ -7189,7 +6770,7 @@ function runClaudeLivenessTick(key: ThreadKey): void {
       // Advance the heartbeat glyph, then push the frame through the same
       // coalescer scraped ticks use (429-aware, dedups identical text).
       state.livenessGlyphIndex = (state.livenessGlyphIndex + 1) % CLAUDE_LIVENESS_GLYPHS.length;
-      handleAgentStatus(key, getClaudeLivenessFrameText(state));
+      void handleAgentStatus(key, getClaudeLivenessFrameText(state));
       break;
     case 'delete':
       void deleteStatusMessage(key).catch(() => {});
@@ -7414,11 +6995,11 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   clearThinkingMessage(key);
   // A question UI supersedes the sub-agent "working" line — remove it too.
   clearSubagentStatus(key);
-  // DM-only (P3): the question UI takes over mid-stream — FINALIZE the live draft
-  // so its already-accumulated text lands as a permanent message above the prompt
-  // (not dropped); the finalize IS the persistence (no parallel queueOutput in DM).
-  // No-op in group mode.
-  if (checkIsDmMode()) abortDraftTurn(key);
+  // The question UI takes over mid-stream — FINALIZE any in-flight content (DM:
+  // the live draft so its already-accumulated text lands as a permanent message
+  // above the prompt, not dropped; the finalize IS the persistence — no parallel
+  // queueOutput in DM). Fire-and-forget; group mode's transport noops it.
+  void getOutputTransport().finalizeInFlight(key);
   deleteLoaderMessage(key).catch(() => {});
 
   // Audit S13 / #31: register the pending question BEFORE the async
@@ -8162,6 +7743,22 @@ export async function startBot(): Promise<void> {
   // resolve at render time. Same late-wiring idiom as the event handlers above;
   // before this line they fall back to all-fields-`minimal`.
   registerDisplayPrefsReader((key) => state.getDisplayPrefs(key));
+  // The output path is selected ONCE here from CHAT_MODE (mirrors the adapter /
+  // display-prefs wiring above) instead of a `checkIsDmMode()` branch at each
+  // output site. Group is thin (queueOutput); DM owns the draft-cursor manager.
+  registerOutputTransport(
+    createOutputTransport(getChatMode(), {
+      queueOutput,
+      sendAgentChunks,
+      getThreadMessageState,
+      checkSupportsDraft: checkAdapterSupportsDraftStreaming,
+      checkIsGeneral,
+      callSendMessageDraft,
+      splitMessage,
+      renderAgentHtml,
+      maxMessageLength: MAX_MESSAGE_LEN,
+    }),
+  );
 
   // 3. Connect to Telegram and register commands menu before starting local
   // daemons. If getMe fails, we should not leave an orphan opencode server.

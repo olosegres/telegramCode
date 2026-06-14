@@ -69,8 +69,9 @@ export function getOutputFlushPlan(input: OutputFlushInput): OutputFlushPlan {
 /**
  * @description Coalesce a new output batch into the pending (not yet flushed)
  * buffer. Continuation tails concatenate as-is — they may be cut mid-word, a
- * `\n` would split the word across lines; standalone outputs join with `\n`
- * as distinct logical messages.
+ * `\n` would split the word across lines; DISTINCT standalone outputs join with
+ * a BLANK LINE (`\n\n`) so two separate replies merged into one draft/message
+ * read as paragraphs instead of one glued run.
  */
 export function appendPendingOutput(
   pending: string | null,
@@ -78,5 +79,5 @@ export function appendPendingOutput(
   isContinuation: boolean,
 ): string {
   if (!pending) return output;
-  return isContinuation ? pending + output : `${pending}\n${output}`;
+  return isContinuation ? pending + output : `${pending}\n\n${output}`;
 }

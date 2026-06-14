@@ -123,7 +123,7 @@ describe('appendPendingOutput', () => {
     assert.equal(appendPendingOutput('import', 'ant feature', true), 'important feature');
   });
 
-  it('non-continuation → joins with a single \\n (distinct logical messages)', () => {
-    assert.equal(appendPendingOutput('first message', 'second message', false), 'first message\nsecond message');
+  it('non-continuation → joins with a blank line \\n\\n (distinct logical messages read as paragraphs)', () => {
+    assert.equal(appendPendingOutput('first message', 'second message', false), 'first message\n\nsecond message');
   });
 });

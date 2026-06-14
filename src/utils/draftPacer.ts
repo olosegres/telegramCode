@@ -31,14 +31,6 @@ export type DraftPaceAction = 'send' | 'skip' | 'defer';
 export const DRAFT_MIN_INTERVAL_MS = 700;
 
 /**
- * A native draft expires ~30s after its last update. The keepalive re-sends the
- * SAME current text + SAME draft id this long after the last send, BEFORE the
- * 30s ephemerality, so a long silent gap mid-turn (e.g. deep thinking with no
- * new text) doesn't let the in-progress reply disappear.
- */
-export const DRAFT_KEEPALIVE_MS = 25_000;
-
-/**
  * Fallback draft-channel backoff when a draft 429 omits `retry_after`. The P0.5
  * live probe saw ~20s draft cooldowns; the runtime prefers the error's
  * `retry_after` when present and uses this only as the floor/fallback.
@@ -78,17 +70,19 @@ export function getDraftPaceAction(input: DraftPaceInput): DraftPaceAction {
 }
 
 /**
- * @description Should the keepalive re-send the current draft now? True once at
- * least `keepaliveMs` has elapsed since the last send — so the draft is
- * refreshed before its ~30s native expiry during a silent gap. Never true when
- * nothing has been sent yet (`lastSentAtMs === null`): there is no draft to keep
- * alive.
+ * @description Whether an `output` event should be streamed via the native DM
+ * draft channel. Drafts are for genuinely INCREMENTAL streaming; a COMPLETE
+ * one-shot output (`meta.isComplete`, e.g. the resume context block) is already
+ * whole at emit time — drafting it would make Telegram's native draft "typing"
+ * animation draw static text progressively, so it must post directly. Sub-agent
+ * chunks are never drafted either. Group mode never drafts.
  */
-export function checkShouldKeepaliveDraft(
-  nowMs: number,
-  lastSentAtMs: number | null,
-  keepaliveMs: number,
+export function checkShouldStreamAsDraft(
+  isDmMode: boolean,
+  meta?: { isComplete?: boolean; isSubagent?: boolean },
 ): boolean {
-  if (lastSentAtMs === null) return false;
-  return nowMs - lastSentAtMs >= keepaliveMs;
+  if (!isDmMode) return false;
+  if (meta?.isComplete === true) return false;
+  if (meta?.isSubagent === true) return false;
+  return true;
 }

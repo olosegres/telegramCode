@@ -297,6 +297,16 @@ export interface OutputEventMeta {
    */
   isFinal?: boolean;
   /**
+   * True when this `output` is a COMPLETE one-shot block, whole at emit time
+   * (e.g. the "↩️ Resumed — last N messages" context block) rather than a live
+   * streaming tail. The bot posts it instantly as a single message: in DM mode
+   * it SKIPS the native draft channel (whose typing animation would otherwise
+   * "draw" already-ready text progressively), and flushes the persist
+   * immediately (like {@link OutputEventMeta.isFinal}) instead of waiting out
+   * the debounce.
+   */
+  isComplete?: boolean;
+  /**
    * True when this text comes from a SUB-AGENT (OpenCode: child session SSE;
    * Claude: on-disk transcript tail), only emitted in `/subagent full` mode.
    * The bot renders the chunk visibly marked ("🤖 ⤷ …") and OUTSIDE the parent

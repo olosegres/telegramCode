@@ -3402,7 +3402,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       try {
         const turns = await this.getRecentTurns(key, workDir, sessionId, resumeContextTurnLimit);
         const rendered = formatResumeContext(turns);
-        if (rendered) this.emit('output', key, rendered);
+        // Complete one-shot block — post instantly, never via the dm draft
+        // channel (its typing animation would "draw" this already-whole text).
+        if (rendered) this.emit('output', key, rendered, { isComplete: true });
       } catch (e) {
         console.warn(`[Claude] resume context block failed:`, e instanceof Error ? e.message : e);
       }

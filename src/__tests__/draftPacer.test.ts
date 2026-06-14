@@ -7,19 +7,22 @@
  * ACTION SEQUENCE — not a single call. A single-call test would pass vacuously
  * even if the interval / backoff gates were inverted.
  *
- * The harness mirrors exactly what the S3 runtime does on a `send`: it advances
+ * The harness mirrors exactly what the runtime does on a `send`: it advances
  * `lastSentText`/`lastSentAtMs`. On `skip`/`defer` those stay put, so the next
  * tick re-evaluates against the same baseline — proving the gates fire across
  * time, not just once.
+ *
+ * DM v2 removed the draft keepalive (a draft now either updates within the idle
+ * window or is finalized to a real message at the boundary), so there is no
+ * keepalive case here.
  */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   getDraftPaceAction,
-  checkShouldKeepaliveDraft,
+  checkShouldStreamAsDraft,
   DRAFT_MIN_INTERVAL_MS,
-  DRAFT_KEEPALIVE_MS,
   DRAFT_DEFAULT_BACKOFF_MS,
   type DraftPaceAction,
 } from '../utils/draftPacer';
@@ -132,55 +135,41 @@ test('timeline: defer through a 429 window, send once it clears', () => {
   assert.deepEqual(actions, ['defer', 'defer', 'defer', 'send']);
 });
 
-test('checkShouldKeepaliveDraft: false before keepaliveMs, true at/after', () => {
-  const lastSentAt = 1000;
-  assert.equal(
-    checkShouldKeepaliveDraft(lastSentAt + DRAFT_KEEPALIVE_MS - 1, lastSentAt, DRAFT_KEEPALIVE_MS),
-    false,
-    'just before the keepalive window must not fire',
-  );
-  assert.equal(
-    checkShouldKeepaliveDraft(lastSentAt + DRAFT_KEEPALIVE_MS, lastSentAt, DRAFT_KEEPALIVE_MS),
-    true,
-    'exactly at the keepalive window must fire',
-  );
-  assert.equal(
-    checkShouldKeepaliveDraft(lastSentAt + DRAFT_KEEPALIVE_MS + 5000, lastSentAt, DRAFT_KEEPALIVE_MS),
-    true,
-    'past the keepalive window must fire',
-  );
-});
-
-test('checkShouldKeepaliveDraft: never fires when nothing has been sent yet', () => {
-  assert.equal(
-    checkShouldKeepaliveDraft(999_999, null, DRAFT_KEEPALIVE_MS),
-    false,
-    'no draft sent → nothing to keep alive',
-  );
-});
-
-test('timeline including a keepalive tick at t≈29000', () => {
-  // Drive the full lifecycle the plan names: t=0 send, t=300 defer (too soon),
-  // t=800 send, then a long silent gap — at t=29000 no new text, but the
-  // keepalive must fire (≥25000 since the last send at t=800).
-  const lastSentAtAfterT800 = 800;
-  const actions = runTimeline([
-    { t: 0, text: 'a' },
-    { t: 300, text: 'ab' },
-    { t: 800, text: 'abc' },
-  ]);
-  assert.deepEqual(actions, ['send', 'defer', 'send'], 'paced sends up to the silent gap');
-  // The silent gap: same text, so the pacer itself would `skip`; the keepalive
-  // path is what keeps the draft alive.
-  assert.equal(
-    checkShouldKeepaliveDraft(29000, lastSentAtAfterT800, DRAFT_KEEPALIVE_MS),
-    true,
-    'a >25s silent gap must trigger a keepalive re-send',
-  );
-});
-
-test('constants are the locked P3 values', () => {
+test('constants are the locked draft-pacer values', () => {
   assert.equal(DRAFT_MIN_INTERVAL_MS, 700);
-  assert.equal(DRAFT_KEEPALIVE_MS, 25_000);
   assert.equal(DRAFT_DEFAULT_BACKOFF_MS, 20_000);
+});
+
+// ── checkShouldStreamAsDraft — the group-vs-DM draft gate ──
+//
+// Load-bearing group-mode regression (the #1 risk of the draft migration): the
+// draft path must NEVER engage in group mode, and even in DM must skip the
+// already-whole one-shot / sub-agent outputs. This is the single predicate
+// `handleAgentOutput` branches on, so proving it here proves group mode produces
+// ZERO draft calls regardless of the output meta.
+
+test('checkShouldStreamAsDraft: group mode (isDmMode=false) never drafts, for ANY meta', () => {
+  assert.equal(checkShouldStreamAsDraft(false), false, 'no meta → no draft in group mode');
+  assert.equal(checkShouldStreamAsDraft(false, {}), false);
+  assert.equal(checkShouldStreamAsDraft(false, { isComplete: true }), false);
+  assert.equal(checkShouldStreamAsDraft(false, { isSubagent: true }), false);
+  assert.equal(
+    checkShouldStreamAsDraft(false, { isComplete: false, isSubagent: false }),
+    false,
+    'even an ordinary streaming tail must NOT draft in group mode (the regression guard)',
+  );
+});
+
+test('checkShouldStreamAsDraft: DM mode drafts an ordinary streaming tail', () => {
+  assert.equal(checkShouldStreamAsDraft(true), true, 'no meta → an ordinary DM tail drafts');
+  assert.equal(checkShouldStreamAsDraft(true, {}), true);
+  assert.equal(checkShouldStreamAsDraft(true, { isComplete: false, isSubagent: false }), true);
+});
+
+test('checkShouldStreamAsDraft: DM mode skips the draft for a complete one-shot or a sub-agent chunk', () => {
+  // A complete one-shot (resume context) is whole at emit time — drafting it would
+  // make the typing animation "draw" already-ready text; it posts directly.
+  assert.equal(checkShouldStreamAsDraft(true, { isComplete: true }), false);
+  // Sub-agent chunks are streamed outside the draft cursor.
+  assert.equal(checkShouldStreamAsDraft(true, { isSubagent: true }), false);
 });

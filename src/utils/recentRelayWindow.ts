@@ -56,6 +56,33 @@ export function normalizeForComparison(line: string): string {
 }
 
 /**
+ * @description COARSER normalization for the LONG-HORIZON relay-window dedup
+ * (record + suppress). Builds on {@link normalizeForComparison} and ADDITIONALLY
+ * strips markdown emphasis/code markers (`*`, `_`, `` ` ``, `~`) and collapses
+ * whitespace runs.
+ *
+ * WHY a second, coarser form (live re-emit 2026-06-15): a line that scrolled off
+ * and was re-rendered comes back with the SAME text but different emphasis spans
+ * — `the Claude *liveness loop* …` one capture, `the Claude *liveness* *loop* …`
+ * the next — or shifted padding/wrapping. The per-poll diff's plain
+ * normalization left those as DIFFERENT strings, so the window failed to
+ * recognise the re-render and re-emitted it. Stripping the volatile markup makes
+ * the re-render match.
+ *
+ * It is a strict COARSENING of {@link normalizeForComparison} (only further
+ * transforms its output), so the window still recognises every line the per-poll
+ * diff emitted (it can only match MORE, never fewer) — the "no redraw slips past
+ * one layer" guarantee holds, WITHOUT touching the per-poll core diff (and group
+ * mode), where over-suppression would risk dropping genuinely-new content.
+ */
+export function normalizeForRelayDedup(line: string): string {
+  return normalizeForComparison(line)
+    .replace(/[*_`~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * @description Bounded FIFO of normalized, already-relayed pane lines.
  * Created per Claude session; see {@link createRecentRelayWindow}.
  */
@@ -90,7 +117,7 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
   return {
     record(chunkText: string): void {
       for (const line of chunkText.split('\n')) {
-        const normalized = normalizeForComparison(line);
+        const normalized = normalizeForRelayDedup(line);
         if (normalized.length < relayDedupMinLineLength) continue;
         // A line repeated within one chunk must occupy ONE slot, or the FIFO
         // and the Set would desync on eviction.
@@ -104,7 +131,7 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
       }
     },
     checkHasLine(line: string): boolean {
-      const normalized = normalizeForComparison(line);
+      const normalized = normalizeForRelayDedup(line);
       if (normalized.length < relayDedupMinLineLength) return false;
       return lineSet.has(normalized);
     },

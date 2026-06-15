@@ -46,6 +46,25 @@ test('window: lookup matches across glyph/whitespace re-renders (normalization d
   assert.equal(relayWindow.checkHasLine('   Bash(yarn test) finished with exit code 0  '), true);
 });
 
+test('window: lookup matches across markdown/wrapping re-renders (the 2026-06-15 re-emit)', () => {
+  // Live re-emit: a scrolled-off line came back with different emphasis spans —
+  // `the Claude *liveness loop* …` vs `the Claude *liveness* *loop* …` — and the
+  // base normalization left them as DIFFERENT strings, so the window re-emitted
+  // it. The coarser relay-dedup normalization must recognise the re-render.
+  const relayWindow = createRecentRelayWindow();
+  relayWindow.record('the Claude *liveness loop* (the 1-second heartbeat that re-shows working)');
+  assert.equal(
+    relayWindow.checkHasLine('the Claude *liveness* *loop* (the 1-second heartbeat that re-shows working)'),
+    true,
+    'emphasis-span variance must still dedup',
+  );
+  assert.equal(
+    relayWindow.checkHasLine('the Claude   liveness loop   (the 1-second heartbeat that re-shows working)'),
+    true,
+    'whitespace/padding variance must still dedup',
+  );
+});
+
 test('window: short lines are never recorded and never suppressed', () => {
   const relayWindow = createRecentRelayWindow();
   const shortLine = 'yes, done';

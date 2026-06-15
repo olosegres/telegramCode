@@ -3,12 +3,14 @@ import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
 import type { OpenCodePendingQuestion } from './openCodeAdapter';
+import { TerminalAdapter } from './terminalAdapter';
 
 type AdapterFactory = () => AgentAdapter;
 
 const adapterFactories: Record<string, AdapterFactory> = {
   claude: () => new ClaudeCliAdapter(),
   opencode: () => new OpenCodeAdapter(),
+  terminal: () => new TerminalAdapter(),
 };
 
 /** Singleton adapter instances — one per adapter name */
@@ -156,6 +158,7 @@ export function getAvailableAdapters(): Array<{ name: string; label: string }> {
     const labels: Record<string, string> = {
       claude: 'Claude Code',
       opencode: 'OpenCode',
+      terminal: 'Terminal',
     };
     return { name, label: labels[name] || name };
   });

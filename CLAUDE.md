@@ -68,6 +68,16 @@ config/variants, not a per-message API field).
   containers where the process cwd cannot be controlled.
 - **Per-thread isolation.** Routing, sessions, MCP config, model/effort prefs,
   and history are keyed per topic (`ThreadKey` = `"<chatId>:<threadId>"`).
+- **Terminal sessions (`/terminal`).** A topic can bind to a raw interactive
+  `$SHELL` (in tmux) instead of an AI agent — a third `AgentAdapter`
+  (`terminalAdapter.ts`). The bot proxies the user's text in as keystrokes and
+  streams the scraped pane back (stream-only render model: ONE rolling message
+  per command). Fresh bot-owned shell per topic (NOT attach-to-existing tmux),
+  restart-safe (a live `term-<chatId>-<threadId>` shell re-adopts at boot just
+  like an agent — current pane seeds the baseline, no transcript flood; an
+  explicitly-stopped shell stays gone). No scheduler-MCP is injected into a
+  shell. v1 limitation: full-screen TUIs (vim/htop/less) render messy; normal
+  commands stream cleanly. Mutually exclusive with `/claude` / `/opencode`.
 - **Restart-safe.** State is persisted to `state.json`; on restart the bot
   re-attaches to the `tmux` session (Claude) or re-connects SSE (OpenCode).
   Per-thread prefs (e.g. OpenCode model) live in `DATA_DIR` JSON files.
@@ -245,6 +255,11 @@ config/variants, not a per-message API field).
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `utils/pollBackoff.ts` | Pure adaptive poll cadence: `getNextPollDelay` (300ms while the pane changes → ×2 up to 1.5s after 10 unchanged polls; any write/change snaps back) |
+| `utils/tmuxExec.ts` | Generic tmux/shell primitives shared by the claude + terminal backends (relocated from `claudeCliAdapter`): `tmuxAsync`/`tmuxOrThrowAsync` (best-effort vs strict tmux calls), `checkArgsAreSafe` (reject control chars), `shellSingleQuote`, `execFilePromise` |
+| `utils/ansiClean.ts` | Pane-text cleaning shared by both tmux backends (relocated from `claudeCliAdapter`): `convertAnsiToMarkdown` (ANSI→Telegram markdown, OSC-8 strip, spinner-glyph de-bold), `cleanOutput` (full clean pipeline), private `joinBrokenUrls` |
+| `utils/paneDiff.ts` | Pure line-SET diff between two tmux pane captures (relocated from `claudeCliAdapter`): `getNewPaneContent` + `NewPaneContent` (only NEW lines, `startsNewParagraph` out-of-band); imports `normalizeForComparison` from `utils/recentRelayWindow` so both backends share one normalization domain |
+| `utils/tmuxSessionName.ts` | Pure parameterized tmux session-name codec shared by the tmux backends: `buildTmuxSessionName(prefix, key)` / `parseTmuxSessionName(prefix, name)` — careful negative-chatId + strict per-half regex so a foreign session sharing a prefix is never mis-adopted. Claude binds the `'claude'` prefix via thin wrappers; terminal the `'term'` prefix |
+| `utils/terminalEmitPlan.ts` | Pure helpers behind `terminalAdapter`: `getTerminalEmitPlan(nextOutputFresh)` (fresh→new message, else continuation — one rolling message per command), `buildTerminalNewSessionArgs` (the `tmux new-session` argv: shell-command + `-c workDir` + size flags, no `--session-id`/permission/MCP), and the named constants (`terminalPaneCols` 200, `terminalPaneRows` 50, `terminalTmuxPrefix` `term`, `defaultShell`) |
 | `types.ts` | Shared types incl. the `AgentAdapter` contract and `ThreadKey` |
 
 ### Adapters (`src/adapters/`) — the proxy boundary
@@ -252,8 +267,9 @@ config/variants, not a per-message API field).
 | File | Responsibility |
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
-| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`) |
+| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; one `/event?directory=` stream per bound folder, shared by threads in that folder, parsed once + owner-routed) |
+| `terminalAdapter.ts` | A raw interactive `$SHELL` in `tmux` — a third adapter sibling to claude/opencode (NO AI logic). Types the user's text in as keystrokes (`send-keys`) and streams the scraped pane back as ONE rolling message per command (generic capture → line-set-diff → `cleanOutput` → emit; no question/survey/sub-agent/tool-result/effort/MCP/resume machinery). Restart-safe: `listExistingTmuxSessions`/`adoptExistingTmuxSession` re-adopt a live `term-…` session at boot (current pane seeds the baseline, no flood). Does NOT extend `ClaudeCliAdapter` and leaves `outputsDeltas` falsy, so the Claude liveness loop never fires for it |
 
 The `AgentAdapter` interface (in `types.ts`) is the seam. Per-backend agent
 controls (`setModel`, `getCurrentModel`, `sendInput`, `sendSignal`,
@@ -278,9 +294,27 @@ OpenCode events / bindings).
 
 ## Commands (all registered in `bot.ts`)
 
-- **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/new`
+- **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/terminal`, `/new`
   (`/clear_session`), `/stop`, `/stop-all`, `/quit` (`/q`), `/sessions`
   (`/resume`), `/rename_session`, `/clear_messages`, `/compact`
+  - `/terminal` starts a raw interactive `$SHELL` in the topic's bound folder
+    (a third adapter sibling to `/claude` / `/opencode`, mutually exclusive with
+    them via `switchThreadAdapter`). Unbound topic / General → the same
+    bind-required reply agents give. While active, EVERY plain text message is
+    typed in as a command (Enter appended) and routed DIRECTLY via
+    `adapter.sendInput` — skipping `forwardPromptToAgent` (no `[thread context]`
+    preamble, no `⏳` loader, no interrupt). Output streams back as ONE rolling
+    message per command (continuation), like OpenCode. Raw keys reuse the
+    existing TUI commands: `/c` (Ctrl-C), `/up`·`/down` (history), `/tab`
+    (completion), `/enter`. `/stop`·`/new`·`/quit`·leaving a folder work as for
+    agents; `/sessions` lists nothing (shells aren't resumable); `/model`
+    `/effort` `/thinking` `/tool_results` `/subagent` `/rename_session` reply
+    "not supported" (those adapter methods are simply absent). `/schedule`
+    against a terminal is out of scope for v1. Terminal sessions are NOT
+    auto-started by a natural-language phrase — only by the explicit command.
+    Accepted v1 limitation: full-screen / cursor-addressed TUIs (vim, htop,
+    less) repaint the whole pane and look messy; normal commands/builds/logs
+    stream cleanly.
   - `/new` (alias `/clear_session`) stops the thread's current agent session
     and immediately starts a fresh one in the SAME topic with the SAME adapter.
     The old session is **released, not deleted** (its transcript stays on disk

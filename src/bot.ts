@@ -38,6 +38,7 @@ import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
 import { checkSessionPickAction } from './sessionPick';
 import { ClaudeCliAdapter, getClaudeReplyRoute } from './adapters/claudeCliAdapter';
 import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
+import { TerminalAdapter } from './adapters/terminalAdapter';
 import {
   buildQuestionBodyLines,
   buildQuestionBodyLinesPlain,
@@ -2687,7 +2688,10 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
     void replayBufferedPrompts(key);
 
     const subdir = state.getBinding(key)?.subdir ?? path.basename(ENV.workRoot);
-    return t('agent.ready', {
+    // Terminal gets its own ready copy (it's a shell, not an agent that takes a
+    // prompt) — its keystroke-driven UX differs enough to warrant distinct text.
+    const readyKey = adapter.name === 'terminal' ? 'terminal.ready' : 'agent.ready';
+    return t(readyKey, {
       label: adapter.label,
       subdir,
       argsSuffix: args ? ` (${args})` : '',
@@ -3923,7 +3927,7 @@ command('mcp', async (_ctx, key) => {
 async function handleStartCommand(
   ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>,
   key: ThreadKey,
-  adapterName: 'claude' | 'opencode',
+  adapterName: 'claude' | 'opencode' | 'terminal',
 ): Promise<void> {
   if (checkIsGeneral(key)) {
     await replyToThread(key, t('error.start_in_general'));
@@ -3950,6 +3954,7 @@ async function handleStartCommand(
 
 command('claude', (ctx, key) => handleStartCommand(ctx, key, 'claude'));
 command(['opencode', 'oc'], (ctx, key) => handleStartCommand(ctx, key, 'opencode'));
+command('terminal', (ctx, key) => handleStartCommand(ctx, key, 'terminal'));
 
 command('model', async (ctx, key) => {
   const adapter = getThreadAdapter(key);
@@ -4869,7 +4874,7 @@ command('clear_messages', async (ctx, key) => {
 // removed, but keeping the tokens here makes a stray `/where` inert instead of
 // typing a meaningless "/where" prompt into the agent.
 const botCommands = new Set([
-  'start', 'claude', 'opencode', 'oc', 'agent', 'sessions', 'resume', 'cancel', 'model',
+  'start', 'claude', 'opencode', 'oc', 'terminal', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
@@ -5104,6 +5109,16 @@ bot.on(message('text'), async (ctx) => {
     adapter.sendInput(key, text);
     await deleteThreadMessage(key, ctx.message.message_id);
     await replyToThread(key, t('agent.login_code_relayed'));
+    return;
+  }
+
+  // Terminal backend: a plain text message IS a shell command. Type it straight
+  // in via `sendInput` (which appends Enter and arms a fresh rolling message),
+  // bypassing `forwardPromptToAgent` entirely — no `[thread context]` preamble
+  // (a shell isn't an agent that needs to know WHERE it works), no `⏳` loader,
+  // no interrupt logic. A bare `/clear` is likewise just typed in as input.
+  if (adapter.name === 'terminal' && adapter.checkIsActive(key)) {
+    adapter.sendInput(key, text);
     return;
   }
 
@@ -7270,6 +7285,7 @@ const COMMANDS_MENU = [
   { command: 'mcp', description: '🔌 List active MCP servers' },
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
+  { command: 'terminal', description: '🖥 Open a raw shell in the bound folder' },
   { command: 'new', description: '🆕 Restart session (alias /clear_session)' },
   { command: 'clear_session', description: '🆕 Restart session (alias /new)' },
   { command: 'model', description: '🧠 Switch model' },
@@ -7454,6 +7470,53 @@ async function reattachExistingSessions(
     }
   }
   console.log(`[reattach] opencode: reopened ${reopened} sessions (quiet=${opts.quietReattach})`);
+
+  // 3. Terminal — tmux shells (`term-…`). Like the Claude scan but simpler:
+  //    a terminal has no session-id to recover, so adoption keys purely on a
+  //    live binding whose agent is `terminal`. The tmux name is derived from
+  //    the `ThreadKey`. `adoptExistingTmuxSession` itself liveness/zombie-checks
+  //    the specific session; a dead/missing one is garbage-collected, never
+  //    re-spawned (an explicitly-stopped shell stays gone).
+  const terminalAdapter = getAdapter('terminal');
+  if (terminalAdapter instanceof TerminalAdapter) {
+    try {
+      const found = await terminalAdapter.listExistingTmuxSessions();
+      let adopted = 0;
+      let killed = 0;
+      for (const { key, sessionName } of found) {
+        const binding = state.getBinding(key);
+        const agent = state.getAgent(key);
+        // No binding, or the thread isn't a terminal thread → genuine orphan.
+        if (!binding || agent?.name !== 'terminal') {
+          await terminalAdapter.killOrphanTmuxSession(sessionName);
+          killed += 1;
+          continue;
+        }
+        const workDirDecision = getWorkDirStartDecision(key);
+        if (!workDirDecision.ok) {
+          console.warn(`[reattach] terminal ${keyToString(key)} refused: ${workDirDecision.message}`);
+          await terminalAdapter.killOrphanTmuxSession(sessionName);
+          killed += 1;
+          if (!opts.quietReattach) {
+            replyToThread(key, workDirDecision.message).catch(() => {});
+          }
+          continue;
+        }
+        if (await terminalAdapter.adoptExistingTmuxSession(key, sessionName, workDirDecision.workDir)) {
+          adopted += 1;
+          if (!opts.quietReattach) {
+            replyToThread(key, t('agent.reattached')).catch(() => {});
+          }
+        } else {
+          // Adopt failed (zombie pane / vanished) — it killed the session itself.
+          killed += 1;
+        }
+      }
+      console.log(`[reattach] terminal: adopted ${adopted}, killed ${killed} orphans (quiet=${opts.quietReattach})`);
+    } catch (e) {
+      console.error('[reattach] terminal scan failed:', e);
+    }
+  }
 }
 
 /**

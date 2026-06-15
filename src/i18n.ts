@@ -108,6 +108,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_bound':
       '*Тред привязан к `{subdir}`.*\n' +
       '/claude /opencode — старт агента\n' +
+      '/terminal — открыть shell в этой папке\n' +
       '/new — перезапустить сессию (старая → /sessions)\n' +
       '/model /sessions — переключение\n' +
       '/effort — уровень reasoning effort\n' +
@@ -224,6 +225,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
     'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',
     'agent.workingIndicator': '{glyph} работаю…',
+    'terminal.ready': '🖥 Терминал готов в `{subdir}`{argsSuffix}\nЛюбое сообщение выполнится как команда. /c — Ctrl+C, /up /down — история, /tab — автодополнение, /stop — закрыть.',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──
     'survey.message': '📋 {header}\n{hint}',
@@ -513,6 +515,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_bound':
       '*Thread bound to `{subdir}`.*\n' +
       '/claude /opencode — start an agent\n' +
+      '/terminal — open a shell in this folder\n' +
       '/new — restart the session (old one → /sessions)\n' +
       '/model /sessions — switch\n' +
       '/effort — reasoning-effort level\n' +
@@ -623,6 +626,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
     'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',
     'agent.workingIndicator': '{glyph} working…',
+    'terminal.ready': '🖥 Terminal ready in `{subdir}`{argsSuffix}\nEvery message runs as a command. /c — Ctrl+C, /up /down — history, /tab — completion, /stop — close.',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──
     'survey.message': '📋 {header}\n{hint}',

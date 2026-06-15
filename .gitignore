@@ -10,6 +10,8 @@ data/
 *.tsbuildinfo
 coverage/
 agent/tmp/
+agent/NOTES.md
+.playwright-mcp/
 .yarn/install-state.gz
 .yarn/cache/
 .yarn/unplugged/

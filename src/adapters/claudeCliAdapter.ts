@@ -28,6 +28,7 @@ import { resolveClaudeBinary } from '../utils/resolveBinary';
 import {
   SPINNER_TICK_RE,
   POST_THINKING_TRAILER_RE,
+  THINKING_HEADER_RE,
   OUTPUT_TOOL_HEADER_RE,
   FILE_TOOL_HEADER_RE,
   TOOL_RESULT_MARKER_RE,
@@ -36,8 +37,10 @@ import {
   COLLAPSE_MARKER_RE,
   COMPLETION_SUMMARY_RE,
   TRANSIENT_TICK_RE,
+  checkIsClaudeChromeLine,
   type ToolResultKind,
 } from '../utils/claudeScrapeShapes';
+import { checkIsProgressChunk } from '../progressLine';
 import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
@@ -1188,12 +1191,13 @@ interface StreamingTableState {
 }
 
 /**
- * @description Hard cap on streaming-table hold polls. The normal exit is "the
- * block is byte-identical to last poll" (it stopped re-flowing); if a pane is
- * stuck mid-paint and the table never settles, force-emit the latest version
- * after this many polls so the table can never be swallowed forever. At
- * {@link basePollIntervalMs} (300ms) this is ≈9s of holding before the safety
- * fires — far longer than a real table takes to settle.
+ * @description Hard cap on streaming-table hold polls. The normal exit is a
+ * done-signal — real prose now follows the table, or the turn went idle (see
+ * {@link getTableStabilizationDecision}); if a pane is stuck mid-paint and the
+ * turn never resolves, force-emit the latest version after this many CONSECUTIVE
+ * unchanged-block polls so the table can never be swallowed forever. At
+ * {@link basePollIntervalMs} (300ms) this is ≈9s of an unchanging held block
+ * before the safety fires — far longer than a real table takes to settle.
  */
 const maxTableHoldPolls = 30;
 
@@ -1205,8 +1209,9 @@ const maxTableHoldPolls = 30;
  * - `hold`  — the table is still laying out; mask its lines out of this poll's
  *             delta ({@link maskSharpTableLines}) so no intermediate frame ships,
  *             and carry `nextStreamingTable` forward.
- * - `emit`  — the table settled (or the safety cap fired); emit `block` once via
- *             the normal fence path and clear the held state.
+ * - `emit`  — the table is DONE (prose follows it / the turn went idle / the
+ *             safety cap fired); emit `block` once via the normal fence path and
+ *             clear the held state.
  */
 interface TableStabilizationDecision {
   kind: 'none' | 'hold' | 'emit';
@@ -1217,31 +1222,80 @@ interface TableStabilizationDecision {
 }
 
 /**
- * @description Find the LAST contiguous sharp-corner (markdown) table block in a
- * full pane snapshot, or `null` when none is present. Mirrors the collection
- * loop already in {@link stripTuiElementsWithContext} (a TOP border, then
- * contiguous table lines until the first non-table line, a BOTTOM border ending
- * it inclusively) but returns the raw block text so the stabilizer can compare
- * it across polls. The LAST block is taken because a streaming table sits at the
- * bottom of the pane; an already-finished earlier table was emitted on a prior
- * poll. Pure + exported for unit tests.
+ * @description Locate the LAST contiguous sharp-corner (markdown) table block in
+ * a pre-split pane snapshot: the block text plus the index of its LAST line, or
+ * `null` when none is present. Mirrors the collection loop in
+ * {@link stripTuiElementsWithContext} (a TOP border, then contiguous table lines
+ * until the first non-table line, a BOTTOM border ending it inclusively). The
+ * LAST block is taken because a streaming table sits at the bottom of the pane;
+ * an already-finished earlier table was emitted on a prior poll. The end index
+ * lets {@link checkHasContentAfterLastSharpTable} look at what follows the table
+ * without re-scanning. Internal helper for the two callers below.
  */
-export function getLastSharpTableBlock(content: string): string | null {
-  const lines = content.split('\n');
-  let block: string | null = null;
+function getLastSharpTableRange(lines: string[]): { block: string; endIndex: number } | null {
+  let range: { block: string; endIndex: number } | null = null;
   for (let i = 0; i < lines.length; i++) {
     if (!checkIsSharpTableTop(lines[i])) continue;
     const tableLines: string[] = [lines[i]];
+    let endIndex = i;
     for (let j = i + 1; j < lines.length; j++) {
       if (!checkIsSharpTableLine(lines[j])) break;
       tableLines.push(lines[j]);
+      endIndex = j;
       if (checkIsSharpTableBottom(lines[j])) break;
     }
-    block = tableLines.join('\n');
+    range = { block: tableLines.join('\n'), endIndex };
     // Keep scanning: a later top border means a more recent table further down.
-    i += tableLines.length - 1;
+    i = endIndex;
   }
-  return block;
+  return range;
+}
+
+/**
+ * @description Find the LAST contiguous sharp-corner (markdown) table block in a
+ * full pane snapshot, or `null` when none is present. Returns the raw block text
+ * so the stabilizer can compare it across polls. Pure + exported for unit tests.
+ */
+export function getLastSharpTableBlock(content: string): string | null {
+  return getLastSharpTableRange(content.split('\n'))?.block ?? null;
+}
+
+/**
+ * @description Whether any REAL prose line follows the last sharp-corner table in
+ * the pane — the "the table is done, content moved past it" signal the stabilizer
+ * uses to emit the held table BEFORE that trailing prose (preserving order).
+ *
+ * Deliberately CONSERVATIVE (errs toward `false`): a line after the table counts
+ * as content only when it is none of the recognised non-content shapes —
+ * blank/whitespace, another sharp-table line, TUI chrome
+ * ({@link checkIsClaudeChromeLine} — covers the `❯ …` input box and its `───`
+ * rules, box-drawing borders, the `⏵⏵ bypass permissions…` footer, nav hints),
+ * any progress/spinner/sub-agent frame ({@link checkIsProgressChunk} per line),
+ * a live spinner tick ({@link SPINNER_TICK_RE}), a `✻ … for Ns` post-thinking
+ * trailer ({@link POST_THINKING_TRAILER_RE}), or a `Thinking for Ns…` header
+ * ({@link THINKING_HEADER_RE}). Reuses the SAME predicates the relay already
+ * trusts as chrome — it never invents a looser matcher — so it cannot
+ * false-positive on the input box / spinner / trailers (the failure mode that
+ * would emit a table prematurely). The turn-idle signal and the hold safety cap
+ * are the backstops when this stays `false`. Pure + exported for unit tests.
+ */
+export function checkHasContentAfterLastSharpTable(content: string): boolean {
+  const lines = content.split('\n');
+  const range = getLastSharpTableRange(lines);
+  if (range === null) return false;
+  for (let i = range.endIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (checkIsSharpTableLine(line)) continue;
+    if (checkIsClaudeChromeLine(line)) continue;
+    if (checkIsProgressChunk(line)) continue;
+    if (SPINNER_TICK_RE.test(line)) continue;
+    if (POST_THINKING_TRAILER_RE.test(line.trim())) continue;
+    if (THINKING_HEADER_RE.test(line)) continue;
+    // Survived every chrome predicate → a genuine prose line follows the table.
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1260,37 +1314,60 @@ export function maskSharpTableLines(deltaText: string): string {
 
 /**
  * @description Decide what the poll loop does with a re-flowing sharp-corner
- * table, given the table currently in the pane and the held state from the
- * previous poll. Pure + exported for unit tests. Cases (plan S1):
+ * table. A held table is emitted ONLY when the turn is genuinely DONE — never on
+ * a mere "byte-stable for one poll", because Claude streams a table in stages and
+ * briefly PAUSES at an intermediate row count (e.g. 4 rows), which is byte-stable
+ * across a poll yet not the final table. The old "stable one poll → emit" rule
+ * shipped that 4-row intermediate, then the table grew to 6 rows and shipped
+ * again → the topic got two tables (live incident 2026-06-15). Pure + exported
+ * for unit tests. Rules, in order:
  *
- *  A. a table is present and DIFFERS from the held block → still laying out:
- *     hold + increment `heldPolls` (runaway guard); over {@link maxTableHoldPolls}
- *     force-emit the latest version so a stuck pane can't swallow it forever.
- *  B. a table is present and EQUALS the held block (stable one poll) → emit once.
- *  C. no table in the pane but one was held (scrolled away / message moved on)
- *     → flush the held block once.
+ *  1. no table in the pane: flush whatever was held, once (table scrolled away /
+ *     message moved on); else no-op.
+ *  2. real PROSE now follows the table (`hasContentAfterTable`) → the table is
+ *     done; emit it BEFORE that trailing prose (the poll loop withholds the prose
+ *     this tick), so ordering is table-then-prose.
+ *  3. the turn is IDLE (`isTurnIdle`) → emit promptly (covers a table-only
+ *     answer, which never gets trailing prose).
+ *  4. otherwise HOLD — update the held block and advance `heldPolls` only while
+ *     the block is unchanged (a changed/new block resets the counter); past
+ *     {@link maxTableHoldPolls} force-emit so a never-settling pane can't swallow
+ *     the table forever. A still-busy table is held even when byte-identical
+ *     across polls — that is exactly the mid-stream pause.
  */
 export function getTableStabilizationDecision(input: {
   currentTable: string | null;
   streamingTable: StreamingTableState | null;
+  hasContentAfterTable: boolean;
+  isTurnIdle: boolean;
 }): TableStabilizationDecision {
-  const { currentTable, streamingTable } = input;
+  const { currentTable, streamingTable, hasContentAfterTable, isTurnIdle } = input;
 
   if (currentTable === null) {
-    // CASE C: the table left the pane — flush whatever was held, once.
+    // RULE 1: the table left the pane — flush whatever was held, once.
     if (streamingTable) {
       return { kind: 'emit', block: streamingTable.block, nextStreamingTable: null };
     }
     return { kind: 'none', block: null, nextStreamingTable: null };
   }
 
-  // CASE B: byte-identical to last poll → it stopped re-flowing, emit it once.
-  if (streamingTable && currentTable === streamingTable.block) {
+  // RULE 2: real content follows the table → it is done; emit it BEFORE that
+  // prose (the caller masks the prose out of this tick to keep ordering).
+  if (hasContentAfterTable) {
     return { kind: 'emit', block: currentTable, nextStreamingTable: null };
   }
 
-  // CASE A: still laying out (new or changed). Hold + advance the runaway guard.
-  const heldPolls = (streamingTable?.heldPolls ?? 0) + 1;
+  // RULE 3: the turn finished → emit promptly (a table-only answer never gets
+  // trailing prose, so this is its done-signal).
+  if (isTurnIdle) {
+    return { kind: 'emit', block: currentTable, nextStreamingTable: null };
+  }
+
+  // RULE 4: still mid-turn (incl. a byte-stable mid-stream pause) → HOLD. Advance
+  // the runaway guard only while the block is unchanged; a changed block restarts
+  // the count (it is actively re-flowing, give it the full budget).
+  const sameBlock = streamingTable !== null && currentTable === streamingTable.block;
+  const heldPolls = (sameBlock ? streamingTable.heldPolls : 0) + 1;
   if (heldPolls > maxTableHoldPolls) {
     // SAFETY: a pane stuck mid-paint must never swallow the table — ship the
     // latest version we have and clear, rather than holding indefinitely.
@@ -3563,16 +3640,20 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       this.consumePendingEffortReapply(session);
     }
 
-    // S1 idle-poll table flush: when the pane is byte-unchanged but a table is
-    // still held, the table block is trivially identical across two consecutive
-    // polls (it stopped re-flowing AND the pane went fully idle) — that is the
-    // "stable" signal, so flush it now. The change branch below never runs on an
-    // unchanged poll, so without this a table that is the LAST thing painted
-    // before the pane freezes would stay held forever (never silently drop it).
+    // S1 idle-poll table flush: the change branch below never runs on a
+    // byte-unchanged poll, so a table that is the LAST thing painted before the
+    // pane freezes is flushed here instead (never silently drop it). The flush
+    // is gated on the SAME done-signals as the change branch — real prose after
+    // the table OR the turn going idle — so a mid-stream PAUSE (the pane briefly
+    // frozen at an intermediate row count while still busy) is held, not emitted
+    // (live incident 2026-06-15). A frozen-but-busy table rides the held-poll
+    // safety cap; a frozen idle table emits via the idle signal.
     if (content === session.lastContent && session.streamingTable) {
       const idleDecision = getTableStabilizationDecision({
         currentTable: getLastSharpTableBlock(content),
         streamingTable: session.streamingTable,
+        hasContentAfterTable: checkHasContentAfterLastSharpTable(content),
+        isTurnIdle: !checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: content }),
       });
       session.streamingTable = idleDecision.nextStreamingTable;
       if (idleDecision.kind === 'emit' && idleDecision.block) {
@@ -3593,12 +3674,16 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // full), the final full frame often dropped under the coalescer's
       // debounce / a 429. Operate on the FULL live `content` (not the diff):
       // hold a still-laying-out table (masking its lines out of THIS poll's
-      // delta so no intermediate frame ships), and emit the complete table once
-      // it settles (or the safety cap fires). Runs BEFORE the normal emit so a
-      // settled table is its own fenced block, never mixed into prose.
+      // delta so no intermediate frame ships), and emit the complete table only
+      // when it is DONE — real prose now follows it, or the turn went idle, or
+      // the safety cap fired (NOT on a mid-stream pause; live incident
+      // 2026-06-15). Runs BEFORE the normal emit so a done table is its own
+      // fenced block, ahead of any trailing prose in this same delta.
       const tableDecision = getTableStabilizationDecision({
         currentTable: getLastSharpTableBlock(content),
         streamingTable: session.streamingTable,
+        hasContentAfterTable: checkHasContentAfterLastSharpTable(content),
+        isTurnIdle: !checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: content }),
       });
       session.streamingTable = tableDecision.nextStreamingTable;
       // While a table is held OR being emitted separately, its lines must not

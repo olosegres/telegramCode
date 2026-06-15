@@ -1,10 +1,8 @@
-import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { promisify } from 'util';
 import { sleep } from '../utils';
 import type {
   AgentAdapter,
@@ -45,6 +43,18 @@ import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
+import {
+  tmuxAsync,
+  tmuxOrThrowAsync,
+  checkArgsAreSafe,
+  shellSingleQuote,
+} from '../utils/tmuxExec';
+import { convertAnsiToMarkdown, cleanOutput } from '../utils/ansiClean';
+import { getNewPaneContent, type NewPaneContent } from '../utils/paneDiff';
+import {
+  buildTmuxSessionName as buildTmuxSessionNameWithPrefix,
+  parseTmuxSessionName as parseTmuxSessionNameWithPrefix,
+} from '../utils/tmuxSessionName';
 import { getEffortStartupKeystroke } from '../utils/effortStartupKeystroke';
 import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
 import {
@@ -58,7 +68,6 @@ import {
 import {
   createRecentRelayWindow,
   getRelayDedupedChunk,
-  normalizeForComparison,
   type RecentRelayWindow,
 } from '../utils/recentRelayWindow';
 import {
@@ -341,6 +350,14 @@ function saveEffortPref(key: ThreadKey, level: string): void {
 }
 
 /**
+ * @description Tmux session-name prefix that namespaces Claude's sessions on
+ * the tmux server. The careful build/parse (negative chatId, strict per-half
+ * regex) is shared with other tmux-driven backends in `utils/tmuxSessionName`;
+ * these thin wrappers just bind the `'claude'` prefix.
+ */
+const claudeTmuxPrefix = 'claude';
+
+/**
  * @description Tmux session name for a `ThreadKey`.
  *
  * Format: `claude-<chatId>-<threadId>`. Negative chat ids (forum supergroups
@@ -348,7 +365,7 @@ function saveEffortPref(key: ThreadKey, level: string): void {
  * format is `parse`-able back to `ThreadKey` via {@link parseTmuxSessionName}.
  */
 function buildTmuxSessionName(key: ThreadKey): string {
-  return `claude-${key.chatId}-${key.threadId}`;
+  return buildTmuxSessionNameWithPrefix(claudeTmuxPrefix, key);
 }
 
 /**
@@ -359,26 +376,7 @@ function buildTmuxSessionName(key: ThreadKey): string {
  * Carefully handles negative chat ids: `claude--1001234-42` is `chatId=-1001234, threadId=42`.
  */
 function parseTmuxSessionName(name: string): ThreadKey | null {
-  // The numeric pair after "claude-" is "<chatId>-<threadId>".
-  // chatId may be negative (forum supergroup). We split from the right on the
-  // last '-' so the trailing token is always threadId regardless of sign.
-  //
-  // Strict regex on each half (audit S1 / #22): plain `Number(...)` accepts
-  // `1e5`, `0x10`, `1.5`, `" 42 "`. Such values come from a foreign tmux
-  // session whose name happens to share our prefix; treating them as ours
-  // would cause `adoptExistingTmuxSession` to attach to an unrelated session.
-  if (!name.startsWith('claude-')) return null;
-  const rest = name.slice('claude-'.length);
-  const lastDash = rest.lastIndexOf('-');
-  if (lastDash <= 0) return null;
-  const chatIdStr = rest.slice(0, lastDash);
-  const threadIdStr = rest.slice(lastDash + 1);
-  if (!/^-?\d+$/.test(chatIdStr)) return null;
-  if (!/^\d+$/.test(threadIdStr)) return null;
-  const chatId = Number(chatIdStr);
-  const threadId = Number(threadIdStr);
-  if (!Number.isFinite(chatId) || !Number.isFinite(threadId)) return null;
-  return { chatId, threadId };
+  return parseTmuxSessionNameWithPrefix(claudeTmuxPrefix, name);
 }
 
 /**
@@ -416,198 +414,17 @@ export function parseClaudeSessionIdFromCommand(cmd: string): string | null {
   return checkIsValidUuid(uuid) ? uuid : null;
 }
 
-/**
- * @description Reject `args` with NUL or other control characters before
- * passing to claude. These are unsafe in shell-quoted contexts (the
- * `'\\''` escape doesn't protect against `\x00`), and tmux/terminals
- * treat them as control sequences. Mirrors `validateSubdir`'s reasoning.
- */
-function checkArgsAreSafe(args: string): boolean {
-  return !/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(args);
-}
+// The generic tmux primitives (`tmuxAsync`, `tmuxOrThrowAsync`,
+// `checkArgsAreSafe`, `shellSingleQuote`, `execFilePromise`) now live in
+// `utils/tmuxExec` (shared with the terminal backend). `tmuxAsync` is the only
+// previously-exported one — re-exported below so its existing importers/tests
+// keep resolving unchanged.
+export { tmuxAsync };
 
-const execFilePromise = promisify(execFile);
-
-/** Best-effort tmux call: returns stdout on success, empty string on any error. */
-export async function tmuxAsync(...args: string[]): Promise<string> {
-  try {
-    const { stdout } = await execFilePromise('tmux', args, {
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
-    return stdout.toString().trim();
-  } catch {
-    return '';
-  }
-}
-
-/**
- * @description Strict tmux call: throws if tmux exits non-zero (or times out).
- * Used on critical paths (`new-session`, `send-keys` of the claude command
- * line) where silent failure would leave the bot thinking a session
- * started when it didn't. Callers should wrap and translate to a friendly
- * error for the user.
- */
-async function tmuxOrThrowAsync(...args: string[]): Promise<string> {
-  const { stdout } = await execFilePromise('tmux', args, {
-    encoding: 'utf-8',
-    timeout: 5000,
-  });
-  return stdout.toString().trim();
-}
-
-/**
- * @description Convert ANSI escape codes to Telegram Markdown.
- * Uses a marker-based approach: bold-on → \x01, bold-off → \x02,
- * then strips all remaining ANSI, then converts markers to *bold*.
- * Previous regex approach had two bugs:
- * 1) Bold regex consumed \x1B[ of the following sequence, leaking codes like 38;5;231m
- * 2) Cleanup regex \*\s*\* merged adjacent bold sections, removing newlines between them
- */
-export function convertAnsiToMarkdown(text: string): string {
-  let result = text;
-
-  // Step 0: Strip OSC 8 hyperlink escapes. Plan §2026-05-28
-  // tg-output-readability / S2 (C2).
-  //
-  // The full sequence is one of:
-  //   ESC ] 8 ; <params> ; <url> BEL    <visible text>  ESC ] 8 ; ; BEL
-  //   ESC ] 8 ; <params> ; <url> ESC\   <visible text>  ESC ] 8 ; ; ESC\
-  //
-  // ECMA-48 / xterm spec allows either BEL (0x07) or the C1 string
-  // terminator `ESC \` (0x1B 0x5C, "ST") as the OSC closer. Live
-  // capture from tmux pane shows Claude uses ST, not BEL (see
-  // `od -c` of `tmux capture-pane -e -p` during the live V3
-  // re-verification on 2026-05-28). The two terminators are
-  // interchangeable in the spec; we support both.
-  //
-  // The downstream control-char filter in `cleanOutput` removes the
-  // bare ESC (0x1B) and BEL (0x07) bytes — but the *payload*
-  // (`]8;...;file://...`, then duplicated visible text, then `]8;;`)
-  // is plain ASCII and falls through, producing live artefacts like
-  // `Update(8;id=...;file:///...IDEAS.mdIDEAS.md8;;)` in Telegram.
-  // We strip the whole sequence here, while ESC/BEL are still present
-  // to anchor the regex, and keep only the visible text in $1.
-  //
-  // `\\` inside the character class matches a literal backslash, so
-  // `(?:\x07|\x1B\\\\)` is "BEL  or  ESC followed by `\`".
-  //
-  // Visible text is captured NON-greedily (`[\s\S]*?`) rather than
-  // `[^\x1B\x07]*`: Claude emits an ANSI colour reset BETWEEN the visible
-  // text and the closing `ESC]8;;` (live capture of the data-usage survey
-  // prompt: `…<url>ESC\<url>ESC[39mESC]8;;ESC\`). The old class stopped at
-  // that ESC and then failed to find `ESC]8;;`, so the whole sequence leaked
-  // as `8;id=…;<url><url>8;;`. Non-greedy still stops at the FIRST `ESC]8;;`
-  // (correct for multiple links on a line, and no closer → no match), and any
-  // ANSI codes that ride along in $1 are stripped by Step 2 below.
-  result = result.replace(
-    // eslint-disable-next-line no-control-regex
-    /\x1B\]8;[^;\x07\x1B]*;[^\x07\x1B]*(?:\x07|\x1B\\)([\s\S]*?)\x1B\]8;;(?:\x07|\x1B\\)/g,
-    '$1',
-  );
-
-  // Step 1: Mark bold boundaries with control characters
-  // Bold on: \x1B[1m → \x01 marker
-  // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x1B\[1m/g, '\x01');
-
-  // Bold off / reset: \x1B[0m or \x1B[22m → \x02 marker
-  // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x1B\[(?:0|22)m/g, '\x02');
-
-  // Step 2: Remove ALL remaining ANSI escape codes (colors, cursor, etc.)
-  // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-
-  // Step 3: Convert bold markers to Markdown *bold*
-  // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x01([^\x01\x02]*)\x02/g, (_match, content) => {
-    const trimmed = content.trim();
-    return trimmed ? `*${trimmed}*` : content;
-  });
-
-  // Handle unclosed bold (bold start without matching end, e.g. at end of line)
-  // eslint-disable-next-line no-control-regex
-  result = result.replace(/\x01([^\x01\x02]+)$/gm, '*$1*');
-
-  // Step 4: Clean up remaining markers
-  // eslint-disable-next-line no-control-regex
-  result = result.replace(/[\x01\x02]/g, '');
-
-  // Separate adjacent bold sections: *text1**text2* → *text1* *text2*
-  result = result.replace(/\*\*/g, '* *');
-
-  // Drop bold wrappers around a single Claude TUI spinner glyph. Plan
-  // §2026-05-28 tg-output-readability / S5 (N3): claude's TUI toggles
-  // ANSI bold on the spinner cell every redraw, which our bold→`*X*`
-  // conversion above then turns into `*·* Brewing…` / `*✻* Smooshing…`.
-  // The glyph itself carries the spinner semantics — the asterisks add
-  // nothing and make the rolling status message look broken. Narrow
-  // match (listed glyphs only) so a real `*x*` highlight from prose
-  // survives.
-  result = result.replace(/\*([✻✽✶✢·*●○])\*/g, '$1');
-
-  return result;
-}
-
-/**
- * Join URLs that were broken by terminal line wrapping.
- * Terminal breaks long URLs into multiple lines, which breaks them in Telegram.
- */
-function joinBrokenUrls(text: string): string {
-  const lines = text.split('\n');
-  const result: string[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    const urlMatch = line.match(/(https?:\/\/\S*)$/);
-
-    if (urlMatch) {
-      let fullUrl = urlMatch[1];
-      const prefix = line.slice(0, line.length - fullUrl.length);
-
-      let j = i + 1;
-      while (j < lines.length) {
-        const nextLine = lines[j].trim();
-        if (nextLine && !nextLine.includes(' ') && /^[\w\-._~:/?#\[\]@!$&'()*+,;=%]+$/.test(nextLine)) {
-          fullUrl += nextLine;
-          j++;
-        } else {
-          break;
-        }
-      }
-
-      result.push(prefix + fullUrl);
-      i = j;
-    } else {
-      result.push(line);
-      i++;
-    }
-  }
-
-  return result.join('\n');
-}
-
-export function cleanOutput(text: string): string {
-  let cleaned = convertAnsiToMarkdown(text);
-  cleaned = cleaned.replace(/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/g, '');
-  cleaned = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  cleaned = joinBrokenUrls(cleaned);
-  // Trim trailing whitespace on every line WITHOUT dropping the line
-  // itself. Plan §2026-05-28 tg-output-readability / S1 (C1):
-  // `tmux capture-pane -e` pads every pane line with trailing spaces to
-  // terminal width, so a "blank" paragraph separator arrives as e.g.
-  // "                                                                    "
-  // (not ""). The previous filter dropped any whitespace-only line,
-  // gluing two paragraphs together in Telegram. Per-line trim preserves
-  // the line, leaves a bare empty string in its place, and lets the
-  // `\n{3,}→\n\n` collapse below normalise sequences of newlines.
-  cleaned = cleaned.replace(/[ \t]+$/gm, '');
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-  return cleaned.trim();
-}
+// `convertAnsiToMarkdown`, `cleanOutput` (and the private `joinBrokenUrls`)
+// moved to `utils/ansiClean` (shared with the terminal backend). Re-exported
+// so the previously-exported names keep resolving for existing importers/tests.
+export { convertAnsiToMarkdown, cleanOutput };
 
 function normalizeToolCallLine(line: string): string {
   const trimmed = line.trim();
@@ -2185,18 +2002,8 @@ export function listClaudeSessionsForWorkDir(projectsRoot: string, workDir: stri
   return sessions;
 }
 
-/**
- * @description Shell-quote a path for safe inclusion in a tmux `send-keys "..."` command.
- *
- * The tmux command line concatenates: `tmux send-keys -t <name> "cd <dir> && claude ..."`.
- * The dir is interpreted by the user's shell after tmux delivers the keystrokes, so we
- * single-quote it. Embedded single quotes are escaped via the standard
- * `'\''` close-reopen idiom. This is the path Claude will `cd` into, so paths with
- * spaces or special chars (e.g. `~/my projects/foo`) must survive untouched.
- */
-function shellSingleQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
+// `shellSingleQuote` moved to `utils/tmuxExec` (shared with the terminal
+// backend); it was private here and is imported above.
 
 /**
  * @description A bare slash command (e.g. `/compact`, `/clear`, `/context`) —
@@ -2493,115 +2300,12 @@ const CLAUDE_INTERRUPT_POLL_MS = 100;
  */
 const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
 
-// `normalizeForComparison` moved to `utils/recentRelayWindow.ts` (imported
-// above): the per-poll set diff below and the long-horizon relay window MUST
-// share one normalization domain, so the normalizer lives with the window.
-
-/**
- * @description Result of {@link getNewPaneContent}: the diffed NEW pane text
- * plus an OUT-OF-BAND signal that the chunk's first new line was preceded by a
- * paragraph break in the pane. The break is reported separately (not as a
- * leading blank in `text`) because every downstream `.trim()` would strip a
- * leading blank, and a fresh Telegram message must never start blank anyway —
- * so the JOIN layer reconstructs the separator from this flag instead.
- */
-export interface NewPaneContent {
-  /** The new pane lines, leading/trailing blanks trimmed (interior blanks kept). */
-  text: string;
-  /**
-   * True IFF a blank line immediately preceded the chunk's first new line AND
-   * there was content above that blank (so it is a real inter-paragraph break,
-   * not pane-top padding). Consumed only at the append JOIN, never at a message
-   * start. See {@link OutputEventMeta.startsNewParagraph}.
-   */
-  startsNewParagraph: boolean;
-}
-
-/**
- * @description Diff a freshly-captured pane against the last one and return
- * only the NEW lines, as a line-SET difference (positions ignored — Claude's
- * TUI redraws the whole pane every poll, so a positional diff would re-emit
- * everything that scrolled).
- *
- * Blank lines are NOT part of the matched set (they aren't unique), but a
- * single blank that sat BETWEEN two runs of new content is preserved as a
- * paragraph separator: the previous implementation `continue`d past every
- * empty line, so multi-paragraph answers arrived in Telegram with every
- * paragraph glued to the next (the `cleanOutput` C1 fix only kept blanks in
- * the FULL pane; this delta path still dropped them). An INTERIOR blank (within
- * this chunk) is kept inline in `text`; a LEADING blank (before the chunk's
- * first new line) is instead reported via `startsNewParagraph` so the separator
- * survives the pipeline's trims and is rebuilt only at the append join.
- *
- * Suppression is by SET membership, not multiset count (B10): a line that
- * appeared in `oldContent` at all is suppressed for EVERY occurrence in
- * `newContent`, not just the first `oldCount` of them. Why: typing a draft
- * that wraps to several rows grows Claude's input box; the viewport is fixed
- * height, so the transcript scrolls and tmux re-renders the lines straddling
- * the scrollback↔visible boundary twice in one capture. The old multiset diff
- * suppressed only as many copies as `oldContent` held, so the extra copy of an
- * already-sent answer line counted as new and was re-emitted (a chunk of the
- * previous answer reappeared before the next turn). Set membership errs toward
- * DROPPING such a re-render duplicate — the locked tradeoff, since a re-send is
- * the user-visible bug while a genuinely-new line that merely repeats an
- * earlier transcript line is a rare, low-cost loss. (Note: `lastContent`
- * advances to the full pane on every change in `pollOutput`, NOT only on emit,
- * so a suppressed line does NOT self-heal next poll — hence we suppress only
- * lines that were truly already present.)
- *
- * Exported + pure so the diff is unit-testable without booting tmux.
- */
-export function getNewPaneContent(oldContent: string, newContent: string): NewPaneContent {
-  if (!oldContent) return { text: newContent, startsNewParagraph: false };
-  if (oldContent === newContent) return { text: '', startsNewParagraph: false };
-
-  const oldLines = oldContent.split('\n');
-  const newLines = newContent.split('\n');
-
-  const oldLineSet = new Set<string>();
-  for (const line of oldLines) {
-    const normalized = normalizeForComparison(line);
-    if (normalized) oldLineSet.add(normalized);
-  }
-
-  const newParts: string[] = [];
-  let pendingBlank = false;
-  // True once any content line (retained-old skipped OR new pushed) has been
-  // seen, so a blank that precedes the chunk's FIRST emitted new line counts as
-  // a real paragraph break only when there was content above it — pane-top
-  // padding (no content above) must not produce a leading separator.
-  let sawContent = false;
-  let startsNewParagraph = false;
-
-  for (const line of newLines) {
-    const normalized = normalizeForComparison(line);
-    if (!normalized) {
-      pendingBlank = true;
-      continue;
-    }
-
-    if (oldLineSet.has(normalized)) {
-      pendingBlank = false;
-      sawContent = true;
-      continue;
-    }
-
-    if (newParts.length === 0) {
-      // First emitted new line: the leading blank is dropped from `text` (a
-      // fresh message must never start blank), but reported out-of-band so the
-      // JOIN can rebuild the separator — only when there was content above it.
-      if (pendingBlank && sawContent) startsNewParagraph = true;
-    } else if (pendingBlank) {
-      // Interior blank within this chunk — keep it inline as a separator.
-      newParts.push('');
-    }
-    newParts.push(line);
-    pendingBlank = false;
-    sawContent = true;
-  }
-
-  return { text: newParts.join('\n').trim(), startsNewParagraph };
-}
+// `getNewPaneContent` + the `NewPaneContent` interface moved to `utils/paneDiff`
+// (shared with the terminal backend); it imports `normalizeForComparison` from
+// `utils/recentRelayWindow` so the per-poll set diff and the long-horizon relay
+// window keep one normalization domain. Both names are re-exported so existing
+// importers/tests keep resolving unchanged.
+export { getNewPaneContent, type NewPaneContent };
 
 /**
  * @description Input snapshot of one resume-seeding poll, fed to

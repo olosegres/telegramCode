@@ -9,10 +9,12 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   getTerminalEmitPlan,
+  buildTerminalEmitText,
   buildTerminalNewSessionArgs,
   terminalPaneCols,
   terminalPaneRows,
 } from '../utils/terminalEmitPlan';
+import { appendPendingOutput } from '../utils/outputFlushPlan';
 
 test('getTerminalEmitPlan: a fresh output is a new message, not a continuation', () => {
   assert.deepEqual(getTerminalEmitPlan(true), { isContinuation: false });
@@ -45,6 +47,58 @@ test('getTerminalEmitPlan: fresh→continuation across a command, re-armed by th
   plan = getTerminalEmitPlan(nextOutputFresh);
   nextOutputFresh = false;
   assert.equal(plan.isContinuation, false);
+});
+
+test('buildTerminalEmitText: a continuation delta is prefixed with a single newline', () => {
+  assert.equal(buildTerminalEmitText('stream line 2', true), '\nstream line 2');
+});
+
+test('buildTerminalEmitText: a fresh delta is emitted unchanged (no leading newline)', () => {
+  assert.equal(buildTerminalEmitText('stream line 1', false), 'stream line 1');
+});
+
+test('buildTerminalEmitText: a fresh multi-line chunk keeps its interior newlines, no leading one', () => {
+  const chunk = 'line a\nline b\nline c';
+  const emitted = buildTerminalEmitText(chunk, false);
+  assert.equal(emitted, chunk);
+  assert.ok(!emitted.startsWith('\n'));
+});
+
+test('terminal continuation deltas join with EXACTLY one newline through the bare-concat path', () => {
+  // End-to-end of the actual downstream join used by BOTH transports
+  // (group `queueOutput` and DM `feedDraft` both funnel into
+  // `appendPendingOutput`): a continuation emit concats bare onto the pending
+  // buffer, so the leading `\n` carried in the emit text IS the separator.
+  const first = buildTerminalEmitText('stream line 1', false); // fresh
+  const second = buildTerminalEmitText('stream line 2', true); // continuation
+  const third = buildTerminalEmitText('stream line 3', true); // continuation
+
+  let pending = appendPendingOutput(null, first, false);
+  pending = appendPendingOutput(pending, second, true);
+  pending = appendPendingOutput(pending, third, true);
+
+  assert.equal(pending, 'stream line 1\nstream line 2\nstream line 3');
+  // No doubled newlines anywhere — exactly one between consecutive lines.
+  assert.ok(!pending.includes('\n\n'));
+});
+
+test('a fresh terminal delta never starts the message with a newline (no leading blank line)', () => {
+  // A fresh delta opens a new message; the buffer is empty, so
+  // `appendPendingOutput(null, …)` returns it verbatim — must not be blank-led.
+  const fresh = buildTerminalEmitText('first command output', false);
+  const pending = appendPendingOutput(null, fresh, false);
+  assert.equal(pending, 'first command output');
+  assert.ok(!pending.startsWith('\n'));
+});
+
+test('a single-poll multi-line terminal chunk keeps interior newlines, no doubling', () => {
+  // The whole output of a fast command lands in ONE poll → emitted FRESH with
+  // its interior newlines intact; the join must not add or duplicate any.
+  const chunk = '/home/me/projects/app\ntotal 8\ndrwxr-xr-x  2 me  staff   64';
+  const emitted = buildTerminalEmitText(chunk, false);
+  const pending = appendPendingOutput(null, emitted, false);
+  assert.equal(pending, chunk);
+  assert.ok(!pending.includes('\n\n'));
 });
 
 test('buildTerminalNewSessionArgs: includes the shell command, -c workDir and size flags', () => {

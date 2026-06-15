@@ -41,6 +41,30 @@ export function getTerminalEmitPlan(nextOutputFresh: boolean): { isContinuation:
 }
 
 /**
+ * @description Build the text actually emitted for one terminal poll-delta so the
+ * downstream bare-concat continuation join (`appendPendingOutput`: `pending +
+ * output`) keeps the inter-poll line break.
+ *
+ * Unlike OpenCode's token tails (cut mid-word, so they MUST concat bare), each
+ * terminal poll-delta is a complete line/block of shell output, so consecutive
+ * deltas of one command have to be SEPARATED by a `\n`. We carry that `\n` inside
+ * the emitted text (rather than a `meta` flag) so it works identically for the
+ * group `queueOutput` and the DM `feedDraft` paths without touching either.
+ *
+ * - CONTINUATION (`isContinuation` true) → prefix one `\n`, so the bare concat
+ *   yields `pending\n delta`.
+ * - FRESH (`isContinuation` false) → return the chunk unchanged: a fresh delta
+ *   opens a new message and a message must never start blank.
+ *
+ * No doubling: the chunk is already trailing-`\n`-trimmed upstream
+ * (`getNewPaneContent` trims, the adapter `.trim()`s again), so a single-poll
+ * multi-line chunk keeps its OWN interior newlines and gains no extra blank.
+ */
+export function buildTerminalEmitText(chunk: string, isContinuation: boolean): string {
+  return isContinuation ? `\n${chunk}` : chunk;
+}
+
+/**
  * @description Build the `tmux new-session` argv for a terminal shell. Pure so
  * the shell-command + `-c <workDir>` + size flags are unit-testable. tmux execs
  * the trailing `shellCommand` via `$SHELL -c`; the caller passes an already

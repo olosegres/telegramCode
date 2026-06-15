@@ -18,6 +18,7 @@ import {
 } from '../utils/tmuxSessionName';
 import {
   getTerminalEmitPlan,
+  buildTerminalEmitText,
   buildTerminalNewSessionArgs,
   terminalPaneCols,
   terminalPaneRows,
@@ -363,10 +364,16 @@ export class TerminalAdapter extends EventEmitter implements AgentAdapter {
 
     const { isContinuation } = getTerminalEmitPlan(session.nextOutputFresh);
     session.nextOutputFresh = false;
+    // A continuation poll-delta carries a leading `\n` in its TEXT so the
+    // downstream bare-concat join keeps the inter-poll line break (terminal
+    // deltas are whole lines, unlike OpenCode's mid-word token tails). A fresh
+    // delta opens a new message and is emitted unchanged. See
+    // {@link buildTerminalEmitText}.
+    const emitText = buildTerminalEmitText(chunk, isContinuation);
     if (isContinuation) {
-      this.emit('output', key, chunk, { isContinuation: true });
+      this.emit('output', key, emitText, { isContinuation: true });
     } else {
-      this.emit('output', key, chunk);
+      this.emit('output', key, emitText);
     }
   }
 

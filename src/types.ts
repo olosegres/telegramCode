@@ -330,10 +330,10 @@ export interface OutputEventMeta {
 
 /**
  * @description The per-surface output path, selected ONCE at boot from
- * `CHAT_MODE` (mirroring the {@link AgentAdapter} pattern) instead of a
- * `checkIsDmMode()` branch at every output site. The group impl is thin
- * (`queueOutput` edit-in-place + a noop finalize); the DM impl owns the
- * draft-cursor manager. Built by `createOutputTransport`.
+ * `CHAT_MODE` (mirroring the {@link AgentAdapter} pattern) instead of a per-call
+ * surface branch at every output site. The group impl is thin (`queueOutput`
+ * edit-in-place + a noop finalize); the DM impl owns the draft-cursor manager;
+ * `both` dispatches per key. Built by `createOutputTransport`.
  */
 export interface OutputTransport {
   /** Route one `output` event to its message path (the mode's own logic). */

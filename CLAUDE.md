@@ -104,7 +104,7 @@ config/variants, not a per-message API field).
   its flushes stay one-message-each.
 - **Output transport seam (CHAT_MODE-selected).** HOW agent output reaches a topic
   is chosen ONCE at boot by `CHAT_MODE` via `createOutputTransport` (`src/output/`),
-  mirroring the `AgentAdapter` factory — no per-call `checkIsDmMode()`. **Group** =
+  mirroring the `AgentAdapter` factory — no per-call surface branch. **Group** =
   the `queueOutput` edit-in-place path above. **DM** (`src/output/dmOutputTransport.ts`)
   = the live "cursor" draft: ONE accumulating native `sendMessageDraft` holds the
   full current reply, FINALIZED to a permanent `sendMessage` on boundaries (idle
@@ -118,9 +118,28 @@ config/variants, not a per-message API field).
   heartbeat is kept noop while a draft is active (`OutputTransport.checkIsStreaming`
   ORed into `checkIsOutputStreaming`) so it can't insert a status frame between
   deltas and chop the draft mid-answer. `OutputTransport` interface lives in
-  `types.ts`.
+  `types.ts`. In **`both`** the factory returns a DISPATCHER that routes each
+  per-thread call by `checkIsDmKey(key)` to a once-built DM impl or group impl —
+  so one instance streams the owner DM via the cursor AND the group edit-in-place
+  at the same time.
+- **CHAT_MODE — one surface or both (default `both`).** `CHAT_MODE` selects which
+  Telegram surface(s) the instance serves: `group` (forum supergroup only), `dm`
+  (the owner's private chat only), or `both` (DEFAULT) — ONE instance serves the
+  owner DM AND the group at once, decided PER CHAT off the resolved `ThreadKey`
+  (`checkIsDmKey(key) = key.chatId === ownerUserId`, since a DM key carries the
+  owner's chat id). `OWNER_USER_ID` is REQUIRED for `dm`; for `both` it is
+  OPTIONAL — unset → the DM surface is INERT (group-only, boot logs a notice), so
+  a bare `telegramCode` stays backward-compatible with a group-only deploy and
+  lights up DM the moment `OWNER_USER_ID` is set. Access stays per surface: the
+  owner id gates the DM chat, the served group's admin cache gates the group chat
+  (`checkIsAllowedUser(ctx)` is the single per-chat authority). The bi-surface
+  key resolution (`resolveThreadKeyForMode`) and discriminator
+  (`checkIsDmThreadKey`) are pure in `threadRouting.ts`; `bot.ts` wraps them with
+  the runtime config.
 - **Two-instance ready.** A "pet" and a "work" instance can run on one host with
-  isolated `DATA_DIR`, group, and OpenCode port.
+  isolated `DATA_DIR`, group, and OpenCode port. (Orthogonal to `CHAT_MODE=both`,
+  which serves both surfaces from ONE instance — use two instances when you want
+  process-level isolation/distribution instead.)
 - **MCP hierarchy.** MCP servers merge across user / group / project / thread
   scopes with `${VAR}` env expansion.
 - **Agent scheduling tools (injected).** Separately from that user hierarchy,
@@ -282,7 +301,7 @@ as a command in `bot.ts`.
 
 | File | Responsibility |
 |------|----------------|
-| `createOutputTransport.ts` | Factory: pick the output transport by `CHAT_MODE` (the single mode decision); thin group impl inline (`queueOutput` + noop finalize), DM delegates to `createDmOutputTransport` |
+| `createOutputTransport.ts` | Factory: pick the output transport by `CHAT_MODE` (the single mode decision); thin group impl (`queueOutput` + noop finalize), DM delegates to `createDmOutputTransport`, `both` returns a per-key dispatcher (`checkIsDmKey`) over both impls |
 | `dmOutputTransport.ts` | The DM draft-cursor manager (relocated out of `bot.ts`): `deliverOutput` 3-way route (draft / `isComplete` one-shot / `queueOutput` baseline), `finalizeInFlight`, `disposeThread`, and the whole draft state + send/pace/idle machinery — built from injected `bot.ts` primitives |
 
 The `OutputTransport` interface (in `types.ts`) is the seam, selected once at boot

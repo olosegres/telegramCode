@@ -24,11 +24,14 @@ import * as assert from 'node:assert/strict';
 import {
   resolveThreadKey,
   resolveDmThreadKey,
+  resolveThreadKeyForMode,
+  checkIsDmThreadKey,
   resolvePairingCandidate,
   checkIsGeneralTopic,
   checkIsChatMode,
   GENERAL_THREAD_ID,
   DM_GENERAL_THREAD_ID,
+  type SurfaceRouting,
 } from '../threadRouting';
 
 const ALLOWED = -1001234567890;
@@ -310,10 +313,141 @@ test('checkIsGeneralTopic: General marker is 1 in group mode, 0 in DM mode', () 
 
 // ─── CHAT_MODE validation guard ─────────────────────────────────────────
 
-test('checkIsChatMode accepts only the two known surfaces', () => {
+test('checkIsChatMode accepts only the three known surfaces', () => {
   assert.equal(checkIsChatMode('group'), true);
   assert.equal(checkIsChatMode('dm'), true);
+  assert.equal(checkIsChatMode('both'), true);
   assert.equal(checkIsChatMode('supergroup'), false);
   assert.equal(checkIsChatMode('DM'), false); // case-sensitive, mirrors env intent
   assert.equal(checkIsChatMode(''), false);
+});
+
+// ─── CHAT_MODE=both — per-chat discriminator + bi-surface resolution ─────
+//
+// `both` serves the owner DM AND the group from ONE instance, decided per chat.
+// `checkIsDmThreadKey` is the discriminator (a DM key's chatId is the owner id);
+// `resolveThreadKeyForMode` is the composition `bot.ts:getThreadKey` delegates
+// to. These tests pin: owner private → DM key, group → group key, foreign
+// private → null, and that a DM-inert `both` skips the owner-DM resolver. The
+// `dm`/`group` legs must stay byte-for-byte the single-resolver behaviour.
+
+const ownerDmPrivateChat = { id: OWNER_USER_ID, type: 'private' };
+const servedGroupChat = { id: ALLOWED, type: 'supergroup', is_forum: true };
+
+const bothRouting: SurfaceRouting = {
+  mode: 'both',
+  ownerUserId: OWNER_USER_ID,
+  allowedGroupId: ALLOWED,
+  isDmSurfaceActive: true,
+};
+/** `both` with no OWNER_USER_ID configured → DM surface inert (group-only). */
+const bothInertRouting: SurfaceRouting = {
+  mode: 'both',
+  ownerUserId: NaN,
+  allowedGroupId: ALLOWED,
+  isDmSurfaceActive: false,
+};
+
+test('checkIsDmThreadKey: owner chat id → true, group/foreign chat id → false', () => {
+  assert.equal(checkIsDmThreadKey({ chatId: OWNER_USER_ID, threadId: 0 }, OWNER_USER_ID, true), true);
+  assert.equal(checkIsDmThreadKey({ chatId: ALLOWED, threadId: 1 }, OWNER_USER_ID, true), false);
+  assert.equal(checkIsDmThreadKey({ chatId: 999, threadId: 0 }, OWNER_USER_ID, true), false);
+});
+
+test('checkIsDmThreadKey: inert DM surface → always false (group-only both)', () => {
+  // Even the owner's own chat id is NOT a DM key when the surface is inert —
+  // and with no owner configured the id is NaN, which never matches anyway.
+  assert.equal(checkIsDmThreadKey({ chatId: OWNER_USER_ID, threadId: 0 }, OWNER_USER_ID, false), false);
+  assert.equal(checkIsDmThreadKey({ chatId: OWNER_USER_ID, threadId: 0 }, NaN, false), false);
+});
+
+test('both: owner private chat resolves to a DM key (chatId = owner id)', () => {
+  const key = resolveThreadKeyForMode(
+    { chat: ownerDmPrivateChat, message: { message_thread_id: 500001 } },
+    bothRouting,
+  );
+  assert.deepEqual(key, { chatId: OWNER_USER_ID, threadId: 500001 });
+  // The resolved key reads back as a DM key via the discriminator.
+  assert.equal(checkIsDmThreadKey(key!, OWNER_USER_ID, true), true);
+});
+
+test('both: the served group resolves to a group key (chatId = group id)', () => {
+  const key = resolveThreadKeyForMode(
+    { chat: servedGroupChat, message: { message_thread_id: 42, is_topic_message: true } },
+    bothRouting,
+  );
+  assert.deepEqual(key, { chatId: ALLOWED, threadId: 42 });
+  assert.equal(checkIsDmThreadKey(key!, OWNER_USER_ID, true), false);
+});
+
+test('both: a foreign private chat is dropped (owner gating) — never a group key', () => {
+  // A non-owner DM: the owner-DM resolver rejects it (id mismatch) and the group
+  // resolver rejects it (not a supergroup) → null. No leak onto either surface.
+  const key = resolveThreadKeyForMode(
+    { chat: { id: 999, type: 'private' }, message: {} },
+    bothRouting,
+  );
+  assert.equal(key, null);
+});
+
+test('both: DM-inert skips the owner-DM resolver — the owner private chat is dropped', () => {
+  // With the DM surface inert, an update in the owner's private chat must NOT
+  // resolve to a DM key; the group resolver rejects the private chat → null.
+  const key = resolveThreadKeyForMode(
+    { chat: ownerDmPrivateChat, message: { message_thread_id: 500001 } },
+    bothInertRouting,
+  );
+  assert.equal(key, null);
+});
+
+test('both: DM-inert still serves the group', () => {
+  const key = resolveThreadKeyForMode(
+    { chat: servedGroupChat, message: { message_thread_id: 7, is_topic_message: true } },
+    bothInertRouting,
+  );
+  assert.deepEqual(key, { chatId: ALLOWED, threadId: 7 });
+});
+
+test('regression — dm mode: only the owner-DM resolver runs (group update dropped)', () => {
+  const dmRouting: SurfaceRouting = {
+    mode: 'dm',
+    ownerUserId: OWNER_USER_ID,
+    allowedGroupId: ALLOWED,
+    isDmSurfaceActive: true,
+  };
+  // Owner DM → key.
+  assert.deepEqual(
+    resolveThreadKeyForMode({ chat: ownerDmPrivateChat, message: {} }, dmRouting),
+    { chatId: OWNER_USER_ID, threadId: DM_GENERAL_THREAD_ID },
+  );
+  // A group update in dm mode → null (no group surface).
+  assert.equal(
+    resolveThreadKeyForMode(
+      { chat: servedGroupChat, message: { message_thread_id: 42, is_topic_message: true } },
+      dmRouting,
+    ),
+    null,
+  );
+});
+
+test('regression — group mode: only the group resolver runs (owner DM dropped)', () => {
+  const groupRouting: SurfaceRouting = {
+    mode: 'group',
+    ownerUserId: NaN,
+    allowedGroupId: ALLOWED,
+    isDmSurfaceActive: false,
+  };
+  // Group update → key.
+  assert.deepEqual(
+    resolveThreadKeyForMode(
+      { chat: servedGroupChat, message: { message_thread_id: 42, is_topic_message: true } },
+      groupRouting,
+    ),
+    { chatId: ALLOWED, threadId: 42 },
+  );
+  // The owner's private chat in group mode → null (no DM surface).
+  assert.equal(
+    resolveThreadKeyForMode({ chat: ownerDmPrivateChat, message: {} }, groupRouting),
+    null,
+  );
 });

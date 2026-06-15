@@ -30,9 +30,16 @@ interface RecordedCalls {
   finalizeDraft: number;
 }
 
+/**
+ * @param supportsDraft  the per-thread draft-streaming gate stub.
+ * @param outputsDeltas  whether the thread's adapter emits continuation-less deltas.
+ * @param isDmKey  the per-chat discriminator the `both` dispatcher routes on
+ *   (a function of the key so `both` can route different keys to different impls).
+ */
 function createStubDeps(
   supportsDraft: boolean,
   outputsDeltas = false,
+  isDmKey: (key: ThreadKey) => boolean = () => false,
 ): { deps: OutputTransportDeps; calls: RecordedCalls } {
   const calls: RecordedCalls = {
     queueOutput: [],
@@ -58,6 +65,9 @@ function createStubDeps(
     },
     checkIsGeneral() {
       return false;
+    },
+    checkIsDmKey(key) {
+      return isDmKey(key);
     },
     async callSendMessageDraft() {
       // The factory-route tests never reach the draft network send (no real
@@ -181,4 +191,82 @@ test('dm: a streaming meta on a NON-draft-capable thread (gate off) routes to qu
     isFinal: false,
     isComplete: false,
   });
+});
+
+// ─── both — per-key dispatch (one instance, two surfaces) ────────────────
+//
+// In `both` the transport is a DISPATCHER: each per-thread call routes by
+// `checkIsDmKey(key)` to the DM draft impl or the thin group impl. These tests
+// prove a DM key drives the draft channel (NOT queueOutput) AND a group key
+// drives queueOutput (NOT the draft channel) — concurrently, from one transport.
+
+const OWNER_ID = 7000001;
+const DM_KEY: ThreadKey = { chatId: OWNER_ID, threadId: 0 };
+const GROUP_KEY: ThreadKey = { chatId: -1001234567890, threadId: 5 };
+const isDmKeyByChatId = (key: ThreadKey): boolean => key.chatId === OWNER_ID;
+
+test('both: a DM key routes deliverOutput to the draft path, not queueOutput', () => {
+  const { deps, calls } = createStubDeps(/* supportsDraft */ true, false, isDmKeyByChatId);
+  let draftSendAttempted = false;
+  deps.callSendMessageDraft = async () => {
+    draftSendAttempted = true;
+    return undefined;
+  };
+  const transport = createOutputTransport('both', deps);
+  transport.deliverOutput(DM_KEY, 'streaming tail', { isContinuation: false });
+  assert.equal(draftSendAttempted, true, 'a DM key must drive the draft channel');
+  assert.equal(calls.queueOutput.length, 0, 'a DM key must NOT hit queueOutput');
+});
+
+test('both: a group key routes deliverOutput to queueOutput, not the draft path', () => {
+  const { deps, calls } = createStubDeps(/* supportsDraft */ true, false, isDmKeyByChatId);
+  let draftSendAttempted = false;
+  deps.callSendMessageDraft = async () => {
+    draftSendAttempted = true;
+    return undefined;
+  };
+  const transport = createOutputTransport('both', deps);
+  transport.deliverOutput(GROUP_KEY, 'group line', { isContinuation: true, isFinal: true });
+  assert.equal(calls.queueOutput.length, 1, 'a group key must hit queueOutput');
+  assert.deepEqual(calls.queueOutput[0], {
+    output: 'group line',
+    isContinuation: true,
+    isFinal: true,
+    isComplete: false,
+  });
+  assert.equal(draftSendAttempted, false, 'a group key must NOT touch the draft channel');
+});
+
+test('both: the two surfaces are independent — a DM draft and a group send coexist', () => {
+  const { deps, calls } = createStubDeps(/* supportsDraft */ true, false, isDmKeyByChatId);
+  let dmDraftSends = 0;
+  deps.callSendMessageDraft = async () => {
+    dmDraftSends += 1;
+    return undefined;
+  };
+  const transport = createOutputTransport('both', deps);
+  transport.deliverOutput(GROUP_KEY, 'group line', { isContinuation: false });
+  transport.deliverOutput(DM_KEY, 'dm tail', { isContinuation: false });
+  assert.equal(calls.queueOutput.length, 1, 'the group leg used queueOutput once');
+  assert.ok(dmDraftSends >= 1, 'the DM leg drove its own draft channel');
+});
+
+test('both: checkIsStreaming reports per key — DM draft active, group always false', () => {
+  const { deps } = createStubDeps(/* supportsDraft */ true, /* outputsDeltas */ true, isDmKeyByChatId);
+  deps.callSendMessageDraft = async () => undefined;
+  const transport = createOutputTransport('both', deps);
+  assert.equal(transport.checkIsStreaming(GROUP_KEY), false, 'group leg never reports streaming');
+  assert.equal(transport.checkIsStreaming(DM_KEY), false, 'no DM draft yet → not streaming');
+  transport.deliverOutput(DM_KEY, 'dm delta', { isContinuation: false });
+  assert.equal(transport.checkIsStreaming(DM_KEY), true, 'an active DM draft reports streaming');
+  assert.equal(transport.checkIsStreaming(GROUP_KEY), false, 'the group leg stays false meanwhile');
+});
+
+test('both: finalizeInFlight on a group key is a noop; disposeThread routes without throwing', async () => {
+  const { deps, calls } = createStubDeps(/* supportsDraft */ true, false, isDmKeyByChatId);
+  const transport = createOutputTransport('both', deps);
+  await transport.finalizeInFlight(GROUP_KEY);
+  assert.equal(calls.sendAgentChunks.length, 0, 'group finalize is a noop (no send)');
+  assert.doesNotThrow(() => transport.disposeThread(GROUP_KEY));
+  assert.doesNotThrow(() => transport.disposeThread(DM_KEY));
 });

@@ -32,16 +32,19 @@ export const GENERAL_THREAD_ID = 1;
 export const DM_GENERAL_THREAD_ID = 0;
 
 /**
- * @description Which Telegram surface the bot serves.
+ * @description Which Telegram surface(s) the bot serves.
  *
- * - `group` — the historical forum supergroup (creator/admins gated, paired by
- *   `ALLOWED_GROUP_ID`). DEFAULT; unchanged behaviour.
- * - `dm` — the owner's 1:1 private chat with forum-topic mode (owner-id gated).
+ * - `group` — only the forum supergroup (creator/admins gated, paired by
+ *   `ALLOWED_GROUP_ID`).
+ * - `dm` — only the owner's 1:1 private chat with forum-topic mode (owner-id gated).
+ * - `both` — DEFAULT. ONE instance serves the owner DM AND the group at once,
+ *   decided PER CHAT (the DM surface is inert if no `OWNER_USER_ID` is set, so a
+ *   bare deploy stays group-only).
  */
-export type ChatMode = 'group' | 'dm';
+export type ChatMode = 'group' | 'dm' | 'both';
 
 /** The valid {@link ChatMode} values, for env validation. */
-export const chatModeValues: readonly ChatMode[] = ['group', 'dm'];
+export const chatModeValues: readonly ChatMode[] = ['group', 'dm', 'both'];
 
 /** Type guard: is `value` a valid {@link ChatMode}? */
 export function checkIsChatMode(value: string): value is ChatMode {
@@ -137,6 +140,56 @@ export function resolveDmThreadKey(input: RouteInput, ownerUserId: number): Thre
   const msg = input.message ?? input.callbackQueryMessage;
   const threadId = msg?.message_thread_id ?? DM_GENERAL_THREAD_ID;
   return { chatId: chat.id, threadId };
+}
+
+/** Runtime surface config for {@link resolveThreadKeyForMode} / {@link checkIsDmThreadKey}. */
+export interface SurfaceRouting {
+  /** The served surface(s) for this process. */
+  mode: ChatMode;
+  /** The owner's user id (= the owner's DM chat id), or `NaN` when no DM owner. */
+  ownerUserId: number;
+  /** The effective forum supergroup id, or `NaN` while unpaired. */
+  allowedGroupId: number;
+  /** Whether the DM surface is live (false ⇒ the owner-DM resolver is skipped). */
+  isDmSurfaceActive: boolean;
+}
+
+/**
+ * @description Per-chat discriminator: does `key` belong to the DM surface? A DM
+ * key's `chatId` is the owner's user id (`resolveDmThreadKey` gates
+ * `chat.id === ownerUserId`), so the equality both identifies the surface and
+ * re-asserts the owner. Always false when the DM surface is inert — then
+ * `ownerUserId` is `NaN`, which never equals a real chat id anyway, but the guard
+ * makes a group-only `both` unambiguously group.
+ */
+export function checkIsDmThreadKey(
+  key: ThreadKey,
+  ownerUserId: number,
+  isDmSurfaceActive: boolean,
+): boolean {
+  if (!isDmSurfaceActive) return false;
+  return key.chatId === ownerUserId;
+}
+
+/**
+ * @description Resolve the `ThreadKey` for an update across BOTH surfaces, per
+ * {@link ChatMode}. The two resolvers are disjoint (a private chat vs. a forum
+ * supergroup), so trying both in `both` is unambiguous — an update matches at
+ * most one. The owner-DM resolver runs first when the DM surface is live
+ * (skipped when inert); the group resolver runs unless we are DM-only. A
+ * non-matching surface returns `null` → drop. The single composition behind
+ * `bot.ts:getThreadKey`, kept pure here so it is unit-testable.
+ */
+export function resolveThreadKeyForMode(
+  input: RouteInput,
+  routing: SurfaceRouting,
+): ThreadKey | null {
+  if (routing.isDmSurfaceActive) {
+    const dmKey = resolveDmThreadKey(input, routing.ownerUserId);
+    if (dmKey) return dmKey;
+  }
+  if (routing.mode === 'dm') return null;
+  return resolveThreadKey(input, routing.allowedGroupId);
 }
 
 /**

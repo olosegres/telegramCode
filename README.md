@@ -91,6 +91,10 @@ $EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN (group auto-pai
 cd ~/projects && telegramCode          # WORK_ROOT defaults to $PWD = ~/projects
 ```
 
+Shortcut: `yarn install-link` runs `yarn install && yarn build && npm link`
+in one shot — `npm link` symlinks the global `telegramCode` to this folder, so
+later rebuilds (`yarn build`) are picked up without re-installing.
+
 The wrapper looks for env in two places (in order):
 
 1. `~/.config/telegram-code/.env` — base, set once, used everywhere

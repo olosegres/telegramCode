@@ -99,11 +99,16 @@ config/variants, not a per-message API field).
   = the live "cursor" draft: ONE accumulating native `sendMessageDraft` holds the
   full current reply, FINALIZED to a permanent `sendMessage` on boundaries (idle
   ~4s / 4096 overflow / isFinal / new-response / status / teardown); `isComplete`
-  one-shots post directly. Only OpenCode threads stream via drafts (it marks
-  `isContinuation`); **Claude DM falls through to the plain `queueOutput` baseline**
-  — its scrape never marks continuations, so a per-chunk draft floods/flickers (a
-  proper Claude DM live preview is deferred to a follow-up). `OutputTransport`
-  interface lives in `types.ts`.
+  one-shots post directly. **Both backends stream via the cursor** now: OpenCode
+  marks `isContinuation` directly; the Claude scrape adapter emits each poll's
+  classifier-filtered prose delta with NO meta, so the DM transport synthesises the
+  continuation flag (`getDmDraftContinuation`, gated on the adapter's
+  `outputsDeltas`) — its deltas accumulate into ONE full-snapshot draft instead of
+  finalizing per poll. Tools/status stay separate transients. The Claude liveness
+  heartbeat is kept noop while a draft is active (`OutputTransport.checkIsStreaming`
+  ORed into `checkIsOutputStreaming`) so it can't insert a status frame between
+  deltas and chop the draft mid-answer. `OutputTransport` interface lives in
+  `types.ts`.
 - **Two-instance ready.** A "pet" and a "work" instance can run on one host with
   isolated `DATA_DIR`, group, and OpenCode port.
 - **MCP hierarchy.** MCP servers merge across user / group / project / thread

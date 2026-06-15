@@ -109,12 +109,15 @@ test('getNewPaneContent: identical content yields no delta', () => {
 });
 
 test('getNewPaneContent: a redrawn tool line with a changed glyph is deduped', () => {
-  // `normalizeForComparison` strips the leading ●/○/⏳/✓ glyph, so the same
+  // `normalizeForComparison` strips the leading ●/⏺/○/⏳/✓ glyph, so the same
   // tool line repainted with a different state is NOT re-emitted; only the
-  // genuinely new line is.
-  const out = getNewPaneContent('● Done', '✓ Done\nNew line');
-  assert.equal(out.text, 'New line');
-  assert.equal(out.startsNewParagraph, false);
+  // genuinely new line is. Covers both the `●` and the real-v2.1.177 `⏺` bullet
+  // re-rendering to the `✓` done state.
+  for (const bullet of ['●', '⏺'] as const) {
+    const out = getNewPaneContent(`${bullet} Done`, '✓ Done\nNew line');
+    assert.equal(out.text, 'New line', `glyph "${bullet}" → "✓" should dedup`);
+    assert.equal(out.startsNewParagraph, false);
+  }
 });
 
 // ─── B10 — already-sent answer re-emitted when a wrapped draft grows the box ──

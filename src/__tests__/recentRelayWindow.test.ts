@@ -44,6 +44,8 @@ test('window: lookup matches across glyph/whitespace re-renders (normalization d
   relayWindow.record('● Bash(yarn test) finished with exit code 0');
   assert.equal(relayWindow.checkHasLine('✓ Bash(yarn test) finished with exit code 0'), true);
   assert.equal(relayWindow.checkHasLine('   Bash(yarn test) finished with exit code 0  '), true);
+  // The real-v2.1.177 `⏺` output bullet must normalize into the same domain.
+  assert.equal(relayWindow.checkHasLine('⏺ Bash(yarn test) finished with exit code 0'), true);
 });
 
 test('window: lookup matches across markdown/wrapping re-renders (the 2026-06-15 re-emit)', () => {

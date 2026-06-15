@@ -29,11 +29,21 @@ import {
   stripTuiElementsWithContext,
 } from '../adapters/claudeCliAdapter';
 
+/**
+ * The assistant-output bullet Claude's real TUI (v2.1.177) prints on the table's
+ * TOP border (`⏺ ┌…`, U+23FA). The pre-2026-06-15 fixtures used NO bullet, so the
+ * `SHARP_TABLE_TOP_RE` bullet-prefix branch was never exercised and the live bug
+ * (top border `⏺`-led → not matched → table never collected → wide rows dropped
+ * by the >50-char chrome filter) shipped green. These fixtures now carry the real
+ * glyph; a parallel `●` set (the older bullet) proves BOTH variants are detected.
+ */
+const outputBullet = '⏺';
+
 /** Pane capture 1: the empty skeleton — borders only, narrowest layout. */
 const captureSkeleton = [
   'Вот план:',
   '',
-  '┌──┬────┬────┐',
+  `${outputBullet} ┌──┬────┬────┐`,
   '│# │План│Суть│',
   '├──┼────┼────┤',
   '└──┴────┴────┘',
@@ -43,7 +53,7 @@ const captureSkeleton = [
 const captureOneRow = [
   'Вот план:',
   '',
-  '┌──┬───────────┬─────────┐',
+  `${outputBullet} ┌──┬───────────┬─────────┐`,
   '│# │ План      │ Суть    │',
   '├──┼───────────┼─────────┤',
   '│3 │ row 3     │ deet 3  │',
@@ -59,7 +69,7 @@ const captureOneRow = [
 const captureFull = [
   'Вот план:',
   '',
-  '┌──┬────────────────────┬──────────────┐',
+  `${outputBullet} ┌──┬────────────────────┬──────────────┐`,
   '│# │ План               │ Суть         │',
   '├──┼────────────────────┼──────────────┤',
   '│3 │ row 3 content      │ detail 3     │',
@@ -74,7 +84,7 @@ const captureFull = [
 const captureFullSettled = [
   'Вот план:',
   '',
-  '┌──┬────────────────────┬──────────────┐',
+  `${outputBullet} ┌──┬────────────────────┬──────────────┐`,
   '│# │ План               │ Суть         │',
   '├──┼────────────────────┼──────────────┤',
   '│3 │ row 3 content      │ detail 3     │',
@@ -84,9 +94,14 @@ const captureFullSettled = [
   '✻ Brewing… (4s · 1.3k tokens)',
 ].join('\n');
 
-/** The full table block alone (what the stabilizer must emit), borders + rows. */
+/**
+ * The full table block alone (what the stabilizer must emit), borders + rows,
+ * carrying the same `⏺ ` top-border bullet the captures do — so the byte-equal
+ * assertion runs the bullet-strip path on both sides (the strip turns `⏺ ` into a
+ * two-space indent on the top border; see {@link ASSISTANT_BULLET_PREFIX_RE}).
+ */
 const fullTableBlock = [
-  '┌──┬────────────────────┬──────────────┐',
+  `${outputBullet} ┌──┬────────────────────┬──────────────┐`,
   '│# │ План               │ Суть         │',
   '├──┼────────────────────┼──────────────┤',
   '│3 │ row 3 content      │ detail 3     │',
@@ -94,6 +109,11 @@ const fullTableBlock = [
   '│5 │ row 5 content      │ detail 5     │',
   '└──┴────────────────────┴──────────────┘',
 ].join('\n');
+
+/** Same FULL pane as {@link captureFull} but with the OLDER `●` bullet on the top
+ *  border — proves the detector accepts both assistant-output glyphs. */
+const captureFullDotBullet = captureFull.replace(`${outputBullet} ┌`, '● ┌');
+const captureFullSettledDotBullet = captureFullSettled.replace(`${outputBullet} ┌`, '● ┌');
 
 /** A `│ … │` content/header/separator row count helper (load-bearing assertion). */
 function countTableRows(text: string): number {
@@ -165,6 +185,41 @@ test('table reflow: a settled table (seen twice) emits EXACTLY ONCE, complete', 
   assert.ok(emitted.includes('row 4 content'), 'row 4 must be present');
   assert.ok(emitted.includes('row 5 content'), 'row 5 must be present');
 });
+
+// Both assistant-output bullets the live TUI prints on a table's top border are
+// detected, emitted once, complete, and identically (this is the regression the
+// 2026-06-15 glyph fix closes: a `⏺`-led top border was never matched, so the
+// whole wide table was dropped — the no-bullet-only fixtures hid it).
+for (const { glyph, settledCapture } of [
+  { glyph: outputBullet, settledCapture: captureFullSettled },
+  { glyph: '●', settledCapture: captureFullSettledDotBullet },
+] as const) {
+  test(`table reflow: a "${glyph}"-bulleted top border is detected and emitted complete`, () => {
+    // The bulleted top border MUST be recognised as a table start.
+    assert.ok(
+      getLastSharpTableBlock(settledCapture) !== null,
+      `"${glyph} ┌…" top border must be detected as a sharp table`,
+    );
+
+    const fullCapture = glyph === outputBullet ? captureFull : captureFullDotBullet;
+    const { tableEmits } = replayPoll([
+      captureSkeleton,
+      captureOneRow,
+      fullCapture,
+      settledCapture,
+    ]);
+
+    assert.equal(tableEmits.length, 1, `expected ONE table emit, got ${tableEmits.length}`);
+    const emitted = tableEmits[0];
+    // The strip path turns the bullet into a uniform indent, so BOTH glyphs emit
+    // byte-identically to the canonical `⏺`-topped block — every row complete.
+    assert.equal(emitted, stripTuiElementsWithContext(fullTableBlock).text);
+    assert.equal(countTableRows(emitted), countTableRows(fullTableBlock), 'all table rows must survive');
+    assert.ok(emitted.includes('row 3 content'), 'row 3 must be present');
+    assert.ok(emitted.includes('row 4 content'), 'row 4 must be present');
+    assert.ok(emitted.includes('row 5 content'), 'row 5 must be present');
+  });
+}
 
 test('table reflow: NO empty-skeleton or partial frame is ever emitted', () => {
   const { tableEmits } = replayPoll([

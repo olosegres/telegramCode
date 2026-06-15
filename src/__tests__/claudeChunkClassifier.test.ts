@@ -35,27 +35,30 @@ function findSegment(
 
 // ─── tool header + ⎿ body ──────────────────────────────────────────────
 
-test('a tool header + ⎿ body → toolHeader then toolBody, body text intact', () => {
-  const chunk = [
-    '● *Bash*(yarn test)',
-    '  ⎿  build exit=0',
-    '     2 passing',
-  ].join('\n');
-  const { segments } = classifyClaudeChunk(chunk, createInitialChunkContext());
+// Both assistant-output bullets that lead a real tool header (`●`, and the
+// v2.1.177 `⏺`) must tag as ToolHeader, not prose — a `⏺`-led header going
+// unrecognised was the 2026-06-15 relay bug.
+for (const bullet of ['●', '⏺'] as const) {
+  test(`a "${bullet}"-led tool header + ⎿ body → toolHeader then toolBody, body text intact`, () => {
+    const header = `${bullet} *Bash*(yarn test)`;
+    const chunk = [
+      header,
+      '  ⎿  build exit=0',
+      '     2 passing',
+    ].join('\n');
+    const { segments } = classifyClaudeChunk(chunk, createInitialChunkContext());
 
-  assert.deepEqual(
-    segments.map(s => s.tag),
-    [ClaudeChunkTag.ToolHeader, ClaudeChunkTag.ToolBody],
-  );
-  const body = findSegment(segments, ClaudeChunkTag.ToolBody);
-  assert.ok(body, 'a toolBody segment must exist');
-  assert.ok(body.text.includes('build exit=0'), 'the ⎿ marker line is body');
-  assert.ok(body.text.includes('2 passing'), 'the indented continuation is body');
-  assert.equal(
-    findSegment(segments, ClaudeChunkTag.ToolHeader)?.text,
-    '● *Bash*(yarn test)',
-  );
-});
+    assert.deepEqual(
+      segments.map(s => s.tag),
+      [ClaudeChunkTag.ToolHeader, ClaudeChunkTag.ToolBody],
+    );
+    const body = findSegment(segments, ClaudeChunkTag.ToolBody);
+    assert.ok(body, 'a toolBody segment must exist');
+    assert.ok(body.text.includes('build exit=0'), 'the ⎿ marker line is body');
+    assert.ok(body.text.includes('2 passing'), 'the indented continuation is body');
+    assert.equal(findSegment(segments, ClaudeChunkTag.ToolHeader)?.text, header);
+  });
+}
 
 test('an Update(…) header (Claude TUI render of Edit) → toolHeader, not prose', () => {
   // Live bug (all-minimal topic, 2026-06-13): `Update` was missing from

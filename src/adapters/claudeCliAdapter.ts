@@ -429,13 +429,13 @@ export { convertAnsiToMarkdown, cleanOutput };
 function normalizeToolCallLine(line: string): string {
   const trimmed = line.trim();
   const toolPattern = /^(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i;
-  const bulletToolPattern = /^([●○])\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i;
+  const bulletToolPattern = /^([●○⏺])\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i;
 
   const bulletMatch = trimmed.match(bulletToolPattern);
   if (bulletMatch) {
     const bullet = bulletMatch[1];
     const rest = trimmed.slice(bulletMatch[1].length).trimStart();
-    const icon = bullet === '●' ? '⏳' : '✓';
+    const icon = bullet === '●' || bullet === '⏺' ? '⏳' : '✓';
     return `${icon} ${rest}`;
   }
 
@@ -941,7 +941,7 @@ export interface ClaudeSurvey {
  */
 const CLAUDE_SURVEY_HEADER_TEXT = 'How is Claude doing this session?';
 const CLAUDE_SURVEY_HEADER_REGEX =
-  /^\s*●?\s*How is Claude doing this session\?(\s*\(optional\))?\s*$/;
+  /^\s*[●⏺]?\s*How is Claude doing this session\?(\s*\(optional\))?\s*$/;
 /**
  * The inline option row: `N: Label  N: Label …` — every token is
  * `digit: word`, ≥2 of them, and the WHOLE line is option tokens (anchored),
@@ -1110,15 +1110,15 @@ const DIFF_FALLBACK_MIN_ROWS = 2;
  * table-collecting branch run BEFORE the chrome filters, so table rows can
  * never be dropped while chrome (rounded) handling stays untouched.
  *
- * An optional leading `● ` assistant bullet + indent is tolerated on the TOP
+ * An optional leading `●/⏺ ` assistant bullet + indent is tolerated on the TOP
  * border (Claude prints the bullet on the table's first line).
  */
-const SHARP_TABLE_TOP_RE = /^\s*●?\s*┌[─┬]+┐\s*$/;
+const SHARP_TABLE_TOP_RE = /^\s*[●⏺]?\s*┌[─┬]+┐\s*$/;
 const SHARP_TABLE_BOTTOM_RE = /^\s*└[─┴]+┘\s*$/;
 const SHARP_TABLE_SEPARATOR_RE = /^\s*├[─┼]+┤\s*$/;
 const SHARP_TABLE_CONTENT_RE = /^\s*│.*│\s*$/;
-/** Strip a leading `● ` assistant bullet so the collected box indent is uniform. */
-const ASSISTANT_BULLET_PREFIX_RE = /^(\s*)●\s/;
+/** Strip a leading `●/⏺ ` assistant bullet so the collected box indent is uniform. */
+const ASSISTANT_BULLET_PREFIX_RE = /^(\s*)[●⏺]\s/;
 
 /** True iff `line` is the TOP border of a sharp-corner (markdown) table. */
 function checkIsSharpTableTop(line: string): boolean {
@@ -1652,7 +1652,7 @@ export function stripTuiElementsWithContext(
     if (POST_THINKING_TRAILER_RE.test(line.trim())) continue;
 
     const trimmedLine = line.trim();
-    const isToolCall = /^[●○]?\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i.test(trimmedLine);
+    const isToolCall = /^[●○⏺]?\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i.test(trimmedLine);
 
     if (!isToolCall && /ctrl\+c.*to interrupt/i.test(line)) continue;
     if (/claude code has switched|native installer|Run.*install.*or see/i.test(line)) continue;
@@ -2103,10 +2103,10 @@ export function checkIsClaudeSessionBusy(args: { isActive: boolean; lastContent:
 
 /**
  * @description Markers that a frame carries real agent content (a tool header
- * `●`, a tool-result `⎿`, or a ``` ``` ``` code fence). Their presence vetoes
+ * `●`/`⏺`, a tool-result `⎿`, or a ``` ``` ``` code fence). Their presence vetoes
  * the input-echo classification in {@link checkIsInputEchoFrame}.
  */
-const CONTENT_MARKER_RE = /^(?:●|⎿|```)/;
+const CONTENT_MARKER_RE = /^(?:[●⏺]|⎿|```)/;
 
 /**
  * @description Whether a cleaned output frame is nothing but the TUI input box
@@ -3745,7 +3745,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
                 // permanent output is the `else` below and still always wins.
                 const statusText = activityLine ?? cleanedOutput;
                 // Deduplicate spinner updates: normalize spinner character and compare
-                const dedupKey = activityLine ?? cleanedOutput.replace(/^[✻✽✶✢·*●○]\s*/gm, '');
+                const dedupKey = activityLine ?? cleanedOutput.replace(/^[✻✽✶✢·*●○⏺]\s*/gm, '');
                 if (dedupKey !== session.lastStatusText) {
                   session.lastStatusText = dedupKey;
                   this.emit('status', key, statusText);

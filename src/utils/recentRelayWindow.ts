@@ -44,7 +44,8 @@ export const relayWindowMaxLines = 1500;
 /**
  * @description Normalise a pane line for line-identity comparison: trim, drop
  * a leading status/tool glyph so a tool header matches regardless of which
- * `●/○/⏳/✓` state it was last rendered in.
+ * `●/⏺/○/⏳/✓` state it was last rendered in (`⏺` U+23FA is the real
+ * assistant-output bullet in Claude v2.1.177).
  *
  * Single source of truth for BOTH dedup layers — the per-poll set diff
  * (`getNewPaneContent`) and this relay window — which MUST share one
@@ -52,7 +53,7 @@ export const relayWindowMaxLines = 1500;
  * diff compares, otherwise a redraw would slip past one layer or the other.
  */
 export function normalizeForComparison(line: string): string {
-  return line.trim().replace(/^[●○⏳✓]\s*/, '');
+  return line.trim().replace(/^[●○⏺⏳✓]\s*/, '');
 }
 
 /**

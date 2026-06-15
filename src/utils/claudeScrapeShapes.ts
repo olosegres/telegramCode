@@ -99,7 +99,7 @@ export const POST_THINKING_TRAILER_RE =
  * match (no `\d+s…` tail).
  */
 export const THINKING_HEADER_RE =
-  /^\s*[●○✻✽✶✢·*]?\s*Thinking for\s+\*?(?:\d+h\s+)?(?:\d+m\s+)?\d+s\*?…/;
+  /^\s*[●○⏺✻✽✶✢·*]?\s*Thinking for\s+\*?(?:\d+h\s+)?(?:\d+m\s+)?\d+s\*?…/;
 
 /**
  * @description Code-producing tool headers whose `⎿` result is code / diff /
@@ -120,9 +120,9 @@ export const THINKING_HEADER_RE =
  * may license fencing (a thinking block has no such header). Allowlist, not
  * blocklist — unknown shapes stay prose.
  */
-export const OUTPUT_TOOL_HEADER_RE = /^\s*[●○⏳✓]?\s*\*?(?:Bash|Grep|Glob)\*?\s*\(/;
+export const OUTPUT_TOOL_HEADER_RE = /^\s*[●○⏺⏳✓]?\s*\*?(?:Bash|Grep|Glob)\*?\s*\(/;
 export const FILE_TOOL_HEADER_RE =
-  /^\s*[●○⏳✓]?\s*\*?(?:Read|Edit|Update|Write|MultiEdit|NotebookEdit)\*?\s*\(/;
+  /^\s*[●○⏺⏳✓]?\s*\*?(?:Read|Edit|Update|Write|MultiEdit|NotebookEdit)\*?\s*\(/;
 
 /**
  * @description ANY tool-call header line (`● Bash(…)`, `✓ Read(…)`,
@@ -137,7 +137,7 @@ export const FILE_TOOL_HEADER_RE =
  * and its sub-agent `⎿ Update(…)` previews bypass the verbosity routing and leak.
  */
 export const ANY_TOOL_HEADER_RE =
-  /^\s*[●○⏳✓]?\s*\*?(?:Bash|Read|Write|Edit|Update|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|TodoWrite|WebFetch|WebSearch)\*?\s*\(/;
+  /^\s*[●○⏺⏳✓]?\s*\*?(?:Bash|Read|Write|Edit|Update|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|TodoWrite|WebFetch|WebSearch)\*?\s*\(/;
 
 /** Tool RESULT marker line: `  ⎿  <summary or first output line>`. */
 export const TOOL_RESULT_MARKER_RE = /^(\s*)⎿/;

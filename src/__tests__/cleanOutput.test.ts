@@ -261,14 +261,18 @@ test('stripTuiElements: drops a MULTI-WORD task-title tick inside a chunk', () =
   assert.ok(/Agent\(Review fix\)/.test(out), `tool header lost: ${JSON.stringify(out)}`);
 });
 
-test('stripTuiElements: keeps tool-call header "● Bash(ls -la)" — no ellipsis, no time pattern', () => {
-  // Disambiguator: tool-call headers start with `●` but have NO `…`
-  // and NO `(Xs · ...)` shape. They must survive.
-  const input = '● Bash(ls -la)';
-  const out = stripTuiElements(input);
-  // After `normalizeToolCallLine` the `●` becomes `⏳`.
-  assert.ok(/Bash\(ls -la\)/.test(out), `tool header lost: ${JSON.stringify(out)}`);
-});
+for (const bullet of ['●', '⏺'] as const) {
+  test(`stripTuiElements: keeps tool-call header "${bullet} Bash(ls -la)" — no ellipsis, no time pattern`, () => {
+    // Disambiguator: tool-call headers start with the assistant-output bullet
+    // (`●` or the real-v2.1.177 `⏺`) but have NO `…` and NO `(Xs · ...)` shape.
+    // They must survive.
+    const input = `${bullet} Bash(ls -la)`;
+    const out = stripTuiElements(input);
+    // After `normalizeToolCallLine` the filled bullet (`●`/`⏺`) becomes `⏳`.
+    assert.ok(/Bash\(ls -la\)/.test(out), `tool header lost: ${JSON.stringify(out)}`);
+    assert.ok(/⏳ Bash/.test(out), `filled bullet "${bullet}" should map to ⏳: ${JSON.stringify(out)}`);
+  });
+}
 
 test('stripTuiElements: keeps real prose that contains "(5s)"', () => {
   // Guard against an over-eager regex on prose with a plain time stamp.

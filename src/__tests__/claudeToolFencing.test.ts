@@ -385,34 +385,40 @@ function getFenceDelimiterCount(text: string): number {
   return text.split('\n').filter(line => line === '```').length;
 }
 
-test('stripTuiElements: WIDE sharp-corner table keeps ALL body rows, fenced (bug #10)', () => {
-  const input = [
-    '● ┌───────┬────────────────────────────────────────────────────────────┬─────────┐',
-    '  │ Scope │            Description of the change in detail             │ Ratchet │',
-    '  ├───────┼────────────────────────────────────────────────────────────┼─────────┤',
-    '  │ S1    │ rewrite all the date helper functions into solUtils module │ 8 → 2   │',
-    '  ├───────┼────────────────────────────────────────────────────────────┼─────────┤',
-    '  │ S2    │ migrate the legacy ScrollView component over to KitEngine  │ 1 → 0   │',
-    '  └───────┴────────────────────────────────────────────────────────────┴─────────┘',
-  ].join('\n');
-  const out = stripTuiElements(input);
+// Both assistant-output bullets the live TUI leads a wide table's top border with
+// (`●` historically, `⏺` U+23FA in v2.1.177) must license the table-collecting
+// branch — a `⏺`-led top border going unmatched was the 2026-06-15 wide-table
+// content-loss bug (every body row fell through to the >50-char chrome filter).
+for (const bullet of ['●', '⏺'] as const) {
+  test(`stripTuiElements: WIDE "${bullet}"-led sharp-corner table keeps ALL body rows, fenced (bug #10)`, () => {
+    const input = [
+      `${bullet} ┌───────┬────────────────────────────────────────────────────────────┬─────────┐`,
+      '  │ Scope │            Description of the change in detail             │ Ratchet │',
+      '  ├───────┼────────────────────────────────────────────────────────────┼─────────┤',
+      '  │ S1    │ rewrite all the date helper functions into solUtils module │ 8 → 2   │',
+      '  ├───────┼────────────────────────────────────────────────────────────┼─────────┤',
+      '  │ S2    │ migrate the legacy ScrollView component over to KitEngine  │ 1 → 0   │',
+      '  └───────┴────────────────────────────────────────────────────────────┴─────────┘',
+    ].join('\n');
+    const out = stripTuiElements(input);
 
-  // Every header + body cell must survive — these are the rows the bug dropped.
-  for (const token of [
-    'Scope',
-    'S1',
-    'rewrite all the date helper functions into solUtils module',
-    'S2',
-    'migrate the legacy ScrollView component over to KitEngine',
-    '8 → 2',
-    '1 → 0',
-  ]) {
-    assert.ok(out.includes(token), `dropped table content "${token}": ${JSON.stringify(out)}`);
-  }
-  // The block is wrapped in exactly one fence (open + close), rows in between.
-  assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
-  assert.ok(checkIsInsideFence(out, 'rewrite all the date helper functions into solUtils module'));
-});
+    // Every header + body cell must survive — these are the rows the bug dropped.
+    for (const token of [
+      'Scope',
+      'S1',
+      'rewrite all the date helper functions into solUtils module',
+      'S2',
+      'migrate the legacy ScrollView component over to KitEngine',
+      '8 → 2',
+      '1 → 0',
+    ]) {
+      assert.ok(out.includes(token), `dropped table content "${token}": ${JSON.stringify(out)}`);
+    }
+    // The block is wrapped in exactly one fence (open + close), rows in between.
+    assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
+    assert.ok(checkIsInsideFence(out, 'rewrite all the date helper functions into solUtils module'));
+  });
+}
 
 test('stripTuiElements: NARROW sharp-corner table keeps all rows, fenced', () => {
   const input = [
@@ -430,21 +436,23 @@ test('stripTuiElements: NARROW sharp-corner table keeps all rows, fenced', () =>
   assert.ok(checkIsInsideFence(out, 'date-хелперы'));
 });
 
-test('stripTuiElements: leading "● " bullet does not break the table frame', () => {
-  const input = [
-    '● ┌───────┬─────────┐',
-    '  │ Scope │ Ratchet │',
-    '  ├───────┼─────────┤',
-    '  │ S1    │ 8 → 2   │',
-    '  └───────┴─────────┘',
-  ].join('\n');
-  const out = stripTuiElements(input);
-  // The bullet is gone but the box stays intact — top border survives, fenced.
-  assert.ok(!out.includes('●'), `bullet leaked into the frame: ${JSON.stringify(out)}`);
-  assert.ok(out.includes('┌'), `top border lost: ${JSON.stringify(out)}`);
-  assert.ok(out.includes('└'), `bottom border lost: ${JSON.stringify(out)}`);
-  assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
-});
+for (const bullet of ['●', '⏺'] as const) {
+  test(`stripTuiElements: leading "${bullet} " bullet does not break the table frame`, () => {
+    const input = [
+      `${bullet} ┌───────┬─────────┐`,
+      '  │ Scope │ Ratchet │',
+      '  ├───────┼─────────┤',
+      '  │ S1    │ 8 → 2   │',
+      '  └───────┴─────────┘',
+    ].join('\n');
+    const out = stripTuiElements(input);
+    // The bullet is gone but the box stays intact — top border survives, fenced.
+    assert.ok(!out.includes(bullet), `bullet leaked into the frame: ${JSON.stringify(out)}`);
+    assert.ok(out.includes('┌'), `top border lost: ${JSON.stringify(out)}`);
+    assert.ok(out.includes('└'), `bottom border lost: ${JSON.stringify(out)}`);
+    assert.equal(getFenceDelimiterCount(out), 2, `expected a single fence: ${JSON.stringify(out)}`);
+  });
+}
 
 test('stripTuiElements: GUARD — WIDE rounded-corner chrome is still DROPPED', () => {
   // A wide `│ … │` line that belongs to a ROUNDED chrome panel (no sharp `┌`

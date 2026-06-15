@@ -222,6 +222,19 @@ interface ClaudeSession {
    * resume / adopt all flow through `createSession`).
    */
   chunkContext: ClaudeChunkContext;
+  /**
+   * Streaming-table stabilizer state (live incident 2026-06-11, plan
+   * `2026-06-11-claude-wide-table-content-loss`). A wide markdown table re-flows
+   * its column widths as longer cells stream in; the line-SET diff treats each
+   * intermediate layout as "new" and would ship the table once per layout (empty
+   * skeleton → 1 row → full), with the final full frame often dropped under the
+   * coalescer's debounce / a 429. We hold the table back until it settles, then
+   * emit the complete version once. `null` = no table currently held. Reset at
+   * the same lifecycle points as {@link recentRelayWindow} (fresh per session
+   * object via `createSession`, and on the resume-seed exit). See
+   * {@link getTableStabilizationDecision}.
+   */
+  streamingTable: StreamingTableState | null;
 }
 
 /**
@@ -1337,6 +1350,136 @@ function getFenced(bodyLines: string[]): string[] {
     line.replace(/`{3,}/g, run => run.split('').join('​')),
   );
   return ['```', ...safe, '```'];
+}
+
+/**
+ * @description Per-session state for the streaming-table stabilizer (live
+ * incident 2026-06-11, plan `2026-06-11-claude-wide-table-content-loss`): the
+ * sharp-corner table block currently being held back, and how many polls it has
+ * been held. Held back because a wide markdown table RE-FLOWS its column widths
+ * as longer cells stream in, so every border/row line is byte-distinct between
+ * layouts → {@link getNewPaneContent} (line-SET diff) classifies the whole table
+ * "new" each poll and it would otherwise ship once per intermediate layout
+ * (empty skeleton → 1 row → full). We withhold the table until it settles, then
+ * emit the complete version exactly once.
+ */
+interface StreamingTableState {
+  /** The full last-contiguous sharp-table block text seen on the previous poll. */
+  block: string;
+  /** Consecutive polls this table has been held without settling — runaway guard. */
+  heldPolls: number;
+}
+
+/**
+ * @description Hard cap on streaming-table hold polls. The normal exit is "the
+ * block is byte-identical to last poll" (it stopped re-flowing); if a pane is
+ * stuck mid-paint and the table never settles, force-emit the latest version
+ * after this many polls so the table can never be swallowed forever. At
+ * {@link basePollIntervalMs} (300ms) this is ≈9s of holding before the safety
+ * fires — far longer than a real table takes to settle.
+ */
+const maxTableHoldPolls = 30;
+
+/**
+ * @description The action {@link getTableStabilizationDecision} tells the poll
+ * loop to take for a re-flowing sharp-corner table.
+ *
+ * - `none`  — no table in flux; emit the poll's delta as usual.
+ * - `hold`  — the table is still laying out; mask its lines out of this poll's
+ *             delta ({@link maskSharpTableLines}) so no intermediate frame ships,
+ *             and carry `nextStreamingTable` forward.
+ * - `emit`  — the table settled (or the safety cap fired); emit `block` once via
+ *             the normal fence path and clear the held state.
+ */
+interface TableStabilizationDecision {
+  kind: 'none' | 'hold' | 'emit';
+  /** The complete table block to emit, set only for `kind: 'emit'`. */
+  block: string | null;
+  /** Held state to store back on the session (null clears it). */
+  nextStreamingTable: StreamingTableState | null;
+}
+
+/**
+ * @description Find the LAST contiguous sharp-corner (markdown) table block in a
+ * full pane snapshot, or `null` when none is present. Mirrors the collection
+ * loop already in {@link stripTuiElementsWithContext} (a TOP border, then
+ * contiguous table lines until the first non-table line, a BOTTOM border ending
+ * it inclusively) but returns the raw block text so the stabilizer can compare
+ * it across polls. The LAST block is taken because a streaming table sits at the
+ * bottom of the pane; an already-finished earlier table was emitted on a prior
+ * poll. Pure + exported for unit tests.
+ */
+export function getLastSharpTableBlock(content: string): string | null {
+  const lines = content.split('\n');
+  let block: string | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (!checkIsSharpTableTop(lines[i])) continue;
+    const tableLines: string[] = [lines[i]];
+    for (let j = i + 1; j < lines.length; j++) {
+      if (!checkIsSharpTableLine(lines[j])) break;
+      tableLines.push(lines[j]);
+      if (checkIsSharpTableBottom(lines[j])) break;
+    }
+    block = tableLines.join('\n');
+    // Keep scanning: a later top border means a more recent table further down.
+    i += tableLines.length - 1;
+  }
+  return block;
+}
+
+/**
+ * @description Drop every sharp-corner table line from a poll's delta text so a
+ * mid-layout table frame never ships while the stabilizer is holding the table.
+ * Only table-shaped lines are removed — surrounding prose streams as usual.
+ * Pure + exported for unit tests.
+ */
+export function maskSharpTableLines(deltaText: string): string {
+  return deltaText
+    .split('\n')
+    .filter(line => !checkIsSharpTableLine(line))
+    .join('\n')
+    .trim();
+}
+
+/**
+ * @description Decide what the poll loop does with a re-flowing sharp-corner
+ * table, given the table currently in the pane and the held state from the
+ * previous poll. Pure + exported for unit tests. Cases (plan S1):
+ *
+ *  A. a table is present and DIFFERS from the held block → still laying out:
+ *     hold + increment `heldPolls` (runaway guard); over {@link maxTableHoldPolls}
+ *     force-emit the latest version so a stuck pane can't swallow it forever.
+ *  B. a table is present and EQUALS the held block (stable one poll) → emit once.
+ *  C. no table in the pane but one was held (scrolled away / message moved on)
+ *     → flush the held block once.
+ */
+export function getTableStabilizationDecision(input: {
+  currentTable: string | null;
+  streamingTable: StreamingTableState | null;
+}): TableStabilizationDecision {
+  const { currentTable, streamingTable } = input;
+
+  if (currentTable === null) {
+    // CASE C: the table left the pane — flush whatever was held, once.
+    if (streamingTable) {
+      return { kind: 'emit', block: streamingTable.block, nextStreamingTable: null };
+    }
+    return { kind: 'none', block: null, nextStreamingTable: null };
+  }
+
+  // CASE B: byte-identical to last poll → it stopped re-flowing, emit it once.
+  if (streamingTable && currentTable === streamingTable.block) {
+    return { kind: 'emit', block: currentTable, nextStreamingTable: null };
+  }
+
+  // CASE A: still laying out (new or changed). Hold + advance the runaway guard.
+  const heldPolls = (streamingTable?.heldPolls ?? 0) + 1;
+  if (heldPolls > maxTableHoldPolls) {
+    // SAFETY: a pane stuck mid-paint must never swallow the table — ship the
+    // latest version we have and clear, rather than holding indefinitely.
+    return { kind: 'emit', block: currentTable, nextStreamingTable: null };
+  }
+  return { kind: 'hold', block: null, nextStreamingTable: { block: currentTable, heldPolls } };
 }
 
 /**
@@ -2565,6 +2708,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'recentRelayWindow'
       | 'subagentTail'
       | 'chunkContext'
+      | 'streamingTable'
     >,
   ): ClaudeSession {
     return {
@@ -2607,6 +2751,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S4: fresh cross-poll classifier context per session — the all-closed
       // start, so a fresh session never inherits a prior session's open block.
       chunkContext: createInitialChunkContext(),
+      // No table held at session start (start / resume / adopt all flow through
+      // here) — this IS the "reset on session start"; stop deletes it with the
+      // session. The resume-seed exit clears it again (see `pollOutput`).
+      streamingTable: null,
     };
   }
 
@@ -3692,6 +3840,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         // emits no output so nothing was recorded — the reset keeps that
         // invariant explicit rather than incidental.
         session.recentRelayWindow.reset();
+        // Same invariant for the table stabilizer: seeding swallowed any
+        // restored table, so nothing should carry over into the live phase.
+        session.streamingTable = null;
         console.log(`[Claude] resume seeding done after ${session.resumeSeedPolls} polls`);
       }
       return;
@@ -3708,10 +3859,53 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       this.consumePendingEffortReapply(session);
     }
 
+    // S1 idle-poll table flush: when the pane is byte-unchanged but a table is
+    // still held, the table block is trivially identical across two consecutive
+    // polls (it stopped re-flowing AND the pane went fully idle) — that is the
+    // "stable" signal, so flush it now. The change branch below never runs on an
+    // unchanged poll, so without this a table that is the LAST thing painted
+    // before the pane freezes would stay held forever (never silently drop it).
+    if (content === session.lastContent && session.streamingTable) {
+      const idleDecision = getTableStabilizationDecision({
+        currentTable: getLastSharpTableBlock(content),
+        streamingTable: session.streamingTable,
+      });
+      session.streamingTable = idleDecision.nextStreamingTable;
+      if (idleDecision.kind === 'emit' && idleDecision.block) {
+        this.emitStabilizedTable(key, session, idleDecision.block);
+      }
+    }
+
     if (content !== session.lastContent) {
       const previousPane = session.lastContent;
-      const { text: newPart, startsNewParagraph } = getNewPaneContent(previousPane, content);
+      const diff = getNewPaneContent(previousPane, content);
+      const startsNewParagraph = diff.startsNewParagraph;
       session.lastContent = content;
+
+      // S1 streaming-table stabilizer (live incident 2026-06-11): a wide
+      // markdown table re-flows its column widths as longer cells stream in, so
+      // every layout is byte-distinct and the line-SET diff marks the whole
+      // table "new" each poll — it would ship once per layout (empty → 1 row →
+      // full), the final full frame often dropped under the coalescer's
+      // debounce / a 429. Operate on the FULL live `content` (not the diff):
+      // hold a still-laying-out table (masking its lines out of THIS poll's
+      // delta so no intermediate frame ships), and emit the complete table once
+      // it settles (or the safety cap fires). Runs BEFORE the normal emit so a
+      // settled table is its own fenced block, never mixed into prose.
+      const tableDecision = getTableStabilizationDecision({
+        currentTable: getLastSharpTableBlock(content),
+        streamingTable: session.streamingTable,
+      });
+      session.streamingTable = tableDecision.nextStreamingTable;
+      // While a table is held OR being emitted separately, its lines must not
+      // also ride in this poll's prose delta — mask them out either way.
+      let newPart = diff.text;
+      if (tableDecision.kind !== 'none') {
+        newPart = maskSharpTableLines(newPart);
+      }
+      if (tableDecision.kind === 'emit' && tableDecision.block) {
+        this.emitStabilizedTable(key, session, tableDecision.block);
+      }
 
       if (newPart) {
         // S4: full body only when explicitly debugging the scrape pipeline;
@@ -3884,6 +4078,27 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
       this.handleAutoLifecycle(session, content, newPart);
     }
+  }
+
+  /**
+   * @description Emit a settled streaming table (S1) as ONE fenced `output`.
+   *
+   * Routes the held block through the SAME fence path as the inline table path
+   * ({@link stripTuiElementsWithContext} fences a sharp-corner table) so the
+   * `<pre>` rendering is byte-identical to today — only the TIMING/dedup change.
+   * Records the raw block in {@link RecentRelayWindow} in the PANE-line domain
+   * (pre-strip) so a later full repaint of the same table is suppressed by the
+   * existing re-render dedup, exactly like the normal permanent-output path.
+   * Emitted with `startsNewParagraph: true` — a table is its own visual block,
+   * so it must not glue onto preceding prose in the append/draft join.
+   */
+  private emitStabilizedTable(key: ThreadKey, session: ClaudeSession, block: string): void {
+    const fenced = stripTuiElementsWithContext(block, session.openToolKind);
+    session.openToolKind = fenced.toolKind;
+    if (!fenced.text) return;
+    session.recentRelayWindow.record(block);
+    session.lastStatusText = '';
+    this.emit('output', key, fenced.text, { startsNewParagraph: true });
   }
 
   /**

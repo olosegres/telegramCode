@@ -87,7 +87,7 @@ import { checkIsProgressChunk, collapseProgressChunk } from './progressLine';
 import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
-import { getOutputFlushPlan, appendPendingOutput } from './utils/outputFlushPlan';
+import { getOutputFlushPlan, appendPendingOutput, getUnsentRemainder } from './utils/outputFlushPlan';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { getOutputDebounceMs as resolveOutputDebounceMs } from './utils/outputDebounce';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
@@ -2079,7 +2079,21 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
     const out = q.pendingOutput;
     const isContinuation = q.pendingIsContinuation;
     q.pendingOutput = null;
-    await sendOutputImmediate(key, out, isContinuation);
+    const { unsentRemainder } = await sendOutputImmediate(key, out, isContinuation);
+    // S2 (no silent drop): a chunk dropped on a 429 after the rate-limit queue
+    // gave up comes back as `unsentRemainder`. Put it BACK at the FRONT of the
+    // buffer (it is older than anything that arrived during the await) so the
+    // re-trigger flush below retries it — never lost. Landed chunks are excluded
+    // by `getUnsentRemainder`, so this never re-sends what already reached
+    // Telegram. The remainder restarts a fresh message (its predecessors landed
+    // / edited in place already), so it is NOT a continuation.
+    if (unsentRemainder) {
+      q.pendingOutput =
+        q.pendingOutput === null
+          ? unsentRemainder
+          : appendPendingOutput(unsentRemainder, q.pendingOutput, false);
+      q.pendingIsContinuation = false;
+    }
   } finally {
     q.isProcessing = false;
     if (q.pendingOutput) {
@@ -2117,7 +2131,11 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
  * deleted / API hiccup) we send every chunk fresh so the full combined text
  * still reaches the user.
  */
-async function sendOutputImmediate(key: ThreadKey, output: string, isContinuation = false): Promise<void> {
+async function sendOutputImmediate(
+  key: ThreadKey,
+  output: string,
+  isContinuation = false,
+): Promise<{ unsentRemainder: string | null }> {
   await deleteLoaderMessage(key);
   await deleteStatusMessage(key);
 
@@ -2143,18 +2161,28 @@ async function sendOutputImmediate(key: ThreadKey, output: string, isContinuatio
     // chunk fresh — the full combined text still reaches the user.
   }
 
+  // S2 (no silent drop): track how many chunks actually landed, counting from
+  // the FRONT. `startIndex` already covers a successful in-place edit of
+  // chunks[0]; when that edit failed it is 0 and every chunk re-sends fresh
+  // below. A `replyChunkWithFallback` that returns null means the chunk was
+  // dropped on a 429 after the rate-limit queue gave up — STOP the run (the
+  // cooldown would drop the rest of this synchronous flush too) and report the
+  // un-sent remainder so the caller re-enqueues it for the next flush.
+  let sentCount = startIndex;
   for (let i = startIndex; i < chunks.length; i++) {
     const id = await replyChunkWithFallback(key, renderAgentHtml(chunks[i]), chunks[i], 'output');
-    if (id) {
-      msgState.lastMessageId = id;
-      msgState.lastMessageText = chunks[i];
-      msgState.needsNewMessage = false;
-    }
+    if (!id) break;
+    msgState.lastMessageId = id;
+    msgState.lastMessageText = chunks[i];
+    msgState.needsNewMessage = false;
+    sentCount = i + 1;
   }
 
   // S3: output just landed below any pending question — bring the question back
   // to the bottom (debounced; no-op when no question is pending).
   onThreadActivityWhileQuestionPending(key);
+
+  return { unsentRemainder: getUnsentRemainder(chunks, sentCount) };
 }
 
 /**

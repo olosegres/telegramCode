@@ -86,3 +86,29 @@ export function appendPendingOutput(
   if (isContinuation) return pending + output;
   return startsNewParagraph ? `${pending}\n\n${output}` : `${pending}\n${output}`;
 }
+
+/** Separator used to re-join un-sent chunks before re-enqueueing them (S2). The
+ *  planner re-splits the rejoined text next flush, so a blank line keeps the
+ *  chunk boundary readable without gluing two messages together. */
+const unsentRemainderSeparator = '\n\n';
+
+/**
+ * @description Compute the text that must be RE-ENQUEUED after a flush where one
+ * or more chunks failed to send (live incident 2026-06-11, plan
+ * `2026-06-11-claude-wide-table-content-loss` S2: `replyChunkWithFallback`
+ * returns `null` when a chunk is dropped on a 429 after the rate-limit queue
+ * gives up; the buffer was already cleared, so the chunk was permanently lost).
+ *
+ * `sentCount` is the number of chunks that landed, counting from the FRONT of
+ * `chunks` (sends are in order, so a failure stops the run and everything from
+ * the first failure onward is un-sent). Returns the rejoined un-sent remainder,
+ * or `null` when everything landed. Idempotent: re-flushing the remainder never
+ * re-sends a landed chunk because those are excluded here. Pure + exported for
+ * unit tests.
+ */
+export function getUnsentRemainder(chunks: string[], sentCount: number): string | null {
+  if (sentCount >= chunks.length) return null;
+  const remainder = chunks.slice(sentCount);
+  if (remainder.length === 0) return null;
+  return remainder.join(unsentRemainderSeparator);
+}

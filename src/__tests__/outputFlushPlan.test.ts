@@ -19,7 +19,11 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { getOutputFlushPlan, appendPendingOutput } from '../utils/outputFlushPlan';
+import {
+  getOutputFlushPlan,
+  appendPendingOutput,
+  getUnsentRemainder,
+} from '../utils/outputFlushPlan';
 import { MAX_MESSAGE_LEN, splitMessage } from '../messageSplit';
 
 describe('getOutputFlushPlan', () => {
@@ -141,5 +145,64 @@ describe('appendPendingOutput', () => {
       appendPendingOutput('first paragraph', 'second paragraph', false, true),
       'first paragraph\n\nsecond paragraph',
     );
+  });
+});
+
+describe('getUnsentRemainder (S2 — no silent drop on send failure)', () => {
+  it('all chunks landed → null (nothing to re-enqueue)', () => {
+    assert.equal(getUnsentRemainder(['a', 'b', 'c'], 3), null);
+    // Defensive: a sentCount past the end is still "all sent".
+    assert.equal(getUnsentRemainder(['a'], 5), null);
+  });
+
+  it('a chunk dropped on a 429 → the un-sent remainder is returned (no loss)', () => {
+    // Sends are in order; chunk index 1 failed, so chunks[1..] are un-sent.
+    assert.equal(getUnsentRemainder(['a', 'b', 'c'], 1), 'b\n\nc');
+  });
+
+  it('the FIRST chunk failed → the whole batch is the remainder', () => {
+    assert.equal(getUnsentRemainder(['only'], 0), 'only');
+    assert.equal(getUnsentRemainder(['a', 'b'], 0), 'a\n\nb');
+  });
+
+  it('landed chunks are NOT part of the remainder (idempotent on re-flush)', () => {
+    // Flush 1: chunks [a,b,c]; only "a" landed (b dropped on 429). The remainder
+    // must exclude "a" so the retry never re-sends it.
+    const remainder = getUnsentRemainder(['a', 'b', 'c'], 1);
+    assert.equal(remainder, 'b\n\nc');
+    assert.ok(!remainder!.includes('a'), 'a already landed — must not be re-sent');
+
+    // Flush 2 re-splits the remainder; assume both land this time → no further
+    // remainder, i.e. the buffer is finally empty (no infinite re-send loop).
+    const reChunks = splitMessage(remainder!);
+    assert.equal(getUnsentRemainder(reChunks, reChunks.length), null);
+  });
+
+  it('models the processOutputQueue re-enqueue: dropped text is retained, then sent once', () => {
+    // Simulate the coalescer with a batch the planner splits into 3 chunks (use
+    // explicit chunks so the model does not depend on the Telegram cap math).
+    // Flush 1 lands chunk 0, then chunk 1 is dropped on a 429 → the loop stops.
+    let pendingOutput: string | null = null;
+    const landed: string[] = [];
+
+    const chunks1 = ['chunk A', 'chunk B', 'chunk C'];
+    pendingOutput = null; // bot.ts clears the buffer before sending
+    const sentCount1 = 1; // chunk 0 landed; chunk 1 (B) dropped on 429
+    landed.push(...chunks1.slice(0, sentCount1));
+    const remainder1 = getUnsentRemainder(chunks1, sentCount1);
+    // Re-enqueue at the FRONT (nothing else arrived during the await here).
+    if (remainder1) pendingOutput = remainder1;
+    assert.equal(pendingOutput, 'chunk B\n\nchunk C', 'dropped text must be retained');
+    assert.ok(!pendingOutput!.includes('chunk A'), 'the landed chunk must NOT be retained');
+
+    // Flush 2: the remainder splits back to chunks and all land this time.
+    const chunks2 = ['chunk B', 'chunk C'];
+    const sentCount2 = chunks2.length;
+    landed.push(...chunks2.slice(0, sentCount2));
+    const remainder2 = getUnsentRemainder(chunks2, sentCount2);
+    assert.equal(remainder2, null, 'after a successful retry nothing remains');
+
+    // The full original content survived exactly once each across both flushes.
+    assert.deepEqual(landed, ['chunk A', 'chunk B', 'chunk C']);
   });
 });

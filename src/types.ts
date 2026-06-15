@@ -339,6 +339,14 @@ export interface OutputTransport {
    * group has nothing to drop (noop). Called AFTER `finalizeInFlight`.
    */
   disposeThread(key: ThreadKey): void;
+  /**
+   * True while in-flight content "owns" the live message (DM: a draft turn is
+   * active). The Claude liveness loop ORs this into `checkIsOutputStreaming` so a
+   * heartbeat status frame can't be created between prose deltas — which would
+   * trip a mid-answer `needsNewMessage` and chop the draft. Group: always false
+   * (its streaming is already tracked via the output queue).
+   */
+  checkIsStreaming(key: ThreadKey): boolean;
 }
 
 /**

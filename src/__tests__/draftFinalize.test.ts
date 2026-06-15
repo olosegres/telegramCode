@@ -13,6 +13,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   getDraftFeedAction,
+  getDmDraftContinuation,
   checkShouldFinalizeOnIdle,
   FINALIZE_IDLE_MS,
 } from '../utils/draftFinalize';
@@ -115,6 +116,53 @@ test('new-response ordering: a non-continuation OVER the cap still finalizes-the
     renderedCap: CAP,
   });
   assert.equal(action, 'finalizeThenStart');
+});
+
+test('getDmDraftContinuation: a delta adapter always continues (Claude per-poll deltas accumulate)', () => {
+  // Claude emits each poll's delta with no meta (metaIsContinuation=false), yet
+  // every delta continues the same answer — forcing true keeps it in ONE draft
+  // instead of finalizing per poll. The real turn break is needsNewMessage/idle.
+  assert.equal(getDmDraftContinuation(false, true), true);
+  assert.equal(getDmDraftContinuation(true, true), true);
+});
+
+test('getDmDraftContinuation: a continuation-marking adapter passes the meta flag through', () => {
+  // OpenCode marks continuations itself — the meta is authoritative, so the
+  // first tail of a response (metaIsContinuation=false) stays a new response.
+  assert.equal(getDmDraftContinuation(false, false), false);
+  assert.equal(getDmDraftContinuation(true, false), true);
+});
+
+test('getDmDraftContinuation: drives the draft action — a delta adapter appends, never finalizeThenStart, mid-answer', () => {
+  // End-to-end of the two decisions: with no needsNewMessage break, a delta
+  // adapter's output must `append` (accumulate), proving the synthesised flag
+  // keeps the cursor in one draft rather than the per-poll flood.
+  const isContinuation = getDmDraftContinuation(false, /* outputsDeltas */ true);
+  const action = getDraftFeedAction({
+    isDraftActive: true,
+    isContinuation,
+    needsNewMessage: false,
+    isFinal: false,
+    prospectiveRenderedLength: 200,
+    renderedCap: CAP,
+  });
+  assert.equal(action, 'append', 'a delta adapter accumulates mid-answer instead of finalizing per poll');
+});
+
+test('getDmDraftContinuation: a delta adapter still breaks the turn on needsNewMessage (answer→tool / new prompt)', () => {
+  // The synthesised continuation must NOT mask the real boundary: when the bot
+  // marks needsNewMessage (output after a status frame, or a fresh prompt) the
+  // active draft finalizes first.
+  const isContinuation = getDmDraftContinuation(false, /* outputsDeltas */ true);
+  const action = getDraftFeedAction({
+    isDraftActive: true,
+    isContinuation,
+    needsNewMessage: true,
+    isFinal: false,
+    prospectiveRenderedLength: 200,
+    renderedCap: CAP,
+  });
+  assert.equal(action, 'finalizeThenStart', 'needsNewMessage still breaks the turn for a delta adapter');
 });
 
 test('checkShouldFinalizeOnIdle: false before the window, true at/after', () => {

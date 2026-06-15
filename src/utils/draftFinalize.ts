@@ -88,6 +88,35 @@ export function getDraftFeedAction(input: DraftFeedInput): DraftFeedAction {
 }
 
 /**
+ * @description The effective continuation flag the DM draft cursor should use
+ * for an incoming `output`, accounting for adapters that stream WITHOUT marking
+ * continuations.
+ *
+ * OpenCode marks every tail except the first of a response with
+ * `meta.isContinuation` (it tracks `lastEmittedLength`), so the cursor knows
+ * which outputs accumulate into the live draft. The Claude scrape adapter emits
+ * each poll's delta with NO meta — `metaIsContinuation` is always false — even
+ * though every delta is the SAME answer continuing. Treating those as
+ * non-continuations would hit the new-response boundary on every poll
+ * (`getDraftFeedAction` → `finalizeThenStart`) and flood the topic with one tiny
+ * message per delta.
+ *
+ * For a delta-emitting adapter the answer therefore accumulates as a
+ * continuation; the real turn boundaries are driven separately by
+ * `needsNewMessage` (a new prompt, or the answer→tool transition the bot marks
+ * when output resumes after a status frame), the idle timer, overflow, and
+ * isFinal — exactly the boundary set `getDraftFeedAction` already honours. For a
+ * continuation-marking adapter the meta flag is authoritative and passes through
+ * unchanged.
+ */
+export function getDmDraftContinuation(
+  metaIsContinuation: boolean,
+  outputsDeltas: boolean,
+): boolean {
+  return outputsDeltas ? true : metaIsContinuation;
+}
+
+/**
  * @description Should the idle timer finalize the draft now? True once a draft
  * is active and at least {@link FINALIZE_IDLE_MS} has elapsed since the last
  * feed with no newer output. Never true when nothing has been fed yet

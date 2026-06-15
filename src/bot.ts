@@ -1129,6 +1129,10 @@ function getOutputQueueState(key: ThreadKey): OutputQueueState {
  * `.get()` so a thread that never streamed output is trivially "not streaming".
  */
 function checkIsOutputStreaming(key: ThreadKey): boolean {
+  // The DM draft transport streams via drafts, not the output queue, so ask it
+  // too — otherwise the Claude liveness loop, blind to an active draft, inserts a
+  // heartbeat status frame between prose deltas and chops the draft mid-answer.
+  if (getOutputTransport().checkIsStreaming(key)) return true;
   const q = outputQueues.get(keyToString(key));
   if (!q) return false;
   return q.pendingOutput !== null || q.isProcessing || q.debounceTimer !== null;
@@ -6193,22 +6197,28 @@ async function applyQuestionAnswerInner(key: ThreadKey, answerForCurrent: string
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * @description Whether the thread's backend emits the continuation-marked
- * streaming the DM draft "cursor" model depends on. The cursor accumulates an
- * output into the live draft only while `isContinuation` is set: OpenCode marks
- * it (`openCodeAdapter` tracks `lastEmittedLength`), but the Claude scrape
- * adapter emits every chunk WITHOUT continuation meta. On Claude, therefore,
- * every output hits the new-response boundary (`getDraftFeedAction` →
- * `finalizeThenStart`), finalizes the draft, and becomes its own message — a
- * flood of tiny messages each preceded by a draft that flashes then vanishes
- * (the live "сообщения прыгают / то что думал, показывается потом исчезает" bug).
- *
- * Until the per-backend output transport lands (separate adapter-rework plan),
- * Claude DM streams through the plain finalized-message path (`queueOutput`)
- * instead of drafts — the proven pre-draft baseline. OpenCode keeps the cursor.
+ * @description Whether the thread's backend streams output the DM draft "cursor"
+ * can accumulate. BOTH streaming backends qualify now: OpenCode marks
+ * continuations directly (`openCodeAdapter` tracks `lastEmittedLength`), while
+ * the Claude scrape adapter emits each poll's prose delta with NO continuation
+ * meta — the DM transport synthesises the flag for it (`getDmDraftContinuation`,
+ * gated on `checkAdapterOutputsDeltas`) so the answer accumulates into one
+ * full-snapshot draft instead of finalizing per poll. Group mode never reaches
+ * here (the group transport is the thin `queueOutput` path).
  */
 function checkAdapterSupportsDraftStreaming(key: ThreadKey): boolean {
-  return getThreadAdapterName(key) === 'opencode';
+  const name = getThreadAdapterName(key);
+  return name === 'opencode' || name === 'claude';
+}
+
+/**
+ * @description Whether the thread's adapter emits incremental deltas without
+ * continuation meta (the Claude scrape adapter). The DM cursor reads this to
+ * synthesise the continuation flag so Claude's per-poll prose deltas accumulate
+ * into ONE draft rather than each finalizing as its own message.
+ */
+function checkAdapterOutputsDeltas(key: ThreadKey): boolean {
+  return getThreadAdapter(key).outputsDeltas === true;
 }
 
 function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMeta): void {
@@ -7752,6 +7762,7 @@ export async function startBot(): Promise<void> {
       sendAgentChunks,
       getThreadMessageState,
       checkSupportsDraft: checkAdapterSupportsDraftStreaming,
+      checkOutputsDeltas: checkAdapterOutputsDeltas,
       checkIsGeneral,
       callSendMessageDraft,
       splitMessage,

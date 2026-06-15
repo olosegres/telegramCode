@@ -10,6 +10,7 @@ import {
 } from '../utils/draftPacer';
 import {
   getDraftFeedAction,
+  getDmDraftContinuation,
   checkShouldFinalizeOnIdle,
   FINALIZE_IDLE_MS,
 } from '../utils/draftFinalize';
@@ -72,8 +73,13 @@ export interface DmOutputTransportDeps {
   ): void;
   sendAgentChunks(key: ThreadKey, chunks: string[]): Promise<void>;
   getThreadMessageState(key: ThreadKey): DraftMessageState;
-  /** Per-thread draft-streaming gate — OpenCode only; Claude DM streams the plain path. */
+  /** Per-thread draft-streaming gate — true for any backend whose streaming output
+   * the DM cursor can accumulate (OpenCode + the Claude scrape adapter). */
   checkSupportsDraft(key: ThreadKey): boolean;
+  /** Whether the thread's adapter emits incremental deltas WITHOUT continuation
+   * meta (Claude). The cursor synthesises the continuation flag for those so the
+   * answer accumulates into one draft instead of finalizing per poll. */
+  checkOutputsDeltas(key: ThreadKey): boolean;
   checkIsGeneral(key: ThreadKey): boolean;
   callSendMessageDraft(method: 'sendMessageDraft', payload: Record<string, unknown>): Promise<unknown>;
   splitMessage(text: string, max: number, measure: (text: string) => number): string[];
@@ -87,9 +93,12 @@ export interface DmOutputTransportDeps {
  * Telegram draft (the "bot is typing this message" animation) and FINALIZED to a
  * permanent message at boundaries (idle / overflow / isFinal / new-response /
  * teardown). The draft channel runs OFF the message rate-limiter so a draft 429
- * can never delay a real send; every draft call is best-effort. Only OpenCode
- * threads stream via drafts ({@link DmOutputTransportDeps.checkSupportsDraft}
- * gate); Claude DM falls through to the plain `queueOutput` baseline.
+ * can never delay a real send; every draft call is best-effort. Both streaming
+ * backends use the cursor ({@link DmOutputTransportDeps.checkSupportsDraft}
+ * gate): OpenCode marks its continuations, while the Claude scrape adapter emits
+ * each poll's prose delta with no meta, so the transport synthesises the
+ * continuation flag ({@link getDmDraftContinuation}) — the answer accumulates
+ * into ONE draft re-rendered as the full snapshot, with the same boundary set.
  */
 export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTransport {
   const draftStreams = new Map<string, DraftStreamState>();
@@ -451,9 +460,16 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
    *  • otherwise (e.g. Claude DM baseline) → the original `queueOutput` path.
    */
   function deliverOutput(key: ThreadKey, output: string, meta?: OutputEventMeta): void {
-    const isContinuation = meta?.isContinuation === true;
     const isFinal = meta?.isFinal === true;
     const isComplete = meta?.isComplete === true;
+    // For a delta-emitting backend (Claude scrape) the meta carries no
+    // continuation, but each poll's prose delta continues the same answer — so
+    // accumulate it into the live draft. The real turn boundaries come from
+    // `needsNewMessage` / idle / overflow / isFinal, which `feedDraft` honours.
+    const isContinuation = getDmDraftContinuation(
+      meta?.isContinuation === true,
+      deps.checkOutputsDeltas(key),
+    );
     if (checkShouldStreamAsDraft(true, meta) && deps.checkSupportsDraft(key)) {
       void feedDraft(key, output, isContinuation, isFinal);
     } else if (isComplete) {
@@ -477,6 +493,13 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
       // accumulated draft text (synchronously capturing it + clearing the timers);
       // drop the now-reset map entry so it doesn't leak across a rebind.
       draftStreams.delete(keyToString(key));
+    },
+    // Peek WITHOUT creating state: a thread with no draft is trivially not
+    // streaming. While `active`, the Claude liveness loop must stay noop so its
+    // heartbeat can't insert a status frame between prose deltas (which would
+    // trip `needsNewMessage` and finalize the draft mid-answer).
+    checkIsStreaming(key) {
+      return draftStreams.get(keyToString(key))?.active === true;
     },
   };
 }

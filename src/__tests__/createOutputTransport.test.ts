@@ -9,9 +9,10 @@
  * reached its expected primitive (the recorded call), not just "no crash":
  *  - group.deliverOutput → queueOutput (NOT the draft path); group.finalizeInFlight
  *    resolves as a noop with no side effect.
- *  - dm.deliverOutput → feedDraft for a streaming meta on a draft-capable thread,
- *    → finalizeDraft+sendAgentChunks for `{isComplete:true}`, → queueOutput when the
- *    supports-draft gate is false (the Claude-DM baseline).
+ *  - dm.deliverOutput → feedDraft for a streaming meta on a draft-capable thread
+ *    (both OpenCode and the delta-emitting Claude scrape adapter, which now
+ *    synthesises the continuation flag), → finalizeDraft+sendAgentChunks for
+ *    `{isComplete:true}`, → queueOutput when the supports-draft gate is false.
  */
 
 import { test } from 'node:test';
@@ -29,7 +30,10 @@ interface RecordedCalls {
   finalizeDraft: number;
 }
 
-function createStubDeps(supportsDraft: boolean): { deps: OutputTransportDeps; calls: RecordedCalls } {
+function createStubDeps(
+  supportsDraft: boolean,
+  outputsDeltas = false,
+): { deps: OutputTransportDeps; calls: RecordedCalls } {
   const calls: RecordedCalls = {
     queueOutput: [],
     sendAgentChunks: [],
@@ -48,6 +52,9 @@ function createStubDeps(supportsDraft: boolean): { deps: OutputTransportDeps; ca
     },
     checkSupportsDraft() {
       return supportsDraft;
+    },
+    checkOutputsDeltas() {
+      return outputsDeltas;
     },
     checkIsGeneral() {
       return false;
@@ -128,14 +135,48 @@ test('dm: a complete one-shot finalizes then sends as a permanent message (not a
   assert.equal(draftSendAttempted, false, 'a complete one-shot must NOT animate as a draft');
 });
 
-test('dm: a streaming meta on a NON-draft-capable thread (Claude baseline) routes to queueOutput', () => {
+test('dm: a Claude delta (no continuation meta, outputsDeltas) drives the draft cursor, not queueOutput', () => {
+  // The scrape adapter emits each poll's prose delta with isContinuation absent.
+  // The transport must synthesise the continuation flag so the delta accumulates
+  // into the live draft (drives the draft channel) instead of finalizing per poll.
+  const { deps, calls } = createStubDeps(/* supportsDraft */ true, /* outputsDeltas */ true);
+  let draftSendAttempted = false;
+  deps.callSendMessageDraft = async () => {
+    draftSendAttempted = true;
+    return undefined;
+  };
+  const transport = createOutputTransport('dm', deps);
+  transport.deliverOutput(KEY, 'claude prose delta', { isContinuation: false });
+  assert.equal(calls.queueOutput.length, 0, 'a Claude DM delta must NOT hit the queueOutput baseline');
+  assert.equal(draftSendAttempted, true, 'a Claude DM delta must drive the draft cursor');
+});
+
+test('group: checkIsStreaming is always false (group streaming is tracked via the output queue)', () => {
+  const { deps } = createStubDeps(true);
+  const transport = createOutputTransport('group', deps);
+  assert.equal(transport.checkIsStreaming(KEY), false);
+});
+
+test('dm: checkIsStreaming flips true once a draft turn is active (the liveness anti-thrash gate)', () => {
+  // Regression guard: the Claude liveness loop ORs checkIsStreaming into
+  // checkIsOutputStreaming; if a draft did not report "streaming", a heartbeat
+  // status frame would be inserted between prose deltas and chop the draft.
+  const { deps } = createStubDeps(/* supportsDraft */ true, /* outputsDeltas */ true);
+  deps.callSendMessageDraft = async () => undefined;
+  const transport = createOutputTransport('dm', deps);
+  assert.equal(transport.checkIsStreaming(KEY), false, 'no draft yet → not streaming');
+  transport.deliverOutput(KEY, 'claude prose delta', { isContinuation: false });
+  assert.equal(transport.checkIsStreaming(KEY), true, 'an active draft turn must report streaming');
+});
+
+test('dm: a streaming meta on a NON-draft-capable thread (gate off) routes to queueOutput', () => {
   const { deps, calls } = createStubDeps(false);
   const transport = createOutputTransport('dm', deps);
-  transport.deliverOutput(KEY, 'claude dm output', { isContinuation: true });
+  transport.deliverOutput(KEY, 'gate-off output', { isContinuation: true });
   assert.equal(calls.sendAgentChunks.length, 0, 'the gate-off path is the plain queueOutput baseline');
   assert.equal(calls.queueOutput.length, 1);
   assert.deepEqual(calls.queueOutput[0], {
-    output: 'claude dm output',
+    output: 'gate-off output',
     isContinuation: true,
     isFinal: false,
     isComplete: false,

@@ -35,6 +35,7 @@ export function createOutputTransport(
       },
       finalizeInFlight: async () => {},
       disposeThread: () => {},
+      checkIsStreaming: () => false,
     };
   }
   return createDmOutputTransport(deps);

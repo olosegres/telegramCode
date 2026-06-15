@@ -70,6 +70,7 @@ export interface DmOutputTransportDeps {
     isContinuation: boolean,
     isFinal: boolean,
     isComplete: boolean,
+    startsNewParagraph: boolean,
   ): void;
   sendAgentChunks(key: ThreadKey, chunks: string[]): Promise<void>;
   getThreadMessageState(key: ThreadKey): DraftMessageState;
@@ -318,13 +319,21 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
    * mirroring what the eventual message holds), then pace the draft update and
    * (re)arm the idle-finalize timer. The boundary router (`feedDraft`) calls this
    * for the `append`/`overflow`-remainder/post-`finalizeThenStart` cases.
+   * `startsNewParagraph` (Claude only) upgrades a non-continuation join to a
+   * blank line so the live preview keeps the pane's paragraph structure.
    */
-  function appendToDraft(key: ThreadKey, output: string, isContinuation: boolean): void {
+  function appendToDraft(
+    key: ThreadKey,
+    output: string,
+    isContinuation: boolean,
+    startsNewParagraph = false,
+  ): void {
     const draft = getDraftStreamState(key);
     draft.accumulatedText = appendPendingOutput(
       draft.accumulatedText === '' ? null : draft.accumulatedText,
       output,
       isContinuation,
+      startsNewParagraph,
     );
     draft.lastFedAtMs = Date.now();
     void runDraftPacer(key);
@@ -410,6 +419,7 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
     output: string,
     isContinuation: boolean,
     isFinal: boolean,
+    startsNewParagraph = false,
   ): Promise<void> {
     const draft = getDraftStreamState(key);
     const needsNewMessage = deps.getThreadMessageState(key).needsNewMessage;
@@ -443,11 +453,11 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
     }
     if (!draft.active) startDraftTurn(key);
     if (action === 'finalize') {
-      appendToDraft(key, output, isContinuation);
+      appendToDraft(key, output, isContinuation, startsNewParagraph);
       await finalizeDraft(key);
       return;
     }
-    appendToDraft(key, output, isContinuation);
+    appendToDraft(key, output, isContinuation, startsNewParagraph);
     if (action === 'overflow') await spillDraftOverflow(key);
   }
 
@@ -462,6 +472,10 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
   function deliverOutput(key: ThreadKey, output: string, meta?: OutputEventMeta): void {
     const isFinal = meta?.isFinal === true;
     const isComplete = meta?.isComplete === true;
+    // Claude reports out-of-band that the pane had a paragraph break before this
+    // chunk; the draft / baseline join rebuilds the `\n\n` separator so the live
+    // preview matches the persisted message (ignored when starting a new turn).
+    const startsNewParagraph = meta?.startsNewParagraph === true;
     // For a delta-emitting backend (Claude scrape) the meta carries no
     // continuation, but each poll's prose delta continues the same answer — so
     // accumulate it into the live draft. The real turn boundaries come from
@@ -471,7 +485,7 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
       deps.checkOutputsDeltas(key),
     );
     if (checkShouldStreamAsDraft(true, meta) && deps.checkSupportsDraft(key)) {
-      void feedDraft(key, output, isContinuation, isFinal);
+      void feedDraft(key, output, isContinuation, isFinal, startsNewParagraph);
     } else if (isComplete) {
       void (async () => {
         await finalizeDraft(key);
@@ -481,7 +495,7 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
         );
       })();
     } else {
-      deps.queueOutput(key, output, isContinuation, isFinal, isComplete);
+      deps.queueOutput(key, output, isContinuation, isFinal, isComplete, startsNewParagraph);
     }
   }
 

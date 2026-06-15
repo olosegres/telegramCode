@@ -31,6 +31,7 @@ export function createOutputTransport(
           meta?.isContinuation === true,
           meta?.isFinal === true,
           meta?.isComplete === true,
+          meta?.startsNewParagraph === true,
         );
       },
       finalizeInFlight: async () => {},

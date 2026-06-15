@@ -112,18 +112,34 @@ describe('getOutputFlushPlan', () => {
 });
 
 describe('appendPendingOutput', () => {
-  it('null pending → returns output unchanged (continuation flag ignored)', () => {
+  it('null pending → returns output unchanged (continuation + paragraph flags ignored)', () => {
     assert.equal(appendPendingOutput(null, 'hello', true), 'hello');
     assert.equal(appendPendingOutput(null, 'hello', false), 'hello');
+    // Even with the paragraph flag set, an empty buffer yields the output
+    // verbatim — a fresh message must never start with a separator.
+    assert.equal(appendPendingOutput(null, 'hello', false, true), 'hello');
   });
 
   it('continuation → raw concat, NO separator: a mid-word tail joins seamlessly', () => {
     // The streamed tail was cut mid-word ("import" + "ant"); a '\n' here would
-    // corrupt the word, so continuation must concatenate raw.
+    // corrupt the word, so continuation must concatenate raw. The paragraph flag
+    // never upgrades a continuation join.
     assert.equal(appendPendingOutput('import', 'ant feature', true), 'important feature');
+    assert.equal(appendPendingOutput('import', 'ant feature', true, true), 'important feature');
   });
 
-  it('non-continuation → joins with a blank line \\n\\n (distinct logical messages read as paragraphs)', () => {
-    assert.equal(appendPendingOutput('first message', 'second message', false), 'first message\n\nsecond message');
+  it('non-continuation WITHOUT the paragraph flag → joins with a single \\n', () => {
+    // Default standalone coalescing: a single newline, NOT a blank line. The
+    // blank is reserved for chunks the pane actually separated with one.
+    assert.equal(appendPendingOutput('first', 'second', false), 'first\nsecond');
+  });
+
+  it('non-continuation WITH the paragraph flag → joins with a blank line \\n\\n', () => {
+    // Claude reported a real paragraph break before this chunk → rebuild the
+    // blank-line separator so paragraphs stay paragraphs.
+    assert.equal(
+      appendPendingOutput('first paragraph', 'second paragraph', false, true),
+      'first paragraph\n\nsecond paragraph',
+    );
   });
 });

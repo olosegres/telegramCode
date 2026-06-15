@@ -315,6 +315,17 @@ export interface OutputEventMeta {
    * corrupt the answer's accounting).
    */
   isSubagent?: boolean;
+  /**
+   * Claude-only. True when the pane had a paragraph break immediately before
+   * this chunk's first new line (carried out-of-band because the relay
+   * pipeline's `.trim()`s would strip a leading blank). The bot inserts a
+   * blank-line (`\n\n`) separator when APPENDING this chunk to the pending
+   * buffer / live draft, so multi-paragraph answers keep their structure;
+   * IGNORED when the chunk starts a fresh message (a message must never start
+   * blank). OpenCode never sets it — it re-renders the full accumulated text,
+   * so blanks already survive.
+   */
+  startsNewParagraph?: boolean;
 }
 
 /**

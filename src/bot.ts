@@ -2042,12 +2042,13 @@ function queueOutput(
   isContinuation = false,
   isFinal = false,
   isComplete = false,
+  startsNewParagraph = false,
 ): void {
   const q = getOutputQueueState(key);
   // The continuation flag of the FIRST batch in a fresh buffer decides whether
   // the whole flush extends the last sent message; later batches only append.
   if (q.pendingOutput === null) q.pendingIsContinuation = isContinuation;
-  q.pendingOutput = appendPendingOutput(q.pendingOutput, output, isContinuation);
+  q.pendingOutput = appendPendingOutput(q.pendingOutput, output, isContinuation, startsNewParagraph);
   if (q.debounceTimer) clearTimeout(q.debounceTimer);
 
   const timing = getOutputFlushTiming({

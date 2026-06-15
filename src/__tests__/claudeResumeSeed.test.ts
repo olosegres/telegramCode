@@ -74,6 +74,6 @@ describe('getResumeSeedDecision', () => {
     // not reappear.
     const afterNewLine = restoredPane + '\nassistant: brand new reply';
     const newPart = getNewPaneContent(baseline, afterNewLine);
-    assert.equal(newPart, 'assistant: brand new reply');
+    assert.equal(newPart.text, 'assistant: brand new reply');
   });
 });

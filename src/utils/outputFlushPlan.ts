@@ -69,15 +69,20 @@ export function getOutputFlushPlan(input: OutputFlushInput): OutputFlushPlan {
 /**
  * @description Coalesce a new output batch into the pending (not yet flushed)
  * buffer. Continuation tails concatenate as-is — they may be cut mid-word, a
- * `\n` would split the word across lines; DISTINCT standalone outputs join with
- * a BLANK LINE (`\n\n`) so two separate replies merged into one draft/message
- * read as paragraphs instead of one glued run.
+ * `\n` would split the word across lines. DISTINCT standalone outputs join with
+ * a single `\n` by default, UPGRADED to a BLANK LINE (`\n\n`) only when
+ * `startsNewParagraph` is set — the Claude scrape adapter reports out-of-band
+ * (`OutputEventMeta.startsNewParagraph`) when the pane had a real paragraph
+ * break before the chunk, so multi-paragraph answers keep their structure while
+ * a single wrapped paragraph spanning two polls is NOT split by a blank.
  */
 export function appendPendingOutput(
   pending: string | null,
   output: string,
   isContinuation: boolean,
+  startsNewParagraph = false,
 ): string {
   if (!pending) return output;
-  return isContinuation ? pending + output : `${pending}\n\n${output}`;
+  if (isContinuation) return pending + output;
+  return startsNewParagraph ? `${pending}\n\n${output}` : `${pending}\n${output}`;
 }

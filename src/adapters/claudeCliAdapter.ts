@@ -2355,6 +2355,26 @@ const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
 // share one normalization domain, so the normalizer lives with the window.
 
 /**
+ * @description Result of {@link getNewPaneContent}: the diffed NEW pane text
+ * plus an OUT-OF-BAND signal that the chunk's first new line was preceded by a
+ * paragraph break in the pane. The break is reported separately (not as a
+ * leading blank in `text`) because every downstream `.trim()` would strip a
+ * leading blank, and a fresh Telegram message must never start blank anyway —
+ * so the JOIN layer reconstructs the separator from this flag instead.
+ */
+export interface NewPaneContent {
+  /** The new pane lines, leading/trailing blanks trimmed (interior blanks kept). */
+  text: string;
+  /**
+   * True IFF a blank line immediately preceded the chunk's first new line AND
+   * there was content above that blank (so it is a real inter-paragraph break,
+   * not pane-top padding). Consumed only at the append JOIN, never at a message
+   * start. See {@link OutputEventMeta.startsNewParagraph}.
+   */
+  startsNewParagraph: boolean;
+}
+
+/**
  * @description Diff a freshly-captured pane against the last one and return
  * only the NEW lines, as a line-SET difference (positions ignored — Claude's
  * TUI redraws the whole pane every poll, so a positional diff would re-emit
@@ -2365,9 +2385,10 @@ const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
  * paragraph separator: the previous implementation `continue`d past every
  * empty line, so multi-paragraph answers arrived in Telegram with every
  * paragraph glued to the next (the `cleanOutput` C1 fix only kept blanks in
- * the FULL pane; this delta path still dropped them). The pending-blank flag
- * is flushed only right before the next emitted new line, so leading/trailing
- * blanks and blanks adjacent to suppressed (duplicate) lines never leak out.
+ * the FULL pane; this delta path still dropped them). An INTERIOR blank (within
+ * this chunk) is kept inline in `text`; a LEADING blank (before the chunk's
+ * first new line) is instead reported via `startsNewParagraph` so the separator
+ * survives the pipeline's trims and is rebuilt only at the append join.
  *
  * Suppression is by SET membership, not multiset count (B10): a line that
  * appeared in `oldContent` at all is suppressed for EVERY occurrence in
@@ -2387,9 +2408,9 @@ const CLAUDE_INTERRUPT_TIMEOUT_MS = 3000;
  *
  * Exported + pure so the diff is unit-testable without booting tmux.
  */
-export function getNewPaneContent(oldContent: string, newContent: string): string {
-  if (!oldContent) return newContent;
-  if (oldContent === newContent) return '';
+export function getNewPaneContent(oldContent: string, newContent: string): NewPaneContent {
+  if (!oldContent) return { text: newContent, startsNewParagraph: false };
+  if (oldContent === newContent) return { text: '', startsNewParagraph: false };
 
   const oldLines = oldContent.split('\n');
   const newLines = newContent.split('\n');
@@ -2402,6 +2423,12 @@ export function getNewPaneContent(oldContent: string, newContent: string): strin
 
   const newParts: string[] = [];
   let pendingBlank = false;
+  // True once any content line (retained-old skipped OR new pushed) has been
+  // seen, so a blank that precedes the chunk's FIRST emitted new line counts as
+  // a real paragraph break only when there was content above it — pane-top
+  // padding (no content above) must not produce a leading separator.
+  let sawContent = false;
+  let startsNewParagraph = false;
 
   for (const line of newLines) {
     const normalized = normalizeForComparison(line);
@@ -2412,15 +2439,25 @@ export function getNewPaneContent(oldContent: string, newContent: string): strin
 
     if (oldLineSet.has(normalized)) {
       pendingBlank = false;
+      sawContent = true;
       continue;
     }
 
-    if (pendingBlank && newParts.length > 0) newParts.push('');
+    if (newParts.length === 0) {
+      // First emitted new line: the leading blank is dropped from `text` (a
+      // fresh message must never start blank), but reported out-of-band so the
+      // JOIN can rebuild the separator — only when there was content above it.
+      if (pendingBlank && sawContent) startsNewParagraph = true;
+    } else if (pendingBlank) {
+      // Interior blank within this chunk — keep it inline as a separator.
+      newParts.push('');
+    }
     newParts.push(line);
     pendingBlank = false;
+    sawContent = true;
   }
 
-  return newParts.join('\n').trim();
+  return { text: newParts.join('\n').trim(), startsNewParagraph };
 }
 
 /**
@@ -3646,7 +3683,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       session.lastContent = content;
       session.resumeSeedPrevContent = content;
       session.resumeSeedPolls += 1;
-      this.handleAutoLifecycle(session, content, getNewPaneContent('', content));
+      this.handleAutoLifecycle(session, content, getNewPaneContent('', content).text);
       if (!decision.keepSeeding) {
         session.resumeSeeding = false;
         // The relay window must start EMPTY here: seeding SWALLOWED the
@@ -3673,7 +3710,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     if (content !== session.lastContent) {
       const previousPane = session.lastContent;
-      const newPart = getNewPaneContent(previousPane, content);
+      const { text: newPart, startsNewParagraph } = getNewPaneContent(previousPane, content);
       session.lastContent = content;
 
       if (newPart) {
@@ -3823,7 +3860,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
                 // only — status frames roll/are edited in place and never
                 // flood as separate messages.
                 session.recentRelayWindow.record(relayablePart);
-                this.emit('output', key, cleanedOutput);
+                // Carry the dropped leading paragraph break out-of-band (S2): the
+                // bot rebuilds the `\n\n` separator only when APPENDING this prose
+                // chunk to the pending buffer / live draft — never at a message
+                // start. Out-of-band so the pipeline's trims can't strip it.
+                this.emit('output', key, cleanedOutput, { startsNewParagraph });
               }
             } else if (activityLine) {
               // Quiet path folded every routable segment into the status frame

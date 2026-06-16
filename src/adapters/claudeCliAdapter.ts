@@ -3885,10 +3885,25 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * so it must not glue onto preceding prose in the append/draft join.
    */
   private emitStabilizedTable(key: ThreadKey, session: ClaudeSession, block: string): void {
+    // Root-cause dedup (flood 2026-06-16): the table block was RECORDED into the
+    // relay window but never CHECKED before emit, and table lines are masked out
+    // of the prose delta before `getRelayDedupedChunk` runs — so the long-horizon
+    // re-render guard structurally never saw a re-printed/looped table. Each
+    // re-render → one new message (a single topic flooded with ~500 byte-identical
+    // copies). Check the window at the BLOCK level (border rows / tiny cells fall
+    // under the per-line gate, so a per-line check would miss them) in the SAME
+    // pre-strip pane-line domain `record` uses. An identical block → skip the
+    // emit (suppressed exactly like a re-rendered prose chunk); a CHANGED table is
+    // a different signature → still emits. Still record() to keep the window warm.
+    const isAlreadyRelayed = session.recentRelayWindow.checkBlockAlreadyRelayed(block);
     const fenced = stripTuiElementsWithContext(block, session.openToolKind);
     session.openToolKind = fenced.toolKind;
     if (!fenced.text) return;
     session.recentRelayWindow.record(block);
+    if (isAlreadyRelayed) {
+      console.log(`[Claude] already-relayed table re-render suppressed (${block.length} chars)`);
+      return;
+    }
     session.lastStatusText = '';
     this.emit('output', key, fenced.text, { startsNewParagraph: true });
   }

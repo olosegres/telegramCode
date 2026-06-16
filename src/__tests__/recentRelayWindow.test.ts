@@ -18,9 +18,11 @@ import * as assert from 'node:assert/strict';
 import {
   createRecentRelayWindow,
   getRelayDedupedChunk,
+  buildRelayBlockSignature,
   normalizeForComparison,
   relayDedupMinLineLength,
   relayWindowMaxLines,
+  relayBlockSignatureMax,
 } from '../utils/recentRelayWindow';
 
 /** A substantial (≥ min length) line unique per index — diff-result shaped. */
@@ -207,4 +209,115 @@ test('filter: keeps one separator between surviving paragraphs, drops blanks at 
     getRelayDedupedChunk(relayWindow, mixedChunk),
     'new paragraph one, substantial line\n\nnew paragraph two, substantial line',
   );
+});
+
+// ─── block-level dedup: the box-table flood guard (2026-06-16) ────────────────
+
+/**
+ * The flood shape: a Claude TUI box-drawing table re-printed byte-identically
+ * ~500 times. Its individual lines (border rows `├──┤`, tiny cells `│ ✅ │`)
+ * are mostly UNDER the per-line min length, so `checkHasLine` could never catch
+ * it — only the whole-block signature can. These tests anchor that.
+ */
+const boxTableBlock = [
+  '⏺ ┌────┬──────────────┬────┐',
+  '│ #  │ Check        │ OK │',
+  '├────┼──────────────┼────┤',
+  '│ 1  │ login        │ ✅ │',
+  '│ 2  │ logout       │ ✅ │',
+  '│ 3  │ refresh      │ ⏳ │',
+  '└────┴──────────────┴────┘',
+].join('\n');
+
+test('block: an identical table block is recognised as already-relayed', () => {
+  const relayWindow = createRecentRelayWindow();
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(boxTableBlock), false, 'unseen block must be new');
+  relayWindow.record(boxTableBlock);
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(boxTableBlock), true, 're-printed identical block → already relayed');
+});
+
+test('block: a table whose individual lines are too short is STILL recognised as a duplicate', () => {
+  // The load-bearing case: every line of this table is short (< the per-line min
+  // length after normalization), so the per-line layer (checkHasLine) cannot
+  // catch it — only the whole-block signature can.
+  const tinyTable = ['┌──┬──┐', '│✅│⏳│', '├──┼──┤', '│1 │2 │', '└──┴──┘'].join('\n');
+  const relayWindow = createRecentRelayWindow();
+  relayWindow.record(tinyTable);
+  // Per-line layer misses every short line…
+  for (const line of tinyTable.split('\n')) {
+    assert.equal(relayWindow.checkHasLine(line), false, 'short lines never match per-line');
+  }
+  // …but the block layer recognises the whole duplicate block.
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(tinyTable), true);
+});
+
+test('block: a CHANGED table (one cell flips ⏳→✅) is a different block → not suppressed', () => {
+  const relayWindow = createRecentRelayWindow();
+  relayWindow.record(boxTableBlock);
+  const changedTable = boxTableBlock.replace('│ refresh      │ ⏳ │', '│ refresh      │ ✅ │');
+  assert.notEqual(changedTable, boxTableBlock);
+  assert.equal(
+    relayWindow.checkBlockAlreadyRelayed(changedTable),
+    false,
+    'a genuine change is a new block and must still emit',
+  );
+});
+
+test('block: a re-rendered table with different column widths (re-flow) still dedups', () => {
+  // The TUI re-flows column widths as it repaints — the block signature drops
+  // markdown/whitespace noise, but border widths differ by character, so a true
+  // re-flow is a DIFFERENT block. We only claim byte-identical suppression here:
+  // an identical re-print (same widths) dedups; a re-flow is intentionally a new
+  // block (it carries genuinely new layout, and S1's stabilizer holds re-flows
+  // until they settle so only the settled form reaches record()).
+  const relayWindow = createRecentRelayWindow();
+  relayWindow.record(boxTableBlock);
+  // Same content, identical widths, only a state glyph on the bullet line and
+  // surrounding whitespace differ — must still dedup (coarse normalization).
+  const reRenderedSameWidth = boxTableBlock
+    .replace('⏺ ┌', '● ┌')
+    .split('\n')
+    .map(line => `  ${line}  `)
+    .join('\n');
+  assert.equal(
+    relayWindow.checkBlockAlreadyRelayed(reRenderedSameWidth),
+    true,
+    'a glyph/whitespace re-render of the same-width table must dedup',
+  );
+});
+
+test('block: an empty / whitespace-only block is never treated as relayed', () => {
+  const relayWindow = createRecentRelayWindow();
+  relayWindow.record('   \n\n  ');
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(''), false);
+  assert.equal(relayWindow.checkBlockAlreadyRelayed('   \n\n  '), false);
+});
+
+test('block: reset forgets recorded block signatures', () => {
+  const relayWindow = createRecentRelayWindow();
+  relayWindow.record(boxTableBlock);
+  relayWindow.reset();
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(boxTableBlock), false);
+});
+
+test('block: oldest signature evicts once the block FIFO is full', () => {
+  const relayWindow = createRecentRelayWindow();
+  // Record one distinctive block, then flood past the signature cap with others.
+  relayWindow.record(boxTableBlock);
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(boxTableBlock), true);
+  for (let n = 0; n < relayBlockSignatureMax; n += 1) {
+    relayWindow.record(`a distinct relayed block number ${n} with enough length to be real`);
+  }
+  assert.equal(
+    relayWindow.checkBlockAlreadyRelayed(boxTableBlock),
+    false,
+    'the first block must have evicted past the signature cap',
+  );
+});
+
+test('buildRelayBlockSignature: drops blanks and normalizes; same content → same signature', () => {
+  const a = ['│ a │', '', '│ b │'].join('\n');
+  const b = ['  │ a │  ', '│ b │'].join('\n');
+  assert.equal(buildRelayBlockSignature(a), buildRelayBlockSignature(b));
+  assert.equal(buildRelayBlockSignature('   \n  '), '', 'whitespace-only → empty signature');
 });

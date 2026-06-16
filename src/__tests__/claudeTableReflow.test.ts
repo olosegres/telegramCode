@@ -33,6 +33,7 @@ import {
   maskSharpTableLines,
   stripTuiElementsWithContext,
 } from '../adapters/claudeCliAdapter';
+import { createRecentRelayWindow } from '../utils/recentRelayWindow';
 
 /**
  * The assistant-output bullet Claude's real TUI (v2.1.177) prints on the table's
@@ -212,6 +213,99 @@ function replayPoll(captures: string[]): { proseEmits: string[]; tableEmits: str
 
   return { proseEmits, tableEmits };
 }
+
+/**
+ * Faithful mini-driver for the BLOCK-LEVEL DEDUP at the table emit (flood
+ * 2026-06-16). Mirrors `replayPoll` AND the real `emitStabilizedTable` choke
+ * point: a settled table block is emitted ONLY when it was not already relayed
+ * to this topic (the relay window's block-level check), and is recorded either
+ * way so the window stays warm. This is what stops a re-printed / looped
+ * identical table from being re-emitted as a duplicate message — the bug where a
+ * single topic got ~500 byte-identical table copies. A CHANGED table is a
+ * different block, so it is NOT suppressed.
+ */
+function replayPollWithDedup(captures: string[]): { tableEmits: string[] } {
+  let lastContent = '';
+  let streamingTable: ReturnType<typeof getTableStabilizationDecision>['nextStreamingTable'] = null;
+  const relayWindow = createRecentRelayWindow();
+  const tableEmits: string[] = [];
+
+  /** Mirrors `emitStabilizedTable`: check the window, then record either way. */
+  const emitTableBlock = (block: string): void => {
+    const isAlreadyRelayed = relayWindow.checkBlockAlreadyRelayed(block);
+    const fenced = stripTuiElementsWithContext(block).text;
+    if (!fenced) return;
+    relayWindow.record(block);
+    if (isAlreadyRelayed) return;
+    tableEmits.push(fenced);
+  };
+
+  for (const content of captures) {
+    const isTurnIdle = !checkIsClaudeSessionBusy({ isActive: true, lastContent: content });
+    const hasContentAfterTable = checkHasContentAfterLastSharpTable(content);
+
+    if (content === lastContent) {
+      if (!streamingTable) continue;
+      const idle = getTableStabilizationDecision({
+        currentTable: getLastSharpTableBlock(content),
+        streamingTable,
+        hasContentAfterTable,
+        isTurnIdle,
+      });
+      streamingTable = idle.nextStreamingTable;
+      if (idle.kind === 'emit' && idle.block) emitTableBlock(idle.block);
+      continue;
+    }
+
+    lastContent = content;
+    const decision = getTableStabilizationDecision({
+      currentTable: getLastSharpTableBlock(content),
+      streamingTable,
+      hasContentAfterTable,
+      isTurnIdle,
+    });
+    streamingTable = decision.nextStreamingTable;
+    if (decision.kind === 'emit' && decision.block) emitTableBlock(decision.block);
+  }
+
+  return { tableEmits };
+}
+
+test('table dedup: the SAME table settled twice across turns emits ONCE (the flood guard)', () => {
+  // The flood shape: the table settles + emits, then the TUI re-renders the SAME
+  // table and it settles again. Without the block-level dedup each settle → one
+  // new message (a topic flooded ~500 times). With it, the second identical
+  // settle is suppressed.
+  const { tableEmits } = replayPollWithDedup([
+    captureSkeleton, //      hold
+    captureFullBusy, //      hold
+    captureFullThenProse, // DONE → emit the full table (1st)
+    captureFullBusy, //      same table re-renders, busy → hold
+    captureFullThenProse, // DONE again → identical block → SUPPRESSED
+  ]);
+  assert.equal(tableEmits.length, 1, `a re-printed identical table must emit once, got ${tableEmits.length}`);
+  assert.ok(tableEmits[0].includes('row 5 content'), 'the one emit is the full table');
+});
+
+test('table dedup: a CHANGED table after the first emits a SECOND time', () => {
+  // A genuine change (a different full table) is a different block → not
+  // suppressed. Build a changed full table by flipping a cell value.
+  const changedFullBody = fullTableBody.map(line =>
+    line.replace('row 5 content', 'row 5 CHANGED').replace('detail 5', 'detail 5!'),
+  );
+  const changedFullThenProse = withFooter([...changedFullBody, '', 'Готово.'], idleFooter);
+
+  const { tableEmits } = replayPollWithDedup([
+    captureSkeleton,
+    captureFullBusy,
+    captureFullThenProse, //    DONE → emit table v1
+    withFooter(changedFullBody, busyFooter), // changed table re-flows, busy → hold
+    changedFullThenProse, //    DONE → different block → emit table v2
+  ]);
+  assert.equal(tableEmits.length, 2, `a changed table must emit a second time, got ${tableEmits.length}`);
+  assert.ok(tableEmits[0].includes('row 5 content'), 'first emit is the original');
+  assert.ok(tableEmits[1].includes('row 5 CHANGED'), 'second emit is the changed version');
+});
 
 test('table reflow: grows in stages (with a mid-stream pause) → EXACTLY ONE emit, complete', () => {
   // The live bug (2026-06-15): the table paints to 4 rows, PAUSES there for a

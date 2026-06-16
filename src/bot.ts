@@ -109,6 +109,7 @@ import {
   type FileSendItem,
 } from './utils/fileSendPlan';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
 import {
   getThinkingEventAction,
   getThinkingAnswerStartAction,
@@ -757,6 +758,15 @@ const statusCoalescers = new Map<string, StatusCoalesceState>();
 const thinkingCoalescers = new Map<string, ThinkingCoalesceState>();
 
 /**
+ * @description Per-thread backstop against a runaway flood of byte-identical
+ * PERMANENT output (flood 2026-06-16: a Claude topic re-emitted one table ~500
+ * times). Defense-in-depth behind the table-emit root-cause fix (S1) — caps ANY
+ * emit path that re-sends the same large block. Reset on every session
+ * stop/closed/unbind via `clearThreadQueues`. See `utils/identicalOutputGuard`.
+ */
+const identicalOutputGuard = createIdenticalOutputGuard();
+
+/**
  * @description Register/replace a thread's pending interactive question in BOTH
  * the in-memory `pendingQuestions` map and the persisted store, so a restart
  * can restore it (the in-memory map is otherwise lost — see `state.ts`). Single
@@ -1256,6 +1266,11 @@ function clearThinkingMessage(key: ThreadKey): void {
 function clearThreadQueues(key: ThreadKey): void {
   const k = keyToString(key);
   clearThreadOutputQueues(outputQueues.get(k), statusCoalescers.get(k));
+  // A new session starts with empty context — forget the last-sent outputs so
+  // the identical-output backstop can't suppress a legitimate repeat across a
+  // session boundary (the same convergence point that clears the other
+  // per-thread relay state: /stop release, session closed/stopped, /unbind).
+  identicalOutputGuard.reset(k);
   // A teardown that clears queued output must also FINALIZE any in-flight content
   // (DM: the live draft → a permanent message, not dropped, then reset). This is
   // the convergence point for `/stop` release, session `closed`/`stopped`,
@@ -6486,6 +6501,19 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
   // orphan under the freshly-arrived output (the leftover-spinner half of #11).
   // When no id is tracked it's a cheap no-op delete that still bumps the gen.
   void deleteStatusMessage(key).catch(() => {});
+
+  // Defense-in-depth backstop (flood 2026-06-16): suppress a FRESH permanent
+  // output that is byte-identical to one recently sent to this thread, capping a
+  // runaway regardless of which emit path produced it (the table flood was ~500
+  // identical copies). Guard ONLY fresh permanent output: a continuation is the
+  // OpenCode append chain (its tail is expected to repeat-then-extend), and
+  // status/transient/question frames never reach here (separate events). Short
+  // blocks pass (the helper's min-chars gate) so a legitimately-repeated short
+  // answer is never eaten. On a suppressed duplicate: do NOT deliver, log once.
+  if (!meta?.isContinuation && identicalOutputGuard.checkAndRecord(keyToString(key), output, Date.now())) {
+    console.log(`[Bot] identical-output backstop suppressed a repeat ${keyToString(key)} (${output.length} chars)`);
+    return;
+  }
 
   // Output routing is selected once at boot by CHAT_MODE (the OutputTransport
   // seam). Group routes to the unchanged `queueOutput` edit-in-place persist

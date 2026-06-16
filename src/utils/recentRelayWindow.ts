@@ -42,6 +42,16 @@ export const relayDedupMinLineLength = 16;
 export const relayWindowMaxLines = 1500;
 
 /**
+ * @description Capacity of the block-signature FIFO behind
+ * {@link RecentRelayWindow.checkBlockAlreadyRelayed}. A block is one emitted
+ * chunk (a table, a prose paragraph) recorded as a SINGLE joined signature, so
+ * far fewer entries than the per-line window need bounding. Sized to remember a
+ * good run of recent emitted blocks (covers a looped table re-printed many times
+ * within a turn) while keeping the memory bound trivial.
+ */
+export const relayBlockSignatureMax = 200;
+
+/**
  * @description Normalise a pane line for line-identity comparison: trim, drop
  * a leading status/tool glyph so a tool header matches regardless of which
  * `●/⏺/○/⏳/✓` state it was last rendered in (`⏺` U+23FA is the real
@@ -84,12 +94,31 @@ export function normalizeForRelayDedup(line: string): string {
 }
 
 /**
+ * @description Build a single normalized signature for a WHOLE block (a table,
+ * a paragraph) so a fully-duplicate block can be recognised even when its
+ * individual lines are too short to clear the per-line {@link
+ * relayDedupMinLineLength} gate — table border rows (`├──┤`) and tiny cells
+ * (`│ ✅ │`) are exactly that case. Drops blank lines, normalizes each surviving
+ * line in the SAME coarse domain {@link normalizeForRelayDedup} uses, and joins
+ * with `\n`. Returns `''` for a block with no substantial content (so a
+ * whitespace-only block is never treated as a relayed block).
+ */
+export function buildRelayBlockSignature(blockText: string): string {
+  const normalizedLines = blockText
+    .split('\n')
+    .map(normalizeForRelayDedup)
+    .filter(line => line.length > 0);
+  return normalizedLines.join('\n');
+}
+
+/**
  * @description Bounded FIFO of normalized, already-relayed pane lines.
  * Created per Claude session; see {@link createRecentRelayWindow}.
  */
 export interface RecentRelayWindow {
   /**
-   * Store the chunk's substantial lines (normalized). Call ONLY after the
+   * Store the chunk's substantial lines (normalized) AND the chunk's joined
+   * block signature ({@link buildRelayBlockSignature}). Call ONLY after the
    * chunk was actually emitted as permanent OUTPUT — transient status frames
    * roll in place and never flood as separate messages, so recording them
    * would only risk suppressing genuine output.
@@ -101,6 +130,13 @@ export interface RecentRelayWindow {
    * false — they are never suppressed.
    */
   checkHasLine(line: string): boolean;
+  /**
+   * True when the WHOLE block (its joined {@link buildRelayBlockSignature})
+   * was already relayed — the table-flood guard. Recognises a fully-duplicate
+   * block even when every line is too short for the per-line gate. An
+   * empty-signature block (whitespace only) always returns false.
+   */
+  checkBlockAlreadyRelayed(blockText: string): boolean;
   /** Forget everything (session lifecycle reset points). */
   reset(): void;
 }
@@ -114,6 +150,10 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
   const lineFifo: string[] = [];
   /** Same lines as `lineFifo`, for O(1) membership checks. */
   const lineSet = new Set<string>();
+  /** Insertion-ordered joined block signatures — defines block eviction order. */
+  const blockSignatureFifo: string[] = [];
+  /** Same signatures as `blockSignatureFifo`, for O(1) membership checks. */
+  const blockSignatureSet = new Set<string>();
 
   return {
     record(chunkText: string): void {
@@ -130,15 +170,35 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
           if (evictedLine !== undefined) lineSet.delete(evictedLine);
         }
       }
+
+      // Also record the chunk's whole-block signature so a fully-duplicate
+      // block (a re-printed table whose individual lines are too short for the
+      // per-line gate) is recognised by `checkBlockAlreadyRelayed`.
+      const blockSignature = buildRelayBlockSignature(chunkText);
+      if (blockSignature && !blockSignatureSet.has(blockSignature)) {
+        blockSignatureFifo.push(blockSignature);
+        blockSignatureSet.add(blockSignature);
+        if (blockSignatureFifo.length > relayBlockSignatureMax) {
+          const evictedSignature = blockSignatureFifo.shift();
+          if (evictedSignature !== undefined) blockSignatureSet.delete(evictedSignature);
+        }
+      }
     },
     checkHasLine(line: string): boolean {
       const normalized = normalizeForRelayDedup(line);
       if (normalized.length < relayDedupMinLineLength) return false;
       return lineSet.has(normalized);
     },
+    checkBlockAlreadyRelayed(blockText: string): boolean {
+      const blockSignature = buildRelayBlockSignature(blockText);
+      if (!blockSignature) return false;
+      return blockSignatureSet.has(blockSignature);
+    },
     reset(): void {
       lineFifo.length = 0;
       lineSet.clear();
+      blockSignatureFifo.length = 0;
+      blockSignatureSet.clear();
     },
   };
 }

@@ -91,6 +91,22 @@ config/variants, not a per-message API field).
 - **Startup-safe input.** A session has an async boot window (Claude tmux/pty,
   OpenCode server + `POST /session`). Prompts typed during it are buffered
   (`startupPromptBuffer.ts`) and replayed in order when ready — never dropped.
+- **Agent start UX — one-tap start + ONE typing loader.** The post-bind welcome
+  buttons (▶️ Claude / ▶️ OpenCode) START the chosen agent in one tap (the
+  `agent_<name>` callback funnels through `handleAgentStart`, the shared core
+  also behind `/claude` `/opencode` `/terminal`), not a select-then-type step.
+  The sole "agent is working" cue is the native typing indicator (`startTypingLoader`
+  re-fires `sendChatAction('typing')` every `typingLoaderRefreshMs`; it REPLACED
+  the old `⏳` placeholder message). It runs at every wait point — a self-greeting
+  agent's boot AND every prompt forward — and is cleared ONLY by a real event
+  (first output via `handleAgentOutput`, a status/question frame, or session
+  teardown / start-fail via `stopTypingLoader`); there is NO timeout, so a
+  long-thinking agent keeps showing it. An adapter that prints its own greeting
+  declares `selfGreetsOnStart` (Claude's TUI banner) — then `startAgentSession`
+  suppresses the bot's `agent.ready` notice (returns `''` via `getStartReadyMessage`)
+  and keeps the loader up until that banner lands. OpenCode/terminal don't
+  self-greet, so they keep the `agent.ready` / `terminal.ready` cue (and boot uses
+  a one-shot typing ping, not the sustained loader — no output is coming yet).
 - **Streaming output appends, never overwrites.** OpenCode streams a reply as
   incremental tails; every `output` emit after the first of a response carries
   `isContinuation: true` (`OutputEventMeta` in `types.ts`). The bot appends a
@@ -322,7 +338,7 @@ OpenCode events / bindings).
     bind-required reply agents give. While active, EVERY plain text message is
     typed in as a command (Enter appended) and routed DIRECTLY via
     `adapter.sendInput` — skipping `forwardPromptToAgent` (no `[thread context]`
-    preamble, no `⏳` loader, no interrupt). Output streams back as ONE rolling
+    preamble, no typing loader, no interrupt). Output streams back as ONE rolling
     message per command (continuation), like OpenCode. Raw keys reuse the
     existing TUI commands: `/c` (Ctrl-C), `/up`·`/down` (history), `/tab`
     (completion), `/enter`. `/stop`·`/new`·`/quit`·leaving a folder work as for
@@ -339,10 +355,13 @@ OpenCode events / bindings).
     The old session is **released, not deleted** (its transcript stays on disk
     → still resumable via `/sessions`; a bot restart won't auto-reattach it).
     Reuses the `/stop` release path (`releaseThreadSession`) then
-    `startAgentSession` (so it carries startup buffering, typing indicator,
-    preamble-marker reset, and the single `agent.ready` notice). Unbound topic →
-    bind-required reply; General → a hint that `/new` works inside a bound topic.
-    It no longer creates a forum topic (that behavior was removed).
+    `startAgentSession` (so it carries startup buffering, the typing loader, and
+    the preamble-marker reset). The `agent.ready` notice is shown only for a
+    non-self-greeting backend (OpenCode/terminal) — Claude prints its own banner,
+    so `startAgentSession` returns `''` and the typing loader covers the gap (see
+    "agent start / typing loader" below). Unbound topic → bind-required reply;
+    General → a hint that `/new` works inside a bound topic. It no longer creates
+    a forum topic (that behavior was removed).
   - `/clear_messages` (formerly `/clear`) deletes this thread's Telegram
     messages (up to 48h, Telegram limit). The bare `/clear` is **no longer
     bot-owned** — it's forwarded verbatim to the agent like `/compact` (Claude

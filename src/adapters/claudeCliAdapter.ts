@@ -2423,6 +2423,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   readonly name = 'claude';
   readonly label = 'Claude Code';
   readonly outputsDeltas = true;
+  // The TUI prints its own banner to the topic — the bot suppresses `agent.ready`
+  // and keeps the typing loader up until that first output (see AgentAdapter).
+  readonly selfGreetsOnStart = true;
 
   /**
    * Map of serialised `ThreadKey` (`"<chatId>:<threadId>"`) → live session.

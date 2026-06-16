@@ -510,6 +510,15 @@ const CLAUDE_LIVENESS_TICK_MS = 1000;
 const subagentTickMs = 10_000;
 
 /**
+ * Re-fire cadence of the native typing-indicator loader. Telegram's `typing`
+ * chat action self-expires after ~5 s, so the sustained loader re-sends it on
+ * this interval (comfortably under the expiry) to keep the dots visible for as
+ * long as the agent is working. One `sendChatAction` per tick is negligible
+ * against the rate budget.
+ */
+const typingLoaderRefreshMs = 4_000;
+
+/**
  * Rotating spinner glyphs for the liveness frame's neutral fallback (used only
  * when no scraped activity line is available). Cycling them on each tick makes
  * the frame visibly alive even while the scrape is quiet. Mirrors the TUI's own
@@ -567,15 +576,15 @@ interface ThreadMessageState {
   lastMessageText: string | null;
   /** True when next output should send a new message instead of editing. */
   needsNewMessage: boolean;
-  /** Loader (⏳) message id — deleted when the first real output arrives. */
-  loaderMessageId: number | null;
   /**
-   * True once output superseded the loader. The loader send is fire-and-forget
-   * (it can stall behind a chat-wide 429 cooldown), so the agent's reply can
-   * land BEFORE the loader's own send resolves; this flag tells the late
-   * loader to delete itself on arrival instead of sticking under the answer.
+   * The sole "agent is working" loader: a timer that re-fires the native typing
+   * indicator (`sendChatAction('typing')`) while the bot waits for output (a
+   * self-greeting boot, every prompt forward). `null` = no loader running.
+   * Re-fired because Telegram's typing action self-expires after a few seconds.
+   * Cleared ONLY by a real event (first output / status / question / teardown /
+   * start-fail) — never by a timeout, so a long-thinking agent keeps the loader.
    */
-  loaderObsolete: boolean;
+  typingLoaderTimer: NodeJS.Timeout | null;
   /** Transient status/spinner message id — replaced by permanent text. */
   statusMessageId: number | null;
   /**
@@ -1157,7 +1166,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, loaderMessageId: null, loaderObsolete: false, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -1480,6 +1489,9 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   // it survives the `threadMessageStates.delete` as an orphan that fires into a
   // freshly-bound session (same reasoning as the output debounce timer above).
   stopClaudeLiveness(key);
+  // Same orphan-prevention for the typing-loader timer (it lives in the
+  // message-state entry too) — covers /unbind and a deleted topic.
+  stopTypingLoader(key);
   threadMessageStates.delete(k);
   outputQueues.delete(k);
   clearPendingQuestion(key);
@@ -2006,6 +2018,39 @@ async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
   }
 }
 
+/**
+ * @description Start the sustained "agent is working" loader for `key`: fire the
+ * native typing indicator NOW, then keep re-firing it every
+ * {@link typingLoaderRefreshMs} (Telegram's `typing` action self-expires). This
+ * is the ONLY loader — it replaced the old `⏳` placeholder message. Idempotent:
+ * an already-running loader is cleared first so a second start can't leave two
+ * timers. There is deliberately NO self-cap/timeout — a long-thinking agent must
+ * keep the loader; it is cleared only by a real event via {@link stopTypingLoader}.
+ */
+function startTypingLoader(key: ThreadKey): void {
+  const s = getThreadMessageState(key);
+  if (s.typingLoaderTimer) clearInterval(s.typingLoaderTimer);
+  sendThreadTypingIndicator(key).catch(() => {});
+  s.typingLoaderTimer = setInterval(() => {
+    sendThreadTypingIndicator(key).catch(() => {});
+  }, typingLoaderRefreshMs);
+  // Don't keep the event loop alive just for a loader (mirrors the liveness timer).
+  s.typingLoaderTimer.unref?.();
+}
+
+/**
+ * @description Stop the typing loader for `key` (clear the re-fire timer). The
+ * typing indicator itself self-expires within a few seconds, so there is nothing
+ * to delete — just stop refreshing it. Idempotent (no-op when no loader runs).
+ */
+function stopTypingLoader(key: ThreadKey): void {
+  const s = getThreadMessageState(key);
+  if (s.typingLoaderTimer) {
+    clearInterval(s.typingLoaderTimer);
+    s.typingLoaderTimer = null;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Output rendering — split, escape, queued edits
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2193,7 +2238,8 @@ async function sendOutputImmediate(
   output: string,
   isContinuation = false,
 ): Promise<{ unsentRemainder: string | null }> {
-  await deleteLoaderMessage(key);
+  // The typing loader is stopped upstream in `handleAgentOutput` (the shared
+  // onOutput entry for BOTH transports), so it's not repeated here.
   await deleteStatusMessage(key);
 
   const msgState = getThreadMessageState(key);
@@ -2301,17 +2347,6 @@ async function sendAgentChunks(key: ThreadKey, chunks: string[]): Promise<void> 
       msgState.needsNewMessage = false;
     }
   }
-}
-
-async function deleteLoaderMessage(key: ThreadKey): Promise<void> {
-  const s = getThreadMessageState(key);
-  // Mark even when no id is stored yet: an in-flight loader send (stalled in
-  // the rate-limit queue) checks this flag on arrival and self-deletes.
-  s.loaderObsolete = true;
-  if (s.loaderMessageId === null) return;
-  const id = s.loaderMessageId;
-  s.loaderMessageId = null;
-  await deleteThreadMessage(key, id);
 }
 
 async function deleteStatusMessage(key: ThreadKey): Promise<void> {
@@ -2650,6 +2685,9 @@ async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof s
   // before the session is released, so the kick never lands in a torn-down
   // session.
   cancelApiRetry(key);
+  // Session is going away → no output is coming, so stop the "working" loader
+  // (covers /stop and the release half of /new before its fresh start re-arms it).
+  stopTypingLoader(key);
   const result = stopAllAdaptersFor(key);
   await state.clearAgentSessionIds(key);
   return result;
@@ -2707,6 +2745,33 @@ async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<voi
   await state.setAgent(key, next);
 }
 
+/**
+ * @description The post-start "ready" notice for an agent that just came up — or
+ * the empty string when none should be posted. Pure decision extracted from
+ * {@link startAgentSession} so the capability gate is unit-testable without the
+ * whole start machinery (tmux/HTTP/state):
+ *  - a self-greeting agent (Claude — `selfGreetsOnStart`) returns `''`: it prints
+ *    its OWN banner to the topic, so the bot's notice would be a redundant,
+ *    slightly-early "ready" line above it (the typing loader covers the gap);
+ *  - terminal returns the shell-specific `terminal.ready` copy (a shell isn't an
+ *    agent that takes a prompt);
+ *  - any other backend (OpenCode) returns the generic `agent.ready` notice —
+ *    without it the user would have no cue the session is up, since nothing greets.
+ */
+export function getStartReadyMessage(
+  adapter: AgentAdapter,
+  subdir: string,
+  args?: string,
+): string {
+  if (adapter.selfGreetsOnStart) return '';
+  const readyKey = adapter.name === 'terminal' ? 'terminal.ready' : 'agent.ready';
+  return t(readyKey, {
+    label: adapter.label,
+    subdir,
+    argsSuffix: args ? ` (${args})` : '',
+  });
+}
+
 async function startAgentSession(key: ThreadKey, args?: string): Promise<string> {
   const kStr = keyToString(key);
   // The bound folder IS the agent's cwd — refuse to start without one. The
@@ -2725,9 +2790,16 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
   clearThreadContextMarker(key);
   const adapter = getThreadAdapter(key);
 
-  // U1 from plan §10.2 / §16.3: typing indicator while the agent boots so
-  // the user doesn't think the bot is asleep.
-  sendThreadTypingIndicator(key).catch(() => {});
+  // Boot loader. A self-greeting agent (Claude) prints its banner shortly — keep
+  // the SUSTAINED loader up from now until that first output covers the gap. A
+  // non-self-greeting agent (OpenCode/terminal) emits nothing until the user
+  // prompts, so a one-shot typing ping is enough — its `ready` notice (below)
+  // tells the user the session is up; a sustained loader would dangle forever.
+  if (adapter.selfGreetsOnStart) {
+    startTypingLoader(key);
+  } else {
+    sendThreadTypingIndicator(key).catch(() => {});
+  }
 
   try {
     await adapter.startSession(key, workDir, args);
@@ -2744,18 +2816,13 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
     void replayBufferedPrompts(key);
 
     const subdir = state.getBinding(key)?.subdir ?? path.basename(ENV.workRoot);
-    // Terminal gets its own ready copy (it's a shell, not an agent that takes a
-    // prompt) — its keystroke-driven UX differs enough to warrant distinct text.
-    const readyKey = adapter.name === 'terminal' ? 'terminal.ready' : 'agent.ready';
-    return t(readyKey, {
-      label: adapter.label,
-      subdir,
-      argsSuffix: args ? ` (${args})` : '',
-    });
+    return getStartReadyMessage(adapter, subdir, args);
   } catch (e) {
     // Start failed — the buffered prompts have nowhere to go, so drop them
-    // rather than replaying into a dead session.
+    // rather than replaying into a dead session. Stop the boot loader too: a
+    // self-greeting start armed the sustained loader, and no output is coming.
     startupPromptBuffer.discardPrompts(kStr);
+    stopTypingLoader(key);
     return t('agent.start_failed', {
       label: adapter.label,
       error: e instanceof Error ? e.message : String(e),
@@ -2866,9 +2933,11 @@ async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
 
 /**
  * @description Forward one user prompt to a live agent: mark the thread for a
- * fresh output message, show the `⏳` loader, and hand the text to the adapter.
- * Shared by the text handler, the voice handler, and startup-prompt replay so
- * the loader/marker behaviour stays identical across all three.
+ * fresh output message, start the typing loader (the sole "agent is working"
+ * cue), and hand the text to the adapter. Shared by the text handler, the voice
+ * handler, and startup-prompt replay so the loader/marker behaviour stays
+ * identical across all three. The loader is cleared by the agent's first output
+ * (or status / question / teardown) — never by a timeout.
  *
  * If the adapter implements `interruptAndWaitIdle`, we interrupt the running
  * turn and wait until it is actually idle before handing over the text. Only
@@ -2892,23 +2961,10 @@ async function forwardPromptToAgent(
   // post-`/clear` marker reset). See `threadContextPreamble.ts`.
   const promptText = getPromptWithThreadContext(key, text);
   markNeedsNewMessage(key);
-  const msgState = getThreadMessageState(key);
-  msgState.loaderObsolete = false;
-  // Deliberately NOT awaited (B6): during a chat-wide 429 cooldown this send
-  // can stall for tens of seconds, and the prompt's local tmux/HTTP delivery
-  // must never wait on Telegram send capacity. If the agent's reply lands
-  // first, `deleteLoaderMessage` flips `loaderObsolete` and the late ⏳
-  // deletes itself on arrival instead of sticking under the answer.
-  void replyToThread(key, '⏳')
-    .then((loaderId) => {
-      if (!loaderId) return;
-      if (msgState.loaderObsolete) {
-        void deleteThreadMessage(key, loaderId).catch(() => {});
-        return;
-      }
-      msgState.loaderMessageId = loaderId;
-    })
-    .catch(() => {});
+  // The native typing indicator is the loader: it shows immediately, can't be
+  // delayed behind a chat-wide 429 cooldown (unlike a sent message), and clears
+  // on the agent's first output via `handleAgentOutput`'s `stopTypingLoader`.
+  startTypingLoader(key);
   if (adapter.interruptAndWaitIdle) {
     await adapter.interruptAndWaitIdle(key);
   }
@@ -3489,11 +3545,11 @@ command(['new', 'clear_session'], async (_ctx, key) => {
   // The fresh start below uses the thread's current adapter, so we keep the
   // adapter selection untouched.
   await releaseThreadSession(key);
-  // `startAgentSession` handles startup buffering, the typing indicator, the
-  // preamble-marker reset, and sends its own `agent.ready` — no extra "started"
-  // notice here to avoid double-posting.
+  // `startAgentSession` handles startup buffering, the typing-loader boot, and
+  // the preamble-marker reset. It returns `''` for a self-greeting agent (Claude
+  // prints its own banner) — show a notice only for a non-empty ready text.
   const msg = await startAgentSession(key);
-  await replyToThread(key, msg);
+  if (msg) await replyToThread(key, msg);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3985,10 +4041,26 @@ command('mcp', async (_ctx, key) => {
   );
 });
 
-async function handleStartCommand(
-  ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>,
+/**
+ * @description Switch a thread to `adapterName` and START a session in one step —
+ * the shared core behind the `/claude` `/opencode` `/terminal` commands AND the
+ * post-bind welcome buttons (one tap: select + start). Returns nothing user-facing
+ * itself beyond the replies it sends, so callers can layer their own follow-up
+ * (the button re-renders its keyboard ✓ + refreshes the pinned banner).
+ *
+ * Guards (in order): General topic → refuse; no binding → bind-required reply +
+ * folder picker; already-active session → "already running". A self-greeting
+ * agent's `startAgentSession` returns `''` (Claude prints its own banner), so the
+ * ready notice is shown only when there is text.
+ *
+ * `adapterName` is typed `string` because the button passes a raw callback match;
+ * an unknown name makes `getThreadAdapter` throw, which the caller wrapping this
+ * (the `agent_*` action) turns into a "unknown agent" answer.
+ */
+async function handleAgentStart(
   key: ThreadKey,
-  adapterName: 'claude' | 'opencode' | 'terminal',
+  adapterName: string,
+  args?: string,
 ): Promise<void> {
   if (checkIsGeneral(key)) {
     await replyToThread(key, t('error.start_in_general'));
@@ -4008,9 +4080,22 @@ async function handleStartCommand(
     await replyToThread(key, t('agent.already_active', { label: adapter.label }));
     return;
   }
+  const msg = await startAgentSession(key, args);
+  if (msg) await replyToThread(key, msg);
+}
+
+/**
+ * @description Thin wrapper extracting the trailing args from the command text
+ * for {@link handleAgentStart}. The args are everything after the command word
+ * (e.g. `/claude refactor src/bot.ts` → `refactor src/bot.ts`).
+ */
+function handleStartCommand(
+  ctx: NarrowedContext<Context, Update.MessageUpdate<Message.TextMessage>>,
+  key: ThreadKey,
+  adapterName: 'claude' | 'opencode' | 'terminal',
+): Promise<void> {
   const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-  const msg = await startAgentSession(key, args || undefined);
-  await replyToThread(key, msg);
+  return handleAgentStart(key, adapterName, args || undefined);
 }
 
 command('claude', (ctx, key) => handleStartCommand(ctx, key, 'claude'));
@@ -5111,7 +5196,9 @@ bot.on(message('text'), async (ctx) => {
         await replyToThread(key, t('thread.no_binding'), extra);
         return;
       }
-      await replyToThread(key, result.message);
+      // Empty when a self-greeting agent started (its banner is the cue) — guard
+      // like the /schedule consumer so we never post a blank message.
+      if (result.message) await replyToThread(key, result.message);
       return;
     }
   }
@@ -5176,7 +5263,7 @@ bot.on(message('text'), async (ctx) => {
   // Terminal backend: a plain text message IS a shell command. Type it straight
   // in via `sendInput` (which appends Enter and arms a fresh rolling message),
   // bypassing `forwardPromptToAgent` entirely — no `[thread context]` preamble
-  // (a shell isn't an agent that needs to know WHERE it works), no `⏳` loader,
+  // (a shell isn't an agent that needs to know WHERE it works), no typing loader,
   // no interrupt logic. A bare `/clear` is likewise just typed in as input.
   if (adapter.name === 'terminal' && adapter.checkIsActive(key)) {
     adapter.sendInput(key, text);
@@ -5323,8 +5410,10 @@ bot.on(message('voice'), async (ctx) => {
           return;
         }
         await switchThreadAdapter(key, startMatch.adapterName);
+        // Empty for a self-greeting agent (Claude self-announces) — the typing
+        // loader covers the gap; show a notice only when there's ready text.
         const msg = await startAgentSession(key, startMatch.args);
-        await replyToThread(key, msg);
+        if (msg) await replyToThread(key, msg);
         return;
       }
     }
@@ -6115,24 +6204,23 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const adapterName = ctx.match[1];
   try {
-    await switchThreadAdapter(key, adapterName);
-    const adapter = getThreadAdapter(key);
+    // Resolve up-front so an unknown name throws into the catch (→ "unknown
+    // agent") before any side effect, and so the toast can name the label.
+    const adapter = getAdapter(adapterName);
     await ctx.answerCbQuery(t('cb.agent_switched', { label: adapter.label }));
-    await replyToThread(
-      key,
-      `Agent: ${adapter.label}\nSend a message or /${adapterName} to start`,
-    );
-    // Persist the choice so the banner survives restart and reflect it now.
+    // One-tap start: switch + start the agent (was select-only — the user then
+    // had to type /claude). `handleAgentStart` owns the General / binding /
+    // already-active guards and the self-greeting ready-text suppression, and
+    // `switchThreadAdapter` inside it persists the adapter choice.
+    await handleAgentStart(key, adapterName);
     if (state.getBinding(key)) {
-      await state.setAgent(key, { name: adapterName }).catch(() => {});
       await updatePinnedStatus(key).catch(() => {});
     }
 
     // Re-render the picker so the `✓` marker follows the newly-selected agent
     // instead of staying stuck on the previous one (B16, mirrors B12). The
-    // switch keeps the picker message visible (a fresh "Agent: …" reply is
-    // sent, the picker is neither edited nor deleted), so the stale marker
-    // would otherwise persist.
+    // start keeps the picker message visible (it is neither edited nor deleted),
+    // so the stale marker would otherwise persist.
     const cbMsg = ctx.callbackQuery?.message as Message | undefined;
     if (cbMsg) {
       const keyboard = buildAgentKeyboard(getAvailableAdapters(), adapterName);
@@ -6387,6 +6475,10 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     const adapter = getThreadAdapter(key);
     if (adapter.outputsDeltas) msgState.needsNewMessage = true;
   }
+  // The agent produced output → the "working" loader has done its job. Stop it
+  // HERE (the shared onOutput entry for BOTH group and DM transports) so the DM
+  // path is covered too, not only the group's `sendOutputImmediate`.
+  stopTypingLoader(key);
   // Delete UNCONDITIONALLY — not only when a frame is currently visible. A
   // liveness/scrape `sendStatusFrame` create may be mid-`await` with its id not
   // yet stored; calling `deleteStatusMessage` here bumps the frame generation so
@@ -6444,7 +6536,8 @@ async function handleAgentStatus(key: ThreadKey, status: string): Promise<void> 
   console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
   traceAgentEmit('status', key, status);
 
-  deleteLoaderMessage(key).catch(() => {});
+  // A status / thinking frame already signals "working" — drop the typing loader.
+  stopTypingLoader(key);
 
   // DM streaming v2 — status is ALWAYS the bottom-most message. If a content
   // cursor draft is still active, finalize it to a permanent message FIRST so the
@@ -7115,7 +7208,8 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   // above the prompt, not dropped; the finalize IS the persistence — no parallel
   // queueOutput in DM). Fire-and-forget; group mode's transport noops it.
   void getOutputTransport().finalizeInFlight(key);
-  deleteLoaderMessage(key).catch(() => {});
+  // The question UI replaces the "working" cue — stop the typing loader.
+  stopTypingLoader(key);
 
   // Audit S13 / #31: register the pending question BEFORE the async
   // network round-trip. A user hammering an inline button right after

@@ -699,6 +699,18 @@ export interface AgentAdapter extends EventEmitter {
    */
   readonly outputsDeltas?: boolean;
 
+  /**
+   * @description When true, the backend prints its OWN visible greeting to the
+   * topic shortly after the session starts (Claude's TUI banner). The bot then
+   * suppresses its `agent.ready` notice (the bot's text would be a redundant lie
+   * seconds before the agent's real banner) and instead keeps the typing loader
+   * up from start until that first output. Backends that emit nothing on session
+   * create (OpenCode = HTTP; terminal = a bare shell) leave it falsy and keep the
+   * `agent.ready` / `terminal.ready` cue — without it the user would stare at a
+   * loader forever, since nothing ever greets.
+   */
+  readonly selfGreetsOnStart?: boolean;
+
   // — Optional TUI controls (Claude CLI specific) —
 
   sendEnter?(key: ThreadKey): void;

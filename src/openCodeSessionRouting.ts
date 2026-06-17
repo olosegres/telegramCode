@@ -52,9 +52,10 @@ export interface BoundSessionRef {
  * @description Resolve the SINGLE bound thread that owns an incoming SSE event,
  * so an event is delivered to at most one topic (single-owner delivery).
  *
- * Even with one stream per bound folder (threads sharing a folder share it),
- * the same event reaches the dispatcher once and may match more than one bound
- * thread: a false lineage link OR a duplicated session id (two threads
+ * Even on the single global stream (every instance's events multiplexed on
+ * one `/global/event`), the same event reaches the dispatcher once and may match
+ * more than one bound thread: a false lineage link OR a duplicated session id
+ * (two threads
  * accidentally bound to the same server session) would make the event match —
  * and emit to — more than one topic (bug B20: the same answer appeared in two
  * threads). The single-owner rule picks exactly one.
@@ -250,12 +251,12 @@ export function touchLineageOnUse(
 
 /**
  * @description Resolve an event's owner by DIRECTORY when id/lineage resolution
- * has already failed — the SSE-routing fallback (S2). The stream is opened per
- * bound folder (`?directory=<dir>`), so an event arriving on it provably belongs
- * to one of the threads bound to THAT folder, even when the per-session lineage
- * map briefly disagrees (the child's `parentID` link was evicted or not yet
- * recorded). Pure: the caller passes the directory's ACTIVE bound sessions, so
- * it is unit-testable without a live server.
+ * has already failed — the SSE-routing fallback. On the single `/global/event`
+ * stream every session event is tagged with its owning folder, so an event
+ * provably belongs to one of the threads bound to THAT folder, even when the
+ * per-session lineage map briefly disagrees (the child's `parentID` link was
+ * evicted or not yet recorded). Pure: the caller passes the directory's ACTIVE
+ * bound sessions, so it is unit-testable without a live server.
  *
  * Decision rule (never guess a topic — a wrong topic is worse than a logged
  * drop):

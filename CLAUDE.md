@@ -25,23 +25,32 @@ to the agent rather than handled locally:
   one-line size summaries).
 - **OpenCode** runs as a local HTTP server. The bot talks to it over
   **HTTP + SSE**: it POSTs prompts to `/session/:id/prompt_async` (with a
-  `model: {providerID, modelID}` override) and consumes one
-  `/event?directory=<workDir>` stream **per unique bound folder** (not per
-  thread). Each directory instance delivers only its own events, so threads
-  sharing a folder share one stream and every event is JSON-parsed once and
-  routed to the owning session (plan `agent/tasks/completed/2026-06-05-event-loop-saturation-phase1.md`,
-  S5). The stream opens with the first active session in a folder and closes
-  with the last. **Owner resolution is robust (plan
-  `agent/tasks/actual/2026-06-08-fix-lost-final-message-and-silent-question-drops.md`,
+  `model: {providerID, modelID}` override) and consumes ONE multiplexed
+  `/global/event` stream for the WHOLE server. Every event is wrapped in
+  `payload` and tagged with a top-level `directory` field; the bot JSON-parses
+  each event exactly once and routes it by envelope `directory` + `sessionID`
+  to the owning session (plan
+  `agent/tasks/actual/2026-06-17-opencode-global-event-stream.md`). The single
+  stream opens with the FIRST active session anywhere and closes with the LAST.
+  (Why not `/event?directory=<workDir>` — the old per-folder model: on opencode
+  1.14.41 that endpoint goes silent for an aged sole subscriber, keeping only
+  `server.heartbeat` flowing so the stall watchdog never trips → the topic
+  hangs. `/global/event` delivers reliably regardless of connection age.)
+  Scheduler-MCP is registered per directory on session start (Set-gated, cleared
+  on server restart), decoupled from the stream. **Owner resolution is robust
+  (plan `agent/tasks/actual/2026-06-08-fix-lost-final-message-and-silent-question-drops.md`,
   S1+S2):** an event routes by `sessionID` (direct id, else child→parent lineage
   ancestor — sub-agents run in CHILD sessions), and when both miss it falls back
-  to the stream's DIRECTORY (the sole active session there, or — when two topics
-  share a folder — only the one that is a genuine lineage ancestor, else a LOUD
-  drop, never a guess). Lineage is recorded from ANY event exposing `parentID`
-  (not just `session.updated`) and refreshed-on-use so an actively-routing child
-  is never evicted from the bounded map. `question.asked`/`permission.asked` are
-  CRITICAL: a genuinely unroutable one is logged, never silently swallowed (the
-  old silent drop = the user's "question vanished, looked hung" bug).
+  to the envelope's DIRECTORY (the sole active session there, or — when two
+  topics share a folder — only the one that is a genuine lineage ancestor, else
+  a LOUD drop, never a guess). Events for directories the bot does not own (the
+  user's by-hand opencode in other folders, now visible on the global stream)
+  drop cheaply at owner resolution — never emitted to a topic. Lineage is
+  recorded from ANY event exposing `parentID` (not just `session.updated`) and
+  refreshed-on-use so an actively-routing child is never evicted from the
+  bounded map. `question.asked`/`permission.asked` are CRITICAL: a genuinely
+  unroutable one is logged, never silently swallowed (the old silent drop = the
+  user's "question vanished, looked hung" bug).
 
 When adding a feature, first decide: *is this a bot-local concern, or something
 that must be proxied to the agent?* If it changes agent behavior (model,
@@ -264,7 +273,7 @@ config/variants, not a per-message API field).
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `apiErrorRetry.ts` | Pure auto-retry decision layer for agent **API** errors: `classifyAgentApiError` (transient / usageLimit / null-for-auth; markers from the claude.exe strings), `parseResetAt`, `getRetryPlan` (backoff schedule), `decideRetryAction` (arm/ignore/giveUp + grace-window dedup). The `bot.ts` manager owns the timer + kick |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`), verify strict descent (`getLineageDepthToAncestor` — busy tracking records a busy CHILD only for a verified descendant, so a dir-fallback-routed foreign sibling's busy=true never pins the thread busy) |
-| `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's per-directory SSE streams: open/close edge detection (`getSseStreamTransition`), the directory reference count (`countActiveSessionsForDirectory`), and the wanted-stream set (`getWantedStreamDirectories`) |
+| `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's single `/global/event` stream: open/close edge detection (`getSseStreamTransition`, driven by the TOTAL active-session count — open on first session anywhere, close on last). The per-directory helpers (`countActiveSessionsForDirectory`, `getWantedStreamDirectories`) now serve scheduler-MCP per-directory tracking, not the stream |
 | `utils/displayVerbosity.ts` | THE shared display-verbosity vocabulary for `/thinking` / `/tool_results` / `/subagent`: option order (`displayVerbosityModeOptions`: minimal, short, full), the locked default (`defaultDisplayVerbosityMode` = `minimal`), the type guard (`checkIsDisplayVerbosityMode`), and the legacy-name normalization (`normalizeDisplayVerbosityMode`: `detailed`→`full`, `brief`→`short`, `hide`→`minimal`, `compact`→`short`; unknown→null) used both for old persisted values and old command/callback aliases |
 | `utils/verbosityRender.ts` | Pure decision helper for the `/verbosity` umbrella picker: `getUniformVerbosityLevel` returns the level all three display prefs share (✓ marker target) or `null` when mixed → rendered as "custom" with the three values spelled out. The macro's write path just reuses the per-command apply helpers in `bot.ts` |
 | `utils/thinkingRender.ts` | Pure decision/format helpers behind `/thinking`: the OpenCode mode×phase action matrix (`getThinkingEventAction`), the answer-start removal rule, the ms→seconds formatter (`formatThinkingDurationSeconds`), and — for the Claude scrape path (no ms timestamps) — `parseThinkingDurationSeconds` (scrapes the duration out of the "Thinking for…" header / "✻ … for Ns" trailer) |
@@ -303,7 +312,7 @@ config/variants, not a per-message API field).
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
 | `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat |
-| `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; one `/event?directory=` stream per bound folder, shared by threads in that folder, parsed once + owner-routed) |
+| `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; ONE multiplexed `/global/event` stream for the whole server, every event parsed once + routed by envelope `directory` + `sessionID`) |
 | `terminalAdapter.ts` | A raw interactive `$SHELL` in `tmux` — a third adapter sibling to claude/opencode (NO AI logic). Types the user's text in as keystrokes (`send-keys`) and streams the scraped pane back as ONE rolling message per command (generic capture → line-set-diff → `cleanOutput` → emit; no question/survey/sub-agent/tool-result/effort/MCP/resume machinery). Restart-safe: `listExistingTmuxSessions`/`adoptExistingTmuxSession` re-adopt a live `term-…` session at boot (current pane seeds the baseline, no flood). Does NOT extend `ClaudeCliAdapter` and leaves `outputsDeltas` falsy, so the Claude liveness loop never fires for it |
 
 The `AgentAdapter` interface (in `types.ts`) is the seam. Per-backend agent

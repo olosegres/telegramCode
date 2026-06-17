@@ -10,9 +10,9 @@
  * Fix: track `lastEmittedLength` and emit only the unsent tail in both places.
  *
  * These tests drive the REAL adapter event path: synthesized SSE JSON is fed
- * through `routeSseData` (the same entry the live per-directory `/event` reader
- * uses), `output` events (text + `meta`) are captured off the adapter
- * EventEmitter, and the 500ms debounce is advanced with `node:test` mock timers.
+ * through `routeSseData` (the same entry the live `/global/event` reader uses),
+ * `output` events (text + `meta`) are captured off the adapter EventEmitter,
+ * and the 500ms debounce is advanced with `node:test` mock timers.
  *
  * Bot merge semantics (see `bot.ts` `queueOutput` / `appendPendingOutput`):
  * the FIRST tail of a response is a standalone `output`; every later tail
@@ -30,9 +30,9 @@ import { keyToString, type OutputEventMeta, type ThreadKey } from '../types';
 const sseOutputBatchMs = 500;
 const ownSessionId = 'ses_own';
 const key: ThreadKey = { chatId: -100123, threadId: 42 };
-/** The injected session's bound folder — the stream directory `routeSseData`
- * resolves the owner within. The events carry `ownSessionId`, so the owner is
- * the injected session regardless of the directory string itself. */
+/** The injected session's bound folder — tagged on each `/global/event`
+ * envelope. The events carry `ownSessionId`, so the owner resolves by direct id
+ * match regardless of the directory string itself. */
 const workDir = '/tmp/work';
 
 /** Build a minimal-but-complete live session and inject it into the adapter. */
@@ -79,26 +79,24 @@ function createAdapterWithSession(): {
   return { adapter, outputs, metas };
 }
 
+/** Build the `/global/event` envelope shape `routeSseData` consumes: the event
+ * wrapped in `payload`, tagged with a top-level `directory`. */
+function globalEnvelope(type: string, properties: Record<string, unknown>): string {
+  return JSON.stringify({ directory: workDir, project: 'proj', payload: { type, properties } });
+}
+
 /** Feed one `message.part.delta` text event through the real SSE dispatcher. */
 function feedTextDelta(adapter: OpenCodeAdapter, delta: string): void {
   adapter['routeSseData'](
-    workDir,
-    JSON.stringify({
-      type: 'message.part.delta',
-      properties: { sessionID: ownSessionId, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta },
+    globalEnvelope('message.part.delta', {
+      sessionID: ownSessionId, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta,
     }),
   );
 }
 
 /** Feed a `session.idle` event (the second emit site, via flushOutput). */
 function feedSessionIdle(adapter: OpenCodeAdapter): void {
-  adapter['routeSseData'](
-    workDir,
-    JSON.stringify({
-      type: 'session.idle',
-      properties: { sessionID: ownSessionId },
-    }),
-  );
+  adapter['routeSseData'](globalEnvelope('session.idle', { sessionID: ownSessionId }));
 }
 
 describe('OpenCode output dedup (B4)', () => {

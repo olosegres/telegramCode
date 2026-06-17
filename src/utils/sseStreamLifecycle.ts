@@ -1,32 +1,33 @@
 /**
- * @description Pure decision logic for the OpenCode adapter's per-directory SSE
- * streams — extracted from `openCodeAdapter.ts` so the "open on the first
- * session for a directory, close on the last" rule is unit-testable without a
- * live server or sockets.
+ * @description Pure decision logic for the OpenCode adapter's SSE stream
+ * lifecycle — extracted from `openCodeAdapter.ts` so the "open on the first
+ * session, close on the last" rule is unit-testable without a live server or
+ * sockets.
  *
- * Background (plan 2026-06-05 S5): the adapter used to open one
- * `/global/event` stream PER bound thread, and the server multiplexed every
- * event to each — so every delta was JSON-parsed and owner-routed once per
- * thread. Now the adapter owns ONE `/event?directory=<workDir>` stream per
- * unique bound directory; threads sharing a folder share its stream. The
- * lifecycle is reference-counted by directory: the stream opens when the first
- * active session for that directory appears and closes when the last one goes
- * away.
+ * Background (plan 2026-06-17): the adapter owns ONE `/global/event` stream for
+ * the whole server (it superseded both the per-thread `/global/event` model of
+ * plan 2026-06-05 and the per-directory `/event?directory=` model, the latter
+ * going silent for an aged sole subscriber on opencode 1.14.41). Every event is
+ * JSON-parsed exactly once and routed by the envelope `directory` + `sessionID`.
+ * The single stream's lifecycle is reference-counted by the TOTAL active-session
+ * count: it opens when the FIRST active session (any folder) appears and closes
+ * when the LAST one goes away — `getSseStreamTransition` is driven with those
+ * totals.
  */
 
 /**
- * @description Decide what to do with a directory's SSE stream after the count
- * of active sessions sharing it changes by one.
+ * @description Decide what to do with the SSE stream after the count of active
+ * sessions changes by one. Driven with the TOTAL active-session count (plan
+ * 2026-06-17): the single global stream opens on the first session anywhere and
+ * closes on the last.
  *
- * `open`  — the directory went from zero active sessions to one: start a stream.
- * `close` — the directory went from one active session to zero: tear it down.
+ * `open`  — went from zero active sessions to one: start the stream.
+ * `close` — went from one active session to zero: tear it down.
  * `none`  — a sibling session already keeps (or still keeps) the stream alive,
  *           or the change is a no-op.
  *
- * @param activeSessionCountBefore active sessions sharing the directory BEFORE
- *   the change (must be ≥ 0).
- * @param activeSessionCountAfter active sessions sharing the directory AFTER
- *   the change (must be ≥ 0).
+ * @param activeSessionCountBefore active sessions BEFORE the change (must be ≥ 0).
+ * @param activeSessionCountAfter active sessions AFTER the change (must be ≥ 0).
  */
 export function getSseStreamTransition(
   activeSessionCountBefore: number,
@@ -35,45 +36,4 @@ export function getSseStreamTransition(
   if (activeSessionCountBefore <= 0 && activeSessionCountAfter > 0) return 'open';
   if (activeSessionCountBefore > 0 && activeSessionCountAfter <= 0) return 'close';
   return 'none';
-}
-
-/** A bound session reduced to the one field the stream-set computation needs. */
-export interface DirectoryBoundSession {
-  /** Working directory the session is bound to — the SSE stream selector. */
-  workDir: string;
-  /** Whether the session is currently active (only active ones want a stream). */
-  isActive: boolean;
-}
-
-/**
- * @description Compute the set of unique directories that should currently have
- * an open SSE stream, given all bound sessions. A directory is "wanted" iff at
- * least one session bound to it is active. Used to reconcile streams after a
- * server restart (re-open exactly the directories that still have live
- * sessions) and as the source of truth the reference counting must agree with.
- */
-export function getWantedStreamDirectories(
-  sessions: readonly DirectoryBoundSession[],
-): Set<string> {
-  const wanted = new Set<string>();
-  for (const session of sessions) {
-    if (session.isActive) wanted.add(session.workDir);
-  }
-  return wanted;
-}
-
-/**
- * @description Count active sessions bound to `directory` across all sessions.
- * The reference count the lifecycle keys streams on — recomputed from the
- * session map rather than tracked separately so it can never drift.
- */
-export function countActiveSessionsForDirectory(
-  sessions: readonly DirectoryBoundSession[],
-  directory: string,
-): number {
-  let count = 0;
-  for (const session of sessions) {
-    if (session.isActive && session.workDir === directory) count += 1;
-  }
-  return count;
 }

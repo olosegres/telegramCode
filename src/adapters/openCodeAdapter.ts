@@ -29,11 +29,7 @@ import {
   checkIsMeaningfulPrompt,
   checkIsPlaceholderTitle,
 } from '../openCodeSessionTitle';
-import {
-  countActiveSessionsForDirectory,
-  getSseStreamTransition,
-  type DirectoryBoundSession,
-} from '../utils/sseStreamLifecycle';
+import { getSseStreamTransition } from '../utils/sseStreamLifecycle';
 import {
   buildDelegatingStatusText,
   getSubagentPartAction,
@@ -310,15 +306,25 @@ interface OpenCodeSseEvent {
 }
 
 /**
- * @description Live SSE stream owned by the adapter for ONE bound directory
- * (plan 2026-06-05 S5). Threads bound to the same folder share this single
- * stream — the server delivers only that directory instance's events on
- * `/event?directory=<workDir>`, so each event is parsed once and routed to the
- * owning session. Opened when the first active session for the directory
- * appears, closed when the last one goes away.
+ * @description The adapter's SINGLE live SSE stream over `/global/event` (plan
+ * 2026-06-17). One multiplexed stream carries every project instance's events
+ * for the whole server, each wrapped in `payload` and tagged with a top-level
+ * `directory` field. The bot parses each event exactly once and routes it by
+ * the envelope `directory` + `sessionID`. Opened when the FIRST active session
+ * (any folder) appears, closed when the LAST one goes away.
+ *
+ * Background (why not `/event?directory=<dir>`): on opencode 1.14.41 the
+ * per-directory endpoint stops delivering session events to an aged sole
+ * subscriber (it keeps emitting `server.heartbeat`, so the stall watchdog never
+ * trips) — the topic then hangs. `/global/event` delivers reliably regardless
+ * of connection age (plan 2026-06-17 S1).
  */
 interface SseStreamState {
-  /** The bound directory this stream is scoped to (the `?directory=` value). */
+  /**
+   * A fixed label for this stream in logs/diag (`globalStreamLabel`). No longer
+   * a `?directory=` selector — the global stream has no per-folder scope; the
+   * owning directory of each event comes from the event envelope instead.
+   */
   directory: string;
   /**
    * Abort controller for the live `fetch` + reader. `.abort()` unblocks the
@@ -343,20 +349,10 @@ interface SseStreamState {
   /**
    * Latch flipped to `true` by teardown so an in-flight reconnect/await that
    * resumes after the stream is closed exits instead of reopening it. A closed
-   * directory entry is also deleted from the stream map, but a reconnect
+   * stream reference is also dropped from `globalStream`, but a reconnect
    * promise may already hold a stale reference.
    */
   isClosed: boolean;
-  /**
-   * Latch set once the scheduler MCP server has been registered for this
-   * directory's instance (plan S6). The stream's lifetime IS the server
-   * generation: a fresh stream opens per directory on start/resume and again
-   * after `restartServer` re-opens streams, so registering on the first
-   * `ensureDirectoryStream` per stream re-registers exactly when the runtime
-   * registration would have died with the old server — once per directory per
-   * server generation, not once per session.
-   */
-  isSchedulerMcpRegistered: boolean;
 }
 
 /**
@@ -504,6 +500,13 @@ const sseOutputBatchMs = 500;
  */
 const delegationToolName = 'task';
 
+/**
+ * Fixed `SseStreamState.directory` label for the single `/global/event` stream
+ * in logs/diag. The global stream has no per-folder scope (it multiplexes every
+ * project instance), so its "directory" is a constant marker, not a selector.
+ */
+const globalStreamLabel = '<global>';
+
 /** Base delay (ms) for exponential backoff on SSE reconnect */
 const sseReconnectBaseDelayMs = 2000;
 
@@ -561,6 +564,15 @@ export const criticalSseEventTypes = new Set<string>([
   'question.asked',
   'permission.asked',
 ]);
+
+/**
+ * Event types the dispatcher intentionally ignores WITHOUT a stdout log. On the
+ * global stream the bot sees OWNED sessions emit global-only bookkeeping events
+ * (`sync` / `session.diff`) the per-directory stream never surfaced; logging
+ * each "unhandled SSE event" would spam stdout (plan 2026-06-17 S2). The silent
+ * `server.heartbeat` is handled before dispatch and is not listed here.
+ */
+const ignoredSseEventTypes = new Set<string>(['sync', 'session.diff']);
 
 /**
  * @description Grace period before the bot-side fallback rename checks whether
@@ -879,13 +891,24 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   private sessions: Map<string, OpenCodeSession> = new Map();
 
   /**
-   * One SSE stream per unique bound directory (plan 2026-06-05 S5), keyed by
-   * the directory path. The server delivers only that directory instance's
-   * events on `/event?directory=<dir>`, so threads sharing a folder share one
-   * stream and each event is JSON-parsed once. Opened when the first active
-   * session for a directory appears, closed when the last one goes away.
+   * The ONE `/global/event` SSE stream for the whole adapter (plan 2026-06-17).
+   * It multiplexes every project instance's events, each tagged with a top-level
+   * `directory` field, so a single reader parses each event once and routes it
+   * by envelope `directory` + `sessionID`. Opened when the FIRST active session
+   * (any folder) appears, closed when the LAST one goes away. `null` while no
+   * session is active.
    */
-  private sseStreams: Map<string, SseStreamState> = new Map();
+  private globalStream: SseStreamState | null = null;
+
+  /**
+   * Directories whose OpenCode instance already has the bot's scheduler MCP
+   * server registered for the CURRENT server generation (plan 2026-06-17 S3).
+   * Registration is now per directory on session start (decoupled from the
+   * stream, which is no longer per-folder); the Set gates it to once per
+   * directory per generation and is cleared on `restartServer` so each dir is
+   * re-registered after the server (and its in-memory MCP table) restarts.
+   */
+  private registeredSchedulerMcpDirs: Set<string> = new Set();
 
   /**
    * child sessionID → parent sessionID, learned from `session.updated` events.
@@ -1034,14 +1057,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       await ensureOpenCodeServer();
       console.log(`[OpenCode] Server restarted successfully`);
 
-      // Close every directory stream up front: their readers point at the
-      // crashed server's connection. The resume loop below re-opens a fresh
-      // stream per still-active directory (plan 2026-06-05 S5: re-open the
-      // directory streams, then restore sessions). Without this, a stream
-      // shared by two threads would keep its stale reader (it only self-heals
-      // later via the stall watchdog) — re-opening here makes recovery
-      // deterministic and tied to the restart.
-      this.closeAllStreams();
+      // Close the global stream up front: its reader points at the crashed
+      // server's connection. The resume loop below re-opens the (idempotent)
+      // single stream via connectSse (plan 2026-06-17 S4). Without this the
+      // stale reader would only self-heal later via the stall watchdog —
+      // closing here makes recovery deterministic and tied to the restart.
+      this.closeGlobalStream();
+      // The restarted server has a fresh, empty MCP table, so every directory's
+      // scheduler-MCP registration died with the old generation. Clear the gate
+      // so connectSse re-registers each still-active directory on resume.
+      this.registeredSchedulerMcpDirs.clear();
 
       // OpenCode persists sessions to disk, so the restarted server still
       // knows the previous session ids — that's the basis of this recovery.
@@ -1336,8 +1361,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       session.reasoningTimer = null;
     }
 
-    // Tear down the directory's SSE stream if this was its last active session
-    // (also clears that stream's reconnect + stall timers).
+    // Tear down the global SSE stream if this was the last active session
+    // anywhere (also clears that stream's reconnect + stall timers).
     this.disconnectSse(key);
 
     // Abort any running generation. Audit S15: log failures instead
@@ -1942,145 +1967,134 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Ensure the SSE stream for this session's bound directory is
-   * open (plan 2026-06-05 S5). Called after a session is inserted active into
-   * `this.sessions` (start / resume / restart). Threads sharing a folder share
-   * one stream: the stream opens only for the FIRST active session in a
-   * directory; later sessions reuse it. Keeps the `(key)` signature so the
-   * lifecycle paths and tests (which stub `connectSse` to a no-op) are
-   * unchanged.
+   * @description Ensure the single global SSE stream is open and the session's
+   * directory has its scheduler MCP registered (plan 2026-06-17). Called after
+   * a session is inserted active into `this.sessions` (start / resume / restart).
+   * The stream is shared by ALL sessions, so it opens only for the FIRST active
+   * session anywhere; later calls reuse it. Scheduler-MCP registration is per
+   * directory (decoupled from the stream), gated to once per dir per server
+   * generation. Keeps the `(key)` signature so the lifecycle paths and tests
+   * (which stub `connectSse` / `pollSseStream`) are unchanged.
    */
   private connectSse(key: ThreadKey): void {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
-    this.ensureDirectoryStream(session.workDir);
+    this.ensureGlobalStream();
+    void this.registerSchedulerMcpForDirectory(session.workDir);
   }
 
   /**
-   * @description Mark a session inactive and tear down its directory's SSE
-   * stream IFF it was the last active session sharing that folder. The stream
-   * is reference-counted by directory (recomputed from `this.sessions` so it
-   * can never drift): a sibling session in the same folder keeps it open.
+   * @description Mark a session inactive and tear down the global SSE stream IFF
+   * it was the LAST active session anywhere. The stream is reference-counted by
+   * the TOTAL active-session count (recomputed from `this.sessions` so it can
+   * never drift): any other active session — in any folder — keeps it open.
    *
    * Order-independent: callers vary in whether they pre-set `isActive = false`
-   * (`stopSessionInner` does, before calling here), so the decision counts
-   * OTHER active sessions for the directory and treats this one as departing.
-   * `before = other + 1`, `after = other` → `close` exactly when no sibling
-   * keeps the stream alive.
+   * (`stopSessionInner` does, before calling here), so the decision counts OTHER
+   * active sessions and treats this one as departing. `before = other + 1`,
+   * `after = other` → `close` exactly when no sibling keeps the stream alive.
    */
   private disconnectSse(key: ThreadKey): void {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
-    const { workDir } = session;
     session.isActive = false;
-    const otherActive = this.countOtherActiveSessionsForDir(workDir, key);
+    // Count OTHER active sessions (excluding this departing one) — `before =
+    // other + 1`, `after = other` → `close` exactly when no sibling anywhere
+    // keeps the global stream alive.
+    const otherActive = this.countActiveSessions(key);
     if (getSseStreamTransition(otherActive + 1, otherActive) === 'close') {
-      this.closeDirectoryStream(workDir);
+      this.closeGlobalStream();
     }
   }
 
   /**
-   * @description All sessions reduced to the directory-routing shape for the
-   * pure helpers, optionally excluding one key (the departing session in a
-   * teardown decision).
+   * @description Total count of currently-active sessions, optionally excluding
+   * one key (the departing session in a teardown decision) — the reference count
+   * the single global stream's lifecycle keys on.
    */
-  private getDirectoryBoundSessions(excludeKey?: ThreadKey): DirectoryBoundSession[] {
+  private countActiveSessions(excludeKey?: ThreadKey): number {
     const excludeKeyStr = excludeKey ? keyToString(excludeKey) : null;
-    const bound: DirectoryBoundSession[] = [];
+    let count = 0;
     for (const [keyStr, session] of this.sessions) {
       if (keyStr === excludeKeyStr) continue;
-      bound.push({ workDir: session.workDir, isActive: session.isActive });
+      if (session.isActive) count += 1;
     }
-    return bound;
+    return count;
   }
 
   /**
-   * @description Active sessions bound to `directory` EXCLUDING `key` — the
-   * sibling count that decides whether a departing session's stream stays up.
+   * @description Open the single `/global/event` stream if it is not already
+   * open (plan 2026-06-17). Idempotent — a second active session finds the
+   * stream present and no-ops. The reader runs detached; a fatal start error
+   * surfaces to every active session so the user isn't left with a silently-dead
+   * session (audit S10 / #43).
    */
-  private countOtherActiveSessionsForDir(directory: string, key: ThreadKey): number {
-    return countActiveSessionsForDirectory(this.getDirectoryBoundSessions(key), directory);
-  }
-
-  /**
-   * @description Open the SSE stream for `directory` if it is not already open.
-   * Idempotent — a second active session in the same folder finds the stream
-   * present and no-ops. The reader runs detached; a fatal start error surfaces
-   * to every session bound to the directory so the user isn't left with a
-   * silently-dead session (audit S10 / #43).
-   */
-  private ensureDirectoryStream(directory: string): void {
-    if (this.sseStreams.has(directory)) return;
+  private ensureGlobalStream(): void {
+    if (this.globalStream) return;
 
     const stream: SseStreamState = {
-      directory,
+      directory: globalStreamLabel,
       controller: null,
       stallTimer: null,
       reconnectTimer: null,
       isClosed: false,
-      isSchedulerMcpRegistered: false,
     };
-    this.sseStreams.set(directory, stream);
+    this.globalStream = stream;
 
-    // Register the bot's scheduler MCP server for this directory's instance
-    // (plan S6). Tied to the stream so it re-runs once per server generation:
-    // a runtime registration dies with the opencode server, and a fresh stream
-    // is what `restartServer` re-opens after the self-heal. Fire-and-forget —
-    // `ensureDirectoryStream` is sync and the registration is an enhancement,
-    // not a dependency of the session starting.
-    void this.registerSchedulerMcpForDirectory(stream);
-
-    // `/event?directory=<dir>` delivers ONLY this directory instance's events
-    // (verified live, opencode 1.16.0) — no `/global/event` multiplex, so each
-    // event is parsed once here and routed to its owning session.
-    const sseUrl = `${this.baseUrl}${buildDirectoryScopedPath('/event', directory)}`;
-    console.log(`[OpenCode] Connecting SSE for ${directory}: ${sseUrl}`);
-    appendDiagLog(`sse open dir=${directory}`);
+    // `/global/event` multiplexes every project instance's events (each wrapped
+    // in `payload`, tagged with a top-level `directory`), delivering reliably
+    // regardless of connection age (plan 2026-06-17 S1: the per-directory
+    // endpoint goes silent for an aged sole subscriber on opencode 1.14.41).
+    // Each event is parsed once here and routed by envelope directory + sessionID.
+    const sseUrl = `${this.baseUrl}/global/event`;
+    console.log(`[OpenCode] Connecting global SSE: ${sseUrl}`);
+    appendDiagLog(`sse open ${globalStreamLabel}`);
 
     this.pollSseStream(stream, sseUrl).catch((e) => {
-      console.error(`[OpenCode] SSE connection error for ${directory}:`, e);
-      this.emitToDirectorySessions(directory, 'error', e instanceof Error ? e : new Error(String(e)));
+      console.error(`[OpenCode] global SSE connection error:`, e);
+      this.emitToAllActiveSessions('error', e instanceof Error ? e : new Error(String(e)));
     });
   }
 
   /**
-   * @description Register the bot's scheduler MCP server for `stream.directory`'s
-   * OpenCode instance via the runtime `POST /mcp?directory=` endpoint (plan S6).
-   * Idempotent on the server (re-POSTing the same `name` overwrites/no-ops), and
-   * gated by `stream.isSchedulerMcpRegistered` so it runs once per stream (i.e.
-   * once per directory per server generation). Inert until S8 wires injection —
-   * the builder returns `null` and this no-ops. A registration FAILURE is logged
-   * and swallowed: scheduling tools are an enhancement, the session must still
-   * start (and the stream may have closed mid-flight, so re-check before latching).
+   * @description Register the bot's scheduler MCP server for `directory`'s
+   * OpenCode instance via the runtime `POST /mcp?directory=` endpoint (plan
+   * 2026-06-17 S3). Idempotent on the server (re-POSTing the same `name`
+   * overwrites/no-ops) and gated by `registeredSchedulerMcpDirs` so it runs once
+   * per directory per server generation — `restartServer` clears the Set so a
+   * dir is re-registered after the server's MCP table is wiped. Inert until
+   * injection is configured — the builder returns `null` and this no-ops. A
+   * registration FAILURE is logged and swallowed: scheduling tools are an
+   * enhancement, the session must still start.
    */
-  private async registerSchedulerMcpForDirectory(stream: SseStreamState): Promise<void> {
-    if (stream.isSchedulerMcpRegistered || stream.isClosed) return;
-    const registration = await buildOpenCodeSchedulerMcpRegistration(stream.directory);
+  private async registerSchedulerMcpForDirectory(directory: string): Promise<void> {
+    if (this.registeredSchedulerMcpDirs.has(directory)) return;
+    const registration = await buildOpenCodeSchedulerMcpRegistration(directory);
     if (!registration) return;
-    if (stream.isClosed) return;
+    if (this.registeredSchedulerMcpDirs.has(directory)) return;
     try {
       await this.apiRequest(
         'POST',
-        buildDirectoryScopedPath('/mcp', stream.directory),
+        buildDirectoryScopedPath('/mcp', directory),
         registration,
       );
-      stream.isSchedulerMcpRegistered = true;
-      appendDiagLog(`scheduler mcp registered dir=${stream.directory}`);
+      this.registeredSchedulerMcpDirs.add(directory);
+      appendDiagLog(`scheduler mcp registered dir=${directory}`);
     } catch (e) {
       console.warn(
-        `[OpenCode] scheduler MCP registration failed for ${stream.directory}:`,
+        `[OpenCode] scheduler MCP registration failed for ${directory}:`,
         e instanceof Error ? e.message : e,
       );
     }
   }
 
   /**
-   * @description Tear down the SSE stream for `directory`: latch it closed,
-   * abort the in-flight reader (unblocks `reader.read()` immediately — audit
-   * S7 / #12), cancel its stall + reconnect timers, and drop it from the map.
+   * @description Tear down the global SSE stream: latch it closed, abort the
+   * in-flight reader (unblocks `reader.read()` immediately — audit S7 / #12),
+   * cancel its stall + reconnect timers, and drop the reference.
    */
-  private closeDirectoryStream(directory: string): void {
-    const stream = this.sseStreams.get(directory);
+  private closeGlobalStream(): void {
+    const stream = this.globalStream;
     if (!stream) return;
     stream.isClosed = true;
     if (stream.controller) {
@@ -2092,29 +2106,17 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(stream.reconnectTimer);
       stream.reconnectTimer = null;
     }
-    this.sseStreams.delete(directory);
-    appendDiagLog(`sse close dir=${directory}`);
+    this.globalStream = null;
+    appendDiagLog(`sse close ${globalStreamLabel}`);
   }
 
-  /**
-   * @description Close every open directory stream (used on server restart
-   * before re-opening fresh ones). Iterates a snapshot of directories so
-   * deletion during the loop is safe.
-   */
-  private closeAllStreams(): void {
-    for (const directory of Array.from(this.sseStreams.keys())) {
-      this.closeDirectoryStream(directory);
-    }
-  }
-
-  /** Emit an event to every active session bound to `directory`. */
-  private emitToDirectorySessions(
-    directory: string,
+  /** Emit an event to every active session. */
+  private emitToAllActiveSessions(
     eventName: 'error',
     error: Error,
   ): void {
     for (const session of this.sessions.values()) {
-      if (session.isActive && session.workDir === directory) {
+      if (session.isActive) {
         this.emit(eventName, session.key, error);
       }
     }
@@ -2192,11 +2194,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Fetch-based SSE reader for ONE directory's `/event?directory=`
-   * stream (plan 2026-06-05 S5). OpenCode sends every event as a `data:` line
-   * with JSON payload { type, properties }; this stream carries only the
-   * directory instance's own events, so each line is parsed once here and
-   * routed to its owning session.
+   * @description Fetch-based SSE reader for the single `/global/event` stream
+   * (plan 2026-06-17). OpenCode sends every event as a `data:` line with a JSON
+   * envelope `{ directory, payload: { type, properties } }`; this one stream
+   * multiplexes every project instance, so each line is parsed once here and
+   * routed by the envelope `directory` + `sessionID` to its owning session.
    *
    * On connection failure: checks if the server is alive, attempts a restart if
    * dead, and retries forever with capped exponential backoff until reconnect
@@ -2204,7 +2206,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    */
   private async pollSseStream(stream: SseStreamState, sseUrl: string, reconnectAttempt = 0, reconnectStartTs = Date.now()): Promise<void> {
     if (stream.isClosed) return;
-    const { directory } = stream;
+    // The "directory" is the fixed `globalStreamLabel` — a log marker only; the
+    // global stream has no per-folder scope (events carry their own directory).
+    const streamLabel = stream.directory;
 
     const headers: Record<string, string> = {
       'Accept': 'text/event-stream',
@@ -2216,7 +2220,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Audit S7 / #12: SSE was previously read with no abort path —
     // `await reader.read()` blocks until bytes arrive, so a teardown during a
     // silent server couldn't actually free the connection. The stream-scoped
-    // controller is stored so `closeDirectoryStream` can abort the in-flight
+    // controller is stored so `closeGlobalStream` can abort the in-flight
     // `fetch` and `reader.read` immediately.
     const controller = new AbortController();
     stream.controller = controller;
@@ -2227,14 +2231,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       const response = await fetch(sseUrl, { headers, signal: controller.signal });
 
       if (!response.ok || !response.body) {
-        console.error(`[OpenCode] SSE connection failed for ${directory}: ${response.status}`);
+        console.error(`[OpenCode] SSE connection failed for ${streamLabel}: ${response.status}`);
         await response.body?.cancel().catch(() => {});
         await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, `HTTP ${response.status}`);
         return;
       }
 
-      console.log(`[OpenCode] SSE connected for ${directory}`);
-      appendDiagLog(`sse connected dir=${directory} attempt=${reconnectAttempt}`);
+      console.log(`[OpenCode] SSE connected for ${streamLabel}`);
+      appendDiagLog(`sse connected dir=${streamLabel} attempt=${reconnectAttempt}`);
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -2259,7 +2263,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           sawData = true;
           reconnectAttempt = 0;
           reconnectStartTs = Date.now();
-          appendDiagLog(`sse first-data dir=${directory}`);
+          appendDiagLog(`sse first-data dir=${streamLabel}`);
         }
 
         buffer += decoder.decode(value, { stream: true });
@@ -2270,7 +2274,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           if (!line.startsWith('data: ')) continue;
 
           const dataStr = line.slice(6);
-          this.routeSseData(directory, dataStr);
+          this.routeSseData(dataStr);
         }
       }
 
@@ -2281,12 +2285,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
       // If the stream is still wanted but the server closed it, reconnect.
       if (!stream.isClosed) {
-        console.log(`[OpenCode] SSE stream for ${directory} ended while wanted, reconnecting...`);
+        console.log(`[OpenCode] SSE stream for ${streamLabel} ended while wanted, reconnecting...`);
         await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, 'stream ended');
       }
     } catch (e) {
       this.clearStreamStallTimer(stream);
-      // An aborted controller means either `closeDirectoryStream` (stream no
+      // An aborted controller means either `closeGlobalStream` (stream no
       // longer wanted → just exit) or the stall watchdog firing on a silently
       // dead stream (stream still wanted → reconnect).
       if (controller.signal.aborted) {
@@ -2297,7 +2301,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       }
       if (!stream.isClosed) {
         const errorMessage = e instanceof Error ? e.message : String(e);
-        console.error(`[OpenCode] SSE error for ${directory}:`, errorMessage);
+        console.error(`[OpenCode] SSE error for ${streamLabel}:`, errorMessage);
         await this.handleSseReconnect(stream, sseUrl, reconnectAttempt, reconnectStartTs, errorMessage);
       }
     } finally {
@@ -2332,7 +2336,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Handle SSE reconnection for a directory's stream with server
+   * @description Handle reconnection for the single global stream with server
    * health check, auto-restart, and exponential backoff. If the server is dead,
    * attempts a restart before reconnecting. Never gives up while the stream is
    * still wanted — reconnects until success — with backoff capped at
@@ -2347,7 +2351,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     reason: string,
   ): Promise<void> {
     if (stream.isClosed) return;
-    const { directory } = stream;
+    const streamLabel = stream.directory;
 
     const elapsed = Date.now() - reconnectStartTs;
 
@@ -2361,9 +2365,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         // restartServer already notified threads and cleaned up sessions
         return;
       }
-      // restartServer re-opens streams for every still-active directory via the
-      // resume path; if this stream was torn down in the process, stop here so
-      // we don't double-open it.
+      // restartServer re-opens the global stream via the resume path; if this
+      // stream was torn down in the process, stop here so we don't double-open it.
       if (stream.isClosed) return;
       // Server restarted — reset the attempt counter so backoff starts fresh.
       attempt = 0;
@@ -2376,10 +2379,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       sseReconnectBaseDelayMs * Math.pow(2, Math.min(attempt, maxSseReconnectBackoffExponent)),
       maxSseReconnectDelayMs,
     );
-    console.log(`[OpenCode] SSE reconnecting ${directory} in ${delay}ms (attempt ${attempt + 1}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
-    appendDiagLog(`sse reconnect dir=${directory} attempt=${attempt + 1} reason=${reason} delay=${delay}ms`);
+    console.log(`[OpenCode] SSE reconnecting ${streamLabel} in ${delay}ms (attempt ${attempt + 1}, reason: ${reason}, elapsed: ${Math.round(elapsed / 1000)}s)`);
+    appendDiagLog(`sse reconnect dir=${streamLabel} attempt=${attempt + 1} reason=${reason} delay=${delay}ms`);
 
-    // Store the timer handle on the stream so `closeDirectoryStream` can cancel
+    // Store the timer handle on the stream so `closeGlobalStream` can cancel
     // it; otherwise a `setTimeout` fired after the stream is gone re-enters
     // `pollSseStream` for a dead stream and keeps the event loop alive (audit
     // S8 / #14).
@@ -2396,19 +2399,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Route a single raw SSE `data:` line from a directory's stream
-   * (the live per-directory reader path, plan 2026-06-05 S5). The JSON is parsed
-   * ONCE here, the owning session is resolved from its sessionID/lineage, and
-   * the event is dispatched to that session. `streamDirectory` is the stream's
-   * own bound folder — passed through so instance-local replies
-   * (questions/permissions) target the right project instance even though the
-   * bare `/event` payload carries no `directory` field.
+   * @description Route a single raw SSE `data:` line from the global stream
+   * (plan 2026-06-17). The JSON is parsed ONCE here, the owning session is
+   * resolved from its sessionID/lineage (with an envelope-directory fallback),
+   * and the event is dispatched to that session. The owning project instance
+   * comes from the event ENVELOPE'S `directory` field — `/global/event` tags
+   * every session event with it — so instance-local replies
+   * (questions/permissions) target the right instance.
    *
    * Also the entry the SSE unit tests drive (a session injected into the map +
-   * synthesized event JSON for its own folder), so the real parse→route→dispatch
+   * synthesized payload-wrapped envelope), so the real parse→route→dispatch
    * path is exercised end to end.
    */
-  private routeSseData(streamDirectory: string, dataStr: string): void {
+  private routeSseData(dataStr: string): void {
     let parsed: unknown;
     try {
       parsed = JSON.parse(dataStr);
@@ -2419,13 +2422,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const event = normaliseOpenCodeSseEvent(parsed);
     if (!event) return;
 
-    const ownerKeyStr = this.resolveSseEventOwner(event, streamDirectory);
+    const ownerKeyStr = this.resolveSseEventOwner(event);
     if (ownerKeyStr === undefined) return;
-
-    // The instance directory is the stream's own folder; the bare `/event`
-    // payload omits it, so a wrapped envelope's value (legacy/global) is only a
-    // fallback when present.
-    const directory = event.directory ?? streamDirectory;
 
     if (ownerKeyStr === null) {
       // Session-less event (server.connected / heartbeat) — no owner to look up.
@@ -2435,22 +2433,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     const ownerSession = this.sessions.get(ownerKeyStr);
     if (!ownerSession?.isActive) return;
-    this.dispatchSseEvent(ownerSession.key, event, directory);
+    // The owning project instance is the envelope's `directory` (session-less
+    // events have none and need none) — used for instance-scoped replies.
+    this.dispatchSseEvent(ownerSession.key, event, event.directory);
   }
 
   /**
    * @description Resolve which thread (if any) should process `event`, applying
    * the single-owner invariant (B20) and recording subagent lineage. Owner
    * resolution is by sessionID (direct id, else lineage ancestor) with a
-   * DIRECTORY fallback off `streamDirectory` when both miss (S2). Returns:
+   * DIRECTORY fallback off the event ENVELOPE'S `directory` when both miss
+   * (plan 2026-06-17). Returns:
    *   - the owning thread's serialised key for a per-session event;
    *   - `null` for a session-less event (`server.connected`/`heartbeat`) that
    *     every reader handles directly;
    *   - `undefined` to signal "do not dispatch" (missing sessionID, or no bound
    *     thread owns the session — a genuine drop, loud-logged for every critical
    *     type incl. question/permission, so a routable event is never a no-op).
+   *     Events for directories the bot does not own (the user's by-hand opencode
+   *     in other folders, now visible on the global stream) drop here cheaply.
    */
-  private resolveSseEventOwner(event: OpenCodeSseEvent, streamDirectory: string): string | null | undefined {
+  private resolveSseEventOwner(event: OpenCodeSseEvent): string | null | undefined {
     const eventType = event.type;
 
     // OpenCode runs subagents in CHILD sessions; their events carry the child
@@ -2484,15 +2487,21 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const ownerKeyStr = this.resolveEventOwnerKey(eventSessionId, { refreshLineageOnUse: true });
     if (ownerKeyStr !== null) return ownerKeyStr;
 
-    // Id/lineage resolution failed. Before dropping, fall back to the stream's
-    // DIRECTORY (S2): the stream is opened per bound folder, so the event
-    // provably belongs to a thread bound to THAT folder even when the per-session
-    // lineage map briefly disagrees (link evicted / not yet recorded). SYNC only
-    // — no HTTP on the per-event hot path; the decision uses in-memory state.
-    const fallbackOwnerKeyStr = this.resolveOwnerByDirectoryFallback(eventSessionId, streamDirectory);
+    // Id/lineage resolution failed. Before dropping, fall back to the event
+    // ENVELOPE'S DIRECTORY (plan 2026-06-17): `/global/event` tags every session
+    // event with its owning folder, so the event provably belongs to a thread
+    // bound to THAT folder even when the per-session lineage map briefly
+    // disagrees (link evicted / not yet recorded). The fallback also drops an
+    // event for a directory the bot does not own (the user's by-hand opencode in
+    // another folder): no active bound session there → `null` → cheap drop. SYNC
+    // only — no HTTP on the per-event hot path; the decision uses in-memory state.
+    const eventDirectory = event.directory;
+    const fallbackOwnerKeyStr = eventDirectory !== undefined
+      ? this.resolveOwnerByDirectoryFallback(eventSessionId, eventDirectory)
+      : null;
     if (fallbackOwnerKeyStr !== null) {
       appendDiagLog(
-        `sse dir-fallback ${eventType} es=${eventSessionId} dir=${streamDirectory} -> ${fallbackOwnerKeyStr}`,
+        `sse dir-fallback ${eventType} es=${eventSessionId} dir=${eventDirectory} -> ${fallbackOwnerKeyStr}`,
       );
       return fallbackOwnerKeyStr;
     }
@@ -2523,8 +2532,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /**
    * @description Dispatch a normalised, OWNED SSE event to its owning session's
    * handlers. `key` is the resolved single owner (B20); `directory` is the
-   * owning project instance (the stream's folder), used for instance-scoped
-   * question / permission replies.
+   * owning project instance (the event envelope's `directory`), used for
+   * instance-scoped question / permission replies.
    */
   private dispatchSseEvent(key: ThreadKey, event: OpenCodeSseEvent, directory: string | undefined): void {
     const eventType = event.type;
@@ -2582,8 +2591,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         break;
 
       default:
-        // Log unhandled event types for debugging (skip heartbeats)
-        if (eventType !== 'server.heartbeat') {
+        // Log unhandled event types for debugging, skipping the ones we
+        // intentionally ignore (heartbeat + global-only bookkeeping) so the
+        // multiplexed global stream doesn't spam stdout (plan 2026-06-17 S2).
+        if (eventType !== 'server.heartbeat' && !ignoredSseEventTypes.has(eventType)) {
           console.log(`[OpenCode] SSE event: ${eventType}`);
         }
         break;
@@ -2733,18 +2744,20 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Directory fallback (S2): resolve an owner from the stream's
-   * bound folder when id/lineage resolution already failed. The stream is opened
-   * per directory (`?directory=`), so an event on it provably belongs to a
-   * thread bound to that folder. SYNC — uses only in-memory session state, NEVER
-   * an HTTP call on the per-event hot path. Delegates the decision to the pure
-   * {@link resolveOwnerByDirectoryFallbackPure}; the wiring here is just
-   * selecting the directory's active sessions.
+   * @description Directory fallback (plan 2026-06-17): resolve an owner from the
+   * event envelope's `directory` when id/lineage resolution already failed.
+   * `/global/event` tags every session event with its owning folder, so an event
+   * provably belongs to a thread bound to that folder — and an event for a
+   * directory with no active bound session (the user's by-hand opencode
+   * elsewhere) resolves to `null` and is dropped. SYNC — uses only in-memory
+   * session state, NEVER an HTTP call on the per-event hot path. Delegates the
+   * decision to the pure {@link resolveOwnerByDirectoryFallbackPure}; the wiring
+   * here is just selecting the directory's active sessions.
    */
-  private resolveOwnerByDirectoryFallback(eventSessionId: string, streamDirectory: string): string | null {
+  private resolveOwnerByDirectoryFallback(eventSessionId: string, directory: string): string | null {
     const directoryActiveSessions: BoundSessionRef[] = [];
     for (const [keyStr, session] of this.sessions) {
-      if (session.isActive && session.workDir === streamDirectory) {
+      if (session.isActive && session.workDir === directory) {
         directoryActiveSessions.push({ keyStr, sessionId: session.sessionId });
       }
     }

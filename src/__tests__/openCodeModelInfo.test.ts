@@ -87,14 +87,19 @@ function createAdapterWithSession(): {
   return { adapter, outputs, setConfigResponse };
 }
 
-/** Feed a `message.updated` assistant event through the real SSE dispatcher. */
+/** Feed a `message.updated` assistant event through the real SSE dispatcher,
+ * shaped as a `/global/event` envelope (event wrapped in `payload`, tagged with
+ * a top-level `directory`). */
 function feedAssistantMessage(adapter: OpenCodeAdapter, providerID: string, modelID: string): void {
   adapter['routeSseData'](
-    '/tmp/work',
     JSON.stringify({
-      type: 'message.updated',
-      properties: {
-        info: { sessionID: ownSessionId, role: 'assistant', providerID, modelID },
+      directory: '/tmp/work',
+      project: 'proj',
+      payload: {
+        type: 'message.updated',
+        properties: {
+          info: { sessionID: ownSessionId, role: 'assistant', providerID, modelID },
+        },
       },
     }),
   );

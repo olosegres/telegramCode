@@ -35,6 +35,10 @@ import { spawn, spawnSync, type ChildProcess } from 'child_process';
  * project — `npm link` exposes the same `node_modules/.bin`).
  */
 export async function runHot(): Promise<void> {
+  // The operator's real launch directory (e.g. `~/src`). Captured BEFORE any
+  // spawn so it reflects where `telegramCode hot` was invoked — the worker
+  // can't derive it later, because nodemon runs it with cwd = projectRoot.
+  const launchCwd = process.cwd();
   const projectRoot = resolveProjectRoot();
   const distEntry = path.join(projectRoot, 'dist', 'cli.js');
   const tscBin = localBin(projectRoot, 'tsc');
@@ -88,6 +92,7 @@ export async function runHot(): Promise<void> {
   const nodemonChild = spawn(process.execPath, [nodemonBin], {
     cwd: projectRoot,
     stdio: 'inherit',
+    env: buildHotWorkerEnv(process.env, launchCwd),
   });
 
   const children: ChildProcess[] = [tscChild, nodemonChild];
@@ -145,6 +150,30 @@ export async function runHot(): Promise<void> {
   );
 
   process.exit(finalCode);
+}
+
+/**
+ * @description Build the env handed to the hot-mode worker (nodemon → bot).
+ *
+ * In hot mode the supervisor runs `nodemon` with cwd = projectRoot (it must,
+ * to watch `dist/`), and the worker (`node dist/cli.js bot`) inherits that
+ * cwd. Left alone the worker would default `WORK_ROOT` to `process.cwd()` =
+ * the project checkout, so `/bind` would list folders inside telegram-code
+ * instead of the operator's projects parent. We hand the worker the real
+ * launch dir as `WORK_ROOT` so it binds against where the wrapper was started.
+ *
+ * An explicit `WORK_ROOT` in the inherited env always wins (advanced
+ * override); empty/unset falls back to `launchCwd` — matching how `runBot`
+ * itself treats `WORK_ROOT` (`!process.env.WORK_ROOT`).
+ */
+export function buildHotWorkerEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  launchCwd: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    WORK_ROOT: baseEnv.WORK_ROOT || launchCwd,
+  };
 }
 
 /**

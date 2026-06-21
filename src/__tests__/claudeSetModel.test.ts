@@ -11,9 +11,15 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+// testSetup FIRST: points DATA_DIR at a temp dir + seeds an effort pref before
+// the adapter resolves its prefs-file path at module load.
+import {
+  seededThreadKeyString,
+} from './claudeSetModel.testSetup';
 import { ClaudeCliAdapter } from '../adapters/claudeCliAdapter';
+import { defaultEffortLevel } from '../effortLevels';
 import { t } from '../i18n';
-import { keyToString, type ThreadKey } from '../types';
+import { keyToString, keyFromString, type ThreadKey } from '../types';
 
 function createAdapter(): { adapter: ClaudeCliAdapter; sent: string[] } {
   const adapter = new ClaudeCliAdapter();
@@ -32,13 +38,35 @@ describe('Claude setModel session guard (S3)', () => {
     assert.deepEqual(sent, [], 'no keystrokes when there is no session (was: silent no-op + false success)');
   });
 
-  it('active session → sends "/model <id>", returns null', async () => {
+  it('active session with NO effort pref → sends "/model <id>" then the default "/effort xhigh"', async () => {
+    // Thread absent from the seeded prefs file → getEffort returns null → the
+    // bot re-applies its default effort for the newly picked model.
     const key: ThreadKey = { chatId: -100555, threadId: 2 };
     const { adapter, sent } = createAdapter();
     adapter['sessions'].set(keyToString(key), { isActive: true });
 
     const result = await adapter.setModel(key, 'sonnet');
     assert.equal(result, null, 'a live switch succeeds');
-    assert.deepEqual(sent, ['/model sonnet'], 'the slash command is typed into the TUI');
+    assert.deepEqual(
+      sent,
+      ['/model sonnet', `/effort ${defaultEffortLevel}`],
+      'a no-pref switch applies the default effort for the new model',
+    );
+  });
+
+  it('active session WITH an explicit effort pref → sends only "/model <id>" (no default re-apply)', async () => {
+    // Seeded thread (claudeSetModel.testSetup) → getEffort returns the explicit
+    // level → the default is NOT re-applied; claude carries the pref across.
+    const key: ThreadKey = keyFromString(seededThreadKeyString);
+    const { adapter, sent } = createAdapter();
+    adapter['sessions'].set(keyToString(key), { isActive: true });
+
+    const result = await adapter.setModel(key, 'sonnet');
+    assert.equal(result, null, 'a live switch succeeds');
+    assert.deepEqual(
+      sent,
+      ['/model sonnet'],
+      'an explicit pref must NOT be overwritten by the default on a model switch',
+    );
   });
 });

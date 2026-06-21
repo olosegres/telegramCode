@@ -44,7 +44,7 @@ import { checkIsProgressChunk } from '../progressLine';
 import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
 import { t } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
-import { getClaudeAvailableLevels, checkIsClaudeEffortLevel } from '../effortLevels';
+import { getClaudeAvailableLevels, checkIsClaudeEffortLevel, defaultEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
 import {
   tmuxAsync,
@@ -3107,6 +3107,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return t('model.start_agent_first');
     this.sendInput(key, `/model ${modelId}`);
+    // No explicit /effort pref → (re)apply the bot's default for the newly
+    // picked model (claude self-clamps unsupported levels). An explicit pick
+    // is left alone — claude carries it across the model switch.
+    if (this.getEffort(key) === null) this.sendInput(key, `/effort ${defaultEffortLevel}`);
     return null;
   }
 
@@ -3194,14 +3198,15 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * its in-TUI effort intact and may be mid-turn, so re-applying would be both
    * unnecessary and risk interleaving with a running stream.
    *
-   * No stored pref → nothing armed (claude's own default stands). A level
-   * claude can't honour is armed as-is — claude clamps per model (D2), same as
-   * a manual `/effort`.
+   * No stored pref → the bot's default (`defaultEffortLevel` = xhigh) is armed
+   * instead of claude's own default, so a no-pref spawn types `/effort xhigh`
+   * (claude clamps per model — same as a manual `/effort` or an explicit pref).
+   * An explicit per-thread pref still wins and is armed verbatim.
    */
   private applyStoredEffortOnSpawn(key: ThreadKey): void {
     const session = this.sessions.get(keyToString(key));
     if (!session) return;
-    const level = this.getEffort(key);
+    const level = this.getEffort(key) ?? defaultEffortLevel;
     if (!getEffortStartupKeystroke(level)) return;
     session.pendingEffortReapply = level;
   }

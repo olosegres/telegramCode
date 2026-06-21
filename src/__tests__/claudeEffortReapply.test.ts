@@ -40,6 +40,7 @@ import {
   noPrefThreadKeyString,
 } from './claudeEffortReapply.testSetup';
 import { ClaudeCliAdapter, checkIsClaudePromptReady } from '../adapters/claudeCliAdapter';
+import { defaultEffortLevel } from '../effortLevels';
 import { keyToString, keyFromString, type ThreadKey } from '../types';
 
 const seededKey: ThreadKey = keyFromString(seededThreadKeyString);
@@ -95,12 +96,30 @@ describe('Claude effort re-apply on fresh spawn (S7)', () => {
       assert.deepEqual(typed, [], 'arming must not touch the pane — that is the booting-paint bug');
     });
 
-    it('arms nothing when there is no stored pref', () => {
+    it('arms the bot default when there is no stored pref', () => {
       ({ adapter, typed, session } = createAdapterWithSession(noPrefKey));
       assert.equal(adapter.getEffort(noPrefKey), null, 'precondition: no pref for this thread');
       adapter['applyStoredEffortOnSpawn'](noPrefKey);
-      assert.equal(session.pendingEffortReapply, null, 'no pref ⇒ nothing armed');
-      assert.deepEqual(typed, [], 'no pref ⇒ no keystroke ever');
+      // No explicit pref now arms the bot's default (xhigh), not nothing — so a
+      // fresh spawn types `/effort xhigh` instead of inheriting claude's global.
+      assert.equal(
+        session.pendingEffortReapply,
+        defaultEffortLevel,
+        'no pref ⇒ the bot default is armed for re-apply',
+      );
+      assert.deepEqual(typed, [], 'arming must not touch the pane — that is the booting-paint bug');
+    });
+
+    it('the consume step types the default for a no-pref spawn', () => {
+      ({ adapter, typed, session } = createAdapterWithSession(noPrefKey));
+      adapter['applyStoredEffortOnSpawn'](noPrefKey);
+      adapter['consumePendingEffortReapply'](session);
+      assert.deepEqual(
+        typed,
+        [`/effort ${defaultEffortLevel}`],
+        'a no-pref fresh spawn must type the bot default once the box is ready',
+      );
+      assert.equal(session.pendingEffortReapply, null, 'consumed flag must be cleared');
     });
   });
 

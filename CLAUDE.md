@@ -478,6 +478,14 @@ OpenCode events / bindings).
     `GET /config/providers` and applied per-prompt as `body.variant` on the
     prompt request (no env configuration). See plan
     `agent/tasks/completed/2026-05-31-effort-buttons-both-backends.md`.
+    - **Default reasoning effort is `xhigh`** (hard-coded `defaultEffortLevel`
+      in `effortLevels.ts`, no env var). It auto-applies on session start /
+      resume / `/model` change whenever the thread has NO explicit `/effort`
+      pick — an explicit pick always wins and is never overwritten, and the
+      default is never persisted as a pref. OpenCode clamps it to the resolved
+      model's variants (`clampEffortToAvailable`, since not every model ships
+      `xhigh`); Claude types `/effort xhigh` and self-clamps per model. NOT
+      applied on Claude adopt/reattach (the surviving TUI keeps its effort).
     - **Effort survives the session lifecycle (per-thread, permanent).** claude
       persists effort GLOBALLY in its own settings.json, so a fresh TUI (start /
       `/new` / resume) would otherwise inherit the last globally-set level

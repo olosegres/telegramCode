@@ -11,6 +11,8 @@ import {
   claudeEffortLevels,
   getClaudeAvailableLevels,
   checkIsClaudeEffortLevel,
+  defaultEffortLevel,
+  clampEffortToAvailable,
 } from '../effortLevels';
 
 // ── Claude canonical catalog ────────────────────────────────────────────────
@@ -43,4 +45,45 @@ test('checkIsClaudeEffortLevel — accept canonical, reject anything else', () =
   for (const bad of ['', 'HIGH', 'highest', 'none', 'minimal', 'xxhigh', ' high', 'high ']) {
     assert.ok(!checkIsClaudeEffortLevel(bad), `expected "${bad}" to be rejected`);
   }
+});
+
+// ── Default level + clamp ───────────────────────────────────────────────────
+
+test('defaultEffortLevel is xhigh', () => {
+  assert.equal(defaultEffortLevel, 'xhigh');
+});
+
+test('clampEffortToAvailable — xhigh against full opus-4-8 set is kept', () => {
+  assert.equal(
+    clampEffortToAvailable('xhigh', ['low', 'medium', 'high', 'xhigh', 'max']),
+    'xhigh',
+  );
+});
+
+test('clampEffortToAvailable — no xhigh → highest below it (high), not max', () => {
+  // sonnet/haiku-style sets that stop at high/max: xhigh isn't there, so the
+  // closest level at-or-below xhigh wins. high (rank 3) ≤ xhigh, max (rank 5) >.
+  assert.equal(clampEffortToAvailable('xhigh', ['high', 'max']), 'high');
+});
+
+test('clampEffortToAvailable — opus-4-5 style [low,medium,high] → high', () => {
+  assert.equal(clampEffortToAvailable('xhigh', ['low', 'medium', 'high']), 'high');
+});
+
+test('clampEffortToAvailable — empty available → null (no effort concept)', () => {
+  assert.equal(clampEffortToAvailable('xhigh', []), null);
+});
+
+test('clampEffortToAvailable — none-prefixed set still resolves to high', () => {
+  assert.equal(clampEffortToAvailable('xhigh', ['none', 'low', 'medium', 'high']), 'high');
+});
+
+test('clampEffortToAvailable — only-max set → max (closest above when none below)', () => {
+  // max (rank 5) is the only known variant and it is ABOVE xhigh, so it is
+  // returned as the closest-above fallback.
+  assert.equal(clampEffortToAvailable('xhigh', ['max']), 'max');
+});
+
+test('clampEffortToAvailable — only-unknown variants → null', () => {
+  assert.equal(clampEffortToAvailable('xhigh', ['weird']), null);
 });

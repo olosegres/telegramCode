@@ -1269,11 +1269,11 @@ function clearThreadQueues(key: ThreadKey): void {
   // A new session starts with empty context — forget the last-sent outputs so
   // the identical-output backstop can't suppress a legitimate repeat across a
   // session boundary (the same convergence point that clears the other
-  // per-thread relay state: /stop release, session closed/stopped, /unbind).
+  // per-thread relay state: /quit release, session closed/stopped, /unbind).
   identicalOutputGuard.reset(k);
   // A teardown that clears queued output must also FINALIZE any in-flight content
   // (DM: the live draft → a permanent message, not dropped, then reset). This is
-  // the convergence point for `/stop` release, session `closed`/`stopped`,
+  // the convergence point for `/quit` release, session `closed`/`stopped`,
   // `/unbind`, and topic-delete — all route through here. Fire-and-forget,
   // matching the old `void abortDraftTurn`; group mode's transport noops it.
   void getOutputTransport().finalizeInFlight(key);
@@ -2688,7 +2688,7 @@ function stopAllAdaptersFor(key: ThreadKey, adapterNames?: string[]) {
 }
 
 /**
- * @description Explicit-stop teardown shared by `/stop` and `/new`/`/clear_session`:
+ * @description Explicit-stop teardown used by `/new`/`/clear_session`:
  * sweep every adapter active for the thread, then RELEASE the persisted session
  * ids (even when nothing was running) so a later bot restart won't auto-reattach
  * and any half-dead state from a crash/SSE-giveup is cleared. The session stays
@@ -2696,12 +2696,12 @@ function stopAllAdaptersFor(key: ThreadKey, adapterNames?: string[]) {
  * can decide what to reply.
  */
 async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof stopAllAdaptersFor>> {
-  // User took over (/stop, /new) → cancel any pending API-error retry silently
+  // User took over (/new) → cancel any pending API-error retry silently
   // before the session is released, so the kick never lands in a torn-down
   // session.
   cancelApiRetry(key);
   // Session is going away → no output is coming, so stop the "working" loader
-  // (covers /stop and the release half of /new before its fresh start re-arms it).
+  // (covers the release half of /new before its fresh start re-arms it).
   stopTypingLoader(key);
   const result = stopAllAdaptersFor(key);
   await state.clearAgentSessionIds(key);
@@ -3132,7 +3132,7 @@ command('start', async (_ctx, key) => {
       `Available agents:\n${list}\n\n` +
       '/claude /opencode — start an agent in this thread\n' +
       '/sessions — previous sessions\n' +
-      '/stop — stop current agent\n' +
+      '/quit — quit current agent\n' +
       '/status — show status',
   );
 });
@@ -3541,7 +3541,7 @@ command('list', async (_ctx, key) => {
  * session and immediately start a fresh one in the SAME topic with the SAME
  * adapter. The old session is RELEASED (not deleted): its transcript stays on
  * disk so it's still resumable via `/sessions`, but a bot restart won't
- * auto-reattach it. Unlike `/stop` + `/claude`, this is one tap and keeps the
+ * auto-reattach it. Unlike `/quit` + `/claude`, this is one tap and keeps the
  * thread's chosen backend.
  *
  * Guards mirror `handleStartCommand`: General has no binding/agent, so it just
@@ -3556,7 +3556,7 @@ command(['new', 'clear_session'], async (_ctx, key) => {
     await replyToThread(key, t('thread.bind_required'));
     return;
   }
-  // Release the current session the same way `/stop` does (sweep + clear ids).
+  // Release the current session (sweep + clear ids) via `releaseThreadSession`.
   // The fresh start below uses the thread's current adapter, so we keep the
   // adapter selection untouched.
   await releaseThreadSession(key);
@@ -4621,24 +4621,8 @@ async function resumeSessionByIndex(
 
 command(['sessions', 'resume'], (_ctx, key) => handleSessionsList(key));
 
-command('stop', async (_ctx, key) => {
-  // Sweep every adapter, not just the one the in-memory map currently
-  // points at — keeps `/stop` working when state and reality have drifted
-  // apart (a previous switch left a live session on the other adapter).
-  // `releaseThreadSession` also wipes the persisted ids unconditionally so a
-  // later bot restart won't auto-reattach and half-dead state is cleared.
-  const { stopped, attempted } = await releaseThreadSession(key);
-  if (attempted === 0) {
-    await replyToThread(key, 'No agent running');
-    return;
-  }
-  for (const label of stopped) {
-    await replyToThread(key, t('agent.stopped', { label }));
-  }
-});
-
 /**
- * @description `/stop-all` — kill every active agent across every thread.
+ * @description `/quit-all` — kill every active agent across every thread.
  *
  * General-only because it's a workspace-wide operation that's easy to
  * fire by mistake; restricting to General + needing an explicit command
@@ -4651,13 +4635,13 @@ command('stop', async (_ctx, key) => {
  * adapter that thread is configured for and stop only if it's active —
  * idempotent, so re-running is safe.
  */
-command(['stop-all', 'stopall'], async (_ctx, key) => {
+command(['quit-all', 'quitall'], async (_ctx, key) => {
   if (!checkIsGeneral(key)) {
-    await replyToThread(key, t('stop_all.general_only'));
+    await replyToThread(key, t('quit_all.general_only'));
     return;
   }
 
-  // Same sweep semantics as `/stop`: kill any adapter that's actually
+  // Same sweep semantics as `/quit`: kill any adapter that's actually
   // active for this key, not only the one the thread map points at —
   // otherwise a desynced thread (state says opencode but claude tmux is
   // running) gets counted as inactive and skipped. `attempted` /
@@ -4669,15 +4653,15 @@ command(['stop-all', 'stopall'], async (_ctx, key) => {
     const result = stopAllAdaptersFor(bKey);
     active += result.attempted;
     stopped += result.stopped.length;
-    // Same release-for-good semantics as `/stop`, per swept thread.
+    // Same release-for-good semantics as `/quit`, per swept thread.
     await state.clearAgentSessionIds(bKey);
   }
 
   if (active === 0) {
-    await replyToThread(key, t('stop_all.none_active'));
+    await replyToThread(key, t('quit_all.none_active'));
     return;
   }
-  await replyToThread(key, t('stop_all.summary', { stopped: String(stopped), total: String(active) }));
+  await replyToThread(key, t('quit_all.summary', { stopped: String(stopped), total: String(active) }));
 });
 
 /**
@@ -4691,24 +4675,22 @@ command(['stop-all', 'stopall'], async (_ctx, key) => {
  */
 const CLAUDE_DOUBLE_SIGINT_GAP_MS = 250;
 
-// `/quit` (alias `/q`) — graceful exit of the agent, regardless of
-// adapter shape. Lives alongside `/stop` and `/stop-all` because it's
-// a session-end command, not a tmux-style intra-session control.
+// `/quit` (alias `/q`) — THE session-end command: gracefully ends the
+// current thread's agent for every adapter shape.
 // Two distinct paths because the agents themselves have very
 // different "exit" semantics:
 //
 // • Claude CLI runs in a tmux session. Its canonical exit is two
 //   Ctrl+C in quick succession (the first cancels the current turn,
 //   the second leaves the CLI). We replay that by sending `SIGINT`
-//   through the adapter twice with a small gap — softer than the
-//   `tmux kill-session` that `/stop` performs.
+//   through the adapter twice with a small gap — softer than a
+//   `tmux kill-session`.
 //
-// • OpenCode is a long-running HTTP server, not a TUI. There is no
-//   "double Ctrl+C" — the only way to actually leave is to abort
-//   the running generation, disconnect the SSE stream and drop the
-//   session, which is exactly what `stopSession` does. We call it
-//   directly so `/quit` behaves like a real exit instead of two
-//   no-op aborts.
+// • Every other adapter (OpenCode HTTP server, the raw terminal shell,
+//   any future backend) has no "double Ctrl+C" to leave cleanly — the
+//   only real teardown is `stopSession` (abort the running generation /
+//   `tmux kill-session`, drop the session). We call it directly so
+//   `/quit` behaves like a real exit instead of two no-op aborts.
 command(['quit', 'q'], async (_ctx, key) => {
   // User took over (/quit) → cancel any pending API-error retry silently. /quit
   // does NOT go through releaseThreadSession (it stops adapters + clears ids
@@ -4720,9 +4702,8 @@ command(['quit', 'q'], async (_ctx, key) => {
 
   // Defensive: any *other* adapter that's also active for this thread is
   // a leftover from a previous botched switch. Kill it first so it can't
-  // keep streaming after the user's "quit". Same robustness as `/stop` —
-  // re-using the sweep helper instead of an open-coded loop avoids
-  // drift between the two call sites.
+  // keep streaming after the user's "quit". Re-using the sweep helper
+  // instead of an open-coded loop avoids drift between the call sites.
   const otherAdapters = getKnownAdapterNames().filter(n => n !== adapterName);
   stopAllAdaptersFor(key, otherAdapters);
 
@@ -4732,20 +4713,21 @@ command(['quit', 'q'], async (_ctx, key) => {
   }
   markNeedsNewMessage(key);
 
-  if (adapterName === 'opencode') {
-    adapter.stopSession(key);
+  if (adapterName === 'claude') {
+    adapter.sendSignal(key, 'SIGINT');
+    await new Promise((r) => setTimeout(r, CLAUDE_DOUBLE_SIGINT_GAP_MS));
+    adapter.sendSignal(key, 'SIGINT');
     // Explicit quit releases the session for good — no auto-reattach later.
     await state.clearAgentSessionIds(key);
-    await replyToThread(key, t('agent.stopped', { label: adapter.label }));
+    await replyToThread(key, t('agent.exit_signal_sent', { label: adapter.label }));
     return;
   }
 
-  adapter.sendSignal(key, 'SIGINT');
-  await new Promise((r) => setTimeout(r, CLAUDE_DOUBLE_SIGINT_GAP_MS));
-  adapter.sendSignal(key, 'SIGINT');
+  // OpenCode, terminal, any future adapter: tear down via stopSession.
+  adapter.stopSession(key);
   // Explicit quit releases the session for good — no auto-reattach later.
   await state.clearAgentSessionIds(key);
-  await replyToThread(key, t('agent.exit_signal_sent', { label: adapter.label }));
+  await replyToThread(key, t('agent.stopped', { label: adapter.label }));
 });
 
 // ── tmux-style controls (Claude CLI) ──
@@ -5031,12 +5013,13 @@ command('clear_messages', async (ctx, key) => {
 
 // Slash tokens the text handler must NOT forward to the agent. Covers every
 // bot-owned command (incl. the raw-key controls c/y/n/enter/up/down/tab/esc)
-// PLUS the retired commands (agent/cancel/unbind/where): their handlers were
-// removed, but keeping the tokens here makes a stray `/where` inert instead of
-// typing a meaningless "/where" prompt into the agent.
+// PLUS the retired commands (agent/cancel/unbind/where/stop/stopall/stop-all):
+// their handlers were removed, but keeping the tokens here makes a stray
+// `/where` (or `/stop`) inert instead of typing a meaningless prompt into the
+// agent.
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'terminal', 'agent', 'sessions', 'resume', 'cancel', 'model',
-  'stop', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
+  'stop', 'stopall', 'stop-all', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
   'subagent',
@@ -7431,8 +7414,8 @@ function handleAgentStarted(key: ThreadKey): void {
  */
 function handleAgentStopped(key: ThreadKey): void {
   // Single convergence point for every `stopSession`-driven stop path —
-  // `/stop`, `/stop-all`, `/quit` (OpenCode), `/unbind`, and adapter switch
-  // all emit `stopped`. Drop the thread's queued-but-unsent output here so
+  // `/quit` (OpenCode/terminal), `/quit-all`, `/new`, `/unbind`, and adapter
+  // switch all emit `stopped`. Drop the thread's queued-but-unsent output here so
   // nothing coalesced before the stop posts after the "stopped" confirmation.
   clearThreadQueues(key);
   // Stop the liveness loop and remove its frame — a stopped session is idle, so
@@ -7480,9 +7463,8 @@ const COMMANDS_MENU = [
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
   { command: 'resume', description: '📋 Resume a previous session' },
   { command: 'rename_session', description: '✏️ Rename the current session (OpenCode)' },
-  { command: 'stop', description: '⏹ Stop agent (hard kill)' },
-  { command: 'quit', description: '🚪 Quit agent (graceful, alias /q)' },
-  { command: 'stopall', description: '🛑 Stop ALL agents (General-only)' },
+  { command: 'quit', description: '🚪 Quit agent (alias /q)' },
+  { command: 'quitall', description: '🚪 Quit ALL agents (General-only)' },
   { command: 'compact', description: '🧹 Compact agent context' },
   { command: 'schedule', description: '⏰ Schedule a prompt (agent does the work)' },
   { command: 'status', description: '📊 Show status' },
@@ -8236,8 +8218,8 @@ export async function startBot(): Promise<void> {
     console.error('[bot.catch] unhandled error:', err, 'update:', ctx.updateType);
   });
 
-  // 7. Shutdown — preserve active agents for restart/reattach. Use /stop
-  //    or /stop-all for an intentional agent stop; process signals only
+  // 7. Shutdown — preserve active agents for restart/reattach. Use /quit
+  //    (or /quit-all) for an intentional agent stop; process signals only
   //    stop the bot itself. Ordering (bot.stop → state.flush →
   //    releaseLock → exit) is enforced by `gracefulShutdown` so the
   //    previous race against `lock.ts`'s synchronous `process.exit(0)`

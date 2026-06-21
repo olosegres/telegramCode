@@ -249,11 +249,11 @@ export interface StopAllAdaptersResult {
  *
  * Why this is its own helper: adapter switching used to leak the previous
  * adapter's session — e.g. `/claude` then `/opencode` left the claude
- * tmux session alive while the thread map said opencode. `/stop` and
- * `/quit` would then silently no-op the surviving session because they
- * only stopped the adapter the map pointed at. Routing every stop call
- * through this sweep makes the user's intent ("stop the thing in this
- * topic") immune to that drift.
+ * tmux session alive while the thread map said opencode. `/quit` would
+ * then silently no-op the surviving session because it only stopped the
+ * adapter the map pointed at. Routing every stop call through this sweep
+ * makes the user's intent ("stop the thing in this topic") immune to that
+ * drift.
  *
  * `resolveAdapter` is taken as a parameter so tests can pass fakes; the
  * production caller passes `getAdapter` from this module. Adapter names

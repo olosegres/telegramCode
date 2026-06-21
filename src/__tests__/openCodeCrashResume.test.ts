@@ -37,7 +37,7 @@ const sessionId = 'ses_persisted_7';
 const workDir = '/tmp/work-crash';
 const healthPath = '/global/health';
 const restoredNotice = 'OpenCode server restarted; session restored. In-flight reply was lost — resend if needed.';
-const lostNotice = 'OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /stop to release).';
+const lostNotice = 'OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /quit to release).';
 
 let originalFetch: typeof fetch;
 let originalOpencodeBin: string | undefined;

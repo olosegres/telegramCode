@@ -1092,7 +1092,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           // wipes the persisted session id too — otherwise the next bot
           // restart would try to resume an id the server no longer has.
           console.error(`[OpenCode] Could not restore session ${sessionId} after restart:`, e);
-          this.emit('output', sessionKey, `OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /stop to release).`);
+          this.emit('output', sessionKey, `OpenCode server restarted; previous session lost. Starting a fresh one with /opencode (or /quit to release).`);
           this.stopSessionInner(sessionKey);
           this.emit('closed', sessionKey);
           // Defensive: stopSessionInner deletes from `this.sessions`, but

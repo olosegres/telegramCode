@@ -93,7 +93,7 @@ config/variants, not a per-message API field).
   If the `opencode serve` process crashes, the bot auto-restarts the server
   and **restores** each active session by re-resuming its persisted id
   (sessions persist on opencode disk; the in-flight reply is lost). Explicit
-  `/stop`, `/stop-all`, `/quit`, and leaving a folder (the `/bind` «leave
+  `/quit`, `/quit-all`, and leaving a folder (the `/bind` «leave
   current dir» button) instead **release** the persisted session ids — so a
   later bot restart does NOT auto-reattach those sessions (they stay reachable
   only via the `/sessions` picker).
@@ -237,7 +237,7 @@ config/variants, not a per-message API field).
   nudges the still-live session with a neutral "continue" via
   `forwardPromptToAgent` (NEVER a wait-for-idle path — OpenCode's optimistic
   `isBusy` is not cleared on `session.error` and would stall the 10-min cap).
-  Any user message / `/stop` / `/new` / `/quit` / leaving a folder cancels a
+  Any user message / `/new` / `/quit` / leaving a folder cancels a
   pending retry; pending retries survive a bot restart (`state.json` `apiRetries`,
   re-armed after reattach). **⚠️ Known check (not yet verified live):** the
   Claude scrape-detection regex (`^\s*API Error:`, run over `cleanOutput(raw)`
@@ -339,7 +339,7 @@ OpenCode events / bindings).
 ## Commands (all registered in `bot.ts`)
 
 - **Session lifecycle:** `/claude`, `/opencode` (`/oc`), `/terminal`, `/new`
-  (`/clear_session`), `/stop`, `/stop-all`, `/quit` (`/q`), `/sessions`
+  (`/clear_session`), `/quit` (`/q`), `/quit-all`, `/sessions`
   (`/resume`), `/rename_session`, `/clear_messages`, `/compact`
   - `/terminal` starts a raw interactive `$SHELL` in the topic's bound folder
     (a third adapter sibling to `/claude` / `/opencode`, mutually exclusive with
@@ -350,7 +350,7 @@ OpenCode events / bindings).
     preamble, no typing loader, no interrupt). Output streams back as ONE rolling
     message per command (continuation), like OpenCode. Raw keys reuse the
     existing TUI commands: `/c` (Ctrl-C), `/up`·`/down` (history), `/tab`
-    (completion), `/enter`. `/stop`·`/new`·`/quit`·leaving a folder work as for
+    (completion), `/enter`. `/new`·`/quit`·leaving a folder work as for
     agents; `/sessions` lists nothing (shells aren't resumable); `/model`
     `/effort` `/thinking` `/tool_results` `/subagent` `/rename_session` reply
     "not supported" (those adapter methods are simply absent). `/schedule`
@@ -363,7 +363,7 @@ OpenCode events / bindings).
     and immediately starts a fresh one in the SAME topic with the SAME adapter.
     The old session is **released, not deleted** (its transcript stays on disk
     → still resumable via `/sessions`; a bot restart won't auto-reattach it).
-    Reuses the `/stop` release path (`releaseThreadSession`) then
+    Reuses the release path (`releaseThreadSession`) then
     `startAgentSession` (so it carries startup buffering, the typing loader, and
     the preamble-marker reset). The `agent.ready` notice is shown only for a
     non-self-greeting backend (OpenCode/terminal) — Claude prints its own banner,

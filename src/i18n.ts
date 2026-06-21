@@ -98,7 +98,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/ls — подпапки `WORK_ROOT`\n' +
       '/list — список тредов\n' +
       '/status — статус всех тредов\n' +
-      '/stopall — остановить все агенты\n' +
+      '/quitall — завершить всех агентов\n' +
       '/whoami /version — debug\n\n' +
       'Чтобы начать диалог с агентом — открой тематический тред.',
     'help.thread_unbound':
@@ -113,7 +113,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/model /sessions — переключение\n' +
       '/effort — уровень reasoning effort\n' +
       '/verbosity — детализация вывода (размышления/инструменты/суб-агенты)\n' +
-      '/stop /status /output — контроль\n' +
+      '/quit /status /output — контроль\n' +
       '/compact — сжать контекст агента\n' +
       '/clear — удалить сообщения треда\n' +
       '/c /y /n /enter /up /down /tab /esc — TUI-команды (Claude)\n' +
@@ -215,7 +215,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.session_ended': '{label}: сессия завершена',
     'agent.stopped': '{label} остановлен',
     'agent.exit_signal_sent': 'Послан двойной Ctrl+C — {label} завершает работу',
-    'agent.already_active': '{label} уже работает в этом треде. Отправь сообщение или /stop.',
+    'agent.already_active': '{label} уже работает в этом треде. Отправь сообщение или /quit.',
     'agent.starting': 'Запускаю {label} в `{subdir}`…',
     'agent.queued_starting': '⏳ {label} ещё запускается — сообщение в очереди, отправлю как только будет готов.',
     'agent.question_hint': 'ℹ️ Ответь цифрой варианта (например 1) или y/n. Также: /up /down — выбор, /enter — подтвердить, /c — отмена.',
@@ -225,7 +225,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
     'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',
     'agent.workingIndicator': '{glyph} работаю…',
-    'terminal.ready': '🖥 Терминал готов в `{subdir}`{argsSuffix}\nЛюбое сообщение выполнится как команда. /c — Ctrl+C, /up /down — история, /tab — автодополнение, /stop — закрыть.',
+    'terminal.ready': '🖥 Терминал готов в `{subdir}`{argsSuffix}\nЛюбое сообщение выполнится как команда. /c — Ctrl+C, /up /down — история, /tab — автодополнение, /quit — закрыть.',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──
     'survey.message': '📋 {header}\n{hint}',
@@ -312,10 +312,10 @@ const dict: Record<Lang, Record<string, string>> = {
     'rename_session.success': '✅ Сессия переименована: {title}',
     'rename_session.failed': '⚠️ Не удалось переименовать сессию: {reason}',
 
-    // ── /stop-all ──
-    'stop_all.none_active': 'Нет активных агентов — нечего останавливать.',
-    'stop_all.summary': '🛑 Остановлено {stopped} из {total} активных агентов.',
-    'stop_all.general_only': 'Команда `/stop-all` доступна только в General-топике.',
+    // ── /quit-all ──
+    'quit_all.none_active': 'Нет активных агентов — нечего останавливать.',
+    'quit_all.summary': '🚪 Завершено {stopped} из {total} активных агентов.',
+    'quit_all.general_only': 'Команда `/quit-all` доступна только в General-топике.',
 
     // ── /clear_messages ──
     'clearMessages.summary':
@@ -505,7 +505,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/ls — list `WORK_ROOT` subfolders\n' +
       '/list — list threads\n' +
       '/status — status of all threads\n' +
-      '/stopall — stop every running agent\n' +
+      '/quitall — quit every running agent\n' +
       '/whoami /version — debug\n\n' +
       'To talk to an agent — open a topical thread.',
     'help.thread_unbound':
@@ -520,7 +520,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/model /sessions — switch\n' +
       '/effort — reasoning-effort level\n' +
       '/verbosity — output verbosity (thinking/tools/sub-agents)\n' +
-      '/stop /status /output — control\n' +
+      '/quit /status /output — control\n' +
       '/compact — compact agent context\n' +
       '/clear — delete thread messages\n' +
       '/c /y /n /enter /up /down /tab /esc — TUI keys (Claude)\n' +
@@ -616,7 +616,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.session_ended': '{label}: session ended',
     'agent.stopped': '{label} stopped',
     'agent.exit_signal_sent': 'Double Ctrl+C sent — {label} exiting',
-    'agent.already_active': '{label} is already running here. Send a message or /stop.',
+    'agent.already_active': '{label} is already running here. Send a message or /quit.',
     'agent.starting': 'Starting {label} in `{subdir}`…',
     'agent.queued_starting': '⏳ {label} is still starting — your message is queued and will be sent once it is ready.',
     'agent.question_hint': 'ℹ️ Reply with the option number (e.g. 1) or y/n. Also: /up /down to move, /enter to confirm, /c to cancel.',
@@ -626,7 +626,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
     'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',
     'agent.workingIndicator': '{glyph} working…',
-    'terminal.ready': '🖥 Terminal ready in `{subdir}`{argsSuffix}\nEvery message runs as a command. /c — Ctrl+C, /up /down — history, /tab — completion, /stop — close.',
+    'terminal.ready': '🖥 Terminal ready in `{subdir}`{argsSuffix}\nEvery message runs as a command. /c — Ctrl+C, /up /down — history, /tab — completion, /quit — close.',
 
     // ── Claude CLI bare-digit survey (session-feedback prompt) ──
     'survey.message': '📋 {header}\n{hint}',
@@ -713,9 +713,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'rename_session.success': '✅ Session renamed: {title}',
     'rename_session.failed': '⚠️ Failed to rename the session: {reason}',
 
-    'stop_all.none_active': 'No agents running — nothing to stop.',
-    'stop_all.summary': '🛑 Stopped {stopped} of {total} active agents.',
-    'stop_all.general_only': '`/stop-all` is only available in the General topic.',
+    'quit_all.none_active': 'No agents running — nothing to stop.',
+    'quit_all.summary': '🚪 Quit {stopped} of {total} active agents.',
+    'quit_all.general_only': '`/quit-all` is only available in the General topic.',
 
     'clearMessages.summary':
       '🗑 Deleted {deleted} of {total} messages. ' +

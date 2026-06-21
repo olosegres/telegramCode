@@ -29,6 +29,7 @@ import {
   checkIsMeaningfulPrompt,
   checkIsPlaceholderTitle,
 } from '../openCodeSessionTitle';
+import { clampEffortToAvailable, defaultEffortLevel } from '../effortLevels';
 import { getSseStreamTransition } from '../utils/sseStreamLifecycle';
 import {
   buildDelegatingStatusText,
@@ -1307,6 +1308,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         // line when resolved (B9/B17 semantics unchanged).
         await this.fetchModelInfo(key);
 
+        // Seed the bot's default reasoning effort (xhigh, clamped to the now
+        // resolved model's variants) UNLESS the thread already has an explicit
+        // /effort pref — the model ref is resolved by fetchModelInfo above.
+        await this.applyDefaultEffortIfUnset(key);
+
         // If args provided, send as first message. After fetchModelInfo so the
         // resolved model override rides the prompt body.
         if (args) {
@@ -1533,17 +1539,26 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       session.currentModelLabel = label;
       console.log(`[OpenCode] Model set to: ${label}`);
 
-      // Plan 2026-05-30-effort-command / S4: a stored effort the NEW model
-      // can't honour (variant absent) is dropped so the next prompt doesn't
-      // POST an invalid variant — and the user is told why their effort reset.
-      if (session.effortLevel) {
-        const stillValid = (await this.getAvailableEffortLevels(key)).includes(session.effortLevel);
-        if (!stillValid) {
-          const dropped = session.effortLevel;
+      // Discriminate by the PERSISTED pref, not session.effortLevel (which may
+      // already hold a clamped default we seeded). An explicit /effort pick is
+      // validated against the new model and cleared-with-notice if invalid
+      // (today's behavior, plan 2026-05-30-effort-command / S4). With no
+      // explicit pref the default is silently re-clamped for the new model.
+      const explicit = loadSavedEffort(key);
+      if (explicit) {
+        const stillValid = (await this.getAvailableEffortLevels(key)).includes(explicit);
+        if (stillValid) {
+          session.effortLevel = explicit;
+        } else {
           session.effortLevel = null;
           clearEffortPref(key);
-          this.emit('output', key, t('effort.cleared_on_model_switch', { level: dropped, model: label }));
+          this.emit('output', key, t('effort.cleared_on_model_switch', { level: explicit, model: label }));
         }
+      } else {
+        session.effortLevel = clampEffortToAvailable(
+          defaultEffortLevel,
+          await this.getModelVariants(resolved),
+        );
       }
       return null;
     }
@@ -1642,6 +1657,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       };
     }
     return null;
+  }
+
+  /**
+   * @description Seed the bot's default reasoning effort onto a freshly
+   * started/resumed session that has NO explicit per-thread `/effort` pref.
+   *
+   * Explicit prefs always win and are left untouched (early return). With no
+   * pref, the default (`defaultEffortLevel`) is clamped to the resolved
+   * model's variants — OpenCode effort is a model variant and not every model
+   * ships `xhigh`, so an unclamped value would POST an invalid `body.variant`.
+   * A model with no variants resolves to `null` (no effort), which is correct.
+   *
+   * Never persisted: the default stays a derived fallback, the prefs file
+   * remains "explicit choices only".
+   */
+  private async applyDefaultEffortIfUnset(key: ThreadKey): Promise<void> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return;
+    if (loadSavedEffort(key) !== null) return; // explicit pref wins
+    const variants = await this.getModelVariants(this.getSessionModelRef(session));
+    session.effortLevel = clampEffortToAvailable(defaultEffortLevel, variants);
   }
 
   /**
@@ -1960,6 +1996,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // Silent (emitOutput=false): the label is unchanged from the previous run
       // and already shown in the topic, so re-emitting on each restart is noise.
       await this.fetchModelInfo(key, false);
+
+      // Re-establish the default effort on resume too (no explicit pref →
+      // clamp xhigh to the re-resolved model's variants). Mirrors startSession.
+      await this.applyDefaultEffortIfUnset(key);
     } catch (e) {
       console.error(`[OpenCode] Failed to resume session:`, e);
       throw e;

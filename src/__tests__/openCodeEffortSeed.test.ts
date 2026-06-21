@@ -21,11 +21,30 @@ import assert from 'node:assert/strict';
 import {
   seededThreadKeyString,
   seededEffortLevel,
+  noPrefThreadKeyString,
 } from './openCodeEffortSeed.testSetup';
 import { OpenCodeAdapter } from '../adapters/openCodeAdapter';
+import { defaultEffortLevel } from '../effortLevels';
 import { keyToString, keyFromString, type ThreadKey } from '../types';
 
 const newSessionId = 'ses_effort_seed';
+
+/**
+ * `GET /config/providers` reply for the stub: opus-4-8 ships the full
+ * low…max variant set, so the unclamped default `xhigh` lands verbatim.
+ */
+const providersConfigStub = {
+  providers: [
+    {
+      id: 'anthropic',
+      models: {
+        'claude-opus-4-8': {
+          variants: { low: {}, medium: {}, high: {}, xhigh: {}, max: {} },
+        },
+      },
+    },
+  ],
+};
 
 /**
  * @description Adapter whose lifecycle deps are stubbed: POST /session resolves
@@ -37,6 +56,9 @@ function createStubbedAdapter(): OpenCodeAdapter {
   adapter['apiRequest'] = async (method: string, urlPath: string) => {
     if (method === 'POST' && (urlPath === '/session' || urlPath.startsWith('/session?'))) {
       return { id: newSessionId };
+    }
+    if (method === 'GET' && (urlPath === '/config/providers' || urlPath.startsWith('/config/providers?'))) {
+      return providersConfigStub;
     }
     if (method === 'GET' && (urlPath === '/config' || urlPath.startsWith('/config?'))) {
       return { defaultModel: { providerID: 'anthropic', modelID: 'claude-opus-4-8' } };
@@ -72,6 +94,25 @@ describe('OpenCode new session seeds effort from the saved pref (S7 lock)', () =
       (session as { effortLevel: string | null }).effortLevel,
       seededEffortLevel,
       'a new session must inherit the thread\'s stored effort so it survives /new',
+    );
+  });
+
+  it('a fresh startSession with NO pref seeds the clamped default (xhigh)', async () => {
+    const key: ThreadKey = keyFromString(noPrefThreadKeyString);
+    const adapter = createStubbedAdapter();
+
+    void adapter.startSession(key, '/tmp/work');
+    const session = await waitForSession(adapter, keyToString(key));
+
+    assert.ok(session, 'session must be created');
+    // Load-bearing: with no on-disk pref the session must seed the bot's
+    // default effort, clamped to the resolved model's variants. opus-4-8 ships
+    // xhigh (providersConfigStub), so the default lands verbatim. A regression
+    // (no default applied → null) fails here.
+    assert.equal(
+      (session as { effortLevel: string | null }).effortLevel,
+      defaultEffortLevel,
+      'a new session with no explicit pref must seed the clamped default xhigh',
     );
   });
 });

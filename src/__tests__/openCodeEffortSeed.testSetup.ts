@@ -23,4 +23,11 @@ export const effortPrefsFile = path.join(tempDataDir, '.opencode-effort-prefs.js
 export const seededThreadKeyString = '-100666222:9';
 export const seededEffortLevel = 'high';
 
+/**
+ * Thread with NO stored effort pref → a NEW session must seed effortLevel from
+ * the bot's clamped default (`defaultEffortLevel` = 'xhigh', clamped to the
+ * resolved model's variants). Deliberately absent from the prefs file below.
+ */
+export const noPrefThreadKeyString = '-100666222:11';
+
 fs.writeFileSync(effortPrefsFile, JSON.stringify({ [seededThreadKeyString]: seededEffortLevel }));

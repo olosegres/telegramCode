@@ -619,6 +619,14 @@ rather than typed into the agent.)
   resolves the project root via `fs.realpathSync(__dirname)`, so
   `telegramCode hot` works from any CWD.
 
+- **Verifying code you wrote is YOUR job — do it yourself, never hand the check
+  back to the user.** Run it, exercise it, drive the real surface. If the usual
+  tool is missing (e.g. `telegram-mcp` not connected), find another path to
+  exercise the change — hit the live OpenCode server over HTTP, drive/capture a
+  real `tmux` claude pane, run the bot code path directly — don't offload the
+  check. Asking the user to test what you built is the failure mode, not the
+  fallback. (User instruction, 2026-06-21.)
+
 - **ALWAYS verify output/rendering changes LIVE via Telegram MCP — unit tests
   and code review are NOT enough.** Anything touching how agent output reaches a
   topic (`stripTuiElements`, `cleanOutput`, `getNewPaneContent`, fencing,

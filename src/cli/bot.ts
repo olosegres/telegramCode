@@ -1,6 +1,8 @@
 import * as fs from 'fs';
 import { loadEnvFiles } from './envLoader';
 import { acquireLock, installLockCleanupHandlers } from './lock';
+import { resolveDataDir } from '../state';
+import { installConsoleFileTap } from '../utils/consoleFileTap';
 
 /**
  * @description Wrapper-entry for the `telegramCode` / `telegramCode bot` form.
@@ -27,6 +29,13 @@ import { acquireLock, installLockCleanupHandlers } from './lock';
  */
 export async function runBot(): Promise<void> {
   const { loaded } = loadEnvFiles();
+
+  // Tee stdout/stderr to an hourly bucket file under DATA_DIR as EARLY as
+  // possible (right after env load, so DATA_DIR from .env is honoured) — boot
+  // logs below this line are captured for post-incident reading, terminal view
+  // preserved. Best-effort; never throws into a write.
+  installConsoleFileTap(resolveDataDir());
+
   if (loaded.length === 0) {
     process.stderr.write(
       `Warning: no .env file found in $PWD or ~/.config/telegram-code/. ` +

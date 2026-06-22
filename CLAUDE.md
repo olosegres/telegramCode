@@ -295,7 +295,9 @@ config/variants, not a per-message API field).
 | `scheduler/directoryThreads.ts` | Pure inversion: directory → thread keys bound to it (the MCP `dir:` scope resolution) |
 | `scheduler/rebindResume.ts` | Pure rebind decision: resume a paused job from now, or drop an expired one-shot |
 | `diagLog.ts` | Bounded rotating diagnostic log (`appendDiagLog`) under `DATA_DIR/agent-diag.log` — SSE/session lifecycle milestones only, never the per-delta firehose |
-| `outputTrace.ts` | Output-trace mode, toggled at runtime via `/trace` (no env var): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under `DATA_DIR/output-trace.jsonl` — lets live verification diff what the bot did vs what reached Telegram. The toggle (`tracedThreads` set + `traceAllThreads` flag) is persisted in `state.json` and re-seeded at boot; an async-buffered, single-flight writer flushes on a 500ms timer / 200-entry threshold (sync flush on process exit). OFF by default → one boolean check per hook. Filtering: `recv`/`emit`/send-with-thread-id record iff the thread is traced (all-flag or in the set); send records with NO derivable thread id (e.g. `editMessageText`) record whenever ANY tracing is active |
+| `outputTrace.ts` | Output-trace mode, toggled at runtime via `/trace` (no env var): JSONL record of incoming updates (`recv`), adapter emits (`emit`), and every outgoing Bot API call with outcome (`sendTry`/`sendOk`/`sendErr`, incl. 429 details) under hourly bucket files `DATA_DIR/output-trace-*.jsonl` — lets live verification diff what the bot did vs what reached Telegram. The toggle (`tracedThreads` set + `traceAllThreads` flag) is persisted in `state.json` and re-seeded at boot; an async-buffered, single-flight writer flushes on a 500ms timer / 200-entry threshold (sync flush on process exit). **ON by default for ALL threads** (always-on observability — see below); `/trace off all` turns it off DURABLY (persisted `false`). Buckets pruned at 6h by the bot janitor (`pruneTraceBuckets`). Filtering: `recv`/`emit`/send-with-thread-id record iff the thread is traced (all-flag or in the set); send records with NO derivable thread id (e.g. `editMessageText`) record whenever ANY tracing is active |
+| `utils/rotatingLogFile.ts` | Shared hourly time-bucket helper for the observability logs: `getHourBucketPath(dir,base,ext,nowMs)` (`<base>-YYYYMMDDHH.<ext>`, host-local hour) + `pruneExpiredBuckets(...)` (best-effort unlink of buckets + their `.1` siblings older than `retentionHours = 6`; never throws). Used by BOTH the trace writer and the console tee |
+| `utils/consoleFileTap.ts` | TEE of `process.stdout`/`process.stderr` to `DATA_DIR/bot-console-*.log` (hourly bucket): `installConsoleFileTap(dir)` wraps `write` so each chunk ALSO `fs.appendFileSync`s to the bucket (best-effort, swallows IO errors, NO `console.*` inside → no recursion), original write + return value untouched (terminal preserved). Installed as early as possible at the bot entry (`cli/bot.ts`, after env load). Buckets pruned at 6h by the janitor |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `utils/pollBackoff.ts` | Pure adaptive poll cadence: `getNextPollDelay` (300ms while the pane changes → ×2 up to 1.5s after 10 unchanged polls; any write/change snaps back) |
@@ -589,6 +591,13 @@ OpenCode events / bindings).
     clears the per-thread set too); bare `/trace` reports status. Persisted in
     `state.json`, lifecycle-independent (session stop/new/quit/resume/unbind
     never touch it). Replaces the retired boot-time `OUTPUT_TRACE` env var.
+    **Always-on by default:** the every-thread flag defaults ON (so every
+    thread's recv/emit/send is recorded with zero setup); `/trace off all`
+    turns it off DURABLY (survives restart — `false` is persisted explicitly,
+    not confused with "never set"). Trace lands in hourly bucket files
+    `DATA_DIR/output-trace-*.jsonl`. Separately, the bot's stdout/stderr is
+    TEE'd to `DATA_DIR/bot-console-*.log` (also hourly buckets). BOTH are
+    pruned at 6h by the file-sweep janitor (boot + interval).
 
 When adding a command, follow the existing pattern: register via the
 group-gated `command()` wrapper in `bot.ts`, put user-facing text in `i18n.ts`,
@@ -645,18 +654,21 @@ rather than typed into the agent.)
   button presses to any other topic — those are the user's working threads with
   live agent sessions. (User instruction, 2026-06-04.)
 
-- **For send-path / responsiveness / ordering verification, enable the
-  output-trace mode** at runtime: send `/trace on` in the topic under test
-  (or `/trace on all` for cross-thread forensics), then assert against
-  `DATA_DIR/output-trace.jsonl`, not just `get_history`: recv→sendOk latency
-  per command, `sendErr` 429s with `retryAfterSec`, emit-vs-sendOk order per
-  topic. `/trace off` (or `/trace off all`) stops it; `/trace` reports status.
-  The toggle is persisted in `state.json`, so it survives a hot rebuild
-  mid-debug — no `.env` edit, no restart.
+- **For send-path / responsiveness / ordering verification, use the output
+  trace** — it is ON for all threads BY DEFAULT now (no `/trace on` needed),
+  recorded into hourly bucket files `DATA_DIR/output-trace-*.jsonl` (read the
+  current hour's bucket; older ones prune at 6h). Assert against the trace, not
+  just `get_history`: recv→sendOk latency per command, `sendErr` 429s with
+  `retryAfterSec`, emit-vs-sendOk order per topic. `/trace off all` stops it
+  durably; `/trace` reports status. The toggle is persisted in `state.json`, so
+  it survives a hot rebuild mid-debug — no `.env` edit, no restart. The bot's
+  stdout/stderr is also TEE'd to `DATA_DIR/bot-console-*.log` (same hourly
+  buckets, 6h prune) — readable post-incident without the operator's terminal.
   - **Diagnosing "a message never reached the user"** (dropped agent output,
-    missing question / option buttons) — `output-trace.jsonl` is the SOURCE OF
-    TRUTH, not the bot's stdout (which goes to the operator's terminal, not a
-    file). Method: `/trace on` in the topic → reproduce → follow the chain per
+    missing question / option buttons) — the `output-trace-*.jsonl` buckets are
+    the SOURCE OF TRUTH (not the bot's terminal stdout, though that is now also
+    captured in `bot-console-*.log`). Method: reproduce in the topic → follow
+    the chain per
     message and localize the loss:
     `recv` (update arrived) → `emit` (adapter produced output/question) →
     `sendTry` → `sendOk` / `sendErr`.

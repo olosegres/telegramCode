@@ -134,6 +134,7 @@ import {
 } from './utils/displayVerbosity';
 import { getUniformVerbosityLevel } from './utils/verbosityRender';
 import { createSerialQueue, type SerialQueue } from './utils/serialQueue';
+import { getVoiceTranscriptionQueue } from './voiceQueue';
 import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
@@ -5346,14 +5347,37 @@ bot.on(message('voice'), async (ctx) => {
     return;
   }
 
+  // Offload the slow download+transcribe+forward off the telegraf update loop:
+  // awaiting it here would stall intake of EVERY update until Groq replies
+  // (up to 20s, longer on retries) and freeze the whole bot. The per-thread
+  // FIFO queue preserves per-topic order; different topics run in parallel.
+  // Do NOT await — the handler must return so the batch settles fast. A
+  // rejected job is guarded so it can never become an unhandledRejection
+  // (processVoiceJob already reports its own errors via replyToThread).
+  const fileId = ctx.message.voice.file_id;
+  void getVoiceTranscriptionQueue(key)
+    .run(() => processVoiceJob(key, fileId))
+    .catch((err) => {
+      console.error('[Bot] Voice job error (already handled):', err);
+    });
+});
+
+/**
+ * @description Background worker for a single voice note: download → transcribe
+ * → status emit → (buffer / start-agent-phrase / binding checks / forward).
+ * Byte-for-byte the old voice handler's post-gate body — moved verbatim out of
+ * the handler so it runs OFF the telegraf update loop (per-thread serialized).
+ * Uses only `key`/`bot`, never the request `ctx`, so it survives past the
+ * handler's return.
+ */
+async function processVoiceJob(key: ThreadKey, fileId: string): Promise<void> {
   try {
-    const fileId = ctx.message.voice.file_id;
     // Audit S14 / #33: `getFileLink` builds the bot-token URL in one
     // place inside Telegraf instead of us materialising the token in a
     // JS string. The previous manual interpolation worked but
     // accidentally leaking the token into any future log call would
     // expose the bot.
-    const fileUrlObj = await ctx.telegram.getFileLink(fileId);
+    const fileUrlObj = await bot.telegram.getFileLink(fileId);
     const fileUrl = fileUrlObj.toString();
 
     const tempDir = '/tmp';
@@ -5439,7 +5463,7 @@ bot.on(message('voice'), async (ctx) => {
     console.error('[Bot] Voice handling error:', err);
     await replyToThread(key, 'Error processing voice message');
   }
-});
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  File intake handler — photo / document / video / video_note / audio / animation

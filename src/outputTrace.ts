@@ -2,6 +2,7 @@ import { promises as fsp } from 'node:fs';
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { resolveDataDir } from './state';
+import { getHourBucketPath, pruneExpiredBuckets, retentionMs } from './utils/rotatingLogFile';
 import { GENERAL_THREAD_ID } from './threadRouting';
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
@@ -20,16 +21,21 @@ import { keyToString } from './types';
  * The toggle state is persisted in `state.json` and seeded back into this
  * module at boot via {@link setTraceConfig}, so it survives hot rebuilds.
  *
- * OFF by default: when no thread is traced and the all-flag is clear, every
- * hook early-returns after one cheap boolean / `Set` check (zero IO).
+ * ON by default for ALL threads (always-on observability): a fresh state file
+ * reads back `allThreads: true`, so every thread is recorded with zero setup.
+ * `/trace off all` turns it off DURABLY. When tracing IS off (off-all + no
+ * opted-in thread) every hook early-returns after one cheap boolean / `Set`
+ * check (zero IO).
  *
  * When ON the writer is async-buffered: {@link appendTraceEntry} builds the
  * JSON line immediately and pushes it to an in-memory buffer; a single-flight
  * background flush (`fsp.appendFile`) drains the whole buffer at once, armed
  * by a {@link traceFlushIntervalMs} timer or a {@link traceFlushMaxEntries}
  * length threshold. A `process.on('exit')` hook does a best-effort SYNC flush
- * of the remainder. Entries land in `DATA_DIR/output-trace.jsonl`, size-capped
- * with a single `.1` rollover like `diagLog.ts`.
+ * of the remainder. Entries land in an hourly bucket file
+ * `DATA_DIR/output-trace-YYYYMMDDHH.jsonl` (size-capped per bucket with a single
+ * `.1` rollover like `diagLog.ts`); buckets older than 6h are pruned by the
+ * bot's janitor via {@link pruneTraceBuckets}.
  *
  * Entry kinds:
  *  - `recv`    — incoming Telegram update (middleware): type, from, preview,
@@ -41,7 +47,9 @@ import { keyToString } from './types';
  */
 const maxTraceBytes = 10 * 1024 * 1024;
 const previewLength = 120;
-const traceFileName = 'output-trace.jsonl';
+/** Bucket file base + extension — `output-trace-YYYYMMDDHH.jsonl` per hour. */
+const traceFileBase = 'output-trace';
+const traceFileExt = 'jsonl';
 /** Flush the buffer at least this often (ms) even if it never fills up. */
 const traceFlushIntervalMs = 500;
 /** Flush early once the buffer reaches this many lines (bounds memory + lag). */
@@ -101,8 +109,25 @@ export function checkIsThreadTraced(key: ThreadKey): boolean {
   return traceAllThreads || tracedThreadKeys.has(keyToString(key));
 }
 
+/**
+ * @description Path of the CURRENT hour's trace bucket
+ * (`DATA_DIR/output-trace-YYYYMMDDHH.jsonl`). Recomputed per flush so the writer
+ * rolls into a fresh file every hour with no live-file trimming — old buckets
+ * are pruned wholesale by {@link pruneTraceBuckets} (a writer never touches a
+ * past bucket, so prune races nothing). The per-bucket 10MB `.1` rollover still
+ * applies WITHIN an hour.
+ */
 function getTraceFilePath(): string {
-  return path.join(resolveDataDir(), traceFileName);
+  return getHourBucketPath(resolveDataDir(), traceFileBase, traceFileExt, Date.now());
+}
+
+/**
+ * @description Delete trace buckets older than the shared 6h retention window
+ * (the hourly `output-trace-*.jsonl` files + their `.1` siblings). Best-effort;
+ * called at boot and on the file-sweep interval by the bot's janitor.
+ */
+export function pruneTraceBuckets(nowMs: number): Promise<void> {
+  return pruneExpiredBuckets(resolveDataDir(), traceFileBase, traceFileExt, retentionMs, nowMs);
 }
 
 /**

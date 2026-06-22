@@ -11,12 +11,14 @@ import {
   flushTraceBufferSyncOnExit,
   getTraceConfig,
   installCallApiTrace,
+  pruneTraceBuckets,
   setTraceConfig,
   traceAgentEmit,
   traceRecvUpdate,
   type CallApiHost,
   type TraceWriterDeps,
 } from '../outputTrace';
+import { getHourBucketPath, retentionMs } from '../utils/rotatingLogFile';
 
 const threadKey = { chatId: -100123, threadId: 7 };
 const threadKeyStr = '-100123:7';
@@ -39,6 +41,8 @@ interface FakeWriter {
   asyncAppendCount: number;
   /** Pending file size returned by getFileSize (drives rotation). */
   fileSize: number | null;
+  /** The file path the writer last appended to (proves the bucket path). */
+  lastAppendPath: string | null;
   /** Renames performed (rotation). */
   renames: Array<{ from: string; to: string }>;
   /** Fire the most recently armed flush timer, if any. */
@@ -58,10 +62,12 @@ function createFakeWriter(): FakeWriter {
     written: '',
     asyncAppendCount: 0,
     fileSize: null,
+    lastAppendPath: null,
     renames: [],
     deps: {
-      appendFile: async (_filePath, data) => {
+      appendFile: async (filePath, data) => {
         w.asyncAppendCount += 1;
+        w.lastAppendPath = filePath;
         w.written += data;
       },
       appendFileSync: (_filePath, data) => {
@@ -147,6 +153,23 @@ describe('trace toggle (setTraceConfig / getTraceConfig)', () => {
   });
 });
 
+describe('pruneTraceBuckets — 6h retention over DATA_DIR buckets', () => {
+  it('removes an expired output-trace bucket and keeps the current one', async () => {
+    const nowMs = Date.now();
+    const current = getHourBucketPath(tempDataDir, 'output-trace', 'jsonl', nowMs);
+    const stale = getHourBucketPath(tempDataDir, 'output-trace', 'jsonl', nowMs - retentionMs - 60_000);
+    fs.writeFileSync(current, 'fresh\n');
+    fs.writeFileSync(stale, 'old\n');
+    const backdatedSec = (nowMs - retentionMs - 60_000) / 1000;
+    fs.utimesSync(stale, backdatedSec, backdatedSec);
+
+    await pruneTraceBuckets(nowMs);
+
+    assert.equal(fs.existsSync(current), true, 'current bucket kept');
+    assert.equal(fs.existsSync(stale), false, 'expired bucket removed');
+  });
+});
+
 describe('createTracePreview — surrogate-safe truncation', () => {
   it('returns short text as-is and truncates long ASCII with an ellipsis', () => {
     assert.equal(createTracePreview('short'), 'short');
@@ -226,6 +249,21 @@ describe('buffered writer — order, threshold, rotation, exit-flush', () => {
     const lines = parseLines(fake.written);
     assert.equal(lines.length, 1);
     assert.equal(lines[0].preview, 'after rotation');
+  });
+
+  it('writes to an hourly DATA_DIR bucket file (output-trace-YYYYMMDDHH.jsonl)', async () => {
+    const fake = createFakeWriter();
+    restoreWriter = configureTraceWriterForTests(fake.deps);
+
+    traceAgentEmit('output', threadKey, 'bucketed');
+    fake.fireFlushTimer();
+    await fake.settle();
+
+    assert.ok(fake.lastAppendPath, 'a path was used');
+    const fileName = path.basename(fake.lastAppendPath as string);
+    // The file must live in the temp DATA_DIR and match the hourly bucket shape.
+    assert.equal(path.dirname(fake.lastAppendPath as string), tempDataDir);
+    assert.match(fileName, /^output-trace-\d{10}\.jsonl$/);
   });
 
   it('exit hook flushes the remaining buffer synchronously', () => {

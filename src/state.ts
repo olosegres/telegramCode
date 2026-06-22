@@ -140,7 +140,9 @@ export interface StateV1 {
    * strings explicitly opted into tracing; `traceAllThreads` traces every
    * thread (cross-thread forensics). Persisted so the toggle survives a hot
    * rebuild mid-debug — the writer state in `outputTrace.ts` is re-seeded from
-   * these at boot. Both optional (absent = OFF) so older state files stay valid.
+   * these at boot. `traceAllThreads` defaults to ON when absent (always-on
+   * observability); it is stored EXPLICITLY (incl. `false`) so a `/trace off
+   * all` is durable and not re-enabled by the default on the next boot.
    * Lifecycle-independent: only `/trace` mutates them, never session teardown.
    */
   tracedThreads?: string[];
@@ -873,12 +875,14 @@ export class StateStore {
   /**
    * @description Current persisted trace toggle. `threadKeys` are the
    * {@link ThreadKey} strings opted into tracing; `allThreads` traces
-   * everything. Both default empty/false on a fresh or pre-feature state file.
-   * Read at boot to seed `outputTrace.ts`.
+   * everything. `allThreads` defaults to TRUE on a fresh or pre-feature state
+   * file (always-on observability — only an explicit `/trace off all` turns it
+   * off, stored as a durable `false`); `threadKeys` defaults empty. Read at boot
+   * to seed `outputTrace.ts`.
    */
   getTraceConfig(): { allThreads: boolean; threadKeys: string[] } {
     return {
-      allThreads: this.state.traceAllThreads ?? false,
+      allThreads: this.state.traceAllThreads ?? true,
       threadKeys: this.state.tracedThreads?.slice() ?? [],
     };
   }
@@ -887,15 +891,19 @@ export class StateStore {
    * @description Persist the trace toggle. Not crash-critical (a debug aid), so
    * it rides the debounced save loop rather than an immediate `flush()`. The
    * `tracedThreads` array is normalised to a deduped, sorted form so the
-   * on-disk shape is stable across toggles. Empty/false fields are dropped so
-   * an OFF state leaves a clean `state.json`.
+   * on-disk shape is stable across toggles; an empty list is dropped.
+   *
+   * `traceAllThreads` is stored EXPLICITLY as a boolean (including `false`):
+   * the all-threads default is now ON ({@link getTraceConfig}), so a `/trace
+   * off all` must be DURABLE and distinguishable from "never set" (which reads
+   * back as the ON default). Dropping it on `false` would silently re-enable
+   * tracing on the next boot.
    */
   async setTraceConfig(config: { allThreads: boolean; threadKeys: string[] }): Promise<void> {
     const uniqueKeys = [...new Set(config.threadKeys)].sort();
     if (uniqueKeys.length > 0) this.state.tracedThreads = uniqueKeys;
     else delete this.state.tracedThreads;
-    if (config.allThreads) this.state.traceAllThreads = true;
-    else delete this.state.traceAllThreads;
+    this.state.traceAllThreads = config.allThreads;
     this.scheduleSave();
   }
 

@@ -16,8 +16,10 @@ import { getHourBucketPath } from './rotatingLogFile';
  *  - Idempotent: a second install is a no-op (a hot rebuild re-imports cleanly).
  */
 
-const consoleFileBase = 'bot-console';
-const consoleFileExt = 'log';
+/** Bucket file base + extension — `bot-console-YYYYMMDDHH.log` per hour. The
+ * janitor (bot.ts) imports these to prune the same family it doesn't write. */
+export const consoleFileBase = 'bot-console';
+export const consoleFileExt = 'log';
 
 let isInstalled = false;
 

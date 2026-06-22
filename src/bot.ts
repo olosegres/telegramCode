@@ -95,10 +95,13 @@ import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
 import {
   flushTraceBufferSyncOnExit,
   installCallApiTrace,
+  pruneTraceBuckets,
   setTraceConfig,
   traceAgentEmit,
   traceRecvUpdate,
 } from './outputTrace';
+import { pruneExpiredBuckets, retentionMs as logBucketRetentionMs } from './utils/rotatingLogFile';
+import { consoleFileBase, consoleFileExt } from './utils/consoleFileTap';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { persistAdapterSessionIds } from './utils/persistAdapterSessionIds';
 import {
@@ -8194,8 +8197,12 @@ export async function startBot(): Promise<void> {
   //     than the retention window and prune now-empty thread dirs. Runs once
   //     at boot (catches files orphaned while the bot was down) and then once
   //     a day. The interval is `unref`'d so it never keeps the process alive.
+  //     The same tick also prunes the observability buckets (trace + the
+  //     bot-console tee) past the shared 6h retention — whole-bucket deletes,
+  //     never the live bucket the writer is appending to.
   const runFileSweep = (): void => {
-    void sweepExpiredThreadFiles(resolveFilesRoot(getDataDir()), fileRetentionMs, Date.now())
+    const nowMs = Date.now();
+    void sweepExpiredThreadFiles(resolveFilesRoot(getDataDir()), fileRetentionMs, nowMs)
       .then((result) => {
         if (result.removedFiles > 0 || result.removedDirs > 0) {
           console.log(
@@ -8204,6 +8211,12 @@ export async function startBot(): Promise<void> {
         }
       })
       .catch((e) => console.warn('[fileSweep] sweep failed:', e));
+    // Best-effort already (pruneExpiredBuckets never throws) — the .catch is
+    // belt-and-braces against an unexpected rejection from the shared helper.
+    void pruneTraceBuckets(nowMs).catch((e) => console.warn('[fileSweep] trace prune failed:', e));
+    void pruneExpiredBuckets(getDataDir(), consoleFileBase, consoleFileExt, logBucketRetentionMs, nowMs).catch(
+      (e) => console.warn('[fileSweep] console prune failed:', e),
+    );
   };
   runFileSweep();
   const fileSweepInterval = setInterval(runFileSweep, fileSweepIntervalMs);

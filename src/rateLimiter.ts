@@ -68,23 +68,27 @@ export type SendPriority = 'interactive' | 'output' | 'status';
 const priorityOrder: readonly SendPriority[] = ['interactive', 'output', 'status'];
 
 /**
- * Telegram's documented sustained ceiling for messages into one group is
- * ~20 messages/minute. Sizing the refill below this (rather than the old
- * 1 token/sec = 60/min = 3× overrun) keeps multi-topic streaming under the
- * limit so we stop tripping chat-wide 429 cooldowns.
+ * Telegram's documented *group* ceiling is ~20 msg/min, but that is a soft,
+ * conservative floor — the real per-chat limit is dynamic and higher (the
+ * general guideline is ~1 msg/sec/chat = 60/min, and live probing never tripped
+ * a 429 even with the limiter fully disabled). We sit between the two at
+ * **40/min (≈0.67/s)** for noticeably snappier streaming/replies, well under the
+ * ~1/s guideline. Any rare 429 from the overage is now caught losslessly by the
+ * relay's bounded redelivery + final-flush (plan 2026-06-23-relay-429-resilience),
+ * so the small extra 429 risk costs latency, never a dropped message.
  */
-const groupMessagesPerMinute = 20;
+const groupMessagesPerMinute = 40;
 const secondsPerMinute = 60;
 /** Sustained refill ≈ 0.333 tokens/sec — the group ceiling expressed per second. */
 const bucketRefillPerSec = groupMessagesPerMinute / secondsPerMinute;
 /**
- * Burst capacity: a short interactive flurry (a few quick command replies
+ * Burst capacity: a short interactive flurry (several quick command replies
  * back-to-back) drains the bucket instantly without waiting on the slow
- * sustained refill. Sized so a typical command's reply + follow-ups land
- * immediately, while the sustained rate still pulls the average down to the
- * group ceiling.
+ * sustained refill. Raised to 15 (from 6) so a realistic flurry — a few command
+ * replies, or the opening frames of a streamed answer — lands immediately, while
+ * the sustained refill still pulls the average down to the 40/min ceiling.
  */
-const bucketCapacity = 6;
+const bucketCapacity = 15;
 
 /** A taker parked on an empty bucket, waiting for a token. */
 interface BucketWaiter {

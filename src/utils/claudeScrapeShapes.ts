@@ -210,6 +210,37 @@ export const COLLAPSE_TOOLUSE_MARKER_RE = /^\s*…\s*\+\d+\s+tool uses?\b.*$/;
 export const COMPLETION_SUMMARY_RE = /^\s*Done\s*\([^)]*tokens[^)]*\)\s*$/;
 
 /**
+ * @description A numbered file-DIFF CHANGE gutter line as Claude's TUI renders a
+ * Read/Edit/Update file diff: a left-margin LINE NUMBER, a `+` ADD marker
+ * (optionally `+-` / `++` for a replace row), then the (possibly empty) code.
+ *
+ * Live leak (topic 12238 "my-health", 2026-06-24): when a diff scrolls off and
+ * the pane re-renders it (or the Edit summary `⎿ Updated … with N additions`
+ * scrolled away and an interleaved prose sentence nulled the cross-poll tool
+ * context), these gutters arrive ORPHANED — no open tool kind, non-indented
+ * (`getNewPaneContent`'s leading `.trim()` strips the gutter column off the
+ * chunk's first line) — so they fell to the conservative `prose` default,
+ * which the router always keeps, and leaked into the next message verbatim
+ * (`51 +  считает …`, a bare `40 +`, `42 +- * *Доходит…*`). Tagging it `toolBody`
+ * lets `/tool_results minimal` FOLD it and lets the relay window suppress its
+ * re-render (S2), so it never leaks even at `full`.
+ *
+ * Anchored on a `+`-LED marker ONLY. WHY only `+`: a verified count of every
+ * gutter that leaked in topic 12238 found all 6 are `+`-led and ZERO are pure-`-`
+ * deletion rows — and a bare-`-` marker false-matches common prose (`404 - Not
+ * Found`, `2020 - 2024`, `8 - bit`), the exact regression a `[+-]` form caused in
+ * review. Pure-deletion gutters (`NN - old`) are therefore OUT of scope — an
+ * accepted trade against the `-`-led prose class. The ONLY residual false-positive
+ * is a standalone arithmetic line `5 + 3 = 8` → folds one line at `minimal`, never
+ * a swallowed answer (a solid prose line closes the in-chunk block; `full`/`short`
+ * keep tool bodies).
+ *
+ * Bounded line number (`\d{1,6}`), REQUIRED whitespace before the `+`, optional
+ * second `+`/`-` (the replace marker), then end-of-line or whitespace.
+ */
+export const DIFF_GUTTER_CHANGE_RE = /^\s*\d{1,6}\s+\+[+-]?(?:\s|$)/;
+
+/**
  * @description Which tool a `⎿` result body belongs to, deciding how it is
  * fenced: `output` (Bash/Grep/Glob — the `⎿` line is stdout, fenced with the
  * body) vs `file` (Read/Edit/Update/Write — the `⎿` line is a prose summary,

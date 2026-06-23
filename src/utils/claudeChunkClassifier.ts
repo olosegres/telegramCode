@@ -33,6 +33,7 @@ import {
   COLLAPSE_MARKER_RE,
   COLLAPSE_TOOLUSE_MARKER_RE,
   COMPLETION_SUMMARY_RE,
+  DIFF_GUTTER_CHANGE_RE,
   FILE_TOOL_HEADER_RE,
   OUTPUT_TOOL_HEADER_RE,
   POST_THINKING_TRAILER_RE,
@@ -290,6 +291,23 @@ export function classifyClaudeChunk(
         COLLAPSE_MARKER_RE.test(line) ||
         COMPLETION_SUMMARY_RE.test(line))
     ) {
+      push(ClaudeChunkTag.ToolBody, line);
+      continue;
+    }
+
+    // 8b. File-DIFF CHANGE gutter (S1, live leak topic 12238 2026-06-24). A `+`-led
+    // numbered row (`51 +  …`, a bare `40 +`, `42 +- …`) is an unambiguous diff
+    // signal — tag it toolBody even when ORPHANED (the Read/Edit/Update header /
+    // `⎿` summary scrolled off and an interleaved prose line nulled the tool kind,
+    // so the gutter arrives non-indented with toolKind === null and used to fall to
+    // prose, which the router always keeps even at minimal). Each gutter line
+    // self-matches per poll — NO cross-poll diff-block state and NO numbered
+    // CONTEXT-row (`66  …`) matching: a context row is indistinguishable from a
+    // numbered answer line, and threading an open flag across polls swallowed
+    // multi-line numbered answers (reviewed-out regression). The `+`-only anchor
+    // (see DIFF_GUTTER_CHANGE_RE) keeps `-`-led prose (`404 - Not Found`) prose.
+    if (DIFF_GUTTER_CHANGE_RE.test(line)) {
+      context.isSubagentPanelOpen = false;
       push(ClaudeChunkTag.ToolBody, line);
       continue;
     }

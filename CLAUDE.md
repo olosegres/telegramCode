@@ -658,6 +658,16 @@ rather than typed into the agent.)
   check. Asking the user to test what you built is the failure mode, not the
   fallback. (User instruction, 2026-06-21.)
 
+- **Live-verify on the test thread BEFORE you commit — this is the EXECUTING
+  (sub-)agent's job, not deferred to the orchestrator or the user.** A change
+  that touches relay / output / rendering must be exercised live on the
+  "Telegram code testing" topic (root `9085`) and confirmed via the always-on
+  trace / `get_history` *before* its commit lands. If `telegram-mcp` (the client
+  that drives a topic by sending prompts) is not connected, that is a BLOCKER:
+  say so explicitly, do NOT commit the change as "verified", and do NOT silently
+  skip or claim done. Do not brief sub-agents to "leave on-host to the
+  orchestrator". (User instruction, 2026-06-23.)
+
 - **ALWAYS verify output/rendering changes LIVE via Telegram MCP — unit tests
   and code review are NOT enough.** Anything touching how agent output reaches a
   topic (`stripTuiElements`, `cleanOutput`, `getNewPaneContent`, fencing,

@@ -2229,6 +2229,9 @@ function getOutputDelay(chatId: number): number {
     isFinal: false,
     isRateLimited: checkIsRateLimited(chatId),
     normalDebounceMs,
+    // S3: while throttled, scale the debounce to the live remaining cooldown so
+    // a long 429 batches into one larger edit instead of a backlog of tiny ones.
+    remainingCooldownMs: getRateLimitRemainingMs(chatId),
   });
   // Non-final input can only yield a numeric delay, never `'now'`.
   return timing === 'now' ? normalDebounceMs : timing;
@@ -2268,6 +2271,8 @@ function queueOutput(
     isFinal: isFinal || isComplete,
     isRateLimited: checkIsRateLimited(key.chatId),
     normalDebounceMs: getOutputDebounceMs(),
+    // S3: scale the in-cooldown debounce to the live remaining cooldown.
+    remainingCooldownMs: getRateLimitRemainingMs(key.chatId),
   });
   if (timing === 'now') {
     // Final frame: flush immediately. `processOutputQueue` already guards

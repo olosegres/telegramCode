@@ -127,6 +127,28 @@ config/variants, not a per-message API field).
   message — the old edit-in-place for fresh outputs silently replaced interim
   texts (live bug 2026-06-05). Claude's adapter never marks continuations, so
   its flushes stay one-message-each.
+- **Relay resilience under sustained 429 — never SILENTLY drop, always land the
+  final answer** (plan `agent/tasks/actual/2026-06-23-relay-429-resilience-no-drop-final-flush.md`).
+  The rate limiter never drops (delays, or throws `RateLimitedError` on a
+  double-429) — the keep/drop decision is in `replyToThread`. (S1) A recoverable
+  send (interactive reply, OR the agent's FINAL answer marked `isImportant`)
+  that double-429s is redelivered on a BOUNDED schedule (`decideRedelivery` in
+  `redeliverDecision.ts`: up to `maxRedeliveryAttempts`=4 passes, each waiting
+  the LIVE `getRateLimitRemainingMs`+slack, clamped), and on exhaustion posts ONE
+  deduped degraded notice (`send.degradedUnderLoad`) instead of the old silent
+  `console.error`. Intermediate output / status stay disposable (the
+  `pendingIsFinal` sticky flag threads final-answer eligibility through the output
+  queue → `sendOutputImmediate` → `replyChunkWithFallback` → `replyToThread`).
+  (S2) The group transport's `finalizeInFlight` is now a REAL reconcile
+  (`finalizeGroupOutput` + pure `utils/groupFinalizePlan.ts`): on every
+  settle/teardown it drains the coalesced-but-unsent buffer to a permanent
+  message via the S1 path (mark important) BEFORE `clearThreadOutputQueues`
+  discards it — idempotent, exactly-once (a fully-delivered turn is a no-op),
+  per-key in `both` so DM finalizes its draft and group its buffer (no
+  double-finalize). (S3) While in a 429 cooldown the output debounce
+  (`utils/outputFlushTiming.ts`) scales to the LIVE remaining cooldown
+  (`max(normal, 5s floor, remainingCooldownMs)`) so a long cooldown coalesces into
+  one larger edit instead of a backlog of tiny ones; `isFinal` still flushes now.
 - **Output transport seam (CHAT_MODE-selected).** HOW agent output reaches a topic
   is chosen ONCE at boot by `CHAT_MODE` via `createOutputTransport` (`src/output/`),
   mirroring the `AgentAdapter` factory — no per-call surface branch. **Group** =
@@ -328,7 +350,7 @@ as a command in `bot.ts`.
 
 | File | Responsibility |
 |------|----------------|
-| `createOutputTransport.ts` | Factory: pick the output transport by `CHAT_MODE` (the single mode decision); thin group impl (`queueOutput` + noop finalize), DM delegates to `createDmOutputTransport`, `both` returns a per-key dispatcher (`checkIsDmKey`) over both impls |
+| `createOutputTransport.ts` | Factory: pick the output transport by `CHAT_MODE` (the single mode decision); thin group impl (`queueOutput` + `finalizeInFlight` reconcile — drains the coalesced-but-unsent buffer to a permanent message on teardown so the final answer is never discarded under 429, S2), DM delegates to `createDmOutputTransport`, `both` returns a per-key dispatcher (`checkIsDmKey`) over both impls |
 | `dmOutputTransport.ts` | The DM draft-cursor manager (relocated out of `bot.ts`): `deliverOutput` 3-way route (draft / `isComplete` one-shot / `queueOutput` baseline), `finalizeInFlight`, `disposeThread`, and the whole draft state + send/pace/idle machinery — built from injected `bot.ts` primitives |
 
 The `OutputTransport` interface (in `types.ts`) is the seam, selected once at boot

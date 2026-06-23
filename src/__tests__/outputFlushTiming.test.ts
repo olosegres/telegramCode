@@ -26,10 +26,41 @@ test('final frame flushes now when not rate-limited', () => {
   );
 });
 
-test('non-final + rate-limited stretches the debounce', () => {
+test('non-final + rate-limited (no/short cooldown) holds the 5s floor', () => {
   assert.equal(
     getOutputFlushTiming({ isFinal: false, isRateLimited: true, normalDebounceMs }),
     rateLimitedOutputDebounceMs,
+    'omitted remaining cooldown → at least the floor',
+  );
+  assert.equal(
+    getOutputFlushTiming({ isFinal: false, isRateLimited: true, normalDebounceMs, remainingCooldownMs: 1000 }),
+    rateLimitedOutputDebounceMs,
+    'a cooldown shorter than the floor still gets the floor',
+  );
+});
+
+test('S3: non-final + rate-limited scales the debounce to a longer live cooldown', () => {
+  const remainingCooldownMs = rateLimitedOutputDebounceMs + 20_000;
+  assert.equal(
+    getOutputFlushTiming({ isFinal: false, isRateLimited: true, normalDebounceMs, remainingCooldownMs }),
+    remainingCooldownMs,
+    'a long cooldown coalesces into one larger edit instead of a backlog of tiny ones',
+  );
+});
+
+test('S3: the cooldown scaling is ignored when not rate-limited (no spurious stretch)', () => {
+  assert.equal(
+    getOutputFlushTiming({ isFinal: false, isRateLimited: false, normalDebounceMs, remainingCooldownMs: 30_000 }),
+    normalDebounceMs,
+    'not in cooldown → normal debounce regardless of a stale remaining value',
+  );
+});
+
+test('S3: isFinal still flushes now even with a long remaining cooldown', () => {
+  assert.equal(
+    getOutputFlushTiming({ isFinal: true, isRateLimited: true, normalDebounceMs, remainingCooldownMs: 60_000 }),
+    'now',
+    'the final frame never waits out the cooldown, no matter how long',
   );
 });
 

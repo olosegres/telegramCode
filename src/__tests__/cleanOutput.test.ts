@@ -404,18 +404,6 @@ test('checkIsStatusOutput: substantial multi-line content is not status', () => 
   );
 });
 
-test('checkIsStatusOutput: a "+"-led file-diff gutter is permanent content, NOT status (S2 Finding 4)', () => {
-  // Live 12238 / S2 Finding 4: a lone `40 +` gutter is short and sentence-less, so
-  // it tripped the spinner heuristic → treated as a transient status → NEVER recorded
-  // into the relay window → re-leaked on every scrollback re-render. A "+"-led gutter
-  // must read as real permanent output so the window can learn + suppress its re-render.
-  assert.equal(checkIsStatusOutput('40 +'), false, 'bare "NN +" gutter is permanent');
-  assert.equal(checkIsStatusOutput('42 +- * *Доходит до края поля.*'), false, '"NN +-" gutter is permanent');
-  assert.equal(checkIsStatusOutput('51 +\n40 +'), false, 'a run of "+"-led gutters is permanent');
-  // A "-"-led numbered line is NOT a gutter — it stays on the normal heuristics.
-  assert.equal(checkIsStatusOutput('404 - Not Found'), false, '"-"-led prose is still real content (sentence-ish)');
-});
-
 // ─── N3 — bold around spinner glyph cleanup ────────────────────────────
 
 test('convertAnsiToMarkdown: drops *...* around single spinner glyph "·"', () => {

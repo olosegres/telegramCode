@@ -180,51 +180,6 @@ describe('routeClaudeChunkSegments — orphan ⎿ tool result (S1)', () => {
   });
 });
 
-describe('routeClaudeChunkSegments — orphan file-diff gutter rows (S1, topic 12238)', () => {
-  // Live leak (2026-06-24): a re-rendered Edit diff whose header / `⎿` summary
-  // scrolled off arrives as bare `+`-led numbered gutters (`51 +  …`, `40 +`,
-  // `42 +- …`). The classifier tags the run toolBody, so minimal folds it instead
-  // of leaking the gutters as prose into the next message.
-  const orphanDiff = [
-    '51 +  считает полноценными инструментами, не только проверяемые факты.',
-    '40 +',
-    '42 +- * *Доходит до края поля.* * Ничего не принимает на веру',
-  ].join('\n');
-
-  it('minimal → the whole diff gutter run is FOLDED, never leaked into permanent text', () => {
-    const routed = routeAtMode(orphanDiff, 'minimal');
-    assert.equal(routed.keptText, '', 'nothing permanent — the diff is folded at minimal');
-    assert.ok(!routed.keptText.includes('51 +'), 'the "NN +" gutter never leaks as permanent output');
-    assert.ok(!routed.keptText.includes('считает полноценными'), 'the diff content never leaks');
-    assert.ok(routed.activityLine?.startsWith('ACTIVITY:'), 'it folds into a 🔧 tool activity line');
-  });
-
-  it('full → the diff gutter run is kept verbatim (tool body still visible)', () => {
-    const routed = routeAtMode(orphanDiff, 'full');
-    assert.ok(routed.keptText.includes('51 +  считает'), 'the long diff row is kept at full');
-    assert.ok(routed.keptText.includes('40 +'), 'the bare gutter is kept at full');
-    assert.equal(routed.activityLine, null, 'nothing folded at full');
-  });
-
-  it('a numbered PROSE line (not a "+"-led gutter) is still kept at minimal — never folded', () => {
-    // The strict anchor: a real numbered prose line has no "+" change marker, so it
-    // stays prose and the router keeps it even at minimal (answer not swallowed).
-    const routed = routeAtMode('1. Первый пункт плана — собрать требования.', 'minimal');
-    assert.ok(routed.keptText.includes('Первый пункт плана'), 'numbered prose kept at minimal');
-  });
-
-  it('a numbered CONTEXT-shaped answer line is KEPT at minimal — never swallowed', () => {
-    // The reviewed-out regression: a `66  remaining budget …` line must NOT fold.
-    const routed = routeAtMode('42  remaining budget after rent is paid', 'minimal');
-    assert.ok(routed.keptText.includes('remaining budget after rent'), 'context-shaped answer kept at minimal');
-  });
-
-  it('"-"-led numbered prose (404 - Not Found) is KEPT at minimal — not folded', () => {
-    const routed = routeAtMode('404 - Not Found', 'minimal');
-    assert.ok(routed.keptText.includes('404 - Not Found'), '"-"-led prose kept at minimal');
-  });
-});
-
 describe('routeClaudeChunkSegments — thinking block by mode (S5)', () => {
   // A finished reasoning block: the duration-bearing header + a `⎿` summary
   // body, classified together into one ThinkingBlock segment.

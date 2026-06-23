@@ -19,7 +19,6 @@ import {
   createRecentRelayWindow,
   getRelayDedupedChunk,
   buildRelayBlockSignature,
-  checkIsDiffGutterLine,
   normalizeForComparison,
   relayDedupMinLineLength,
   relayWindowMaxLines,
@@ -186,73 +185,6 @@ test('filter: short lines inside a redraw are never suppressed', () => {
 
   const redraw = [buildDiffLine(1), shortLine, buildDiffLine(2)].join('\n');
   assert.equal(getRelayDedupedChunk(relayWindow, redraw), shortLine);
-});
-
-// ─── S2: short diff-gutter CHANGE lines bypass the length gate ───────────────
-
-test('S2: checkIsDiffGutterLine matches "+"-led gutters, not numbered/"-"-led prose', () => {
-  assert.equal(checkIsDiffGutterLine('40 +'), true, 'bare "NN +" gutter');
-  assert.equal(checkIsDiffGutterLine('51 + считает полноценными'), true, '"NN +" with content (normalized key)');
-  assert.equal(checkIsDiffGutterLine('42 +-'), true, '"NN +-" replace marker');
-  // NOT a "+"-led diff gutter — must stay prose so it is never short-suppressed.
-  assert.equal(checkIsDiffGutterLine('404 - Not Found'), false, '"-"-led prose (the reviewed-out FP)');
-  assert.equal(checkIsDiffGutterLine('65 - old line'), false, 'pure "-" deletion gutter is OUT of scope');
-  assert.equal(checkIsDiffGutterLine('1. Первый пункт плана'), false, 'numbered list item');
-  assert.equal(checkIsDiffGutterLine('2024 was the year'), false, 'numbered prose');
-  assert.equal(checkIsDiffGutterLine('66  ## Структура'), false, 'context row is not a CHANGE gutter');
-  assert.equal(checkIsDiffGutterLine('done'), false, 'short confirmation');
-});
-
-test('S2: a SHORT diff-gutter line IS recorded and suppressed (the live 12238 leak)', () => {
-  // Pre-fix the bare `40 +` (< the 16-char gate) bypassed the window entirely and
-  // re-emitted on every scrollback re-render. The gutter shape is never legit
-  // repeated prose, so it is recorded/suppressed even short.
-  const relayWindow = createRecentRelayWindow();
-  const shortGutter = '40 +';
-  assert.ok(
-    normalizeForComparison(shortGutter).length < relayDedupMinLineLength,
-    'the gutter is below the normal length gate',
-  );
-  assert.equal(relayWindow.checkHasLine(shortGutter), false, 'unseen gutter is new');
-  relayWindow.record(shortGutter);
-  assert.equal(relayWindow.checkHasLine(shortGutter), true, 'the re-rendered gutter is now suppressed');
-});
-
-test('S2: a SHORT non-gutter line is STILL never recorded nor suppressed (no regression)', () => {
-  // The S2 bypass is "+"-led-gutter-shape-specific — short prose still always passes,
-  // including short "-"-led numbered prose (the reviewed-out over-suppression case).
-  const relayWindow = createRecentRelayWindow();
-  for (const shortProse of ['- done', '2 - yes', '8 - bit']) {
-    relayWindow.record(shortProse);
-    assert.equal(relayWindow.checkHasLine(shortProse), false, `short prose "${shortProse}" never suppressed`);
-  }
-});
-
-test('S2: glyph-led gutter records + suppresses across the normalization domain (Finding 5)', () => {
-  // record('⏺ 40 +') and lookup of the plain '40 +' must agree — the gutter verdict
-  // is decided on the NORMALIZED key (leading glyph stripped), one domain for both.
-  const relayWindow = createRecentRelayWindow();
-  relayWindow.record('⏺ 40 +');
-  assert.equal(relayWindow.checkHasLine('40 +'), true, 'plain re-render of the glyph-led gutter is suppressed');
-});
-
-test('S2: getRelayDedupedChunk drops a re-rendered SHORT gutter, keeps it the first time', () => {
-  const relayWindow = createRecentRelayWindow();
-  // First render: the bare gutter passes (not yet recorded), then is recorded.
-  const firstRender = '40 +';
-  assert.equal(getRelayDedupedChunk(relayWindow, firstRender), firstRender, 'first occurrence relays');
-  relayWindow.record(firstRender);
-  // Scrollback re-render of the same gutter → suppressed to empty.
-  assert.equal(getRelayDedupedChunk(relayWindow, firstRender), '', 're-rendered gutter is dropped');
-});
-
-test('S2: two DIFFERENT short gutters both pass (only an exact re-render is dropped)', () => {
-  const relayWindow = createRecentRelayWindow();
-  relayWindow.record('40 +');
-  // A different line number is a different key → not suppressed.
-  assert.equal(relayWindow.checkHasLine('41 +'), false, 'a different gutter line is new');
-  // A "-"-led line is not a "+"-led gutter at all → short gate applies → not suppressed.
-  assert.equal(relayWindow.checkHasLine('40 -'), false, 'a "-"-led short line is not gutter-suppressed');
 });
 
 // ─── chunk filter: blank-line shaping (same shape as getNewPaneContent) ──────

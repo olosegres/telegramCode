@@ -36,7 +36,6 @@ import {
   PROGRESS_PASSTHROUGH_RE,
   COLLAPSE_MARKER_RE,
   COMPLETION_SUMMARY_RE,
-  DIFF_GUTTER_CHANGE_RE,
   TRANSIENT_TICK_RE,
   checkIsClaudeChromeLine,
   type ToolResultKind,
@@ -467,15 +466,6 @@ export function checkIsStatusOutput(text: string): boolean {
   // folded into the ephemeral status frame and lost. The 💭 marker is the bot's
   // own collapse glyph — treat it as real permanent content.
   if (text.trimStart().startsWith('💭')) return false;
-
-  // A file-diff CHANGE gutter (`40 +`, `42 +- …`) is real diff content, not a
-  // transient spinner — its short, sentence-less shape otherwise trips the
-  // heuristics below, so a lone gutter would be folded into the status frame and
-  // NEVER recorded into the relay window, re-leaking on every scrollback re-render
-  // (live 12238, S2 Finding 4). Treat it as permanent output so the window can
-  // learn + suppress its re-render. (At `minimal` it folds via the router's
-  // activityLine path before this check, so this only matters at full/short.)
-  if (text.split('\n').every(line => line.trim() !== '' && DIFF_GUTTER_CHANGE_RE.test(line))) return false;
 
   // Real content is always substantial
   if (text.length > 200) return false;

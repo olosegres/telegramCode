@@ -8,7 +8,8 @@
  * Load-bearing per `rules/tests.md`: each assertion proves the route really
  * reached its expected primitive (the recorded call), not just "no crash":
  *  - group.deliverOutput → queueOutput (NOT the draft path); group.finalizeInFlight
- *    resolves as a noop with no side effect.
+ *    delegates to the bot-owned `finalizeGroupOutput` reconcile (S2 — no longer a
+ *    noop), and a `both` group key routes there without double-finalizing the draft.
  *  - dm.deliverOutput → feedDraft for a streaming meta on a draft-capable thread
  *    (both OpenCode and the delta-emitting Claude scrape adapter, which now
  *    synthesises the continuation flag), → finalizeDraft+sendAgentChunks for
@@ -28,6 +29,8 @@ interface RecordedCalls {
   sendAgentChunks: string[][];
   feedDraft: Array<{ output: string; isContinuation: boolean; isFinal: boolean }>;
   finalizeDraft: number;
+  /** Keys passed to the group-path `finalizeGroupOutput` (S2 delegation). */
+  finalizeGroupOutput: ThreadKey[];
 }
 
 /**
@@ -46,6 +49,7 @@ function createStubDeps(
     sendAgentChunks: [],
     feedDraft: [],
     finalizeDraft: 0,
+    finalizeGroupOutput: [],
   };
   const deps: OutputTransportDeps = {
     queueOutput(_key, output, isContinuation, isFinal, isComplete) {
@@ -81,6 +85,9 @@ function createStubDeps(
       return text;
     },
     maxMessageLength: MAX,
+    async finalizeGroupOutput(key) {
+      calls.finalizeGroupOutput.push(key);
+    },
   };
   return { deps, calls };
 }
@@ -99,11 +106,16 @@ test('group: deliverOutput routes to queueOutput with the meta flags', () => {
   assert.equal(calls.feedDraft.length, 0, 'group must never touch the draft path');
 });
 
-test('group: finalizeInFlight resolves as a noop (no send)', async () => {
+test('group: finalizeInFlight delegates to finalizeGroupOutput (S2 reconcile, not a noop)', async () => {
   const { deps, calls } = createStubDeps(true);
   const transport = createOutputTransport('group', deps);
   await transport.finalizeInFlight(KEY);
-  assert.equal(calls.sendAgentChunks.length, 0);
+  // The group transport no longer noops finalize — it delegates the reconcile to
+  // the bot-owned drain so the final answer is force-delivered before teardown.
+  assert.deepEqual(calls.finalizeGroupOutput, [KEY], 'group finalize must drive finalizeGroupOutput');
+  // The transport itself never sends — the drain (and any redelivery) is the
+  // delegate's job; the stub records the call without sending.
+  assert.equal(calls.sendAgentChunks.length, 0, 'the transport itself does not send (delegate does)');
   assert.equal(calls.queueOutput.length, 0);
 });
 
@@ -262,11 +274,29 @@ test('both: checkIsStreaming reports per key — DM draft active, group always f
   assert.equal(transport.checkIsStreaming(GROUP_KEY), false, 'the group leg stays false meanwhile');
 });
 
-test('both: finalizeInFlight on a group key is a noop; disposeThread routes without throwing', async () => {
+test('both: finalizeInFlight on a group key delegates to finalizeGroupOutput; disposeThread routes without throwing', async () => {
   const { deps, calls } = createStubDeps(/* supportsDraft */ true, false, isDmKeyByChatId);
   const transport = createOutputTransport('both', deps);
   await transport.finalizeInFlight(GROUP_KEY);
-  assert.equal(calls.sendAgentChunks.length, 0, 'group finalize is a noop (no send)');
+  // A group key routes to the group leg's S2 reconcile — NOT the DM draft and NOT
+  // a noop. The dispatcher must not double-finalize: a DM key would finalize its
+  // draft instead (covered by the DM tests), a group key only the group drain.
+  assert.deepEqual(calls.finalizeGroupOutput, [GROUP_KEY], 'group-key finalize drives the group drain');
+  assert.equal(calls.sendAgentChunks.length, 0, 'no draft finalize for a group key');
   assert.doesNotThrow(() => transport.disposeThread(GROUP_KEY));
   assert.doesNotThrow(() => transport.disposeThread(DM_KEY));
+});
+
+test('both: finalizeInFlight on a DM key finalizes the draft, NOT the group drain (no double-finalize)', async () => {
+  const { deps, calls } = createStubDeps(/* supportsDraft */ true, /* outputsDeltas */ true, isDmKeyByChatId);
+  deps.callSendMessageDraft = async () => undefined;
+  const transport = createOutputTransport('both', deps);
+  // Open a DM draft turn, then finalize it.
+  transport.deliverOutput(DM_KEY, 'dm answer', { isContinuation: false });
+  await transport.finalizeInFlight(DM_KEY);
+  await new Promise((resolve) => setImmediate(resolve));
+  // The DM leg finalized its draft to a permanent message; the group drain was
+  // never invoked for a DM key (the dispatcher routes per key — no double-finalize).
+  assert.equal(calls.finalizeGroupOutput.length, 0, 'a DM key must NOT trigger the group drain');
+  assert.deepEqual(calls.sendAgentChunks, [['dm answer']], 'the DM draft finalized to a permanent message');
 });

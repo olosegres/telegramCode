@@ -103,6 +103,7 @@ import {
 import { pruneExpiredBuckets, retentionMs as logBucketRetentionMs } from './utils/rotatingLogFile';
 import { consoleFileBase, consoleFileExt } from './utils/consoleFileTap';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
+import { getGroupFinalizePlan } from './utils/groupFinalizePlan';
 import { persistAdapterSessionIds } from './utils/persistAdapterSessionIds';
 import {
   resolveSendFileWithinDir,
@@ -1278,18 +1279,23 @@ function clearThinkingMessage(key: ThreadKey): void {
  */
 function clearThreadQueues(key: ThreadKey): void {
   const k = keyToString(key);
+  // A teardown that clears queued output must FIRST finalize any in-flight
+  // content so the agent's final answer lands instead of being discarded (DM:
+  // the live draft → a permanent message; group: the coalesced-but-unsent
+  // output buffer → a permanent message, S2). This is the convergence point for
+  // `/quit` release, session `closed`/`stopped`, `/unbind`, and topic-delete —
+  // all route through here. CRITICAL ORDER: finalize BEFORE
+  // `clearThreadOutputQueues`, because the group finalize drains
+  // `q.pendingOutput` and the clear would otherwise null it first (S2). Both
+  // transports capture + reset their in-flight state SYNCHRONOUSLY before any
+  // await, so the clear below can't race the drain. Fire-and-forget.
+  void getOutputTransport().finalizeInFlight(key);
   clearThreadOutputQueues(outputQueues.get(k), statusCoalescers.get(k));
   // A new session starts with empty context — forget the last-sent outputs so
   // the identical-output backstop can't suppress a legitimate repeat across a
   // session boundary (the same convergence point that clears the other
   // per-thread relay state: /quit release, session closed/stopped, /unbind).
   identicalOutputGuard.reset(k);
-  // A teardown that clears queued output must also FINALIZE any in-flight content
-  // (DM: the live draft → a permanent message, not dropped, then reset). This is
-  // the convergence point for `/quit` release, session `closed`/`stopped`,
-  // `/unbind`, and topic-delete — all route through here. Fire-and-forget,
-  // matching the old `void abortDraftTurn`; group mode's transport noops it.
-  void getOutputTransport().finalizeInFlight(key);
 }
 
 function markNeedsNewMessage(key: ThreadKey): void {
@@ -2318,6 +2324,52 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
         processOutputQueue(key);
       }, getOutputDelay(key.chatId));
     }
+  }
+}
+
+/**
+ * @description Group-path `finalizeInFlight`: reconcile the thread's
+ * coalesced-but-unsent output against what actually landed, and force-send the
+ * remainder so the agent's FINAL answer is never discarded on teardown (S2).
+ *
+ * Today the group output queue coalesces into `q.pendingOutput` and the
+ * (possibly 429-stretched) debounce flushes it later; a teardown
+ * (`idle`/`isFinal` → `handleAgentStopped`, `/new`, `/quit`, `/unbind`,
+ * topic-delete) runs `clearThreadOutputQueues` which DISCARDS that buffer — so
+ * under a sustained 429 the settled final answer could vanish with only a
+ * `console.error`. This drains the buffer FIRST.
+ *
+ * Captures + nulls the buffer SYNCHRONOUSLY before its await, so the
+ * immediately-following `clearThreadOutputQueues` finds nothing to discard and
+ * the drain is never double-sent (mirrors `processOutputQueue`'s snapshot
+ * discipline + the DM `finalizeDraft` reset-before-await). Idempotent + runs
+ * exactly once per turn: an empty buffer (a fully-delivered turn) is a no-op,
+ * so no duplicate post. The remainder rides the S1 bounded-redelivery path with
+ * `isImportant = pendingIsFinal` — a buffer that genuinely holds the final
+ * answer becomes redelivery-eligible, while a mid-turn drain (e.g. the
+ * status-ordering finalize) stays disposable.
+ */
+async function finalizeGroupOutput(key: ThreadKey): Promise<void> {
+  const q = outputQueues.get(keyToString(key));
+  if (!q) return;
+  const plan = getGroupFinalizePlan(q);
+  if (plan.action === 'noop') return; // fully delivered → no-op, no dupe.
+  // Snapshot is captured by the plan; null the buffer SYNCHRONOUSLY before the
+  // await so the immediately-following clear / a concurrent flush can't re-send it.
+  q.pendingOutput = null;
+  q.pendingIsFinal = false;
+  if (q.debounceTimer) {
+    clearTimeout(q.debounceTimer);
+    q.debounceTimer = null;
+  }
+  const { unsentRemainder } = await sendOutputImmediate(key, plan.text, plan.isContinuation, plan.isImportant);
+  // A final-answer remainder that still 429'd already armed its per-chunk S1
+  // redelivery inside sendOutputImmediate, so it is not lost. A non-important
+  // remainder at teardown is dropped (the buffer is being torn down anyway —
+  // unchanged from the pre-S2 discard). Either way, do NOT re-queue here: the
+  // queue is about to be cleared, and re-queuing would race that clear.
+  if (unsentRemainder && plan.isImportant) {
+    console.warn(`[send] ${keyToString(key)} final-answer remainder 429'd at finalize — S1 redelivery armed`);
   }
 }
 
@@ -6676,7 +6728,9 @@ async function handleAgentStatus(key: ThreadKey, status: string): Promise<void> 
   // status frame posts BELOW the latest content (never stranded above it). The
   // delete-status-on-output in `handleAgentOutput` is the other half: when content
   // resumes the stale status is removed and the next status re-posts below again.
-  // Group mode's transport noops this, so it stays a no-op there.
+  // Group mode now drains any coalesced-but-unsent output here too (S2), so the
+  // status likewise lands below content rather than above a still-buffered chunk;
+  // a fully-delivered turn is a no-op.
   await getOutputTransport().finalizeInFlight(key);
 
   const c = getStatusCoalesceState(key);
@@ -7338,7 +7392,9 @@ function handleAgentQuestion(key: ThreadKey, questionData: OpenCodePendingQuesti
   // The question UI takes over mid-stream — FINALIZE any in-flight content (DM:
   // the live draft so its already-accumulated text lands as a permanent message
   // above the prompt, not dropped; the finalize IS the persistence — no parallel
-  // queueOutput in DM). Fire-and-forget; group mode's transport noops it.
+  // queueOutput in DM. Group: drain any coalesced-but-unsent output so the answer
+  // lands above the prompt rather than behind it, S2). Fire-and-forget; a
+  // fully-delivered turn is a no-op for both.
   void getOutputTransport().finalizeInFlight(key);
   // The question UI replaces the "working" cue — stop the typing loader.
   stopTypingLoader(key);
@@ -8157,6 +8213,7 @@ export async function startBot(): Promise<void> {
       splitMessage,
       renderAgentHtml,
       maxMessageLength: MAX_MESSAGE_LEN,
+      finalizeGroupOutput,
     }),
   );
 

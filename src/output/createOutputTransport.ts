@@ -13,12 +13,20 @@ import { createDmOutputTransport, type DmOutputTransportDeps } from './dmOutputT
 export type OutputTransportDeps = DmOutputTransportDeps & {
   /** True iff the key belongs to the DM surface (its chat is the owner's). */
   checkIsDmKey(key: ThreadKey): boolean;
+  /**
+   * Group-path finalize: drain the thread's coalesced-but-unsent output buffer
+   * to a permanent message so the agent's final answer is never discarded on
+   * teardown (S2). Owned by `bot.ts` (it touches the output-queue state +
+   * `sendOutputImmediate`); the group transport just delegates `finalizeInFlight`
+   * to it. Idempotent — a fully-delivered turn is a no-op.
+   */
+  finalizeGroupOutput(key: ThreadKey): Promise<void>;
 };
 
 /**
  * @description The thin group output transport — `queueOutput` edit-in-place +
- * noop finalize/dispose, never the draft path. Shared by `group` mode and the
- * group leg of the `both` dispatcher.
+ * `finalizeGroupOutput` reconcile (S2) + noop dispose, never the draft path.
+ * Shared by `group` mode and the group leg of the `both` dispatcher.
  */
 function createGroupOutputTransport(deps: OutputTransportDeps): OutputTransport {
   return {
@@ -32,7 +40,12 @@ function createGroupOutputTransport(deps: OutputTransportDeps): OutputTransport 
         meta?.startsNewParagraph === true,
       );
     },
-    finalizeInFlight: async () => {},
+    // S2: drain the coalesced-but-unsent output to a permanent message so the
+    // final answer is never discarded on teardown. `bot.ts` owns the drain (it
+    // touches the output-queue state); idempotent — a fully-delivered turn is a
+    // no-op, so the status-ordering finalize and a fully-delivered teardown
+    // never double-post.
+    finalizeInFlight: (key) => deps.finalizeGroupOutput(key),
     disposeThread: () => {},
     checkIsStreaming: () => false,
   };

@@ -442,6 +442,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'apiRetry.giveUp':
       '⚠️ Не смог возобновить после {attempts} попыток. Напиши, когда продолжить.',
     'apiRetry.continueNudge': 'Продолжай с того места, где ты остановился.',
+
+    // ── delivery degraded under sustained Telegram 429 (S1/D2). Posted ONCE
+    //    per congestion window when a recoverable send's bounded redelivery is
+    //    exhausted — replaces the old silent console.error so the user knows
+    //    output was delayed/dropped, not that the bot hung ──
+    'send.degradedUnderLoad':
+      '⚠️ Telegram ограничивает скорость — часть сообщений задержалась или не доставлена. Попробуй ещё раз через минуту.',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -836,6 +843,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'apiRetry.giveUp':
       "⚠️ Couldn't resume after {attempts} attempts. Message me when to continue.",
     'apiRetry.continueNudge': 'Continue from where you left off.',
+
+    'send.degradedUnderLoad':
+      '⚠️ Telegram is rate-limiting — some messages were delayed or dropped. Try again in a minute.',
   },
 };
 

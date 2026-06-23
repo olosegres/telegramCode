@@ -1,18 +1,27 @@
 /**
- * @description B14 — pure decision behind redelivering a rate-limited
- * interactive reply after the 429 cooldown.
+ * @description S1 — pure decisions behind the BOUNDED post-cooldown redelivery
+ * of a rate-limited send (B14, now extended to the agent's final answer).
  *
- * The `null`-binding ambiguity is the crux: a fresh `/bind` folder-picker
- * thread (no binding yet) must be redelivered, but a thread the user just
- * unbound (binding wiped) must not. The decision disambiguates by comparing
- * the binding at send time with the binding now.
+ * Two crux behaviours:
+ *  - Eligibility: interactive replies are recoverable; the final answer is too
+ *    (via the explicit `isImportant` marker even though it rides `output`
+ *    priority); intermediate output / status stay disposable.
+ *  - Boundedness: the schedule walks at most `maxRedeliveryAttempts` passes and
+ *    then `exhausted` (the caller notifies), so a sustained 429 can never loop.
+ *
+ * The `null`-binding ambiguity is still load-bearing: a fresh `/bind`
+ * folder-picker thread (no binding yet) must be redelivered, but a thread the
+ * user just unbound (binding wiped) must not. The decision disambiguates by
+ * comparing the binding at send time with the binding now.
  */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
-  checkShouldRedeliverInteractive,
+  checkShouldRedeliver,
+  decideRedelivery,
   scheduleRedelivery,
+  maxRedeliveryAttempts,
 } from '../redeliverDecision';
 import type { BindingData } from '../state';
 import type { SendPriority } from '../rateLimiter';
@@ -23,62 +32,122 @@ const binding = (closed = false): BindingData => ({
   ...(closed ? { closed } : {}),
 });
 
-test('checkShouldRedeliverInteractive: only interactive priority is recoverable', () => {
+test('checkShouldRedeliver: interactive priority is recoverable, disposable output/status is not', () => {
   for (const priority of ['output', 'status'] as const) {
     assert.equal(
-      checkShouldRedeliverInteractive(priority, { hadBindingAtSend: true, bindingNow: binding() }),
+      checkShouldRedeliver(priority, /* isImportant */ false, { hadBindingAtSend: true, bindingNow: binding() }),
       false,
-      `${priority} must not be redelivered`,
+      `non-final ${priority} must not be redelivered`,
     );
   }
   assert.equal(
-    checkShouldRedeliverInteractive('interactive', { hadBindingAtSend: true, bindingNow: binding() }),
+    checkShouldRedeliver('interactive', false, { hadBindingAtSend: true, bindingNow: binding() }),
     true,
     'interactive on a live bound thread must be redelivered',
   );
 });
 
-test('checkShouldRedeliverInteractive: fresh folder-picker (no binding at send, still none) → redeliver', () => {
+test('checkShouldRedeliver: the FINAL answer (output + isImportant) is eligible', () => {
   assert.equal(
-    checkShouldRedeliverInteractive('interactive', { hadBindingAtSend: false, bindingNow: null }),
+    checkShouldRedeliver('output', /* isImportant */ true, { hadBindingAtSend: true, bindingNow: binding() }),
+    true,
+    'final-answer output is recoverable via the important marker',
+  );
+  // status is never important-marked in practice, but the class gate still holds.
+  assert.equal(
+    checkShouldRedeliver('status', /* isImportant */ false, { hadBindingAtSend: true, bindingNow: binding() }),
+    false,
+  );
+});
+
+test('checkShouldRedeliver: fresh folder-picker (no binding at send, still none) → redeliver', () => {
+  assert.equal(
+    checkShouldRedeliver('interactive', false, { hadBindingAtSend: false, bindingNow: null }),
     true,
   );
 });
 
-test('checkShouldRedeliverInteractive: unbound between send and cooldown (had binding, gone now) → skip', () => {
+test('checkShouldRedeliver: unbound between send and cooldown (had binding, gone now) → skip', () => {
   assert.equal(
-    checkShouldRedeliverInteractive('interactive', { hadBindingAtSend: true, bindingNow: null }),
+    checkShouldRedeliver('interactive', false, { hadBindingAtSend: true, bindingNow: null }),
     false,
   );
 });
 
-test('checkShouldRedeliverInteractive: closed topic → skip', () => {
+test('checkShouldRedeliver: closed topic → skip (even for the important final answer)', () => {
   assert.equal(
-    checkShouldRedeliverInteractive('interactive', { hadBindingAtSend: true, bindingNow: binding(true) }),
+    checkShouldRedeliver('interactive', false, { hadBindingAtSend: true, bindingNow: binding(true) }),
     false,
   );
-  // Closed wins even if the thread had no binding at send time.
   assert.equal(
-    checkShouldRedeliverInteractive('interactive', { hadBindingAtSend: false, bindingNow: binding(true) }),
+    checkShouldRedeliver('output', /* isImportant */ true, { hadBindingAtSend: true, bindingNow: binding(true) }),
     false,
+    'closed wins over the important final answer too',
   );
 });
 
-test('scheduleRedelivery: waits cooldown + slack, then redelivers exactly once', () => {
-  const cooldownMs = 1000;
+test('decideRedelivery: disposable class is ineligible (no schedule, no notice)', () => {
+  for (const priority of ['output', 'status'] as const) {
+    assert.deepEqual(
+      decideRedelivery({ priority, isImportant: false, attempt: 0, remainingCooldownMs: 1000, slackMs: 250 }),
+      { action: 'ineligible' },
+      `${priority} (non-final) → ineligible`,
+    );
+  }
+});
+
+test('decideRedelivery: schedules each pass at remaining cooldown + slack, then exhausts after N', () => {
   const slackMs = 250;
+  const remainingCooldownMs = 1000;
+  // attempts 0..N-1 schedule; attempt N is exhausted.
+  for (let attempt = 0; attempt < maxRedeliveryAttempts; attempt++) {
+    const decision = decideRedelivery({ priority: 'interactive', isImportant: false, attempt, remainingCooldownMs, slackMs });
+    assert.deepEqual(
+      decision,
+      { action: 'schedule', delayMs: remainingCooldownMs + slackMs },
+      `attempt ${attempt} must still schedule`,
+    );
+  }
+  assert.deepEqual(
+    decideRedelivery({ priority: 'interactive', isImportant: false, attempt: maxRedeliveryAttempts, remainingCooldownMs, slackMs }),
+    { action: 'exhausted' },
+    'attempt at the cap must exhaust → caller notifies',
+  );
+});
+
+test('decideRedelivery: the final answer (important output) follows the same bounded schedule', () => {
+  const ok = decideRedelivery({ priority: 'output', isImportant: true, attempt: 0, remainingCooldownMs: 500, slackMs: 100 });
+  assert.deepEqual(ok, { action: 'schedule', delayMs: 600 });
+  const spent = decideRedelivery({ priority: 'output', isImportant: true, attempt: maxRedeliveryAttempts, remainingCooldownMs: 500, slackMs: 100 });
+  assert.deepEqual(spent, { action: 'exhausted' });
+});
+
+test('decideRedelivery: backoff is clamped to the max so a pathological retry_after cannot park for minutes', () => {
+  const decision = decideRedelivery({
+    priority: 'interactive',
+    isImportant: false,
+    attempt: 0,
+    remainingCooldownMs: 10 * 60_000,
+    slackMs: 250,
+    maxBackoffMs: 60_000,
+  });
+  assert.deepEqual(decision, { action: 'schedule', delayMs: 60_000 });
+});
+
+test('scheduleRedelivery: waits the precomputed delay, then redelivers exactly once', () => {
+  const delayMs = 1250;
   let scheduledMs: number | null = null;
   let scheduledFn: (() => void) | null = null;
   let delivered = 0;
 
-  scheduleRedelivery('interactive', true, slackMs, {
-    getRemainingCooldownMs: () => cooldownMs,
+  scheduleRedelivery('interactive', /* isImportant */ false, /* hadBindingAtSend */ true, {
+    delayMs,
     scheduleAfter: (fn, ms) => { scheduledFn = fn; scheduledMs = ms; },
     getBindingNow: () => binding(),
     redeliver: () => { delivered += 1; },
   });
 
-  assert.equal(scheduledMs, cooldownMs + slackMs, 'must defer past the cooldown boundary');
+  assert.equal(scheduledMs, delayMs, 'must defer for the precomputed delay');
   assert.equal(delivered, 0, 'nothing before the tick');
 
   scheduledFn!();
@@ -91,8 +160,8 @@ test('scheduleRedelivery: re-checks target at fire time and skips a now-invalid 
   let skipReason: string | null = null;
 
   // Had a binding at send time; by fire time it is gone (unbound).
-  scheduleRedelivery('interactive', true, 250, {
-    getRemainingCooldownMs: () => 0,
+  scheduleRedelivery('interactive', false, /* hadBindingAtSend */ true, {
+    delayMs: 250,
     scheduleAfter: (fn) => { scheduledFn = fn; },
     getBindingNow: () => null,
     redeliver: () => { delivered += 1; },
@@ -108,8 +177,8 @@ test('scheduleRedelivery: a disposable class never even arms the redeliver call'
   let scheduledFn: (() => void) | null = null;
   let delivered = 0;
   const priority: SendPriority = 'output';
-  scheduleRedelivery(priority, true, 250, {
-    getRemainingCooldownMs: () => 0,
+  scheduleRedelivery(priority, /* isImportant */ false, true, {
+    delayMs: 250,
     scheduleAfter: (fn) => { scheduledFn = fn; },
     getBindingNow: () => binding(),
     redeliver: () => { delivered += 1; },

@@ -299,8 +299,8 @@ test('B14: bucket drained + chat blocked → double-429 → interactive reply re
   const timer = createManualTimer();
   let delivered = 0;
   const slackMs = 250;
-  scheduleRedelivery('interactive', /* hadBindingAtSend */ true, slackMs, {
-    getRemainingCooldownMs: () => getRateLimitRemainingMs(chatId),
+  scheduleRedelivery('interactive', /* isImportant */ false, /* hadBindingAtSend */ true, {
+    delayMs: getRateLimitRemainingMs(chatId) + slackMs,
     scheduleAfter: timer.scheduleAfter,
     getBindingNow: () => binding(),
     redeliver: () => { delivered += 1; },
@@ -322,27 +322,40 @@ test('B14: bucket drained + chat blocked → double-429 → interactive reply re
   assert.equal(delivered, 1, 'no second redelivery — bounded to one requeue');
 });
 
-test('B14: no redelivery for output/status priority classes (disposable content)', () => {
+test('B14: no redelivery for disposable (non-final output / status) content', () => {
   for (const priority of ['output', 'status'] as const) {
     const timer = createManualTimer();
     let delivered = 0;
-    scheduleRedelivery(priority, true, 250, {
-      getRemainingCooldownMs: () => 1000,
+    scheduleRedelivery(priority, /* isImportant */ false, true, {
+      delayMs: 1000,
       scheduleAfter: timer.scheduleAfter,
       getBindingNow: () => binding(),
       redeliver: () => { delivered += 1; },
     });
     timer.fireAll();
-    assert.equal(delivered, 0, `${priority} must never be redelivered`);
+    assert.equal(delivered, 0, `non-final ${priority} must never be redelivered`);
   }
+});
+
+test('B14: the FINAL answer (important output) IS redelivered', () => {
+  const timer = createManualTimer();
+  let delivered = 0;
+  scheduleRedelivery('output', /* isImportant */ true, true, {
+    delayMs: 1000,
+    scheduleAfter: timer.scheduleAfter,
+    getBindingNow: () => binding(),
+    redeliver: () => { delivered += 1; },
+  });
+  timer.fireAll();
+  assert.equal(delivered, 1, 'the final answer rides output priority but is recoverable');
 });
 
 test('B14: no redelivery when the thread was unbound between send and cooldown', () => {
   const timer = createManualTimer();
   let delivered = 0;
   // Had a binding at send time, but it is gone now → torn down → skip.
-  scheduleRedelivery('interactive', /* hadBindingAtSend */ true, 250, {
-    getRemainingCooldownMs: () => 1000,
+  scheduleRedelivery('interactive', false, /* hadBindingAtSend */ true, {
+    delayMs: 1000,
     scheduleAfter: timer.scheduleAfter,
     getBindingNow: () => null,
     redeliver: () => { delivered += 1; },
@@ -355,8 +368,8 @@ test('B14: redelivers a still-unbound fresh folder-picker thread (no binding at 
   const timer = createManualTimer();
   let delivered = 0;
   // The live repro: bare /bind folder list on a thread with no binding yet.
-  scheduleRedelivery('interactive', /* hadBindingAtSend */ false, 250, {
-    getRemainingCooldownMs: () => 1000,
+  scheduleRedelivery('interactive', false, /* hadBindingAtSend */ false, {
+    delayMs: 1000,
     scheduleAfter: timer.scheduleAfter,
     getBindingNow: () => null,
     redeliver: () => { delivered += 1; },
@@ -368,8 +381,8 @@ test('B14: redelivers a still-unbound fresh folder-picker thread (no binding at 
 test('B14: no redelivery into a closed topic', () => {
   const timer = createManualTimer();
   let delivered = 0;
-  scheduleRedelivery('interactive', true, 250, {
-    getRemainingCooldownMs: () => 1000,
+  scheduleRedelivery('interactive', false, true, {
+    delayMs: 1000,
     scheduleAfter: timer.scheduleAfter,
     getBindingNow: () => binding(/* closed */ true),
     redeliver: () => { delivered += 1; },

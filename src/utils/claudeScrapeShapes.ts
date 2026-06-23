@@ -18,6 +18,22 @@
  */
 
 /**
+ * @description The full set of leading spinner / bullet glyphs the Claude TUI
+ * (and the bot's own rotating liveness frame, `CLAUDE_LIVENESS_GLYPHS =
+ * ['✻','✽','✶','✢']`) may prepend to a status/activity line, anchored at the
+ * line start with its trailing whitespace. Stripping it yields a
+ * GLYPH-INSENSITIVE signature so a frame that changed only its animation glyph
+ * dedups as identical. ONE definition for every call site that strips the lead
+ * glyph (status dedup, the liveness frame, the adapter's status dedup).
+ */
+export const LEADING_SPINNER_GLYPH_RE = /^[✻✽✶✢·*●○⏺]\s*/;
+
+/** Strip a single leading spinner/bullet glyph (+ trailing ws) from a line. */
+export function stripLeadingSpinnerGlyph(line: string): string {
+  return line.replace(LEADING_SPINNER_GLYPH_RE, '');
+}
+
+/**
  * @description Active spinner tick, per-line shape used by Claude's TUI
  * while it is thinking or running a tool. Examples:
  *   `✽ Doing… (4s · ↓ 14 tokens)`

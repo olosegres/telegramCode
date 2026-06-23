@@ -112,6 +112,7 @@ import {
   type FileSendItem,
 } from './utils/fileSendPlan';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import { stripLeadingSpinnerGlyph } from './utils/claudeScrapeShapes';
 import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
 import {
   getThinkingEventAction,
@@ -6977,7 +6978,7 @@ function getClaudeLivenessFrameText(state: ThreadMessageState): string {
   if (activity) {
     // Swap the scrape's own leading spinner glyph for our rotating one so the
     // heartbeat shows while preserving the activity word + elapsed/token tail.
-    const withoutLeadGlyph = activity.replace(/^[✻✽✶✢·*●○]\s*/, '');
+    const withoutLeadGlyph = stripLeadingSpinnerGlyph(activity);
     return `${glyph} ${withoutLeadGlyph}`;
   }
   return t('agent.workingIndicator', { glyph });

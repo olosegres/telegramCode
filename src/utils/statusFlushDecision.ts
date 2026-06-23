@@ -14,13 +14,19 @@
  * @description
  * - `send`   — text differs from the last sent frame and the chat is not in a
  *   cooldown: send it now.
- * - `skip`   — text equals the last sent frame: sending it would only earn a
- *   `400 "message is not modified"` and waste a token. Consume `pendingText`
- *   and move on.
+ * - `skip`   — text equals the last sent frame after stripping the leading
+ *   spinner glyph: sending it would either earn a `400 "message is not
+ *   modified"` (truly identical) or an `editMessageText` that changed ONLY the
+ *   rotating liveness glyph — a per-second edit purely for animation. Either
+ *   way it wastes a token, so consume `pendingText` and move on. The native
+ *   typing indicator already carries alive-ness; the visible status frame's
+ *   glyph effectively freezes until the activity text actually changes.
  * - `defer`  — the chat is rate-limited: do NOT send (a stale spinner frame is
  *   not worth a token while a 429 cooldown is starving real traffic). Leave
  *   `pendingText` in place so the newest frame is sent once the cooldown lifts.
  */
+import { stripLeadingSpinnerGlyph } from './claudeScrapeShapes';
+
 export type StatusFlushAction = 'send' | 'skip' | 'defer';
 
 export interface StatusFlushDecisionInput {
@@ -41,6 +47,13 @@ export interface StatusFlushDecisionInput {
  */
 export function getStatusFlushAction(input: StatusFlushDecisionInput): StatusFlushAction {
   if (input.isRateLimited) return 'defer';
-  if (input.nextText === input.lastSentText) return 'skip';
+  if (input.lastSentText === null) return 'send';
+  // Compare on a glyph-stripped signature: the liveness frame rotates its
+  // leading spinner glyph every tick, so an exact-string compare treated each
+  // cosmetic-only tick as new → one editMessageText per second. Equal after
+  // stripping the lead glyph ⇒ skip (no edit); a real activity-text change ⇒ send.
+  if (stripLeadingSpinnerGlyph(input.nextText) === stripLeadingSpinnerGlyph(input.lastSentText)) {
+    return 'skip';
+  }
   return 'send';
 }

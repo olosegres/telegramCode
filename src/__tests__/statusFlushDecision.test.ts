@@ -31,6 +31,29 @@ test('skip: identical frame text avoids a "message is not modified" 400', () => 
   );
 });
 
+test('skip: two frames differing ONLY by the leading liveness glyph (S2 — no edit/sec)', () => {
+  // The liveness frame rotates ✻ ✽ ✶ ✢ every 1s tick; pre-fix the exact-string
+  // compare treated each cosmetic tick as new → one editMessageText per second.
+  assert.equal(
+    getStatusFlushAction({ nextText: '✽ 🔧 Update', lastSentText: '✻ 🔧 Update', isRateLimited: false }),
+    'skip',
+  );
+});
+
+test('send: a REAL activity-text change still sends even though the glyph also rotated', () => {
+  assert.equal(
+    getStatusFlushAction({ nextText: '✽ 🔧 Read', lastSentText: '✻ 🔧 Update', isRateLimited: false }),
+    'send',
+  );
+});
+
+test('send: first frame (no lastSentText) sends regardless of glyph stripping', () => {
+  assert.equal(
+    getStatusFlushAction({ nextText: '✻ 🔧 Update', lastSentText: null, isRateLimited: false }),
+    'send',
+  );
+});
+
 test('defer: any frame during a 429 cooldown is held, not sent', () => {
   assert.equal(
     getStatusFlushAction({ nextText: 'Thinking… 9s', lastSentText: 'Thinking… 8s', isRateLimited: true }),

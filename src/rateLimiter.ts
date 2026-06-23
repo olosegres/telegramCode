@@ -1,6 +1,8 @@
 import { sleep } from './utils';
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
+import { SendRateTracker } from './utils/sendRateTracker';
+import { formatRateLimit429Line, formatRateSummaryLine } from './utils/rateLimitLog';
 
 /**
  * @description Telegram-side rate limiting for the multi-thread bot.
@@ -159,6 +161,19 @@ export class TokenBucket {
       + this.waiters.status.length;
   }
 
+  /**
+   * Snapshot of how many sends are currently parked on this bucket, by
+   * priority class. Read-only — used by the 429 instrumentation to capture the
+   * queue depth + priority mix at the moment Telegram pushed back.
+   */
+  getWaitersByPriority(): Record<SendPriority, number> {
+    return {
+      interactive: this.waiters.interactive.length,
+      output: this.waiters.output.length,
+      status: this.waiters.status.length,
+    };
+  }
+
   /** Grant available tokens to waiting takers, highest priority first. */
   private dispatch(): void {
     this.refill();
@@ -215,6 +230,42 @@ export const rateLimiterConstants = {
   bucketRefillPerSec,
   bucketCapacity,
 } as const;
+
+/**
+ * @description Always-on per-chat outbound send-rate instrumentation
+ * (plan 2026-06-24-rate-limit-429-metrics). Records every outbound send at the
+ * single chokepoint ({@link enqueueSend}), so the rich 429 log line and the
+ * periodic rate summary can characterise how hard each chat's channel is being
+ * pushed. Bounded + best-effort — it never throws into the send hot path.
+ */
+const sendRateTracker = new SendRateTracker();
+
+/**
+ * @description Snapshot of one chat's recent outbound rate, for the periodic
+ * summary in `bot.ts`. Returned together with the chat id by
+ * {@link getActiveChatRateSummaries}.
+ */
+export interface ChatRateSummary {
+  chatId: number;
+  sentPerMin: number;
+  peak10s: number;
+}
+
+/**
+ * @description Per-chat outbound-rate snapshots for every chat with activity in
+ * the rolling minute (silent chats omitted). The `bot.ts` periodic janitor logs
+ * these as `[RateLimit] rate …` lines — see {@link formatRateSummaryLine}.
+ */
+export function getActiveChatRateSummaries(nowMs: number = Date.now()): ChatRateSummary[] {
+  return sendRateTracker.getActiveChats(nowMs).map((chatId) => ({
+    chatId,
+    sentPerMin: sendRateTracker.getSendsPerMin(chatId, nowMs),
+    peak10s: sendRateTracker.getPeakInSubWindow(chatId, undefined, nowMs),
+  }));
+}
+
+/** Re-export the pure summary formatter so `bot.ts` has one import surface. */
+export { formatRateSummaryLine };
 
 /**
  * @description Per-thread FIFO of in-flight sends, keyed by serialised
@@ -312,11 +363,40 @@ function checkIsTelegramRateLimitError(err: unknown): err is TelegramErrorLike {
   return e.response?.error_code === 429;
 }
 
+/** Default cooldown when Telegram omits `retry_after` (mirrors {@link getRetryAfterMs}). */
+const defaultRetryAfterSec = 30;
+
 function getRetryAfterMs(err: TelegramErrorLike): number {
-  const retryAfterSec = err.response?.parameters?.retry_after ?? 30;
+  const retryAfterSec = err.response?.parameters?.retry_after ?? defaultRetryAfterSec;
   // Add jitter: multiply by random factor 1.0–1.3 to avoid thundering herd
   const jitter = 1 + Math.random() * 0.3;
   return Math.ceil(retryAfterSec * 1000 * jitter);
+}
+
+/** The raw `retry_after` Telegram returned (seconds) — the value we log. */
+function getRawRetryAfterSec(err: TelegramErrorLike): number {
+  return err.response?.parameters?.retry_after ?? defaultRetryAfterSec;
+}
+
+/**
+ * @description Emit the rich, greppable `[RateLimit] 429` instrumentation line
+ * for one 429, gathering the measured send-rate (from the tracker) and the
+ * queue depth + priority mix (from the chat's bucket). Best-effort: a failure
+ * to build the line must never mask the 429 handling itself.
+ */
+function logRateLimit429(chatId: number, err: TelegramErrorLike, isAfterRetry: boolean): void {
+  try {
+    const line = formatRateLimit429Line({
+      chatId,
+      retryAfterSec: getRawRetryAfterSec(err),
+      sentPerMin: sendRateTracker.getSendsPerMin(chatId),
+      peak10s: sendRateTracker.getPeakInSubWindow(chatId),
+      waitersByPriority: getBucket(chatId).getWaitersByPriority(),
+      isAfterRetry,
+    });
+    if (isAfterRetry) console.error(line);
+    else console.log(line);
+  } catch { /* instrumentation must never break 429 handling */ }
 }
 
 /**
@@ -349,7 +429,7 @@ export async function withRateLimitRetry<T>(
 
     const waitMs = getRetryAfterMs(err);
     state.blockedUntil = Date.now() + waitMs;
-    console.log(`[RateLimit] chat ${chatId} hit 429, waiting ${Math.ceil(waitMs / 1000)}s before retry`);
+    logRateLimit429(chatId, err, /* isAfterRetry */ false);
 
     await sleep(waitMs);
 
@@ -362,7 +442,7 @@ export async function withRateLimitRetry<T>(
       if (checkIsTelegramRateLimitError(retryErr)) {
         const secondWaitMs = getRetryAfterMs(retryErr);
         state.blockedUntil = Date.now() + secondWaitMs;
-        console.error(`[RateLimit] chat ${chatId} still 429 after retry, blocked for ${Math.ceil(secondWaitMs / 1000)}s`);
+        logRateLimit429(chatId, retryErr, /* isAfterRetry */ true);
         // Surface a typed error so a content-owning caller (interactive
         // replies) can decide to redeliver once after the cooldown instead
         // of dropping the message (B14). Cooldown is already set above so
@@ -412,6 +492,9 @@ export async function enqueueSend<T>(
 
   const exec = async (): Promise<T> => {
     await getBucket(key.chatId).take(priority);
+    // Record exactly one outbound send per logical send at the single
+    // chokepoint (best-effort instrumentation — never let it break a send).
+    try { sendRateTracker.recordSend(key.chatId); } catch { /* never throw into the send path */ }
     return withRateLimitRetry(key.chatId, fn);
   };
 

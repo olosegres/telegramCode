@@ -51,6 +51,8 @@ import {
   checkIsRateLimited,
   getRateLimitRemainingMs,
   checkIsRateLimitedError,
+  getActiveChatRateSummaries,
+  formatRateSummaryLine,
   type SendPriority,
 } from './rateLimiter';
 import { scheduleRedelivery, decideRedelivery, maxRedeliveryAttempts } from './redeliverDecision';
@@ -8402,6 +8404,26 @@ export async function startBot(): Promise<void> {
   const fileSweepInterval = setInterval(runFileSweep, fileSweepIntervalMs);
   fileSweepInterval.unref();
 
+  // 5e. Periodic per-chat outbound-rate summary (always-on instrumentation,
+  //     plan 2026-06-24-rate-limit-429-metrics). Every ~5 min, log a
+  //     `[RateLimit] rate chat=… sent/min=… peak10s=…` line for each chat with
+  //     activity in the rolling minute (silent chats skipped) into bot-console.
+  //     Lets us see how close normal operation runs to the per-chat ceiling
+  //     WITHOUT needing a 429. Separate from the daily file sweep because the
+  //     cadence differs; `unref`'d so it never keeps the process alive.
+  const rateSummaryIntervalMs = 5 * 60 * 1000;
+  const runRateSummary = (): void => {
+    try {
+      for (const summary of getActiveChatRateSummaries()) {
+        console.log(formatRateSummaryLine(summary.chatId, summary.sentPerMin, summary.peak10s));
+      }
+    } catch (e) {
+      console.warn('[RateLimit] rate summary failed:', e);
+    }
+  };
+  const rateSummaryInterval = setInterval(runRateSummary, rateSummaryIntervalMs);
+  rateSummaryInterval.unref();
+
   // 6. Global catch — Telegraf swallows handler errors otherwise.
   bot.catch((err, ctx) => {
     if (checkIsStaleAnswerCallbackQueryError(err)) {
@@ -8431,6 +8453,7 @@ export async function startBot(): Promise<void> {
         clearInterval(inMemoryGcInterval);
         clearInterval(heartbeatInterval);
         clearInterval(fileSweepInterval);
+        clearInterval(rateSummaryInterval);
         // Scheduler (S8): clear every armed job timer; persisted nextRunAt
         // means the next boot's rearmAll picks them back up (catch-up replay).
         schedulerEngine?.shutdown();

@@ -102,9 +102,9 @@ test('R7: bucket allows a full burst without delay, then paces at the group ceil
   );
 });
 
-test('refill math: sustained rate ≈ groupMessagesPerMinute/60 (≈3s per token after drain)', () => {
+test('refill math: sustained rate ≈ groupMessagesPerMinute/60 (one refill interval per token after drain)', () => {
   const clock = createFakeClock();
-  const { bucketCapacity, bucketRefillPerSec } = rateLimiterConstants;
+  const { bucketCapacity, bucketRefillPerSec, groupMessagesPerMinute } = rateLimiterConstants;
   const bucket = new TokenBucket(bucketCapacity, bucketRefillPerSec, clock);
 
   // Drain the whole burst capacity instantly (no time advance). The fast
@@ -112,9 +112,15 @@ test('refill math: sustained rate ≈ groupMessagesPerMinute/60 (≈3s per token
   for (let i = 0; i < bucketCapacity; i++) void bucket.take('interactive');
 
   // Now the bucket is empty. Queue 3 more takers and prove each needs one
-  // refill interval (~3s) — i.e. N tokens take ≈ N * (1000 / refillPerSec) ms.
+  // refill interval — i.e. N tokens take ≈ N * (1000 / refillPerSec) ms. The
+  // expected interval is derived from the constants (60_000 / msgs-per-min), so
+  // this stays correct if the budget is retuned (e.g. 40/min ⇒ 1500ms/token).
   const msPerToken = 1000 / bucketRefillPerSec;
-  assert.ok(Math.abs(msPerToken - 3000) < 1, `expected ~3000ms/token, got ${msPerToken}`);
+  const expectedMsPerToken = 60_000 / groupMessagesPerMinute;
+  assert.ok(
+    Math.abs(msPerToken - expectedMsPerToken) < 1,
+    `expected ~${expectedMsPerToken}ms/token, got ${msPerToken}`,
+  );
 
   const order: number[] = [];
   bucket.take('interactive').then(() => order.push(1));

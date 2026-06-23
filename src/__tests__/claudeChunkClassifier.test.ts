@@ -268,6 +268,62 @@ test('a genuine ⎿ stdout line (not a tool-header) under an open tool is toolBo
   assert.equal(findSegment(segments, ClaudeChunkTag.SubagentPanelPreview), undefined);
 });
 
+// ─── orphan ⎿ tool result (header consumed by a prior poll's line-SET diff) ──
+
+test('S1: an orphan ⎿ result (no open kind) → toolBody, NOT prose (minimal must fold it)', () => {
+  // The real-world leak (thread -1001111111111:434): the `⏺ Bash(…)` header was
+  // dropped by the per-poll line-SET diff, an interleaved prose sentence nulled
+  // the cross-poll tool context, so the slow `⎿` output arrived header-less with
+  // toolKind === null. Pre-fix it fell to Prose → router always keeps → leaked
+  // into the topic despite minimal. Now a leading `⎿` opens a synthetic output
+  // kind so the block (and its indented continuation) tags toolBody.
+  const chunk = [
+    '⎿  trace rows: 2199',
+    '     first matching row at offset 12',
+    '     last matching row at offset 2187',
+    '     scan completed in 41ms',
+  ].join('\n');
+  const { segments, outgoingContext } = classifyClaudeChunk(chunk, createInitialChunkContext());
+
+  assert.deepEqual(segments.map(s => s.tag), [ClaudeChunkTag.ToolBody]);
+  assert.ok(
+    segments[0].text.includes('trace rows: 2199'),
+    'the ⎿ result line is part of the tool body',
+  );
+  assert.ok(
+    segments[0].text.includes('scan completed in 41ms'),
+    'the indented continuation lines stay in the same tool body',
+  );
+  assert.equal(outgoingContext.toolKind, 'output', 'a synthetic output kind is opened');
+});
+
+test('S1 cross-poll: header poll → interleaved prose nulls context → orphan ⎿ block folds', () => {
+  // Poll 1: the header opens the kind, an assistant sentence then CLOSES it
+  // (rule #10) — exactly the interleave that produced toolKind === null.
+  const poll1 = classifyClaudeChunk(
+    ['⏺ *Bash*(grep -c match trace.log)', 'Let me check how many rows matched.'].join('\n'),
+    createInitialChunkContext(),
+  );
+  assert.equal(poll1.outgoingContext.toolKind, null, 'the interleaved prose nulled the tool kind');
+
+  // Poll 2: the slow `⎿` output arrives header-less → still toolBody via the
+  // synthetic open, so minimal folds it instead of leaking it as prose.
+  const poll2 = classifyClaudeChunk(
+    ['⎿  trace rows: 2199', '     done'].join('\n'),
+    poll1.outgoingContext,
+  );
+  assert.deepEqual(poll2.segments.map(s => s.tag), [ClaudeChunkTag.ToolBody]);
+});
+
+test('S1 regression: a multi-line prose answer with NO ⎿ still classifies prose (never swallowed)', () => {
+  const chunk = [
+    'Here is the summary of what I found.',
+    'The migration renames the field and remaps its values.',
+    'No further action is required on your side.',
+  ].join('\n');
+  assert.deepEqual(getTags(chunk), [ClaudeChunkTag.Prose]);
+});
+
 // ─── adjacent same-tag coalescing ──────────────────────────────────────
 
 test('adjacent same-tag lines coalesce into one segment', () => {

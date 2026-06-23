@@ -153,6 +153,33 @@ describe('routeClaudeChunkSegments — tool body by mode', () => {
   });
 });
 
+describe('routeClaudeChunkSegments — orphan ⎿ tool result (S1)', () => {
+  // The header was consumed by a prior poll's line-SET diff and an interleaved
+  // prose sentence nulled the tool context, so the `⎿` output arrives with no
+  // open kind. The classifier now opens a synthetic output kind → the router
+  // must fold it at minimal exactly like a header-bearing body.
+  const orphanResult = [
+    '⎿  trace rows: 2199',
+    '     first matching row at offset 12',
+    '     scan completed in 41ms',
+  ].join('\n');
+
+  it('minimal → the orphan ⎿ block is FOLDED, never leaked into permanent text', () => {
+    const routed = routeAtMode(orphanResult, 'minimal');
+    assert.equal(routed.keptText, '', 'nothing permanent — the result is folded at minimal');
+    assert.ok(!routed.keptText.includes('⎿'), 'the ⎿ marker never leaks as permanent output');
+    assert.ok(!routed.keptText.includes('trace rows: 2199'), 'the result content never leaks');
+    assert.ok(routed.activityLine?.startsWith('ACTIVITY:'), 'it folds into a 🔧 tool activity line');
+  });
+
+  it('full → the orphan ⎿ block is kept verbatim (tool body still visible)', () => {
+    const routed = routeAtMode(orphanResult, 'full');
+    assert.ok(routed.keptText.includes('trace rows: 2199'), 'the result line is kept at full');
+    assert.ok(routed.keptText.includes('scan completed in 41ms'), 'the continuation is kept at full');
+    assert.equal(routed.activityLine, null, 'nothing folded at full');
+  });
+});
+
 describe('routeClaudeChunkSegments — thinking block by mode (S5)', () => {
   // A finished reasoning block: the duration-bearing header + a `⎿` summary
   // body, classified together into one ThinkingBlock segment.

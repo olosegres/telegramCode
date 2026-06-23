@@ -260,15 +260,18 @@ export function classifyClaudeChunk(
       continue;
     }
 
-    // 6. `⎿` result marker. With an open tool kind it is the tool body; with no
-    // open kind the owner is unknown (a thinking `⎿` was handled above) — the
-    // adapter leaves it as prose, so do we.
+    // 6. `⎿` result marker. With an open tool kind it is the tool body. With no
+    // open kind the header was consumed by a prior poll's line-SET diff and an
+    // interleaved prose line nulled the context (rule #10) — the `⎿` glyph is
+    // itself a positive tool-result signal in the TUI, so OPEN a synthetic
+    // `output` kind and tag it ToolBody. The indented-continuation branch (#7)
+    // then keeps the rest of the orphan result region as ToolBody until a solid
+    // prose line ends the run. Without this an orphan `⎿ trace rows: …` block
+    // leaked as Prose, which the router always keeps even in minimal.
     if (TOOL_RESULT_MARKER_RE.test(line)) {
-      if (context.toolKind !== null) {
-        push(ClaudeChunkTag.ToolBody, line);
-      } else {
-        push(ClaudeChunkTag.Prose, line);
-      }
+      if (context.toolKind === null) context.toolKind = 'output';
+      context.isSubagentPanelOpen = false;
+      push(ClaudeChunkTag.ToolBody, line);
       continue;
     }
 

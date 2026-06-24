@@ -491,6 +491,12 @@ export function checkIsStatusOutput(text: string): boolean {
 
   return lines.every(line => {
     const trimmed = line.trim();
+    // The ANSWER bullet `●`/`⏺` followed by text is real OUTPUT, never a spinner —
+    // it is Claude's assistant-output marker, NOT a liveness glyph (the liveness
+    // set is `✻✽✶✢·*○`). Lumping it in with the spinner glyphs made a fully short
+    // answer like `● DONE` read as a glyph-led status frame and vanish entirely
+    // (live bug 2026-06-24). A bare bullet with no text stays status-eligible.
+    if (/^[●⏺]\s+\S/.test(trimmed)) return false;
     // Tree structure / subagent progress lines (├─, └─, │, ─)
     if (/^[├└│─]/.test(trimmed)) return true;
     // Contains unicode ellipsis — universal spinner/progress indicator ("Nesting…", "Reading…", "Simmering…")
@@ -501,8 +507,19 @@ export function checkIsStatusOutput(text: string): boolean {
     // bugs.") is real content, not a spinner — spinners always carry a `…`, a
     // glyph, or token stats (caught above). Don't swallow it into a status.
     const isShortSentence = /[а-яёa-z]{2,}/i.test(trimmed) && /[.!?]$/.test(trimmed);
-    // Very short line without sentence-like structure (two 3+ letter words) — likely a lone spinner/icon
-    if (trimmed.length < 40 && !isShortSentence && !/[а-яёa-z]{3,}\s+[а-яёa-z]{3,}/i.test(trimmed)) return true;
+    if (isShortSentence) return false;
+    // Two or more significant words (3+ letters each) ANYWHERE = real prose, not a
+    // spinner icon. The words need NOT be adjacent — a short filler word / digits /
+    // punctuation between them (e.g. «Итог ПО миксу», "Решение ЗА тобой") must not
+    // defeat the count (live bug 2026-06-24: the old adjacency requirement read a
+    // real 3-word heading as word-less → status → swallowed). The glyph/`…`/stats/
+    // tree STATUS checks above run FIRST, so a genuine `✻ Compacting conversation…`
+    // (2 real words but `…`-bearing AND glyph-led) still reads as status.
+    const significantWordCount = (trimmed.match(/[а-яёa-z]{3,}/gi) ?? []).length;
+    if (significantWordCount >= 2) return false;
+    // A short line with no sentence-like structure and < 2 real words — a lone
+    // spinner/icon/stat fragment.
+    if (trimmed.length < 40) return true;
     return false;
   });
 }

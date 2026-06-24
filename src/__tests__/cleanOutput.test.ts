@@ -420,6 +420,48 @@ test('checkIsStatusOutput: a lone `NN +` diff gutter is PERMANENT output, not st
   assert.equal(checkIsStatusOutput('40 -'), true, 'a lone `-` gutter is NOT force-permanent');
 });
 
+// ─── checkIsStatusOutput — bullet-led / filler-separated real prose is NOT status ───
+
+test('checkIsStatusOutput: a bullet-led short answer "● DONE" / "⏺ DONE" is real content', () => {
+  // Live bug 2026-06-24 (topics 434 + 9085): the answer bullet `●`/`⏺` was lumped
+  // into the same glyph class as the liveness spinner `✻✽✶✢`, so a fully short
+  // answer like `● DONE` read as a glyph-led status frame and vanished entirely.
+  // The answer bullet followed by text is ALWAYS content, regardless of length.
+  assert.equal(checkIsStatusOutput('● DONE'), false);
+  assert.equal(checkIsStatusOutput('⏺ DONE'), false);
+});
+
+test('checkIsStatusOutput: a 3-word heading separated by a filler word is real content', () => {
+  // Live bug 2026-06-24: the "real words" test required two 3+-letter words to be
+  // ADJACENT, so the 2-letter filler «по» between "Итог" and "миксу" defeated it
+  // and a real 3-significant-word heading read as word-less → status, and was
+  // swallowed (the body landed headless). ≥2 significant words ANYWHERE = content.
+  assert.equal(checkIsStatusOutput('*Итог по миксу 434 (подтверждено):*'), false);
+});
+
+test('checkIsStatusOutput: a filler-word-separated answer phrase is real content', () => {
+  // The em-dash / digits between long words must not defeat the word count.
+  assert.equal(checkIsStatusOutput('Готово — план переписан и закоммичен.'), false);
+});
+
+test('checkIsStatusOutput: a heading ending in ":" with ≥2 long words is real content', () => {
+  // Ends in `:` (so the short-sentence `[.!?]$` rule does NOT fire) yet carries
+  // two real words → must read as content, not a spinner icon.
+  assert.equal(checkIsStatusOutput('Решение за тобой:'), false);
+});
+
+test('checkIsStatusOutput: genuine spinner / progress shapes stay status (no over-fix)', () => {
+  // Guard against over-fixing: a lone glyph, a lone `·`, token stats, a glyph-led
+  // `…` line (2 real words but a genuine spinner), a token-stat spinner, and a
+  // lone tree line must ALL stay status even after the bullet/word-count change.
+  assert.equal(checkIsStatusOutput('✻'), true);
+  assert.equal(checkIsStatusOutput('·'), true);
+  assert.equal(checkIsStatusOutput('↓ 12.2k tokens'), true);
+  assert.equal(checkIsStatusOutput('✻ Compacting conversation…'), true);
+  assert.equal(checkIsStatusOutput('✽ Smooshing… (1m 49s · ↑ 3.3k tokens)'), true);
+  assert.equal(checkIsStatusOutput('├─'), true);
+});
+
 // ─── N3 — bold around spinner glyph cleanup ────────────────────────────
 
 test('convertAnsiToMarkdown: drops *...* around single spinner glyph "·"', () => {

@@ -232,6 +232,44 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
 }
 
 /**
+ * @description Seed a FRESH relay window from a full pane snapshot so a re-render
+ * of content ALREADY ON the pane is recognised as already-relayed on the very
+ * first poll — never re-emitted.
+ *
+ * WHY (live incident 2026-06-24, thread 434): on adopt/re-attach the bot already
+ * seeds the pane-diff baseline (`lastContent`), which suppresses re-appearing
+ * PROSE. But a SETTLED table already on the pane is deduped ONLY at the BLOCK
+ * level ({@link RecentRelayWindow.checkBlockAlreadyRelayed} in
+ * `emitStabilizedTable`) — its border rows and tiny cells fall under the per-line
+ * gate. Adopt did NOT seed this window, so the first post-adopt poll saw the
+ * table's block signature as unknown and RE-EMITTED the whole table once per
+ * restart (~1100 chars). Recording the pane (per-line + whole-pane block) AND the
+ * settled table's OWN block signature here makes that first re-render hit
+ * `checkBlockAlreadyRelayed === true` and be suppressed.
+ *
+ * `getTableBlock` is injected (the adapter passes its `getLastSharpTableBlock`)
+ * to keep this module free of an adapter import — the adapter already imports
+ * from here, so the reverse would be a cycle. Pure (no I/O); the `record` calls
+ * are byte-identical to the ones the live emit path makes, so the window's
+ * domains agree.
+ */
+export function seedRelayWindowFromPane(
+  window: RecentRelayWindow,
+  paneText: string,
+  getTableBlock: (content: string) => string | null,
+): void {
+  if (!paneText) return;
+  // Records the pane's substantial lines (per-line dedup) AND a whole-pane block
+  // signature so a long-horizon re-render of the same pane is recognised.
+  window.record(paneText);
+  // Record the settled table's OWN block signature in the SAME domain
+  // `emitStabilizedTable` records/checks, so the first post-adopt table re-emit
+  // is suppressed.
+  const seedTable = getTableBlock(paneText);
+  if (seedTable) window.record(seedTable);
+}
+
+/**
  * @description Filter a pane-diff chunk against the window: drop every line
  * whose normalized form was already relayed (substantial lines only — short
  * lines always pass). Returns `''` when nothing survives, so the caller can

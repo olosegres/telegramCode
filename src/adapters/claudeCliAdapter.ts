@@ -72,6 +72,7 @@ import {
 import {
   createRecentRelayWindow,
   getRelayDedupedChunk,
+  seedRelayWindowFromPane,
   type RecentRelayWindow,
 } from '../utils/recentRelayWindow';
 import {
@@ -3552,6 +3553,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S1: seed the raw baseline too so the first poll after adoption — which
       // captures the same idle pane — skips the redundant `cleanOutput`.
       session.lastRawCapture = initialRaw;
+      // Seed the relay window too (live incident 2026-06-24, thread 434): the
+      // baseline above suppresses re-appearing PROSE, but a SETTLED table already
+      // on the pane is deduped ONLY at the BLOCK level (`emitStabilizedTable`).
+      // Without this seed the window is empty, so the first post-adopt poll
+      // re-emits the whole table once per restart (~1100 chars). Recording the
+      // pane + the settled table's own block signature makes that re-render hit
+      // `checkBlockAlreadyRelayed === true` and be suppressed.
+      seedRelayWindowFromPane(session.recentRelayWindow, session.lastContent, getLastSharpTableBlock);
     }
 
     this.sessions.set(k, session);

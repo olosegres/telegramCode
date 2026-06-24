@@ -33,7 +33,10 @@ import {
   maskSharpTableLines,
   stripTuiElementsWithContext,
 } from '../adapters/claudeCliAdapter';
-import { createRecentRelayWindow } from '../utils/recentRelayWindow';
+import {
+  createRecentRelayWindow,
+  seedRelayWindowFromPane,
+} from '../utils/recentRelayWindow';
 
 /**
  * The assistant-output bullet Claude's real TUI (v2.1.177) prints on the table's
@@ -500,6 +503,61 @@ test('getLastSharpTableBlock: returns the LAST table when two are present', () =
   assert.ok(block !== null);
   assert.ok(block!.includes('cc'), 'must return the second (last) table');
   assert.ok(!block!.includes('│a '), 'must not return the first table');
+});
+
+// ─── S0: adopt seeds the relay window so a settled table does NOT re-emit ─────
+
+// A pane carrying a SETTLED sharp table (border rows + tiny cells, all under the
+// 16-char per-line gate) plus a long prose line — the shape thread 434 held at
+// restart. Before the seed, the fresh window knows neither; after the seed, both
+// the whole table block AND the long prose line must be recognised, so the first
+// post-adopt poll's table re-emit is suppressed and prose is not re-relayed.
+const seededPaneWithTable = [
+  '⏺ Here is the comparison table you asked for, with results across runs:',
+  '┌────────┬────────┬────────┐',
+  '│ name   │ before │ after  │',
+  '├────────┼────────┼────────┤',
+  '│ alpha  │ ✅     │ ✅     │',
+  '│ beta   │ ❌     │ ✅     │',
+  '└────────┴────────┴────────┘',
+].join('\n');
+const seededTableBlock = getLastSharpTableBlock(seededPaneWithTable)!;
+const seededLongProseLine = '⏺ Here is the comparison table you asked for, with results across runs:';
+
+test('seedRelayWindowFromPane: BEFORE seeding, the settled table block and long prose line are NOT recognised (red)', () => {
+  const relayWindow = createRecentRelayWindow();
+  assert.ok(seededTableBlock, 'fixture must contain a sharp table');
+  assert.equal(
+    relayWindow.checkBlockAlreadyRelayed(seededTableBlock),
+    false,
+    'a fresh window must NOT recognise the table block — this is the live re-emit',
+  );
+  assert.equal(
+    relayWindow.checkHasLine(seededLongProseLine),
+    false,
+    'a fresh window must NOT recognise the prose line',
+  );
+});
+
+test('seedRelayWindowFromPane: AFTER seeding, the settled table block and long prose line ARE recognised (green)', () => {
+  const relayWindow = createRecentRelayWindow();
+  seedRelayWindowFromPane(relayWindow, seededPaneWithTable, getLastSharpTableBlock);
+  assert.equal(
+    relayWindow.checkBlockAlreadyRelayed(seededTableBlock),
+    true,
+    'after the adopt seed, the first post-adopt poll must see the table as already-relayed → suppressed',
+  );
+  assert.equal(
+    relayWindow.checkHasLine(seededLongProseLine),
+    true,
+    'after the adopt seed, an already-on-pane prose line is recognised and not re-relayed',
+  );
+});
+
+test('seedRelayWindowFromPane: empty pane is a no-op (robust to a failed capture)', () => {
+  const relayWindow = createRecentRelayWindow();
+  seedRelayWindowFromPane(relayWindow, '', getLastSharpTableBlock);
+  assert.equal(relayWindow.checkBlockAlreadyRelayed(seededTableBlock), false);
 });
 
 test('maskSharpTableLines: drops only table lines, keeps prose', () => {

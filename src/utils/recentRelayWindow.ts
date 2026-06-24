@@ -27,12 +27,33 @@
  * relayed.
  */
 
+import { DIFF_CHANGE_GUTTER_RE } from './claudeScrapeShapes';
+
 /**
  * @description Minimum NORMALIZED line length for the window to record or
  * suppress a line. Shorter lines repeat legitimately too often (confirmations,
  * bullets, numbers) to ever be treated as re-render duplicates.
  */
 export const relayDedupMinLineLength = 16;
+
+/**
+ * @description Whether a NORMALIZED line is the short `NN +` diff-gutter shape
+ * that bypasses the length gate (record + suppress on re-appearance).
+ *
+ * WHY a targeted bypass (live leak 2026-06-24, topic my-health): a short `NN +`
+ * gutter scrolled off, was RE-SCRAPED on a later poll, re-emitted as fresh
+ * output, and prepended onto the next real message. Being under the 16-char gate
+ * it bypassed the dedup entirely. The gutter shape — a leading line number, then
+ * a literal `+` change marker — is never legitimate short prose ("done", "yes",
+ * "+1 done", "3 lines changed" all fail it), so suppressing its RE-render is
+ * safe. Strictly `+` (additions); `-` deletion gutters and everything else stay
+ * outside this bypass and keep the normal length gate. Reuses the single
+ * source-of-truth shape {@link DIFF_CHANGE_GUTTER_RE} (called on the same
+ * coarse-normalized form `record`/`checkHasLine` key on, so gate and key agree).
+ */
+function checkIsDiffChangeGutter(normalizedLine: string): boolean {
+  return DIFF_CHANGE_GUTTER_RE.test(normalizedLine);
+}
 
 /**
  * @description Window capacity in lines. Sized to cover the incident-scale
@@ -127,7 +148,9 @@ export interface RecentRelayWindow {
   /**
    * True when the line's normalized form is a substantial line already
    * relayed. Short lines (< {@link relayDedupMinLineLength}) always return
-   * false — they are never suppressed.
+   * false — they are never suppressed — EXCEPT a short `NN +` diff-change
+   * gutter ({@link DIFF_CHANGE_GUTTER_RE}), which is recorded + suppressed on
+   * re-appearance (it re-renders and leaks; the shape is never short prose).
    */
   checkHasLine(line: string): boolean;
   /**
@@ -159,7 +182,9 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
     record(chunkText: string): void {
       for (const line of chunkText.split('\n')) {
         const normalized = normalizeForRelayDedup(line);
-        if (normalized.length < relayDedupMinLineLength) continue;
+        // A short `NN +` diff gutter is recorded too (it re-renders and leaks);
+        // every other short line stays out of the window (legit repeats).
+        if (normalized.length < relayDedupMinLineLength && !checkIsDiffChangeGutter(normalized)) continue;
         // A line repeated within one chunk must occupy ONE slot, or the FIFO
         // and the Set would desync on eviction.
         if (lineSet.has(normalized)) continue;
@@ -186,7 +211,10 @@ export function createRecentRelayWindow(maxLines: number = relayWindowMaxLines):
     },
     checkHasLine(line: string): boolean {
       const normalized = normalizeForRelayDedup(line);
-      if (normalized.length < relayDedupMinLineLength) return false;
+      // Same bypass as `record`: a short `NN +` diff gutter is eligible for
+      // suppression (only on RE-appearance — it had to be recorded first); any
+      // other short line is never suppressed.
+      if (normalized.length < relayDedupMinLineLength && !checkIsDiffChangeGutter(normalized)) return false;
       return lineSet.has(normalized);
     },
     checkBlockAlreadyRelayed(blockText: string): boolean {

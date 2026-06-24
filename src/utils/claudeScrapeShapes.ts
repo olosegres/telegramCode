@@ -210,6 +210,20 @@ export const COLLAPSE_TOOLUSE_MARKER_RE = /^\s*…\s*\+\d+\s+tool uses?\b.*$/;
 export const COMPLETION_SUMMARY_RE = /^\s*Done\s*\([^)]*tokens[^)]*\)\s*$/;
 
 /**
+ * @description A file-diff `NN +` CHANGE gutter line as Claude renders
+ * Read/Edit/Update diffs: a leading line number, then a literal `+` change
+ * marker (`40 +`, `3 +delta`, `51 + content`). Tight by design — `+1 done`,
+ * `3 lines changed`, `done` all fail it, so it never matches legit short prose.
+ *
+ * THE single source of truth for the short-`+`-gutter dedup bypass (live leak
+ * 2026-06-24): a short gutter re-rendered on a later poll and leaked because it
+ * was under the relay-window length gate. Both the relay window
+ * ({@link ../utils/recentRelayWindow}) and `checkIsStatusOutput` key on this
+ * shape — strictly `+` additions; `-` deletion gutters stay outside.
+ */
+export const DIFF_CHANGE_GUTTER_RE = /^\s*\d+\s+\+/;
+
+/**
  * @description Which tool a `⎿` result body belongs to, deciding how it is
  * fenced: `output` (Bash/Grep/Glob — the `⎿` line is stdout, fenced with the
  * body) vs `file` (Read/Edit/Update/Write — the `⎿` line is a prose summary,

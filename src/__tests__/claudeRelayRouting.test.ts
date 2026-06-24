@@ -269,6 +269,39 @@ describe('checkIsClaudeRelayFastPath — the regression-anchor predicate', () =>
   });
 });
 
+describe('ANSWER SURVIVES — a diff gutter bundled with a trailing prose answer never swallows the answer', () => {
+  // The ATTEMPT-1 regression (commit b987947, reverted 11fe632): a final pane
+  // chunk that BUNDLED a `NN +` diff gutter with the `● DONE` prose answer was
+  // folded WHOLESALE as tool-body → "Output filtered out completely" → the
+  // answer was SWALLOWED, never sent. The corrected approach (S2-only) must
+  // NEVER reclassify a `●`/`⏺` prose bullet as tool-body. This is the
+  // load-bearing guard: the trailing prose answer MUST survive at every mode.
+  for (const bullet of ['●', '⏺'] as const) {
+    for (const mode of ['full', 'minimal'] as const) {
+      it(`gutter then \`${bullet} DONE\` prose → answer survives at /tool_results ${mode}`, () => {
+        // The realistic live chunk shape: a `+`-led diff change gutter line
+        // IMMEDIATELY followed by the agent's prose answer bullet.
+        const chunk = ['3 +delta', `${bullet} DONE`].join('\n');
+        const routed = routeAtMode(chunk, mode);
+        assert.ok(
+          routed.keptText.includes('DONE'),
+          `the prose answer "DONE" must be kept as permanent output (was: ${JSON.stringify(routed.keptText)})`,
+        );
+      });
+    }
+  }
+
+  it('a longer gutter content line bundled with the prose answer still keeps the answer (minimal)', () => {
+    // Mirrors the live `51 + считает …` shape immediately before the answer.
+    const chunk = ['51 + считает source rows in the batch', '⏺ Готово: сводка добавлена в конец файла'].join('\n');
+    const routed = routeAtMode(chunk, 'minimal');
+    assert.ok(
+      routed.keptText.includes('Готово'),
+      `the prose answer must survive (was: ${JSON.stringify(routed.keptText)})`,
+    );
+  });
+});
+
 describe('REGRESSION ANCHOR — full-prefs chunk emits byte-identically to pre-S4', () => {
   it('tool header + body + prose, no panel → fast path feeds the ORIGINAL chunk to the stripper', () => {
     // A realistic mixed chunk WITHOUT a sub-agent panel preview.

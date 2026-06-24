@@ -404,6 +404,22 @@ test('checkIsStatusOutput: substantial multi-line content is not status', () => 
   );
 });
 
+test('checkIsStatusOutput: a lone `NN +` diff gutter is PERMANENT output, not status (Finding-4)', () => {
+  // Live diff-line leak 2026-06-24: a lone `40 +` diff-change gutter tripped the
+  // short-line spinner heuristic → folded into the ephemeral status frame →
+  // never RECORDED into the relay window → its later re-render leaked unguarded.
+  // It must read as real output so it gets recorded and the re-render is deduped.
+  assert.equal(checkIsStatusOutput('40 +'), false);
+  assert.equal(checkIsStatusOutput('3 +delta'), false);
+  assert.equal(checkIsStatusOutput('40 +\n41 +\n42 +'), false, 'a run of gutters is still permanent');
+  // A non-gutter status frame must STILL read as status (no over-reach).
+  assert.equal(checkIsStatusOutput('✻ Whirring…'), true);
+  assert.equal(checkIsStatusOutput('· Working… (7s · ↓ 222 tokens)'), true);
+  // A `-` deletion gutter / short prose stay subject to the normal heuristics
+  // (not force-permanent here) — only `+` change gutters get the bypass.
+  assert.equal(checkIsStatusOutput('40 -'), true, 'a lone `-` gutter is NOT force-permanent');
+});
+
 // ─── N3 — bold around spinner glyph cleanup ────────────────────────────
 
 test('convertAnsiToMarkdown: drops *...* around single spinner glyph "·"', () => {

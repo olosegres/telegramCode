@@ -36,6 +36,7 @@ import {
   PROGRESS_PASSTHROUGH_RE,
   COLLAPSE_MARKER_RE,
   COMPLETION_SUMMARY_RE,
+  DIFF_CHANGE_GUTTER_RE,
   TRANSIENT_TICK_RE,
   checkIsClaudeChromeLine,
   type ToolResultKind,
@@ -466,6 +467,19 @@ export function checkIsStatusOutput(text: string): boolean {
   // folded into the ephemeral status frame and lost. The 💭 marker is the bot's
   // own collapse glyph — treat it as real permanent content.
   if (text.trimStart().startsWith('💭')) return false;
+
+  // A lone file-diff `NN +` change gutter (`40 +`, `3 +delta`) is PERMANENT
+  // output, not a transient spinner — its short, glyph-less shape otherwise
+  // trips the heuristics below and folds it into the ephemeral status frame, so
+  // it is never RECORDED into the relay window and its later re-render leaks
+  // unguarded (live diff-line leak 2026-06-24). Treating it as real output sends
+  // it down the `record` path so the re-render dedup (recentRelayWindow's
+  // `NN +`-gutter bypass) can suppress the repaint. Anchored to the gutter shape
+  // — `+1 done`, `3 lines changed`, `done` all stay status-eligible.
+  const gutterLines = text.split('\n').filter(line => line.trim() !== '');
+  if (gutterLines.length > 0 && gutterLines.every(line => DIFF_CHANGE_GUTTER_RE.test(line))) {
+    return false;
+  }
 
   // Real content is always substantial
   if (text.length > 200) return false;

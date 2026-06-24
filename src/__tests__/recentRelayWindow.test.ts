@@ -321,3 +321,71 @@ test('buildRelayBlockSignature: drops blanks and normalizes; same content → sa
   assert.equal(buildRelayBlockSignature(a), buildRelayBlockSignature(b));
   assert.equal(buildRelayBlockSignature('   \n  '), '', 'whitespace-only → empty signature');
 });
+
+// ─── short `+`-gutter re-render dedup (the 2026-06-24 diff-line leak) ──────────
+
+/**
+ * Live bug (topic my-health, Claude scrape backend): a file-diff `NN +` change
+ * gutter line (well under the 16-char per-line gate) scrolled off and was
+ * RE-SCRAPED on a later poll, re-emitted as fresh output, and prepended onto the
+ * next real message (`40 +`, `63 + …`, stray short tokens). The fix (S2-only):
+ * the window records + suppresses a re-appearing `+`-led `NN +` gutter EVEN below
+ * the gate — but ONLY on re-appearance, NEVER the first emit, NEVER a `-`-gutter
+ * or any other short prose.
+ */
+
+test('gutter: a short `+`-led `NN +` gutter is recorded despite being under the per-line gate', () => {
+  const relayWindow = createRecentRelayWindow();
+  const gutter = '40 +';
+  // It is genuinely short — the regular gate would skip it.
+  assert.ok(normalizeForComparison(gutter).length < relayDedupMinLineLength);
+  // First appearance is never suppressed…
+  assert.equal(relayWindow.checkHasLine(gutter), false, 'first emit must not be suppressed');
+  relayWindow.record(gutter);
+  // …but after recording, a re-appearance IS suppressed.
+  assert.equal(relayWindow.checkHasLine(gutter), true, 're-appearing gutter must be suppressed');
+});
+
+test('gutter: a `+`-gutter with trailing content is deduped on re-appearance, not first emit', () => {
+  const relayWindow = createRecentRelayWindow();
+  const gutter = '63 + research note about telomere data';
+  // (This one happens to be long, but the rule applies to short ones too.)
+  assert.equal(relayWindow.checkHasLine(gutter), false);
+  relayWindow.record(gutter);
+  assert.equal(relayWindow.checkHasLine(gutter), true);
+});
+
+test('gutter: a `-`-led deletion gutter is NEVER recorded nor suppressed (only `+` change gutters)', () => {
+  const relayWindow = createRecentRelayWindow();
+  const minusGutter = '40 -';
+  relayWindow.record(minusGutter);
+  assert.equal(relayWindow.checkHasLine(minusGutter), false, '`-` gutters stay outside the short-line dedup');
+});
+
+test('gutter: a legit short prose confirmation is never treated as a gutter', () => {
+  // "done", "yes" etc. must keep repeating freely — the short-line bypass is
+  // strictly the `NN +` diff-gutter shape, never short prose.
+  const relayWindow = createRecentRelayWindow();
+  for (const shortProse of ['done', 'yes', 'ok', '3 lines changed', '+1 done']) {
+    relayWindow.record(shortProse);
+    assert.equal(relayWindow.checkHasLine(shortProse), false, `"${shortProse}" must never be suppressed`);
+  }
+});
+
+test('filter: a re-appearing short `+`-gutter is dropped from a later chunk, first emit passes', () => {
+  // End-to-end through the chunk filter the live relay actually calls: the first
+  // chunk carries the gutter + the prose answer and passes byte-identical; a
+  // later chunk that re-renders the gutter glued to a NEW prose answer drops the
+  // gutter but keeps the new prose (the answer is never swallowed).
+  const relayWindow = createRecentRelayWindow();
+  const firstChunk = ['40 +', '63 +', 'First answer, long enough to be substantial prose'].join('\n');
+  assert.equal(getRelayDedupedChunk(relayWindow, firstChunk), firstChunk, 'first emit passes whole');
+  relayWindow.record(firstChunk);
+
+  const laterChunk = ['40 +', '63 +', 'Second answer, also long enough substantial prose'].join('\n');
+  assert.equal(
+    getRelayDedupedChunk(relayWindow, laterChunk),
+    'Second answer, also long enough substantial prose',
+    're-rendered gutters dropped, the new prose answer survives',
+  );
+});

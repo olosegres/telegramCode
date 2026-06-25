@@ -243,3 +243,31 @@ test('checkIsClaudeLoginPaste matches the /login paste screen, not normal panes'
   assert.equal(checkIsClaudeLoginPaste('Select login method:'), false);
   assert.equal(checkIsClaudeLoginPaste(''), false);
 });
+
+test('checkIsClaudeLoginPaste keys off the live bottom input row, not the marker in scrollback', () => {
+  // Regression (live 2026-06-25, topic 434): the marker phrase is quoted in this
+  // repo's OWN source + CLAUDE.md. When a Claude TUI working on telegramCode
+  // rendered that code/doc, a whole-pane match false-fired and the bot ate the
+  // user's next message as a one-time login code. The detector must look only at
+  // the live input region (pane tail), so the phrase up in scrollback above a
+  // normal ❯ box is NOT a login screen.
+  const markerInScrollback = [
+    'const CLAUDE_LOGIN_PASTE_RE = /Paste code here if prompted/;',
+    '// quoted again in CLAUDE.md and a bot.ts comment',
+    ...Array.from({ length: 14 }, (_, index) => `agent output line ${index + 1}`),
+    '────────────────',
+    '❯ ',
+    '────────────────',
+  ].join('\n');
+  assert.equal(checkIsClaudeLoginPaste(markerInScrollback), false);
+
+  // A genuine login row still wins when it IS the live bottom input region, even
+  // with unrelated conversation scrolled above it.
+  const realLoginAtBottom = [
+    ...Array.from({ length: 20 }, (_, index) => `prior conversation line ${index + 1}`),
+    'Browser didn’t open? Use the url below to sign in:',
+    'https://claude.ai/oauth/authorize?code=true&client_id=...',
+    'Paste code here if prompted > ',
+  ].join('\n');
+  assert.equal(checkIsClaudeLoginPaste(realLoginAtBottom), true);
+});

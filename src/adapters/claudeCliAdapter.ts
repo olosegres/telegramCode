@@ -1118,8 +1118,19 @@ export function getClaudeReplyRoute(input: {
  * so the bot routes the pasted code verbatim instead of as a fresh prompt.
  */
 const CLAUDE_LOGIN_PASTE_RE = /Paste code here if prompted/;
+/**
+ * Lines from the pane BOTTOM that count as the live input region. The real
+ * `/login` "paste code" prompt is the active bottom input row; matching the
+ * marker anywhere in the full pane false-fired whenever this repo's OWN source
+ * or docs (which quote the marker) rendered in a Claude TUI working on
+ * telegramCode — the bot then ate the user's next message as a one-time login
+ * code (live 2026-06-25, topic 434). Anchoring to the tail excludes scrollback
+ * mentions while still catching a genuine login row.
+ */
+const loginPasteTailLineCount = 10;
 export function checkIsClaudeLoginPaste(paneText: string): boolean {
-  return CLAUDE_LOGIN_PASTE_RE.test(paneText);
+  const tail = paneText.split('\n').slice(-loginPasteTailLineCount).join('\n');
+  return CLAUDE_LOGIN_PASTE_RE.test(tail);
 }
 
 /**

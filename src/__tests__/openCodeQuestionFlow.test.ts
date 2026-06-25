@@ -23,6 +23,7 @@ import {
   buildQuestionBodyLinesPlain,
   recordAnswerAndAdvance,
   migratePendingQuestionState,
+  getQuestionReplyRoute,
 } from '../openCodeQuestionFlow';
 import type {
   OpenCodeQuestion,
@@ -239,6 +240,58 @@ test('S2: answering the last hole when an earlier one is already filled submits 
 
   assert.equal(action.kind, 'submit');
   assert.deepEqual(action.kind === 'submit' ? action.matrix : null, [['ans1'], ['ans2']]);
+});
+
+// ── S1 (cancel-on-free-form): reply routing ─────────────────────────────────
+
+test('route: a bare digit in range answers with that option label', () => {
+  const question = makeQuestion({
+    options: [{ label: 'first' }, { label: 'second' }],
+  });
+
+  const route = getQuestionReplyRoute('2', question);
+
+  assert.equal(route.kind, 'answer');
+  assert.deepEqual(route.kind === 'answer' ? route.labels : null, ['second']);
+});
+
+test('route: a digit with surrounding whitespace still answers', () => {
+  const question = makeQuestion({ options: [{ label: 'first' }, { label: 'second' }] });
+
+  const route = getQuestionReplyRoute('  1  ', question);
+
+  assert.equal(route.kind, 'answer');
+  assert.deepEqual(route.kind === 'answer' ? route.labels : null, ['first']);
+});
+
+test('route: a digit OUT of range cancels (no such option)', () => {
+  const question = makeQuestion({ options: [{ label: 'first' }, { label: 'second' }] });
+
+  assert.equal(getQuestionReplyRoute('3', question).kind, 'cancel');
+  assert.equal(getQuestionReplyRoute('0', question).kind, 'cancel');
+});
+
+test('route: free-form prose cancels (a real message means move on)', () => {
+  const question = makeQuestion({ options: [{ label: 'first' }, { label: 'second' }] });
+
+  assert.equal(getQuestionReplyRoute('forget it, let us do something else', question).kind, 'cancel');
+});
+
+test('route: empty / whitespace text cancels', () => {
+  const question = makeQuestion({ options: [{ label: 'first' }] });
+
+  assert.equal(getQuestionReplyRoute('', question).kind, 'cancel');
+  assert.equal(getQuestionReplyRoute('   ', question).kind, 'cancel');
+});
+
+test('route: a digit mixed with text is NOT a bare digit → cancels', () => {
+  const question = makeQuestion({ options: [{ label: 'first' }, { label: 'second' }] });
+
+  assert.equal(getQuestionReplyRoute('1 please', question).kind, 'cancel');
+});
+
+test('route: with no current question, any text cancels', () => {
+  assert.equal(getQuestionReplyRoute('1', undefined).kind, 'cancel');
 });
 
 // ── S2: restore-compat migration ────────────────────────────────────────────

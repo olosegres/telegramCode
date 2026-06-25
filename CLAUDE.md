@@ -477,6 +477,15 @@ OpenCode events / bindings).
     interrupt Escape); any other text breaks out as a fresh prompt. Pre-fix
     the digit was forwarded as a prompt and its Escape cancelled the menu
     ("Login interrupted").
+  - While an **OpenCode** question is pending, the same rule holds via the
+    shared `deliverActivePrompt` choke point (used by BOTH the text and voice
+    handlers): a bare in-range digit ANSWERS that option (a button tap too), any
+    other free-form text OR voice CANCELS the question (clear pending state →
+    neutralize the buttons message → `SIGINT` abort of the wedged turn →
+    `agent.question_cancelled_for_prompt` notice) and is delivered as a fresh
+    prompt. Pre-fix the voice handler had NO question handling, so a voice note
+    queued behind the blocked question-turn and the user got no reply (live
+    2026-06-25, topic «Overview app 1»). Route decision: `getQuestionReplyRoute`.
   - **`/login` OAuth code paste.** The login flow's last step shows
     `Paste code here if prompted >` (a plain `>` box, not `❯`/a selector).
     While it is up (`isLoginPastePending`, `checkIsClaudeLoginPaste` off the

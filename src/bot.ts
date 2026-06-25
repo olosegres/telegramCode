@@ -44,6 +44,7 @@ import {
   buildQuestionBodyLinesPlain,
   recordAnswerAndAdvance,
   migratePendingQuestionState,
+  getQuestionReplyRoute,
 } from './openCodeQuestionFlow';
 import { checkShouldRepostPendingQuestion } from './pendingQuestionRepost';
 import {
@@ -5358,25 +5359,6 @@ bot.on(message('text'), async (ctx) => {
     }
   }
 
-  // Pending interactive question (OpenCode) → answer the CURRENT question only,
-  // then advance / submit via the shared sequential collector (S2). A bare digit
-  // in range of the current question's options is treated as that option (the
-  // `agent.question_hint` tells users to "reply with the option number"), so a
-  // typed digit selects the same label a button tap would; any other text is
-  // sent verbatim as a free-form answer.
-  const pending = pendingQuestions.get(kStr);
-  if (pending && adapter.checkIsActive(key) && adapter.answerQuestion) {
-    const currentQuestion = pending.data.questions[pending.currentIndex];
-    let answerForCurrent: string[] = [text];
-    if (/^\d+$/.test(text) && currentQuestion) {
-      const optionIndex = parseInt(text, 10) - 1;
-      const picked = currentQuestion.options[optionIndex];
-      if (picked) answerForCurrent = [picked.label];
-    }
-    await applyQuestionAnswer(key, answerForCurrent);
-    return;
-  }
-
   // Claude TUI prompt on screen + a bare control reply (option digit or y/n)
   // → drive it in place. `getClaudeReplyRoute` decides precedence: a real
   // AskUserQuestion SELECTOR always wins over a survey; free-form prose breaks
@@ -5425,41 +5407,13 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // Forward text to a running agent. Every user message is treated as a fresh
-  // turn: forwardPromptToAgent interrupts the current turn for TUI backends
-  // (cancelling any on-screen selector and breaking Claude out of the busy
-  // state) and waits for idle before typing, so the message isn't queued
-  // behind the current turn — EXCEPT while a sub-agent runs or context is
-  // compacting, where it deliberately does NOT interrupt and lets the message
-  // queue. Deliberately driving a selector in place is still available via the
-  // explicit /up /down /enter /y /n /c keys, and a bare digit / y / n while a
-  // selector is on screen is routed to it above.
+  // Forward text to a running agent (shared choke point for text + voice). It
+  // owns the pending-question route (digit answers / free-form cancels), the G2
+  // wedge backstop, and the actual forward. The Claude-selector + terminal
+  // branches above already returned for their own cases, so this is reached only
+  // for a generic active prompt.
   if (adapter.checkIsActive(key)) {
-    // A bare `/clear` forwarded to the agent wipes its context (Claude TUI),
-    // so the next prompt must re-carry the thread-context preamble. Reset the
-    // marker before forwarding — the slash text itself never gets a preamble.
-    // The agent's context is gone, so any intake files it might reference are
-    // now useless — purge the thread's files dir in the same breath.
-    if (text === forwardedClearCommand) {
-      clearThreadContextMarker(key);
-      await purgeThreadFiles(getDataDir(), key).catch((e) =>
-        console.warn(`[file] purge on /clear failed for ${keyToString(key)}:`, e),
-      );
-    }
-    // Backstop (G2): we got here with NO pendingQuestions entry (the break-out
-    // above returned otherwise), yet an OpenCode turn can still be wedged
-    // behind an open question the bot lost track of (question.asked dropped at
-    // ask time, or a restore that couldn't run). Forwarding now would queue the
-    // prompt behind the dead turn forever, so if the adapter reports the
-    // session wedged, abort the turn and tell the user the previous question
-    // was cancelled — THEN forward. Strict check (open question for THIS
-    // session only), so a genuinely streaming turn / live sub-agent is never
-    // aborted. Claude has no such method → unchanged.
-    if (await adapter.checkIsWedgedOnQuestion?.(key)) {
-      adapter.sendSignal(key, 'SIGINT');
-      await replyToThread(key, t('agent.question_cancelled_for_prompt'));
-    }
-    await forwardPromptToAgent(key, adapter, text);
+    await deliverActivePrompt(key, adapter, text);
     return;
   }
 
@@ -5611,7 +5565,11 @@ async function processVoiceJob(key: ThreadKey, fileId: string): Promise<void> {
       return;
     }
 
-    await forwardPromptToAgent(key, adapter, transcript);
+    // Same choke point as text: a voice transcript while a question is pending
+    // CANCELS it (a transcript is free-form prose, never a bare digit) and is
+    // delivered as a fresh prompt — closing the gap where voice queued behind a
+    // blocked question-turn and the user got no reply.
+    await deliverActivePrompt(key, adapter, transcript);
   } catch (err) {
     console.error('[Bot] Voice handling error:', err);
     await replyToThread(key, 'Error processing voice message');
@@ -6512,6 +6470,103 @@ bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
   await applyQuestionAnswer(key, [selectedLabel]);
   await ctx.answerCbQuery(selectedLabel);
 });
+
+/**
+ * @description The single choke point for delivering a free-form prompt (text OR
+ * voice) to a thread whose agent is already active. In order:
+ *  1. If an OpenCode question is pending, route the reply: a bare digit in range
+ *     ANSWERS that option (unchanged path); ANY other free-form input CANCELS
+ *     the question and is delivered as a fresh prompt — a real message means
+ *     "move on", never the question's answer.
+ *  2. Else the G2 wedge backstop: an OpenCode turn the bot lost track of can
+ *     still be wedged behind an open question (the `pendingQuestions` map empty,
+ *     e.g. `question.asked` dropped at ask time). Abort the turn and tell the
+ *     user before forwarding so the prompt doesn't queue behind it forever.
+ *  3. Forward the prompt (a bare `/clear` first purges thread context + files).
+ *
+ * Claude/terminal never reach step 1 (their routing returns earlier in the text
+ * handler, and `pendingQuestions`/`answerQuestion` are OpenCode-only). For them
+ * `forwardPromptToAgent` interrupts the TUI selector itself.
+ */
+async function deliverActivePrompt(
+  key: ThreadKey,
+  adapter: AgentAdapter,
+  text: string,
+): Promise<void> {
+  const pending = pendingQuestions.get(keyToString(key));
+  if (pending && adapter.answerQuestion) {
+    const currentQuestion = pending.data.questions[pending.currentIndex];
+    const route = getQuestionReplyRoute(text, currentQuestion);
+    if (route.kind === 'answer') {
+      await applyQuestionAnswer(key, route.labels);
+      return;
+    }
+    await cancelPendingQuestionAndForward(key, adapter, text);
+    return;
+  }
+
+  // A bare `/clear` forwarded to the agent wipes its context (Claude TUI), so
+  // the next prompt must re-carry the thread-context preamble. Reset the marker
+  // before forwarding — the slash text itself never gets a preamble. The agent's
+  // context is gone, so any intake files it might reference are now useless —
+  // purge the thread's files dir in the same breath.
+  if (text === forwardedClearCommand) {
+    clearThreadContextMarker(key);
+    await purgeThreadFiles(getDataDir(), key).catch((e) =>
+      console.warn(`[file] purge on /clear failed for ${keyToString(key)}:`, e),
+    );
+  }
+
+  // Backstop (G2): NO pendingQuestions entry, yet an OpenCode turn can still be
+  // wedged behind an open question the bot lost track of (question.asked dropped
+  // at ask time, or a restore that couldn't run). Forwarding now would queue the
+  // prompt behind the dead turn forever, so if the adapter reports the session
+  // wedged, abort the turn and tell the user the previous question was cancelled
+  // — THEN forward. Strict check (open question for THIS session only), so a
+  // genuinely streaming turn / live sub-agent is never aborted. Claude has no
+  // such method → unchanged.
+  if (await adapter.checkIsWedgedOnQuestion?.(key)) {
+    adapter.sendSignal(key, 'SIGINT');
+    await replyToThread(key, t('agent.question_cancelled_for_prompt'));
+  }
+  await forwardPromptToAgent(key, adapter, text);
+}
+
+/**
+ * @description Cancel a pending OpenCode question because the user sent free-form
+ * input instead of answering it, then deliver that input as a fresh prompt. In
+ * order: clear the bot's pending-question state, neutralize the stale buttons
+ * message (edit it to a "cancelled" label so a late tap can't re-answer an
+ * aborted question), abort the wedged OpenCode turn (`SIGINT` → `/session/:id/
+ * abort`), post the "previous question cancelled" notice, then forward.
+ *
+ * The buttons-message edit runs through `runQuestionLifecycleOp` (same serializer
+ * as the answer path) so it can't race a concurrent re-post-to-bottom. The
+ * `messageId` + header are captured BEFORE clearing, since `clearPendingQuestion`
+ * drops the state.
+ */
+async function cancelPendingQuestionAndForward(
+  key: ThreadKey,
+  adapter: AgentAdapter,
+  text: string,
+): Promise<void> {
+  const pending = pendingQuestions.get(keyToString(key));
+  const cancelledMessageId = pending?.messageId ?? null;
+  const cancelledQuestion = pending?.data.questions[pending.currentIndex];
+
+  clearPendingQuestion(key);
+
+  if (cancelledMessageId !== null && cancelledQuestion) {
+    const header = cancelledQuestion.header || cancelledQuestion.question;
+    await runQuestionLifecycleOp(key, () =>
+      editThreadMessage(key, cancelledMessageId, t('agent.question_cancelled_msg_label', { header })),
+    );
+  }
+
+  adapter.sendSignal(key, 'SIGINT');
+  await replyToThread(key, t('agent.question_cancelled_for_prompt'));
+  await forwardPromptToAgent(key, adapter, text);
+}
 
 /**
  * @description Record one answer for the CURRENTLY shown OpenCode question and

@@ -66,6 +66,43 @@ export function buildQuestionBodyLinesPlain(question: OpenCodeQuestion): string[
 }
 
 /**
+ * @description How to route a user's free-form reply that arrives WHILE an
+ * OpenCode interactive question is pending. Mirrors `getClaudeReplyRoute`:
+ *  - `answer` — the reply is a bare digit in range of the current question's
+ *    options, so it PICKS that option (`labels` are the chosen option labels,
+ *    the same a button tap would send);
+ *  - `cancel` — any other free-form input (prose, an out-of-range digit, a voice
+ *    transcript): the user means "move on", so the bot cancels the question and
+ *    delivers the text as a fresh prompt instead of treating it as the answer.
+ */
+export type QuestionReplyRoute =
+  | { kind: 'answer'; labels: string[] }
+  | { kind: 'cancel' };
+
+/**
+ * @description Decide how to route a user's reply for a thread that has an
+ * OpenCode question on screen. Pure so the digit-in-range precedence is
+ * unit-testable without a live session.
+ *
+ * Only a bare 1-based digit in range of `currentQuestion.options` answers; any
+ * other text (out-of-range digit, prose, empty) cancels. A digit answer carries
+ * the chosen option label(s) so the caller never re-parses the digit (single
+ * source of truth for the digit→label mapping).
+ */
+export function getQuestionReplyRoute(
+  text: string,
+  currentQuestion: OpenCodeQuestion | undefined,
+): QuestionReplyRoute {
+  const trimmed = text.trim();
+  if (currentQuestion && /^\d+$/.test(trimmed)) {
+    const optionIndex = parseInt(trimmed, 10) - 1;
+    const picked = currentQuestion.options[optionIndex];
+    if (picked) return { kind: 'answer', labels: [picked.label] };
+  }
+  return { kind: 'cancel' };
+}
+
+/**
  * @description Outcome of recording one answer into the pending-question state.
  * Either the bot must SHOW the next unanswered question (`showQuestion`, with
  * the new `currentIndex`), or every question is now answered and the bot must

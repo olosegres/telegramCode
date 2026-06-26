@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, DisplayPrefsReader, OutputEventMeta, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, DisplayPrefsReader, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -69,6 +69,26 @@ export function registerDisplayPrefsReader(reader: DisplayPrefsReader): void {
   if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setDisplayPrefsReader(reader);
   const existingClaude = adapterInstances.get('claude');
   if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setDisplayPrefsReader(reader);
+}
+
+/** Per-thread seen-watermark writer for BOTH adapters — same late-wiring idiom
+ * as {@link registerDisplayPrefsReader}: registered once at bot boot, applied to
+ * each instance whether it exists already or is created later. */
+let seenWatermarkWriter: SeenWatermarkWriter | null = null;
+
+/**
+ * @description Register the callback both adapters invoke at TURN END to advance
+ * the per-thread {@link import('../types').SeenWatermark} in `state.json`. No
+ * adapter writes state directly; `bot.ts` wires this to `state.setSeenWatermark`.
+ * Until registered (or for an embedded/test caller that never wires it), the
+ * adapters' advance call is a no-op and watermarking is simply skipped.
+ */
+export function registerSeenWatermarkWriter(writer: SeenWatermarkWriter): void {
+  seenWatermarkWriter = writer;
+  const existingOpenCode = adapterInstances.get('opencode');
+  if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setSeenWatermarkWriter(writer);
+  const existingClaude = adapterInstances.get('claude');
+  if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setSeenWatermarkWriter(writer);
 }
 
 function wireAdapterEvents(adapter: AgentAdapter): void {
@@ -142,6 +162,9 @@ export function getAdapter(name: string): AgentAdapter {
     wireAdapterEvents(adapter);
     if (displayPrefsReader && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
       adapter.setDisplayPrefsReader(displayPrefsReader);
+    }
+    if (seenWatermarkWriter && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
+      adapter.setSeenWatermarkWriter(seenWatermarkWriter);
     }
   }
   return adapter;

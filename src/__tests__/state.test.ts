@@ -290,6 +290,55 @@ test('clearAgentSessionIds: no-op when the thread has no agent record', async ()
   assert.equal(store.getAgent(key1), null, 'must not create a dangling agent row');
 });
 
+// ── setSeenWatermark (reattach recap watermark) ──
+
+test('setSeenWatermark: merges onto the agent row without flipping name, coexists with session ids', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgent(key1, { name: 'claude', model: 'sonnet' });
+  await store.setClaudeSessionId(key1, 'claude-uuid-1');
+
+  await store.setSeenWatermark(key1, { sessionId: 'claude-uuid-1', claudeTranscriptOffset: 4096 });
+
+  const agent = store.getAgent(key1);
+  assert.equal(agent?.name, 'claude', 'name must not flip');
+  assert.equal(agent?.model, 'sonnet', 'model must survive');
+  assert.equal(agent?.claudeSessionId, 'claude-uuid-1', 'session id must coexist');
+  assert.deepEqual(agent?.seenWatermark, { sessionId: 'claude-uuid-1', claudeTranscriptOffset: 4096 });
+});
+
+test('setSeenWatermark: a later write overwrites the previous watermark', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgent(key1, { name: 'opencode' });
+  await store.setSeenWatermark(key1, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-1' });
+  // Intermediate state proves the first write landed (not a vacuous pass).
+  assert.deepEqual(store.getAgent(key1)?.seenWatermark, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-1' });
+  await store.setSeenWatermark(key1, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-2' });
+  assert.deepEqual(store.getAgent(key1)?.seenWatermark, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-2' });
+});
+
+test('setSeenWatermark: no-op when the thread has no agent record (a watermark needs a live agent)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setSeenWatermark(key1, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-1' });
+  assert.equal(store.getAgent(key1), null, 'must not create a dangling agent row');
+});
+
+test('setSeenWatermark: persists to disk and survives a reload', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setAgent(key1, { name: 'opencode' });
+  await first.setOpenCodeSessionId(key1, 'oc-id-1');
+  await first.setSeenWatermark(key1, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-42' });
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getAgent(key1)?.opencodeSessionId, 'oc-id-1', 'session id must survive');
+  assert.deepEqual(second.getAgent(key1)?.seenWatermark, { sessionId: 'oc-id-1', opencodeMessageId: 'msg-42' });
+});
+
 test('clearAgentSessionIds: the wipe is persisted to disk', async () => {
   const first = new StateStore(dataDir, { saveDebounceMs: 5 });
   await first.init();

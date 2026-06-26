@@ -26,9 +26,11 @@ import {
   getDefaultAdapterName,
   registerAdapterEventHandlers,
   registerDisplayPrefsReader,
+  registerSeenWatermarkWriter,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
 } from './adapters/createAdapter';
+import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
 import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { createOutputTransport } from './output/createOutputTransport';
 import { keyToString, keyFromString } from './types';
@@ -7723,6 +7725,45 @@ const COMMANDS_MENU = [
 ];
 
 /**
+ * @description Post the silent-reattach recap for one thread after a successful
+ * re-adopt: how many AGENT messages were produced while the bot was down (vs the
+ * persisted watermark) plus the last few turns. The anti-spam gate
+ * ({@link checkShouldPostReattachRecap}) lives in the recap module: post when
+ * `missedCount > 0` (real missed output, ANY boot mode) OR — only on a COLD start
+ * (`isColdStart`) — the watermark-unknown fallback. The fallback is cold-start
+ * gated precisely so a watermark-less session (first run after ship, pruned
+ * transcript) does NOT re-spam every active topic on every hot rebuild.
+ *
+ * Adapters without `getReattachRecap` (Terminal) are skipped. Best-effort: a
+ * read/format failure logs and posts nothing — it never blocks the reattach
+ * scan or crashes boot.
+ */
+async function postReattachRecap(
+  key: ThreadKey,
+  adapter: AgentAdapter,
+  workDir: string,
+  sessionId: string,
+  isColdStart: boolean,
+): Promise<void> {
+  if (!adapter.getReattachRecap) return;
+  try {
+    const watermark = state.getAgent(key)?.seenWatermark ?? null;
+    const recap = await adapter.getReattachRecap(key, workDir, sessionId, watermark);
+    const shouldPost = checkShouldPostReattachRecap({
+      missedCount: recap.missedCount,
+      isWatermarkKnown: recap.isWatermarkKnown,
+      hasTurns: recap.turns.length > 0,
+      isColdStart,
+    });
+    if (!shouldPost) return;
+    const text = formatReattachRecap(recap);
+    if (text) await replyToThread(key, text);
+  } catch (e) {
+    console.warn(`[reattach] recap post failed for ${keyToString(key)}:`, e instanceof Error ? e.message : e);
+  }
+}
+
+/**
  * @description Re-adopt tmux sessions and OpenCode SSE streams that
  * outlived the bot process.
  *
@@ -7730,14 +7771,16 @@ const COMMANDS_MENU = [
  * user message in any thread already finds a live adapter session, not
  * a stale "agent not running" reply.
  *
- * `opts.quietReattach` controls whether each successfully re-adopted
- * session triggers a per-topic notice (`t('agent.reattached')`). On a hot
- * reload (nodemon swap, sub-threshold downtime) the user typically didn't
- * even notice the bot blinked — spamming every active topic with
- * "session reattached" is noise. On a real cold start (the operator
- * actually stopped and restarted the bot) the notice is informative and
- * stays. The classifier lives in `bootClassifier.ts`; this function only
- * consumes the flag.
+ * A successful re-adopt is SILENT unless the agent kept WORKING during the
+ * downtime: {@link postReattachRecap} then posts ONE bounded recap of the
+ * missed output (gated on `missedCount`), so nothing produced while the bot was
+ * down is lost (the old "session is still alive" notice it replaced only added
+ * noise). `opts.quietReattach` governs ONLY the per-topic ERROR notice this
+ * scan can still post — the workDir-refused case (the bound folder
+ * vanished, so the session can't be re-adopted): held on a hot reload
+ * (nodemon swap, sub-threshold downtime — the user didn't notice the
+ * blink), shown on a real cold start. The classifier lives in
+ * `bootClassifier.ts`; this function only consumes the flag.
  */
 async function reattachExistingSessions(
   opts: { quietReattach: boolean } = { quietReattach: false },
@@ -7833,9 +7876,13 @@ async function reattachExistingSessions(
         const workDir = workDirDecision.workDir;
         if (await claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
           adopted += 1;
-          if (!opts.quietReattach) {
-            replyToThread(key, t('agent.reattached')).catch(() => {});
-          }
+          // Fire-and-forget: the recap reads the watermark synchronously at call
+          // time (race-safe), but its body (a Claude fs read) must not serialize
+          // the reattach scan. postReattachRecap swallows its own errors; the
+          // `.catch` is defensive.
+          void postReattachRecap(key, claudeAdapter, workDir, agent.claudeSessionId, !opts.quietReattach).catch(
+            () => {},
+          );
         }
       }
       console.log(`[reattach] tmux: adopted ${adopted}, reconciled ${reconciled}, killed ${killed} orphans (quiet=${opts.quietReattach})`);
@@ -7866,9 +7913,13 @@ async function reattachExistingSessions(
       const workDir = workDirDecision.workDir;
       await opencodeAdapter.resumeSession(key, workDir, agent.opencodeSessionId);
       reopened += 1;
-      if (!opts.quietReattach) {
-        replyToThread(key, t('agent.reattached')).catch(() => {});
-      }
+      // Fire-and-forget: the recap reads the watermark synchronously at call
+      // time (race-safe), but its body (an OpenCode HTTP GET) must not serialize
+      // the reattach scan. postReattachRecap swallows its own errors; the
+      // `.catch` is defensive.
+      void postReattachRecap(key, opencodeAdapter, workDir, agent.opencodeSessionId, !opts.quietReattach).catch(
+        () => {},
+      );
     } catch (e) {
       console.warn(`[reattach] opencode ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
     }
@@ -7908,9 +7959,6 @@ async function reattachExistingSessions(
         }
         if (await terminalAdapter.adoptExistingTmuxSession(key, sessionName, workDirDecision.workDir)) {
           adopted += 1;
-          if (!opts.quietReattach) {
-            replyToThread(key, t('agent.reattached')).catch(() => {});
-          }
         } else {
           // Adopt failed (zombie pane / vanished) — it killed the session itself.
           killed += 1;
@@ -8258,6 +8306,13 @@ export async function startBot(): Promise<void> {
   // resolve at render time. Same late-wiring idiom as the event handlers above;
   // before this line they fall back to all-fields-`minimal`.
   registerDisplayPrefsReader((key) => state.getDisplayPrefs(key));
+  // Both adapters advance the per-thread seen-watermark at TURN END through this
+  // writer (OpenCode on session.idle, Claude at the ready-prompt turn end) so a
+  // later restart can recover output produced while the bot was down. Same
+  // late-wiring idiom; inert (no-op) until this line runs.
+  registerSeenWatermarkWriter((key, watermark) => {
+    void state.setSeenWatermark(key, watermark);
+  });
   // The output path is selected ONCE here from CHAT_MODE (mirrors the adapter /
   // display-prefs wiring above) instead of a per-call surface branch at each
   // output site. Group is thin (queueOutput); DM owns the draft-cursor manager;
@@ -8303,9 +8358,9 @@ export async function startBot(): Promise<void> {
     }
   }
 
-  // 5. Re-attach sessions that survived the restart. Quiet during a hot
-  //    reload so the user isn't spammed with "session reattached" notices
-  //    on every nodemon swap; verbose on a real cold start.
+  // 5. Re-attach sessions that survived the restart. A successful re-adopt
+  //    is silent; `quietReattach` only suppresses the reattach ERROR notice
+  //    (workDir vanished) during a hot reload, surfaced on a real cold start.
   await reattachExistingSessions({ quietReattach: bootMode.isHotReload });
 
   // 5b. Re-arm pending interactive questions that survived the restart, so the

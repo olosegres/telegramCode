@@ -13,9 +13,12 @@ import type {
   DisplayPrefsReader,
   DisplayVerbosityMode,
   OutputEventMeta,
+  ReattachRecap,
   RecentTurn,
   ResolvedThreadDisplayPrefs,
   ResumeSessionOptions,
+  SeenWatermark,
+  SeenWatermarkWriter,
   SendInputOptions,
   ThreadKey,
 } from '../types';
@@ -201,6 +204,15 @@ interface ClaudeSession {
    * process kept its in-TUI effort and may be mid-turn).
    */
   pendingEffortReapply: string | null;
+  /**
+   * Seen-watermark gate: set `true` on any poll the session is busy
+   * (`esc to interrupt`), then consumed the FIRST ready-prompt poll after that —
+   * the turn-end moment — to advance the persisted {@link SeenWatermark} to the
+   * transcript size now (one write per turn, no re-fire on subsequent idle
+   * polls). Lets a bot restart count the assistant turns produced while it was
+   * down. Starts `false` for every fresh session object (start / resume / adopt).
+   */
+  watermarkPendingActivity: boolean;
   /**
    * Long-horizon dedup of lines already RELAYED to this topic (incident
    * 2026-06-10: a TUI re-render of an hours-old ~1400-line diff re-relayed as
@@ -2020,16 +2032,46 @@ function extractAssistantText(message: unknown): string | null {
 }
 
 /**
+ * @description Parse ONE Claude `.jsonl` transcript line into a renderable
+ * conversational turn, or `null` for a meta / tool-only / empty / malformed
+ * line. Shared by {@link readRecentClaudeTurns} (the resume-context / recap turn
+ * body) and {@link readClaudeReattachTranscript} (the missed-message count) so
+ * both apply the EXACT same renderability rule: a `type:'user'` /
+ * `type:'assistant'` entry whose message yields non-empty text (via
+ * {@link extractUserText} / {@link extractAssistantText}); `summary` and other
+ * meta lines, and assistant entries that are tool_use-only, yield `null`. Never
+ * throws — a torn / half-written line (offset landing mid-record) fails
+ * `JSON.parse` and yields `null`.
+ */
+function parseClaudeTurnLine(line: string): RecentTurn | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  let entry: unknown;
+  try {
+    entry = JSON.parse(trimmed);
+  } catch {
+    return null; // tolerate a half-written / torn line
+  }
+  if (!checkIsRecord(entry)) return null;
+  if (entry.type === 'user') {
+    const text = extractUserText(entry.message);
+    return text ? { role: 'user', text } : null;
+  }
+  if (entry.type === 'assistant') {
+    const text = extractAssistantText(entry.message);
+    return text ? { role: 'assistant', text } : null;
+  }
+  return null;
+}
+
+/**
  * @description Read the last `limit` conversational turns (user/assistant
  * messages with renderable text, oldest→newest) from a Claude `.jsonl`
  * transcript, for the resume context block.
  *
  * Exported and pure (filesystem-only) so it is unit-testable against a temp
- * `.jsonl`. Streams the whole file, collecting each `type:'user'` /
- * `type:'assistant'` entry whose message yields non-empty text (via
- * {@link extractUserText} / {@link extractAssistantText}); `summary` and other
- * meta lines, and assistant entries that are tool_use-only, are skipped. Keeps
- * only the last `limit` in a rolling window so a huge transcript stays cheap.
+ * `.jsonl`. Streams the whole file via {@link parseClaudeTurnLine}, keeping only
+ * the last `limit` in a rolling window so a huge transcript stays cheap.
  * Tolerates a half-written trailing line; a missing/unreadable file → `[]`.
  */
 export function readRecentClaudeTurns(filePath: string, limit: number): RecentTurn[] {
@@ -2042,28 +2084,63 @@ export function readRecentClaudeTurns(filePath: string, limit: number): RecentTu
 
   const turns: RecentTurn[] = [];
   for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let entry: unknown;
-    try {
-      entry = JSON.parse(trimmed);
-    } catch {
-      continue; // tolerate a half-written trailing line
-    }
-    if (!checkIsRecord(entry)) continue;
-
-    if (entry.type === 'user') {
-      const text = extractUserText(entry.message);
-      if (text) turns.push({ role: 'user', text });
-    } else if (entry.type === 'assistant') {
-      const text = extractAssistantText(entry.message);
-      if (text) turns.push({ role: 'assistant', text });
-    }
+    const turn = parseClaudeTurnLine(line);
+    if (turn) turns.push(turn);
     // Bound the window: drop the oldest once we exceed `limit` so a long
     // transcript never accumulates more than `limit` turns in memory.
     if (turns.length > limit) turns.shift();
   }
   return turns;
+}
+
+/**
+ * @description Combined transcript read for the silent-reattach recap: ONE
+ * `fs.readFileSync` yields BOTH the missed-message count and the recap turn
+ * body, so the transcript is not read twice.
+ *
+ * - `missedCount` — renderable `type:'assistant'` turns appended AFTER byte
+ *   `offset` (the seen-watermark = transcript size at the last turn end), counted
+ *   over the `[offset, EOF)` byte tail. A torn leading line (offset mid-record)
+ *   fails to parse and is skipped. `offset >= size` → `0` (nothing appended /
+ *   transcript truncated or rewritten smaller).
+ * - `turns` — the last `limit` renderable turns of the WHOLE session (NOT just
+ *   the missed region), identical to {@link readRecentClaudeTurns}.
+ *
+ * Exported and pure (filesystem-only) so it is unit-testable. `fs.readFileSync`
+ * reads the whole file in one call (it handles short reads internally), so a
+ * large `[offset, EOF)` tail never loses its last lines to a partial `read` —
+ * the silent undercount a manual `Buffer.alloc` + `fs.readSync` would hit on
+ * exactly the long-downtime case this feature targets. A missing/unreadable
+ * file → `{ missedCount: 0, turns: [] }`.
+ */
+export function readClaudeReattachTranscript(
+  filePath: string,
+  offset: number,
+  limit: number,
+): { missedCount: number; turns: RecentTurn[] } {
+  let buffer: Buffer;
+  try {
+    buffer = fs.readFileSync(filePath);
+  } catch {
+    return { missedCount: 0, turns: [] }; // transcript not on disk → nothing to recap
+  }
+
+  // Recap body: last `limit` renderable turns of the WHOLE session.
+  const turns: RecentTurn[] = [];
+  for (const line of buffer.toString('utf-8').split('\n')) {
+    const turn = parseClaudeTurnLine(line);
+    if (turn) turns.push(turn);
+    if (turns.length > limit) turns.shift();
+  }
+
+  // Missed count: renderable assistant turns in the [offset, EOF) byte tail.
+  const start = Math.min(Math.max(0, offset), buffer.length);
+  let missedCount = 0;
+  for (const line of buffer.subarray(start).toString('utf-8').split('\n')) {
+    const turn = parseClaudeTurnLine(line);
+    if (turn?.role === 'assistant') missedCount += 1;
+  }
+  return { missedCount, turns };
 }
 
 /**
@@ -2492,6 +2569,46 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     this.displayPrefsReader = reader;
   }
 
+  /**
+   * Per-thread seen-watermark writer, injected by the bot at boot via
+   * `createAdapter.registerSeenWatermarkWriter`. Called at turn end (the first
+   * ready-prompt poll after activity) to persist the transcript size. `null`
+   * until wired → {@link advanceSeenWatermark} is a no-op.
+   */
+  private seenWatermarkWriter: SeenWatermarkWriter | null = null;
+
+  /** @description Inject the per-thread seen-watermark writer (see the field's JSDoc). */
+  setSeenWatermarkWriter(writer: SeenWatermarkWriter): void {
+    this.seenWatermarkWriter = writer;
+  }
+
+  /** @description Advance the persisted seen-watermark for `key` (no-op until the
+   * writer is wired). */
+  private advanceSeenWatermark(key: ThreadKey, watermark: SeenWatermark): void {
+    this.seenWatermarkWriter?.(key, watermark);
+  }
+
+  /**
+   * @description Record the current transcript byte size as the seen-watermark
+   * at a turn end. Best-effort: a transcript not yet on disk (UUID just born)
+   * leaves the watermark where it was — the next turn end re-tries. The path
+   * resolves the same way {@link getRecentTurns} / {@link getReattachRecap} do.
+   */
+  private advanceClaudeWatermark(key: ThreadKey, session: ClaudeSession): void {
+    const transcriptPath = path.join(
+      getClaudeProjectsRoot(),
+      getClaudeProjectSlug(session.workDir),
+      `${session.claudeSessionId}.jsonl`,
+    );
+    let size: number;
+    try {
+      size = fs.statSync(transcriptPath).size;
+    } catch {
+      return;
+    }
+    this.advanceSeenWatermark(key, { sessionId: session.claudeSessionId, claudeTranscriptOffset: size });
+  }
+
   /** @description Resolve the thread's full display prefs, defaulting every
    * field to `minimal` for any read before the bot wires the reader at boot. */
   private getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
@@ -2532,6 +2649,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'currentPollDelayMs'
       | 'unchangedPollStreak'
       | 'pendingEffortReapply'
+      | 'watermarkPendingActivity'
       | 'recentRelayWindow'
       | 'subagentTail'
       | 'chunkContext'
@@ -2568,6 +2686,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S7: armed explicitly by `applyStoredEffortOnSpawn` after a fresh
       // start/resume spawn; adopt/reattach leaves it null (no re-apply).
       pendingEffortReapply: null,
+      // No turn activity seen yet — the first busy poll arms it; the first
+      // ready poll after that advances the seen-watermark.
+      watermarkPendingActivity: false,
       // Every fresh session object (start / resume / adopt all flow through
       // here) begins with an EMPTY relay window — this IS the "reset on
       // session start"; stop deletes the session and the window with it.
@@ -3320,6 +3441,36 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description Assemble the silent-reattach recap for Claude from the on-disk
+   * transcript via ONE {@link readClaudeReattachTranscript} read: the
+   * missed-message count is the assistant turns appended after the watermark
+   * byte offset, the body is the last {@link resumeContextTurnLimit} turns, and
+   * `isActive` is the best-effort in-memory busy flag (the just-adopted session
+   * seeds `lastContent` from the current pane, so an `esc to interrupt` footer
+   * reads as still-working). The offset is trusted only when the watermark's
+   * `sessionId` matches the session being recapped — a stale watermark from a
+   * different session (`/new`, `/sessions` resume keep the agent row) is treated
+   * as unknown. A `null`/mismatched/offset-less watermark yields
+   * `isWatermarkKnown: false` and `missedCount: 0` (the fallback recap), while
+   * the body still shows the last turns.
+   */
+  async getReattachRecap(
+    key: ThreadKey,
+    workDir: string,
+    sessionId: string,
+    watermark: SeenWatermark | null,
+  ): Promise<ReattachRecap> {
+    const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    const offset = watermark?.claudeTranscriptOffset;
+    const isWatermarkKnown = typeof offset === 'number' && watermark?.sessionId === sessionId;
+    // ONE read serves both the count and the body. When the watermark is unknown
+    // we still want the turn body, so read from 0 and drop the count below.
+    const { missedCount, turns } = readClaudeReattachTranscript(filePath, offset ?? 0, resumeContextTurnLimit);
+    const isActive = this.checkIsBusy(key);
+    return { missedCount: isWatermarkKnown ? missedCount : 0, turns, isWatermarkKnown, isActive };
+  }
+
+  /**
    * @description Resume a Claude session by UUID.
    *
    * Two fixes vs. the legacy implementation:
@@ -3697,6 +3848,21 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     // the serial tmux queue, and this enqueues first.
     if (session.pendingEffortReapply && checkIsClaudePromptReady(content)) {
       this.consumePendingEffortReapply(session);
+    }
+
+    // Seen-watermark advance at turn end. While the turn is busy
+    // (`esc to interrupt`) we arm the gate; the first ready-prompt poll after
+    // that — the turn just finished — records the transcript size as "shown
+    // live up to here" and disarms, so exactly one write lands per turn (idle
+    // polls with no prior activity never fire). Runs every non-seeding poll;
+    // it is cheap (a regex test + a bool), the fs stat only fires on the gated
+    // turn-end poll. Lets a later bot restart count the assistant turns it
+    // missed during downtime (the reattach recap).
+    if (checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: content })) {
+      session.watermarkPendingActivity = true;
+    } else if (session.watermarkPendingActivity && checkIsClaudePromptReady(content)) {
+      session.watermarkPendingActivity = false;
+      this.advanceClaudeWatermark(key, session);
     }
 
     // S1 idle-poll table flush: the change branch below never runs on a

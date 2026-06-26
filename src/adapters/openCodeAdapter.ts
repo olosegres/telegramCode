@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -266,6 +266,14 @@ interface OpenCodeSession {
    */
   busyChildSessionIds: Set<string>;
   /**
+   * Id of the LAST completed parent assistant message of the turn, captured from
+   * the message events (no extra HTTP). Advanced to the persisted
+   * {@link SeenWatermark} on `session.idle` so a bot restart can count the
+   * assistant messages produced after it (the reattach recap). `undefined` until
+   * the first assistant turn finishes.
+   */
+  lastMessageId?: string;
+  /**
    * Whether this session may still be renamed by the bot-side fallback. Set
    * `true` only for sessions the bot created WITHOUT explicit `/opencode args`
    * (those rely on opencode's native auto-title — R1). Cleared on the first
@@ -446,6 +454,24 @@ interface OpenCodeMessageRecord {
 }
 
 /**
+ * @description One renderability rule for a message `part`, shared by
+ * {@link mapOpenCodeMessagesToTurns} (turn body) and
+ * {@link countOpenCodeAssistantMessagesSinceId} (missed count) so both agree on
+ * what counts as visible prose: a non-empty `{ type: 'text' }` part (tool / step
+ * / empty parts don't count). Type guard so the caller can read `part.text` as a
+ * string without a cast.
+ */
+function checkIsRenderableTextPart(part: OpenCodePart): part is OpenCodePart & { text: string } {
+  return (
+    !!part &&
+    typeof part === 'object' &&
+    part.type === 'text' &&
+    typeof part.text === 'string' &&
+    part.text.trim().length > 0
+  );
+}
+
+/**
  * @description Map raw `GET /session/:id/message` records to the last `limit`
  * conversational turns (oldest→newest) for the resume context block.
  *
@@ -467,15 +493,69 @@ export function mapOpenCodeMessagesToTurns(records: unknown, limit: number): Rec
     if (!Array.isArray(parts)) continue;
     const textChunks: string[] = [];
     for (const part of parts) {
-      if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
-        const trimmed = part.text.trim();
-        if (trimmed) textChunks.push(trimmed);
-      }
+      if (checkIsRenderableTextPart(part)) textChunks.push(part.text.trim());
     }
     if (textChunks.length === 0) continue;
     turns.push({ role, text: textChunks.join('\n\n') });
   }
   return turns.slice(-limit);
+}
+
+/**
+ * @description Count the renderable assistant messages that appear AFTER the
+ * watermark message in a `GET /session/:id/message` payload — the OpenCode side
+ * of "how many agent messages did the user miss while the bot was down".
+ *
+ * Pure + exported (no I/O) so it is unit-testable against a records array. Walks
+ * the chronological records (oldest→newest), skipping everything up to and
+ * including the message whose `info.id === watermarkId`, then counts each later
+ * `assistant`-role record that carries at least one non-empty text part (the
+ * same renderability rule as {@link mapOpenCodeMessagesToTurns}, so the count
+ * matches what a turn body would show).
+ *
+ * `isWatermarkKnown` is `false` — and `missedCount` `0` — when the payload is
+ * not an array, no `watermarkId` was given, or the id is absent from the records
+ * (pruned / different session). The caller treats that as the fallback
+ * (no-count) recap, never a crash.
+ */
+export function countOpenCodeAssistantMessagesSinceId(
+  records: unknown,
+  watermarkId: string | undefined,
+): { missedCount: number; isWatermarkKnown: boolean } {
+  if (!Array.isArray(records) || !watermarkId) {
+    return { missedCount: 0, isWatermarkKnown: false };
+  }
+  let foundWatermark = false;
+  let missedCount = 0;
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const { info, parts } = record as OpenCodeMessageRecord;
+    if (!foundWatermark) {
+      if (info?.id === watermarkId) foundWatermark = true;
+      continue;
+    }
+    if (info?.role !== 'assistant' || !Array.isArray(parts)) continue;
+    if (parts.some(checkIsRenderableTextPart)) missedCount += 1;
+  }
+  if (!foundWatermark) return { missedCount: 0, isWatermarkKnown: false };
+  return { missedCount, isWatermarkKnown: true };
+}
+
+/**
+ * @description Best-effort "the turn is still in flight" signal for the reattach
+ * recap, derived from the already-fetched `GET /session/:id/message` payload —
+ * NO extra HTTP probe. True only when the LAST record is an `assistant` message
+ * with no `finish` reason yet (a turn the agent was mid-way through when the bot
+ * went down). Any uncertainty (empty / non-array payload, last record not a
+ * finished-less assistant message) → `false`, so the trailing "still working"
+ * line is never shown on a guess.
+ */
+export function checkIsOpenCodeTurnInFlight(records: unknown): boolean {
+  if (!Array.isArray(records) || records.length === 0) return false;
+  const last = records[records.length - 1];
+  if (!last || typeof last !== 'object') return false;
+  const { info } = last as OpenCodeMessageRecord;
+  return info?.role === 'assistant' && info.finish === undefined;
 }
 
 /**
@@ -965,6 +1045,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     this.displayPrefsReader = reader;
   }
 
+  /**
+   * Per-thread seen-watermark writer, injected by the bot at boot via
+   * `createAdapter.registerSeenWatermarkWriter`. Called at turn end
+   * (`session.idle`) to persist how far the live relay had shown the record.
+   * `null` until wired → {@link advanceSeenWatermark} is a no-op.
+   */
+  private seenWatermarkWriter: SeenWatermarkWriter | null = null;
+
+  /** @description Inject the per-thread seen-watermark writer (see the field's JSDoc). */
+  setSeenWatermarkWriter(writer: SeenWatermarkWriter): void {
+    this.seenWatermarkWriter = writer;
+  }
+
+  /** @description Advance the persisted seen-watermark for `key` (no-op until the
+   * writer is wired). Skips a watermark with no anchor id so the bot's recap
+   * cleanly falls back to its no-count path. */
+  private advanceSeenWatermark(key: ThreadKey, watermark: SeenWatermark): void {
+    if (watermark.opencodeMessageId === undefined) return;
+    this.seenWatermarkWriter?.(key, watermark);
+  }
+
   /** @description Resolve the thread's full display prefs, defaulting every
    * field to `minimal` for any read before the bot wires the reader at boot. */
   private getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
@@ -1289,6 +1390,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           isBusy: false,
           isCompacting: false,
           busyChildSessionIds: new Set(),
+          // No assistant turn has finished yet — the seen-watermark anchor is
+          // set on the first `session.idle` after a turn completes.
+          lastMessageId: undefined,
           // Only untitled (no-args) sessions are eligible for the bot-side
           // fallback rename; an explicit `args` title is user-set and final.
           isAutoNamePending: !args,
@@ -1891,6 +1995,38 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
+  /**
+   * @description Assemble the silent-reattach recap for OpenCode: ONE
+   * `GET /session/:id/message` read serves both the missed-message count (since
+   * the watermark id) and the last-{@link resumeContextTurnLimit} turns. A read
+   * failure degrades to an empty, watermark-unknown recap (the caller posts
+   * nothing). The watermark only counts when its `sessionId` matches the session
+   * being recapped — a stale watermark from a different session (`/new`,
+   * `/sessions` resume keep the agent row) is treated as unknown. `isActive` is
+   * derived from the fetched records (last record = an unfinished assistant
+   * turn), never a blocking server probe.
+   */
+  async getReattachRecap(
+    _key: ThreadKey,
+    _workDir: string,
+    sessionId: string,
+    watermark: SeenWatermark | null,
+  ): Promise<ReattachRecap> {
+    let records: unknown;
+    try {
+      records = await this.apiRequest<unknown>('GET', `/session/${sessionId}/message`);
+    } catch (e) {
+      console.error(`[OpenCode] getReattachRecap read failed:`, e);
+      return { missedCount: 0, turns: [], isWatermarkKnown: false, isActive: false };
+    }
+    // Only trust the watermark id when it was taken against THIS session.
+    const watermarkId = watermark?.sessionId === sessionId ? watermark.opencodeMessageId : undefined;
+    const { missedCount, isWatermarkKnown } = countOpenCodeAssistantMessagesSinceId(records, watermarkId);
+    const turns = mapOpenCodeMessagesToTurns(records, resumeContextTurnLimit);
+    const isActive = checkIsOpenCodeTurnInFlight(records);
+    return { missedCount, turns, isWatermarkKnown, isActive };
+  }
+
   async resumeSession(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {
     // `workDir` is now an explicit argument from the bot, sourced from the
     // thread's binding in state.json. The old code defaulted to
@@ -1949,6 +2085,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         isBusy: false,
         isCompacting: false,
         busyChildSessionIds: new Set(),
+        // The watermark anchor is re-learned from the next finished turn; the
+        // persisted watermark (read by the bot for the reattach recap) is
+        // independent of this fresh-session field.
+        lastMessageId: undefined,
         // A resumed session already has a name and history — never auto-rename.
         isAutoNamePending: false,
       };
@@ -3295,7 +3435,13 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // dedicated sub-agent status — the parent's delegation is still in flight.
       // Only the PARENT's own finishing message ends the delegation defensively.
       const isParentMessage = !info.sessionID || info.sessionID === session.sessionId;
-      if (isParentMessage) this.closeSubagentStatusOnParentTurnEnd(key);
+      if (isParentMessage) {
+        // Anchor the seen-watermark on the PARENT turn's final assistant message
+        // id (a child's id must never become the watermark). Advanced to state on
+        // the following `session.idle`.
+        if (info.id) session.lastMessageId = info.id;
+        this.closeSubagentStatusOnParentTurnEnd(key);
+      }
       this.flushOutput(key);
     }
 
@@ -3342,6 +3488,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // The turn just ended: mark this flush final so the bot delivers the last
     // frame promptly instead of letting it sit out a stretched 429 debounce.
     this.flushOutput(key, true);
+
+    // Advance the seen-watermark only on the PARENT's own idle — a sub-agent
+    // child idle (routed here via lineage) leaves the parent turn in flight.
+    // Anchored on the last completed parent assistant message id (captured in
+    // handleMessageUpdate); a missing anchor is skipped (recap falls back).
+    if (!sessionId || sessionId === session.sessionId) {
+      this.advanceSeenWatermark(key, { sessionId: session.sessionId, opencodeMessageId: session.lastMessageId });
+    }
   }
 
   /**

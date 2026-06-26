@@ -221,7 +221,6 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.question_hint': 'ℹ️ Ответь цифрой варианта (например 1) или y/n. Также: /up /down — выбор, /enter — подтвердить, /c — отмена.',
     'agent.survey_hint': 'ℹ️ Нажми кнопку или ответь цифрой варианта — отправлю в Claude.',
     'agent.start_failed': 'Не удалось запустить {label}: {error}',
-    'agent.reattached': '🔄 Бот перезапущен, сессия жива — продолжаем.',
     'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
     'agent.question_cancelled_msg_label': '❌ Вопрос отменён: {header}',
     'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',
@@ -399,6 +398,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'resume.context_header': '↩️ Возобновлено — последние {count} сообщений:',
     'resume.context_user_label': '👤',
     'resume.context_assistant_label': '🤖',
+
+    // ── reattach recap (silent restart — recover output produced while down) ──
+    'recap.missedCountHeader': '⚠️ Пока бот был недоступен, пропущено сообщений: {count}. Последнее из сессии:',
+    'recap.restartedFallbackHeader': '🔄 Бот перезапущен. Последнее из сессии:',
+    'recap.stillWorkingLine': '⏳ Агент всё ещё работает…',
 
     // ── output-trace toggle (/trace). {count}=кол-во тредов в трейсе ──
     'trace.onThisThreadReply': '🔎 Трейс включён для этого треда.',
@@ -630,7 +634,6 @@ const dict: Record<Lang, Record<string, string>> = {
     'agent.question_hint': 'ℹ️ Reply with the option number (e.g. 1) or y/n. Also: /up /down to move, /enter to confirm, /c to cancel.',
     'agent.survey_hint': 'ℹ️ Tap a button or reply with the option number — I will send it to Claude.',
     'agent.start_failed': 'Failed to start {label}: {error}',
-    'agent.reattached': '🔄 Bot restarted — session is still alive, continuing.',
     'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
     'agent.question_cancelled_msg_label': '❌ Question cancelled: {header}',
     'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',
@@ -801,6 +804,11 @@ const dict: Record<Lang, Record<string, string>> = {
     'resume.context_header': '↩️ Resumed — last {count} messages:',
     'resume.context_user_label': '👤',
     'resume.context_assistant_label': '🤖',
+
+    // ── reattach recap (silent restart — recover output produced while down) ──
+    'recap.missedCountHeader': '⚠️ Missed {count} message(s) while the bot was down. Latest from the session:',
+    'recap.restartedFallbackHeader': '🔄 Bot restarted. Latest from the session:',
+    'recap.stillWorkingLine': '⏳ The agent is still working…',
 
     // ── output-trace toggle (/trace). {count}=number of traced threads ──
     'trace.onThisThreadReply': '🔎 Tracing enabled for this thread.',

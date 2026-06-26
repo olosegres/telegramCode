@@ -9,6 +9,7 @@ import {
   type DisplayVerbosityMode,
   type PendingQuestionState,
   type ResolvedThreadDisplayPrefs,
+  type SeenWatermark,
   type ThreadDisplayPrefs,
   type ThreadKey,
 } from './types';
@@ -106,6 +107,15 @@ export interface AgentData {
    * after a bot restart (plan §13.19).
    */
   opencodeSessionId?: string;
+  /**
+   * Per-thread "seen" watermark advanced at each turn end (see
+   * {@link SeenWatermark}). Lets a bot restart compute how much output the agent
+   * produced WHILE the bot was down and recover it via the reattach recap,
+   * instead of silently dropping it. Optional so older state files stay valid —
+   * a missing value means "watermark unknown" → the recap uses its fallback
+   * (no-count) path. Backend-specific representation; only one sub-field is set.
+   */
+  seenWatermark?: SeenWatermark;
 }
 
 export interface StateV1 {
@@ -126,8 +136,8 @@ export interface StateV1 {
    * lastHeartbeatAt` against {@link HOT_RELOAD_THRESHOLD_MS}: small gaps
    * are a hot reload (quiet reattach, keep buffered updates), large gaps
    * (or `undefined` for fresh installs / older state files) are a cold
-   * start (allow the per-thread "session reattached" notice, optionally
-   * drop the stale update backlog).
+   * start (allow the per-thread reattach ERROR notice — workDir vanished —
+   * optionally drop the stale update backlog).
    *
    * Optional so old `state.json` files (created before heartbeats existed)
    * remain valid — `loadStateFile`'s shape check doesn't require it, and
@@ -764,6 +774,25 @@ export class StateStore {
       this.state.agents[k] = existing
         ? { ...existing, opencodeSessionId: id }
         : { name: 'opencode', opencodeSessionId: id };
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Advance the per-thread {@link SeenWatermark} (set at each turn
+   * end by the adapters via the injected writer). Merges onto the EXISTING agent
+   * row only — never flips `agent.name` (symmetric to
+   * {@link setClaudeSessionId} / {@link setOpenCodeSessionId}) and, unlike them,
+   * never CREATES a row: a watermark is meaningless without a live agent session
+   * (which always recorded its row first), so a write for an unknown thread is a
+   * no-op, not a dangling agent row.
+   */
+  async setSeenWatermark(key: ThreadKey, watermark: SeenWatermark): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.agents[k];
+      if (!existing) return;
+      this.state.agents[k] = { ...existing, seenWatermark: watermark };
       this.scheduleSave();
     });
   }

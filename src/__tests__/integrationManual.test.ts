@@ -37,8 +37,8 @@ test('R9 — re-attach to surviving tmux session after bot restart', { skip: 'in
    *
    *   5. Start the bot again. Expected:
    *        - log line `[reattach] tmux: adopted 1, killed 0 orphans`
-   *        - inside the thread, the bot posts `t('agent.reattached')`
-   *          (currently: "🔄 Bot restarted, session is alive, continuing")
+   *        - the thread stays SILENT — a successful re-adopt posts no
+   *          notice (the old "session is still alive" message was removed)
    *        - `adapter.checkIsActive(<C>:<T>)` reports true again
    *        - the pinned banner edits in place to `🟢 running`
    *

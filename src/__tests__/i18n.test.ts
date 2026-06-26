@@ -76,6 +76,18 @@ test('agent.question_cancelled_for_prompt exists in every locale (S2 wedged-ques
   assert.ok(!out.includes('{'), `unexpected placeholder in "${out}"`);
 });
 
+test('reattach recap keys exist in every locale', () => {
+  for (const code of ['recap.missedCountHeader', 'recap.restartedFallbackHeader', 'recap.stillWorkingLine']) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('recap.missedCountHeader substitutes the {count}', () => {
+  const out = t('recap.missedCountHeader', { count: 7 });
+  assert.ok(out.includes('7'), `expected the count in "${out}"`);
+  assert.ok(!out.includes('{count}'), `placeholder not substituted: "${out}"`);
+});
+
 test('file intake keys exist in every locale', () => {
   assert.ok(checkKeyInAllLangs('file.too_big'), 'file.too_big missing in some locale');
   assert.ok(checkKeyInAllLangs('file.download_failed'), 'file.download_failed missing in some locale');

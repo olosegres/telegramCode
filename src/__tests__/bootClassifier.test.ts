@@ -5,9 +5,9 @@
  * Behaviour matrix (locked by the plan, "Hot reload that keeps agents
  * alive", D3 + §6):
  *
- *   downtime null  → cold start (drop backlog, allow reattach notice)
+ *   downtime null  → cold start (drop backlog, allow reattach error notice)
  *   downtime <  T  → hot reload (keep backlog, quiet reattach)
- *   downtime ≥  T  → cold start (drop backlog, allow reattach notice)
+ *   downtime ≥  T  → cold start (drop backlog, allow reattach error notice)
  *
  * Threshold default is generous (60s) so a slow tsc rebuild still
  * classifies as hot reload; tests pin both the default-threshold path

@@ -20,6 +20,62 @@ export interface RecentTurn {
 }
 
 /**
+ * @description Per-thread "seen" watermark — how far the LIVE relay had shown
+ * the agent's persistent record at the last turn end. Persisted in `state.json`
+ * on the agent row (next to the session ids) so a bot restart can tell how much
+ * output the agent produced WHILE the bot was down (and recover it via the
+ * reattach recap) instead of silently losing it.
+ *
+ * Backend representations live side by side (only one is set per row, mirroring
+ * `claudeSessionId` / `opencodeSessionId`):
+ * - OpenCode → the last completed assistant message `id` of the turn.
+ * - Claude   → the transcript `.jsonl` byte offset (file size) at turn end.
+ *
+ * `sessionId` scopes the watermark to the session it was taken against: it
+ * survives `/new` (which keeps the agent row) and `/sessions` resume (which
+ * merges onto it), so on a later read the recap MUST verify the stored id still
+ * matches the session being recapped — otherwise an old session's offset/id
+ * cross-applies to a different transcript and yields a garbage count. A
+ * mismatch is treated as "watermark unknown" (the no-count fallback).
+ */
+export interface SeenWatermark {
+  sessionId: string;
+  opencodeMessageId?: string;
+  claudeTranscriptOffset?: number;
+}
+
+/**
+ * @description Adapter-side callback that advances the per-thread
+ * {@link SeenWatermark} at turn end. Injected at boot via the same DI seam as
+ * {@link DisplayPrefsReader} (`createAdapter.registerSeenWatermarkWriter`),
+ * wired in `bot.ts` to `state.setSeenWatermark`. Inert (no-op) until registered,
+ * so an embedded / test caller that never wires it simply skips watermarking.
+ */
+export type SeenWatermarkWriter = (key: ThreadKey, watermark: SeenWatermark) => void;
+
+/**
+ * @description Result of {@link AgentAdapter.getReattachRecap} — the data the
+ * bot needs to assemble the post-restart recap for one thread.
+ *
+ * - `missedCount` — number of AGENT (assistant) messages produced during the
+ *   downtime, computed from the persisted {@link SeenWatermark}. `0` when none
+ *   were missed (a clean hot reload) → the bot posts nothing.
+ * - `turns` — the last few conversational turns (already capped), rendered as
+ *   the recap body regardless of `missedCount` (the count line conveys scale).
+ * - `isWatermarkKnown` — whether the watermark was trusted and located in the
+ *   record. `false` (first run after ship, pruned transcript, crash before any
+ *   watermark) → the bot uses the no-number fallback header.
+ * - `isActive` — best-effort "the agent is still working right now" signal,
+ *   read cheaply from in-memory state; drives the trailing status line.
+ */
+export interface ReattachRecap {
+  missedCount: number;
+  turns: RecentTurn[];
+  isWatermarkKnown: boolean;
+  isActive: boolean;
+}
+
+/**
  * @description Options for {@link AgentAdapter.resumeSession}.
  */
 export interface ResumeSessionOptions {
@@ -623,6 +679,24 @@ export interface AgentAdapter extends EventEmitter {
    * session). Used by `resumeSession` to post the short resume context block.
    */
   getRecentTurns?(key: ThreadKey, workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]>;
+
+  /**
+   * @description Assemble the post-restart recap for `sessionId`: how many
+   * assistant messages were produced while the bot was down (vs the persisted
+   * {@link SeenWatermark}) plus the last few turns and a best-effort
+   * still-working signal. Called by `reattachExistingSessions` after a SILENT
+   * re-adopt (NOT the explicit `/sessions` resume, which keeps its own context
+   * block). Optional (optional-method pattern, like {@link getRecentTurns}):
+   * adapters that keep no structured record omit it (Terminal) and the reattach
+   * recap is simply skipped. `watermark` is `null` when none was ever persisted
+   * → the implementation returns `isWatermarkKnown: false` (the fallback path).
+   */
+  getReattachRecap?(
+    key: ThreadKey,
+    workDir: string,
+    sessionId: string,
+    watermark: SeenWatermark | null,
+  ): Promise<ReattachRecap>;
 
   // — Model selection —
 

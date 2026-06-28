@@ -126,6 +126,17 @@ interface ClaudeSession {
    */
   lastQuestionSignature: string;
   /**
+   * Consecutive poll diffs (while a question is pending) in which
+   * {@link extractClaudeQuestion} found NO selector on screen. The selector
+   * repaints constantly, so a single scrape can momentarily fail to match while
+   * it is still up; resolving the question (emit `questionGone`) on that lone
+   * null both unpins prematurely AND re-emits a duplicate question + notification
+   * the next poll (the signature was cleared). We only treat the question as gone
+   * after it has been absent for {@link questionAbsentPollThreshold} consecutive
+   * diffs. Reset to 0 on any detection.
+   */
+  questionAbsentPolls: number;
+  /**
    * Signature of the last emitted Claude CLI bare-digit survey (header +
    * option digits/labels). Same de-dup mechanism as
    * {@link lastQuestionSignature}: the survey repaints every poll while on
@@ -593,6 +604,13 @@ const QUESTION_CHAT_ABOUT_REGEX = /^\s*(?:❯\s*)?Chat about this\s*$/i;
 /** A positive "this is an interactive prompt" signal near the option group. */
 const QUESTION_SELECT_HINT_REGEX = /Enter to select|to select|↑↓|↑\/↓|use arrow|esc to/i;
 const QUESTION_MIN_OPTIONS = 2;
+/**
+ * Consecutive poll diffs with NO selector detected before a pending question is
+ * treated as resolved (`questionGone`). 2 = ignore a single transient scrape
+ * miss while the selector is still repainting; a genuine resolve stays absent
+ * across successive diffs. See {@link ClaudeSession.questionAbsentPolls}.
+ */
+const questionAbsentPollThreshold = 2;
 /** How far below the last option to look for the "Enter to select" hint. */
 const QUESTION_HINT_LOOKAHEAD = 4;
 /**
@@ -2319,6 +2337,13 @@ const CONTENT_MARKER_RE = /^(?:[●⏺]|⎿|```)/;
  * plain — those frames leaked into the topic (B7b). Anchoring on the first line
  * + a content-marker veto keeps a `❯` inside real tool output (e.g. a pane
  * capture printed by a Bash command) classified as content, not an echo.
+ *
+ * MAINTENANCE — Claude Code's TUI rendering drifts between versions, back and
+ * forth (the prompt glyph, the echo indentation, the content markers — e.g. the
+ * `●`→`⏺` bullet change noted in `utils/claudeScrapeShapes.ts`). This detector
+ * must tolerate ALL known formatting variants, not assume the current one: when
+ * an echo starts leaking into the topic, WIDEN the predicate to also cover the
+ * new shape (keep the old variants), don't swap one shape for another.
  */
 export function checkIsInputEchoFrame(frameText: string): boolean {
   const contentLines = frameText
@@ -2636,6 +2661,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'handledApiError'
       | 'lastStatusText'
       | 'lastQuestionSignature'
+      | 'questionAbsentPolls'
       | 'lastSurveySignature'
       | 'autoEnterTimer'
       | 'autoAcceptOuterTimer'
@@ -2666,6 +2692,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       handledApiError: false,
       lastStatusText: '',
       lastQuestionSignature: '',
+      questionAbsentPolls: 0,
       lastSurveySignature: '',
       autoEnterTimer: null,
       autoAcceptOuterTimer: null,
@@ -3945,16 +3972,35 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           // survey signal. Clear the survey de-dup so it can't shadow the
           // question's digit routing.
           session.lastSurveySignature = '';
+          // Detected → reset the absence counter (any prior transient null was a
+          // flicker, not a resolve).
+          session.questionAbsentPolls = 0;
           if (question.signature !== session.lastQuestionSignature) {
             session.lastQuestionSignature = question.signature;
             session.lastStatusText = '';
             session.openToolKind = null; // a question ends any prior tool output
-            this.emit('output', key, `${question.text}\n\n${t('agent.question_hint')}`);
+            // `isQuestion`: the bot sends this as its OWN pinnable message and
+            // pins it so the muted topic fires a notification.
+            this.emit('output', key, `${question.text}\n\n${t('agent.question_hint')}`, { isQuestion: true });
           }
         } else {
-          // No question on screen — clear the de-dup so an identical question
-          // asked again later is delivered, not silently swallowed.
-          session.lastQuestionSignature = '';
+          // No selector THIS diff. While a question is pending, a single miss is
+          // usually the selector mid-repaint, NOT a resolve — debounce so we
+          // don't fire `questionGone` (premature unpin) then re-emit a duplicate
+          // question + notification next poll once it re-appears. Only resolve
+          // after it's been absent for `questionAbsentPollThreshold` consecutive
+          // diffs; clearing the signature only THEN (so an identical question
+          // asked again later is still delivered, not swallowed).
+          if (session.lastQuestionSignature) {
+            session.questionAbsentPolls += 1;
+            if (session.questionAbsentPolls >= questionAbsentPollThreshold) {
+              this.emit('questionGone', key);
+              session.lastQuestionSignature = '';
+              session.questionAbsentPolls = 0;
+            }
+          } else {
+            session.questionAbsentPolls = 0;
+          }
 
           // Claude CLI bare-digit survey (the periodic session-feedback prompt):
           // arm the answerable state + emit tappable buttons ONCE per signature.

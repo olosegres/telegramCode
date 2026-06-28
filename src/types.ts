@@ -372,6 +372,14 @@ export interface OutputEventMeta {
    */
   isSubagent?: boolean;
   /**
+   * Claude-only. True when this `output` is a scraped interactive question
+   * (the TUI selector prompt + hint). The bot sends it as its OWN pinnable
+   * message (instead of the coalescing output cursor) and PINS it, so the muted
+   * topic fires a notification. OpenCode questions never use this — they have a
+   * discrete `question` event with their own post + pin path.
+   */
+  isQuestion?: boolean;
+  /**
    * Claude-only. True when the pane had a paragraph break immediately before
    * this chunk's first new line (carried out-of-band because the relay
    * pipeline's `.trim()`s would strip a leading blank). The bot inserts a

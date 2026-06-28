@@ -763,6 +763,15 @@ const threadMessageStates = new Map<string, ThreadMessageState>();
 const outputQueues = new Map<string, OutputQueueState>();
 const pendingQuestions = new Map<string, PendingQuestionState>();
 /**
+ * @description Per-thread id of the question message currently PINNED in the
+ * topic (in-memory only). A pinned message pierces a MUTED topic, so pinning the
+ * pending question is how the operator — who keeps every topic muted — gets a
+ * Telegram notification about it. Source of truth for {@link unpinThreadQuestion};
+ * re-established after a restart by the OpenCode persisted-`messageId` fallback
+ * and Claude's live re-scrape, so it needs no persistence of its own.
+ */
+const questionPinnedMessageId = new Map<string, number>();
+/**
  * @description Per-thread live Claude survey button message (in-memory only).
  * The adapter's `lastSurveySignature` is the source of truth for "a survey is
  * pending"; this map just remembers the message id + parsed options so a
@@ -806,7 +815,19 @@ function setPendingQuestion(key: ThreadKey, value: PendingQuestionState): void {
  * `pendingQuestions.delete(...)` so memory and disk stay in lockstep.
  */
 function clearPendingQuestion(key: ThreadKey): void {
-  pendingQuestions.delete(keyToString(key));
+  const kStr = keyToString(key);
+  // Post-restart OpenCode: the in-memory pin map was lost on restart but the
+  // question message is still pinned on Telegram (its id lives on the persisted
+  // `pendingQuestions` entry). Seed the map from it so the unpin below finds the
+  // id — deterministic, with no reliance on sync execution order against the
+  // `delete` that follows. The live case is a no-op (the map already holds the
+  // id; `has` is true).
+  const pending = pendingQuestions.get(kStr);
+  if (pending?.messageId != null && !questionPinnedMessageId.has(kStr)) {
+    questionPinnedMessageId.set(kStr, pending.messageId);
+  }
+  void unpinThreadQuestion(key);
+  pendingQuestions.delete(kStr);
   state.clearPendingQuestion(key).catch(e =>
     console.error('[pendingQuestion] clear failed:', e),
   );
@@ -1594,6 +1615,63 @@ const pinnedStatusTextCache = new Map<string, string>();
 const pinnedStatusLock = new KeyLock();
 
 /**
+ * @description Per-thread lock for the question pin/unpin read-modify-write
+ * (`questionPinnedMessageId`). Same rationale as {@link pinnedStatusLock}: both
+ * `pinThreadQuestion` and `unpinThreadQuestion` read the map, `await` an
+ * `enqueueSend` round-trip, then set/delete the map — interleaving two of them
+ * (e.g. an S3 repost racing the answer's unpin) could double-notify or leave a
+ * phantom id that makes the NEXT question pin silently (zero notification — the
+ * worst outcome for a muted topic). Holding ONE lock across both helpers
+ * serialises every pin/unpin for a key.
+ */
+const questionPinLock = new KeyLock();
+
+/**
+ * @description Single source of truth for turning a failed Telegram send into a
+ * log string: prefer the API error description, fall back to the JS message.
+ * Used by every pin/unpin/banner swallow-and-log site so the extraction never
+ * drifts between them.
+ */
+function describeSendError(e: unknown): string {
+  return checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
+}
+
+/**
+ * @description Pin `messageId` for `key` through the rate-limit queue, swallowing
+ * + logging failures (missing `can_pin_messages`, closed topic, network). Returns
+ * `true` on success so the caller can keep its bookkeeping in sync with what is
+ * actually pinned. Bot-owned plumbing primitive for the question pin helpers.
+ */
+async function pinMessageQuiet(key: ThreadKey, messageId: number, options: { disableNotification: boolean }): Promise<boolean> {
+  try {
+    await enqueueSend(key, () =>
+      bot.telegram.pinChatMessage(key.chatId, messageId, { disable_notification: options.disableNotification }),
+      'status',
+    );
+    return true;
+  } catch (e) {
+    console.warn(`[question-pin] pin ${keyToString(key)} msg ${messageId} failed: ${describeSendError(e)}`);
+    return false;
+  }
+}
+
+/**
+ * @description Unpin `messageId` for `key` through the rate-limit queue,
+ * swallowing + logging failures (already-unpinned / deleted / lost permission).
+ * Fire-and-forget sibling of {@link pinMessageQuiet}.
+ */
+async function unpinMessageQuiet(key: ThreadKey, messageId: number): Promise<void> {
+  try {
+    await enqueueSend(key, () =>
+      bot.telegram.unpinChatMessage(key.chatId, messageId),
+      'status',
+    );
+  } catch (e) {
+    console.warn(`[question-pin] unpin ${keyToString(key)} msg ${messageId} failed: ${describeSendError(e)}`);
+  }
+}
+
+/**
  * @description Whether this thread's binding is eligible for a pinned
  * banner. General has no per-thread state to mirror; closed topics get
  * the banner left as-is (Telegram refuses edits in closed topics).
@@ -1747,8 +1825,7 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
       // We still keep the message id so subsequent edits keep refreshing it
       // (so the user at least sees a fresh status line in the topic body
       // even without a pin).
-      const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
-      console.warn(`[pinned] pin ${k} failed: ${desc}`);
+      console.warn(`[pinned] pin ${k} failed: ${describeSendError(e)}`);
     }
 
     await state.setBindingPinnedStatusMessageId(key, messageId).catch(err =>
@@ -1797,8 +1874,7 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
         'status',
       );
     } catch (e) {
-      const desc = checkIsApiError(e) ? getErrorDescription(e) : (e instanceof Error ? e.message : String(e));
-      console.warn(`[pinned] unpin ${k} failed: ${desc}`);
+      console.warn(`[pinned] unpin ${k} failed: ${describeSendError(e)}`);
     }
     try {
       await enqueueSend(key, () =>
@@ -1812,6 +1888,68 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
     // Clear the persisted text alongside the id so a future /bind in the same
     // thread can't have its first banner edit suppressed by a stale match (B8).
     await state.setBindingPinnedStatusText(key, null).catch(() => {});
+  });
+}
+
+/**
+ * @description Pin the pending question's message so the topic — which the
+ * operator keeps muted — fires a Telegram notification (a pin pierces a muted
+ * topic). Mirrors the {@link updatePinnedStatus} pin pattern: routed through
+ * `enqueueSend`, errors swallowed + logged (missing `can_pin_messages`, closed
+ * topic, network) — the pin is convenience UI and must never fail the question
+ * flow. A DIFFERENT question already pinned for this thread is unpinned first, so
+ * the topic never keeps a stale pinned question (Q1→Q2 advance, or an S3
+ * re-post-to-bottom that replaced the message id).
+ *
+ * Notifies ONLY on the FIRST pin of a thread's pending question; every RE-pin is
+ * SILENT (`disable_notification: true`) so one question = one notification. The
+ * first-vs-repin signal is the in-memory map: `existingId === undefined` ⇒ nothing
+ * pinned yet ⇒ first pin ⇒ notify; an `existingId` ⇒ a repin from the S3 repost /
+ * Q1→Q2 advance ⇒ silent (the entry only clears on resolve via
+ * {@link unpinThreadQuestion}, so it survives reposts). Unpinning is per-message-id,
+ * so the banner's own (silent) pin is never disturbed.
+ */
+async function pinThreadQuestion(key: ThreadKey, messageId: number): Promise<void> {
+  const kStr = keyToString(key);
+  // Hold the lock across the whole read-modify-write (F2): re-read the map INSIDE
+  // the critical section so a concurrent pin/unpin for this key can't make us
+  // act on a stale `existingId` (double-notify, or a phantom id that silences
+  // the next first-pin).
+  await questionPinLock.withLock(kStr, async () => {
+    const existingId = questionPinnedMessageId.get(kStr);
+    // A pinned entry already present ⇒ this is a repin (S3 repost / Q1→Q2), which
+    // must NOT re-notify — only the FIRST pin pierces the muted topic, once.
+    const isRepin = existingId !== undefined;
+    // Same message already pinned (and already notified) — nothing to do.
+    if (existingId === messageId) return;
+    // Retire a DIFFERENT previous question pin so the topic never keeps a stale one.
+    if (existingId !== undefined) await unpinMessageQuiet(key, existingId);
+    const pinned = await pinMessageQuiet(key, messageId, { disableNotification: isRepin });
+    // Keep the map in lockstep with what is actually pinned: store on success;
+    // on failure (e.g. lost `can_pin_messages` — we just unpinned any previous)
+    // clear it so a later unpin doesn't chase a message we never pinned AND the
+    // next pin counts as a first pin (notifies).
+    if (pinned) questionPinnedMessageId.set(kStr, messageId);
+    else questionPinnedMessageId.delete(kStr);
+  });
+}
+
+/**
+ * @description Remove the thread's pinned question once it resolves (answered /
+ * cancelled / session torn down / binding left). Fire-and-forget, errors
+ * swallowed. Purely map-driven under {@link questionPinLock}; the post-restart
+ * OpenCode case (in-memory map lost but the message still pinned on Telegram) is
+ * handled by {@link clearPendingQuestion} seeding the map from the persisted
+ * `pendingQuestions` entry BEFORE calling this, so there is no cross-map timing
+ * dependency.
+ */
+async function unpinThreadQuestion(key: ThreadKey): Promise<void> {
+  const kStr = keyToString(key);
+  await questionPinLock.withLock(kStr, async () => {
+    const pinnedId = questionPinnedMessageId.get(kStr);
+    questionPinnedMessageId.delete(kStr);
+    if (pinnedId === undefined) return;
+    await unpinMessageQuiet(key, pinnedId);
   });
 }
 
@@ -6667,6 +6805,26 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     return;
   }
 
+  // A scraped Claude question (S4): send it as its OWN message (id captured)
+  // instead of the coalescing output cursor, then PIN it so the muted topic
+  // fires a notification. `markNeedsNewMessage` so the agent's following answer
+  // starts a fresh message below the question rather than appending onto it.
+  // The unpin is the adapter's `questionGone` event (selector left) or
+  // `clearPendingQuestion` (hard teardown). OpenCode questions never reach here
+  // (they use the discrete `question` event + `postPendingQuestionAt`).
+  if (meta?.isQuestion) {
+    stopTypingLoader(key);
+    void (async () => {
+      // Land any in-flight content (DM draft / coalesced group output) ABOVE the
+      // question first, mirroring the OpenCode question path's finalize.
+      await getOutputTransport().finalizeInFlight(key);
+      const id = await replyChunkWithFallback(key, renderAgentHtml(output), output, 'interactive');
+      if (id !== null) void pinThreadQuestion(key, id);
+    })();
+    markNeedsNewMessage(key);
+    return;
+  }
+
   // Bot-side safety net for Claude-CLI "thinking" bursts that slip past
   // the adapter classifier (`checkIsStatusOutput`'s ≤200-char / ≤3-line
   // heuristic). When the diff between two polls happens to contain
@@ -7559,6 +7717,10 @@ async function postPendingQuestionAt(key: ThreadKey): Promise<void> {
         existing.messageId = messageId;
         setPendingQuestion(key, existing);
         markQuestionMessageSent(key, messageId);
+        // Pin the question so the muted topic fires a notification (S2). The
+        // "unpin previous if different" step inside also retires the prior pin on
+        // a Q1→Q2 advance (Q1 stays as a "✅" message but loses its pin).
+        void pinThreadQuestion(key, messageId);
       } else {
         // The question advanced / was answered while our send sat in the
         // queue (a fast digit reply can beat the post — seen live 2026-06-10:
@@ -7601,6 +7763,18 @@ function handleAgentSurvey(key: ThreadKey, survey: ClaudeSurveyEvent): void {
       console.error('[handleAgentSurvey] Failed:', err);
     }
   })();
+}
+
+/**
+ * @description Claude `questionGone` event — the scraped TUI selector left the
+ * screen (answered / dismissed), so remove its pin. This is Claude's unpin path
+ * for the normal answer case: Claude has no `pendingQuestions` entry, so it can't
+ * lean on `clearPendingQuestion` (which OpenCode uses). The hard-teardown paths
+ * (stop / quit / unbind / closed / error) still route through
+ * `clearPendingQuestion` and unpin there for BOTH backends.
+ */
+function handleQuestionGone(key: ThreadKey): void {
+  void unpinThreadQuestion(key);
 }
 
 function handleAgentClosed(key: ThreadKey): void {
@@ -7669,6 +7843,12 @@ function handleAgentStopped(key: ThreadKey): void {
   clearThinkingMessage(key);
   // A stopped session has no running delegation — remove the sub-agent status.
   clearSubagentStatus(key);
+  // F1: this is the convergence point for `/quit`, `/quit-all`, `/new`, and
+  // adapter switch — none of which fire the adapter's `questionGone` (Claude's
+  // pane is killed; OpenCode emits no resolve), so a pinned question would leak
+  // forever. Clear it here (chains `unpinThreadQuestion`), matching
+  // `handleAgentClosed` / `handleAgentError`.
+  clearPendingQuestion(key);
   // Session ended — a future session starts with empty context, so forget the
   // last-injected thread-context preamble; the next prompt re-carries it.
   clearThreadContextMarker(key);
@@ -8295,6 +8475,7 @@ export async function startBot(): Promise<void> {
     onToolResult: handleAgentToolResult,
     onSubagentStatus: handleSubagentStatus,
     onApiError: handleApiError,
+    onQuestionGone: handleQuestionGone,
     onClosed: handleAgentClosed,
     onStarted: handleAgentStarted,
     onStopped: handleAgentStopped,

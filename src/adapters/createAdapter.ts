@@ -44,6 +44,7 @@ let onThinking: ThinkingHandler | null = null;
 let onToolResult: ToolResultHandler | null = null;
 let onSubagentStatus: SubagentStatusHandler | null = null;
 let onApiError: ApiErrorHandler | null = null;
+let onQuestionGone: ThreadKeyHandler | null = null;
 let onClosed: ThreadKeyHandler | null = null;
 let onStarted: ThreadKeyHandler | null = null;
 let onStopped: ThreadKeyHandler | null = null;
@@ -100,6 +101,7 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onToolResult) adapter.on('toolResult', onToolResult);
   if (onSubagentStatus) adapter.on('subagentStatus', onSubagentStatus);
   if (onApiError) adapter.on('apiError', onApiError);
+  if (onQuestionGone) adapter.on('questionGone', onQuestionGone);
   if (onClosed) adapter.on('closed', onClosed);
   if (onStarted) adapter.on('started', onStarted);
   if (onStopped) adapter.on('stopped', onStopped);
@@ -126,6 +128,7 @@ export function registerAdapterEventHandlers(handlers: {
   onToolResult?: ToolResultHandler;
   onSubagentStatus?: SubagentStatusHandler;
   onApiError?: ApiErrorHandler;
+  onQuestionGone?: ThreadKeyHandler;
   onClosed: ThreadKeyHandler;
   onStarted?: ThreadKeyHandler;
   onStopped?: ThreadKeyHandler;
@@ -139,6 +142,7 @@ export function registerAdapterEventHandlers(handlers: {
   onToolResult = handlers.onToolResult ?? null;
   onSubagentStatus = handlers.onSubagentStatus ?? null;
   onApiError = handlers.onApiError ?? null;
+  onQuestionGone = handlers.onQuestionGone ?? null;
   onClosed = handlers.onClosed;
   onStarted = handlers.onStarted ?? null;
   onStopped = handlers.onStopped ?? null;

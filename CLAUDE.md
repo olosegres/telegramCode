@@ -62,6 +62,26 @@ config/variants, not a per-message API field).
 
 ## Key concepts
 
+- **The operator runs ALL forum topics muted.** Design any "the user must
+  notice this" signal accordingly: a plain bot message is silently muted.
+  Pinning a message DOES pierce a muted topic — it fires a Telegram
+  notification (vibration, no sound). This is why a pending agent question is
+  pinned (see the question-pin behavior below).
+- **A pending interactive question is PINNED so the muted topic notifies.**
+  When the agent asks an interactive question the bot pins that message →
+  Telegram fires a notification even though the topic is muted; the pin is
+  removed when the question resolves (answer / cancel / session teardown /
+  leaving the folder). **Exactly one notification per question:** the first pin
+  notifies, any re-pin from the existing repost-to-bottom or the Q1→Q2 advance
+  is silent (`disable_notification: true`). Both backends, via the shared
+  `pinThreadQuestion` / `unpinThreadQuestion` helpers + the in-memory
+  `questionPinnedMessageId` map (`unpinChatMessage` is per-message-id, so the
+  pinned STATUS banner is never disturbed). **OpenCode** pins its discrete
+  question message (`postPendingQuestionAt`), unpins via the single resolve
+  choke point `clearPendingQuestion`. **Claude** has no discrete message — the
+  scraped selector emit is tagged `isQuestion` (`OutputEventMeta`) so the bot
+  sends it as its OWN standalone pinnable message; a `questionGone` adapter
+  event (fired when `extractClaudeQuestion` goes pending→none) drives the unpin.
 - **One topic ↔ one project folder ↔ one agent session — the bind is mandatory.**
   Each forum topic binds to a subfolder under `WORK_ROOT` and runs its own
   isolated `claude` or `opencode` session **in that folder**. Two topics can

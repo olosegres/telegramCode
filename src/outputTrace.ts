@@ -390,6 +390,11 @@ function getStringField(source: Record<string, unknown>, field: string): string 
   return typeof value === 'string' ? value : undefined;
 }
 
+function getBooleanField(source: Record<string, unknown>, field: string): boolean | undefined {
+  const value = source[field];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function extractApiCallFields(method: string, payload: object): Record<string, TraceFieldValue> {
   const p = payload as Record<string, unknown>;
   const text = getStringField(p, 'text');
@@ -399,6 +404,10 @@ function extractApiCallFields(method: string, payload: object): Record<string, T
     threadId: getNumberField(p, 'message_thread_id'),
     messageId: getNumberField(p, 'message_id'),
     callbackQueryId: getStringField(p, 'callback_query_id'),
+    // Whether a (un)pin / send suppresses the member notification — load-bearing
+    // for the question-pin "one question = one notification" rule (first pin
+    // notifies, repins are silent), so it must be visible in the trace.
+    disableNotification: getBooleanField(p, 'disable_notification'),
     len: text?.length,
     preview: text === undefined ? undefined : createTracePreview(text),
   };

@@ -46,6 +46,22 @@ export const schedulerMcpPath = '/mcp';
 const mcpServerName = 'telegram-bot-scheduler';
 const mcpServerVersion = '1.0.0';
 
+/**
+ * Connect-time `instructions` returned in the MCP `initialize` handshake — a
+ * short, high-level pointer the client surfaces to the agent BEFORE any call.
+ * Deliberately use-case oriented (when to reach for this server, what it can do)
+ * and does NOT repeat the per-tool argument recipes: each tool's own description
+ * already carries those in full. Kept terse on purpose.
+ */
+const mcpServerInstructions = `This MCP lets the agent act on its own Telegram topic.
+
+When to use it:
+• The user asks to run/finish a plan or task LATER ("in 2h", "tomorrow 9am", "every weekday") → schedule_create. Put the work in \`prompt\`; the future run is a fresh session with no memory of this chat.
+• You produced a file/chart/screenshot to deliver → send_file.
+• You need to review or remove scheduled jobs → schedule_list / schedule_cancel.
+
+Each tool's own description has the exact argument recipe (one-shot vs cron vs N-times).`;
+
 /** Max characters of a free-text job name / prompt accepted by a tool (defensive bound). */
 const maxNameLength = 200;
 const maxPromptLength = 8000;
@@ -601,7 +617,10 @@ function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: 
  * request in the stateless flow.
  */
 function buildRequestServer(deps: SchedulerMcpDeps, scope: SchedulerScope): McpServer {
-  const server = new McpServer({ name: mcpServerName, version: mcpServerVersion });
+  const server = new McpServer(
+    { name: mcpServerName, version: mcpServerVersion },
+    { instructions: mcpServerInstructions },
+  );
   registerSchedulerTools(server, deps, scope);
   registerFileSendTool(server, deps, scope);
   return server;

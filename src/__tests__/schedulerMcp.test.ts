@@ -352,6 +352,17 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     await assert.rejects(buildClient(fixture.handle.port, 'garbage.token'));
   });
 
+  it('reports connect-time server instructions on initialize', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    const instructions = client.getInstructions();
+    assert.ok(instructions, 'server should report instructions on initialize');
+    // Use-case pointer, not recipe repetition: names the tools + the fresh-session caveat.
+    assert.match(instructions, /schedule_create/);
+    assert.match(instructions, /send_file/);
+    assert.match(instructions, /fresh session/);
+  });
+
   it('thread-scope: create (cron + once + N-times) → list → cancel → list empty', async () => {
     const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
     const client = await buildClient(fixture.handle.port, token);

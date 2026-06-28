@@ -2123,19 +2123,23 @@ export function readRecentClaudeTurns(filePath: string, limit: number): RecentTu
  *   transcript truncated or rewritten smaller).
  * - `turns` — the last `limit` renderable turns of the WHOLE session (NOT just
  *   the missed region), identical to {@link readRecentClaudeTurns}.
+ * - `headOffset` — the transcript's CURRENT byte size (`buffer.length`), i.e.
+ *   the watermark value meaning "everything currently on disk is accounted for".
+ *   The reattach recap advances the persisted watermark to it for idempotency.
+ *   Absent on an unreadable file (head unknown → the caller omits the watermark).
  *
  * Exported and pure (filesystem-only) so it is unit-testable. `fs.readFileSync`
  * reads the whole file in one call (it handles short reads internally), so a
  * large `[offset, EOF)` tail never loses its last lines to a partial `read` —
  * the silent undercount a manual `Buffer.alloc` + `fs.readSync` would hit on
  * exactly the long-downtime case this feature targets. A missing/unreadable
- * file → `{ missedCount: 0, turns: [] }`.
+ * file → `{ missedCount: 0, turns: [] }` (no `headOffset`).
  */
 export function readClaudeReattachTranscript(
   filePath: string,
   offset: number,
   limit: number,
-): { missedCount: number; turns: RecentTurn[] } {
+): { missedCount: number; turns: RecentTurn[]; headOffset?: number } {
   let buffer: Buffer;
   try {
     buffer = fs.readFileSync(filePath);
@@ -2158,7 +2162,7 @@ export function readClaudeReattachTranscript(
     const turn = parseClaudeTurnLine(line);
     if (turn?.role === 'assistant') missedCount += 1;
   }
-  return { missedCount, turns };
+  return { missedCount, turns, headOffset: buffer.length };
 }
 
 /**
@@ -3492,9 +3496,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const isWatermarkKnown = typeof offset === 'number' && watermark?.sessionId === sessionId;
     // ONE read serves both the count and the body. When the watermark is unknown
     // we still want the turn body, so read from 0 and drop the count below.
-    const { missedCount, turns } = readClaudeReattachTranscript(filePath, offset ?? 0, resumeContextTurnLimit);
+    const { missedCount, turns, headOffset } = readClaudeReattachTranscript(filePath, offset ?? 0, resumeContextTurnLimit);
     const isActive = this.checkIsBusy(key);
-    return { missedCount: isWatermarkKnown ? missedCount : 0, turns, isWatermarkKnown, isActive };
+    // Head watermark = the transcript's current size, scoped to THIS session.
+    // Omitted when the file was unreadable (head unknown → no idempotent advance).
+    const headWatermark: SeenWatermark | undefined =
+      headOffset === undefined ? undefined : { sessionId, claudeTranscriptOffset: headOffset };
+    return { missedCount: isWatermarkKnown ? missedCount : 0, turns, isWatermarkKnown, isActive, headWatermark };
   }
 
   /**

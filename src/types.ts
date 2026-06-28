@@ -67,12 +67,20 @@ export type SeenWatermarkWriter = (key: ThreadKey, watermark: SeenWatermark) => 
  *   watermark) → the bot uses the no-number fallback header.
  * - `isActive` — best-effort "the agent is still working right now" signal,
  *   read cheaply from in-memory state; drives the trailing status line.
+ * - `headWatermark` — the watermark value meaning "everything currently in the
+ *   session's record is accounted for" (the session's CURRENT tail: Claude →
+ *   transcript byte size, OpenCode → latest assistant message id). The bot
+ *   persists this AFTER computing the recap — whether or not a recap posted —
+ *   so the same gap can never re-report on the next reattach (idempotency).
+ *   Absent when the record was unreadable (head unknown → the bot skips the
+ *   advance and retries on the next reattach).
  */
 export interface ReattachRecap {
   missedCount: number;
   turns: RecentTurn[];
   isWatermarkKnown: boolean;
   isActive: boolean;
+  headWatermark?: SeenWatermark;
 }
 
 /**

@@ -542,6 +542,35 @@ export function countOpenCodeAssistantMessagesSinceId(
 }
 
 /**
+ * @description Last assistant message `id` in a `GET /session/:id/message`
+ * payload — the OpenCode reattach-recap HEAD watermark ("everything currently in
+ * the record is accounted for"). Pure + exported (no I/O) so it is unit-testable.
+ *
+ * Walks the chronological records and returns the `info.id` of the LAST record
+ * whose `info.role === 'assistant'` and whose `info.id` is a string; returns
+ * `undefined` for a non-array payload or when no assistant message carries an id
+ * (head unknown → the caller omits the watermark and retries next reattach).
+ *
+ * Anchors on the last ASSISTANT message (not the last record of any role) to
+ * mirror the live-advance watermark ({@link OpenCodeSession.lastMessageId}, set
+ * on the parent turn's final assistant message) and the count keyed off it in
+ * {@link countOpenCodeAssistantMessagesSinceId} — so the next reattach's
+ * `[watermark, …)` window starts at the true tail and yields 0 on a clean
+ * reattach. Unlike the missed-count it does NOT require renderable text: the
+ * watermark must advance past every assistant message seen, tool-only ones too.
+ */
+export function getLatestOpenCodeAssistantMessageId(records: unknown): string | undefined {
+  if (!Array.isArray(records)) return undefined;
+  let latestId: string | undefined;
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const { info } = record as OpenCodeMessageRecord;
+    if (info?.role === 'assistant' && typeof info.id === 'string') latestId = info.id;
+  }
+  return latestId;
+}
+
+/**
  * @description Best-effort "the turn is still in flight" signal for the reattach
  * recap, derived from the already-fetched `GET /session/:id/message` payload —
  * NO extra HTTP probe. True only when the LAST record is an `assistant` message
@@ -2024,7 +2053,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const { missedCount, isWatermarkKnown } = countOpenCodeAssistantMessagesSinceId(records, watermarkId);
     const turns = mapOpenCodeMessagesToTurns(records, resumeContextTurnLimit);
     const isActive = checkIsOpenCodeTurnInFlight(records);
-    return { missedCount, turns, isWatermarkKnown, isActive };
+    // Head watermark = the latest assistant message id, scoped to THIS session.
+    // Omitted when none resolvable (head unknown → no idempotent advance).
+    const latestId = getLatestOpenCodeAssistantMessageId(records);
+    const headWatermark: SeenWatermark | undefined =
+      latestId === undefined ? undefined : { sessionId, opencodeMessageId: latestId };
+    return { missedCount, turns, isWatermarkKnown, isActive, headWatermark };
   }
 
   async resumeSession(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {

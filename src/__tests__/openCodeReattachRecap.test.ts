@@ -17,7 +17,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { checkIsOpenCodeTurnInFlight, countOpenCodeAssistantMessagesSinceId } from '../adapters/openCodeAdapter';
+import {
+  checkIsOpenCodeTurnInFlight,
+  countOpenCodeAssistantMessagesSinceId,
+  getLatestOpenCodeAssistantMessageId,
+} from '../adapters/openCodeAdapter';
 
 const records = [
   { info: { id: 'm1', role: 'user' }, parts: [{ type: 'text', text: 'first ask' }] },
@@ -98,5 +102,28 @@ describe('checkIsOpenCodeTurnInFlight (best-effort still-working signal)', () =>
     assert.equal(checkIsOpenCodeTurnInFlight([]), false);
     assert.equal(checkIsOpenCodeTurnInFlight(null), false);
     assert.equal(checkIsOpenCodeTurnInFlight({}), false);
+  });
+});
+
+describe('getLatestOpenCodeAssistantMessageId (idempotent head watermark)', () => {
+  it('returns the id of the LAST assistant message (skipping trailing non-assistant records)', () => {
+    // m6 is the last assistant; even m5 (tool-only) still counts — the head must
+    // advance past EVERY assistant message seen, not only renderable ones.
+    assert.equal(getLatestOpenCodeAssistantMessageId(records), 'm6');
+  });
+
+  it('ignores trailing user messages when picking the head', () => {
+    const withTrailingUser = [
+      { info: { id: 'a1', role: 'assistant' }, parts: [{ type: 'text', text: 'answer' }] },
+      { info: { id: 'a2', role: 'user' }, parts: [{ type: 'text', text: 'follow-up' }] },
+    ];
+    assert.equal(getLatestOpenCodeAssistantMessageId(withTrailingUser), 'a1');
+  });
+
+  it('is undefined when no assistant message has an id, or for a non-array payload', () => {
+    assert.equal(getLatestOpenCodeAssistantMessageId([{ info: { role: 'user' }, parts: [] }]), undefined);
+    assert.equal(getLatestOpenCodeAssistantMessageId([{ info: { role: 'assistant' }, parts: [] }]), undefined);
+    assert.equal(getLatestOpenCodeAssistantMessageId(null), undefined);
+    assert.equal(getLatestOpenCodeAssistantMessageId({}), undefined);
   });
 });

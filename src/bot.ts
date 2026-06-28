@@ -31,7 +31,7 @@ import {
   getKnownAdapterNames,
 } from './adapters/createAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { createOutputTransport } from './output/createOutputTransport';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
@@ -7917,17 +7917,44 @@ const COMMANDS_MENU = [
  * Adapters without `getReattachRecap` (Terminal) are skipped. Best-effort: a
  * read/format failure logs and posts nothing — it never blocks the reattach
  * scan or crashes boot.
+ *
+ * `watermark` is the PRE-adopt snapshot read by the caller BEFORE `adopt/resume`
+ * (S1-wiring): the concurrent live-advance (Claude's idle-poll tracker / OpenCode's
+ * `session.idle`) starts running the instant the session polls, so re-reading the
+ * watermark here could see it already moved to the tail and silently suppress a
+ * genuine recap. Taking the snapshot before adopt freezes the recap baseline.
+ *
+ * Idempotency: after the recap is computed the persisted watermark is ALWAYS
+ * advanced to the session's current head (`recap.headWatermark`) — whether or not
+ * a recap posted, and even on `missedCount === 0` — so the same gap can never
+ * re-report on the next reattach. Skipped only when the head is unknown (the
+ * record read failed) → retry on the next reattach. The collaborators are
+ * injectable (`deps`) so the orchestration is unit-testable; production uses the
+ * real {@link replyToThread} / {@link StateStore.setSeenWatermark}.
  */
-async function postReattachRecap(
+interface PostReattachRecapDeps {
+  reply: (key: ThreadKey, text: string) => Promise<unknown>;
+  advanceWatermark: (key: ThreadKey, watermark: SeenWatermark) => void;
+}
+
+const defaultPostReattachRecapDeps: PostReattachRecapDeps = {
+  reply: (key, text) => replyToThread(key, text),
+  advanceWatermark: (key, watermark) => {
+    void state.setSeenWatermark(key, watermark);
+  },
+};
+
+export async function postReattachRecap(
   key: ThreadKey,
-  adapter: AgentAdapter,
+  adapter: Pick<AgentAdapter, 'getReattachRecap'>,
   workDir: string,
   sessionId: string,
+  watermark: SeenWatermark | null,
   isColdStart: boolean,
+  deps: PostReattachRecapDeps = defaultPostReattachRecapDeps,
 ): Promise<void> {
   if (!adapter.getReattachRecap) return;
   try {
-    const watermark = state.getAgent(key)?.seenWatermark ?? null;
     const recap = await adapter.getReattachRecap(key, workDir, sessionId, watermark);
     const shouldPost = checkShouldPostReattachRecap({
       missedCount: recap.missedCount,
@@ -7935,9 +7962,13 @@ async function postReattachRecap(
       hasTurns: recap.turns.length > 0,
       isColdStart,
     });
-    if (!shouldPost) return;
-    const text = formatReattachRecap(recap);
-    if (text) await replyToThread(key, text);
+    if (shouldPost) {
+      const text = formatReattachRecap(recap);
+      if (text) await deps.reply(key, text);
+    }
+    if (recap.headWatermark) {
+      deps.advanceWatermark(key, recap.headWatermark);
+    }
   } catch (e) {
     console.warn(`[reattach] recap post failed for ${keyToString(key)}:`, e instanceof Error ? e.message : e);
   }
@@ -8054,15 +8085,23 @@ async function reattachExistingSessions(
           continue;
         }
         const workDir = workDirDecision.workDir;
+        // Snapshot the persisted watermark BEFORE adopt: the live-advance tracker
+        // starts moving it toward EOF the instant the adopted session polls, so a
+        // post-adopt read could miss a genuine recap (S1-wiring).
+        const preAdoptWatermark = state.getAgent(key)?.seenWatermark ?? null;
         if (await claudeAdapter.adoptExistingTmuxSession(key, sessionName, workDir, agent.claudeSessionId)) {
           adopted += 1;
-          // Fire-and-forget: the recap reads the watermark synchronously at call
-          // time (race-safe), but its body (a Claude fs read) must not serialize
-          // the reattach scan. postReattachRecap swallows its own errors; the
-          // `.catch` is defensive.
-          void postReattachRecap(key, claudeAdapter, workDir, agent.claudeSessionId, !opts.quietReattach).catch(
-            () => {},
-          );
+          // Fire-and-forget: the body (a Claude fs read) must not serialize the
+          // reattach scan. postReattachRecap swallows its own errors; the `.catch`
+          // is defensive.
+          void postReattachRecap(
+            key,
+            claudeAdapter,
+            workDir,
+            agent.claudeSessionId,
+            preAdoptWatermark,
+            !opts.quietReattach,
+          ).catch(() => {});
         }
       }
       console.log(`[reattach] tmux: adopted ${adopted}, reconciled ${reconciled}, killed ${killed} orphans (quiet=${opts.quietReattach})`);
@@ -8091,15 +8130,23 @@ async function reattachExistingSessions(
         continue;
       }
       const workDir = workDirDecision.workDir;
+      // Snapshot the persisted watermark BEFORE resume: the live-advance (OpenCode's
+      // `session.idle`) starts moving it once the reconnected session settles, so a
+      // post-resume read could miss a genuine recap (S1-wiring).
+      const preAdoptWatermark = state.getAgent(key)?.seenWatermark ?? null;
       await opencodeAdapter.resumeSession(key, workDir, agent.opencodeSessionId);
       reopened += 1;
-      // Fire-and-forget: the recap reads the watermark synchronously at call
-      // time (race-safe), but its body (an OpenCode HTTP GET) must not serialize
-      // the reattach scan. postReattachRecap swallows its own errors; the
-      // `.catch` is defensive.
-      void postReattachRecap(key, opencodeAdapter, workDir, agent.opencodeSessionId, !opts.quietReattach).catch(
-        () => {},
-      );
+      // Fire-and-forget: the body (an OpenCode HTTP GET) must not serialize the
+      // reattach scan. postReattachRecap swallows its own errors; the `.catch`
+      // is defensive.
+      void postReattachRecap(
+        key,
+        opencodeAdapter,
+        workDir,
+        agent.opencodeSessionId,
+        preAdoptWatermark,
+        !opts.quietReattach,
+      ).catch(() => {});
     } catch (e) {
       console.warn(`[reattach] opencode ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
     }

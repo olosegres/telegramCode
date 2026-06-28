@@ -74,6 +74,19 @@ describe('readClaudeReattachTranscript', () => {
     assert.deepEqual(turns, expectedLastTurns);
   });
 
+  it('reports headOffset === the transcript byte size (the idempotent head watermark)', () => {
+    const filePath = path.join(dir, 'head.jsonl');
+    const fullText = seenText + serialize(missed);
+    fs.writeFileSync(filePath, fullText);
+    const { headOffset } = readClaudeReattachTranscript(filePath, offset, limit);
+    assert.equal(headOffset, Buffer.byteLength(fullText, 'utf-8'), 'headOffset must equal the on-disk byte length');
+  });
+
+  it('omits headOffset for an unreadable file (head unknown → no idempotent advance)', () => {
+    const result = readClaudeReattachTranscript(path.join(dir, 'absent.jsonl'), 0, limit);
+    assert.equal(result.headOffset, undefined);
+  });
+
   it('returns missedCount 0 at EOF but the turn body stays the last-3 of the whole session', () => {
     const filePath = path.join(dir, 'at-eof.jsonl');
     fs.writeFileSync(filePath, seenText + serialize(missed));

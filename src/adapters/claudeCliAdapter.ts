@@ -216,14 +216,20 @@ interface ClaudeSession {
    */
   pendingEffortReapply: string | null;
   /**
-   * Seen-watermark gate: set `true` on any poll the session is busy
-   * (`esc to interrupt`), then consumed the FIRST ready-prompt poll after that —
-   * the turn-end moment — to advance the persisted {@link SeenWatermark} to the
-   * transcript size now (one write per turn, no re-fire on subsequent idle
-   * polls). Lets a bot restart count the assistant turns produced while it was
-   * down. Starts `false` for every fresh session object (start / resume / adopt).
+   * Last transcript byte size persisted as the seen-{@link SeenWatermark} for
+   * this session (in-memory monotonic high-water mark). The poll loop advances
+   * the watermark to the current transcript EOF on EVERY idle+ready poll (not
+   * just the single busy→ready edge), but writes only when EOF actually grew —
+   * this field is the comparison anchor. `undefined` until the first advance,
+   * treated as `-1` (the first idle poll always writes). Fresh per session object
+   * (start / resume / adopt); correctness across a restart is protected by the
+   * recap's PRE-adopt watermark snapshot, not by seeding this from disk. Lets a
+   * bot restart count the assistant turns produced while it was down, and — vs
+   * the old edge-only gate — corrects a premature mid-turn idle advance and
+   * catches a final assistant line flushed just after the turn ends. See
+   * {@link checkShouldAdvanceWatermark} / {@link ClaudeCliAdapter.advanceClaudeWatermarkIfGrown}.
    */
-  watermarkPendingActivity: boolean;
+  lastWatermarkOffset?: number;
   /**
    * Long-horizon dedup of lines already RELAYED to this topic (incident
    * 2026-06-10: a TUI re-render of an hours-old ~1400-line diff re-relayed as
@@ -2474,6 +2480,27 @@ export function checkIsClaudePromptReady(paneText: string): boolean {
 }
 
 /**
+ * @description Pure decision for the S3 idle-poll seen-watermark advance: persist
+ * the transcript's current EOF as "shown live up to here" only when the session
+ * is idle AND its input box is ready AND the file grew past the last persisted
+ * offset. Idle+ready is the load-bearing pair — a live Claude adapter relays the
+ * pane, so an idle+ready moment genuinely means "everything on disk is shown",
+ * and gating on growth (`eof > lastOffset`) avoids a write per idle metadata
+ * rewrite. Exported so the truth table is unit-testable without a live tmux;
+ * {@link ClaudeCliAdapter.advanceClaudeWatermarkIfGrown} is the thin fs+writer
+ * wrapper. Callers pass `lastOffset = session.lastWatermarkOffset ?? -1` so a
+ * never-advanced session writes on its first idle poll.
+ */
+export function checkShouldAdvanceWatermark(args: {
+  isBusy: boolean;
+  isReady: boolean;
+  eof: number;
+  lastOffset: number;
+}): boolean {
+  return !args.isBusy && args.isReady && args.eof > args.lastOffset;
+}
+
+/**
  * @description Markers of a live sub-agent (Task tool) on the pane. While a
  * sub-agent runs the TUI shows a task line led by `◯` (U+25EF LARGE CIRCLE —
  * NOT the spinner glyph `○` U+25CB used elsewhere in this file), e.g.
@@ -2600,9 +2627,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
   /**
    * Per-thread seen-watermark writer, injected by the bot at boot via
-   * `createAdapter.registerSeenWatermarkWriter`. Called at turn end (the first
-   * ready-prompt poll after activity) to persist the transcript size. `null`
-   * until wired → {@link advanceSeenWatermark} is a no-op.
+   * `createAdapter.registerSeenWatermarkWriter`. Called on every idle+ready poll
+   * whose transcript EOF grew past the last persisted offset (via
+   * {@link ClaudeCliAdapter.advanceClaudeWatermarkIfGrown}) to persist the new
+   * EOF. `null` until wired → {@link advanceSeenWatermark} is a no-op.
    */
   private seenWatermarkWriter: SeenWatermarkWriter | null = null;
 
@@ -2618,24 +2646,46 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Record the current transcript byte size as the seen-watermark
-   * at a turn end. Best-effort: a transcript not yet on disk (UUID just born)
-   * leaves the watermark where it was — the next turn end re-tries. The path
-   * resolves the same way {@link getRecentTurns} / {@link getReattachRecap} do.
+   * @description Advance the seen-watermark to the transcript's current EOF when
+   * the session is idle+ready and the file grew since the last write (S3) — the
+   * fs+writer wrapper around {@link checkShouldAdvanceWatermark}. Called every
+   * non-seeding poll with the poll's `isBusy` / `isReady`; it early-returns on a
+   * busy / not-ready poll BEFORE the `fs.stat` (the stat only makes sense at an
+   * idle+ready moment), then writes only when EOF actually grew — so idle
+   * metadata churn (Claude rewrites `last-prompt`/`mode`/… for hours) costs no
+   * more than one bounded write per real growth, and a smaller rewrite never
+   * rewinds the in-memory anchor (monotonic). Best-effort — a transcript not yet
+   * on disk (UUID just born) leaves the watermark where it was, the next idle
+   * poll re-tries. The path resolves the same way {@link getRecentTurns} /
+   * {@link getReattachRecap} do.
    */
-  private advanceClaudeWatermark(key: ThreadKey, session: ClaudeSession): void {
+  private advanceClaudeWatermarkIfGrown(
+    key: ThreadKey,
+    session: ClaudeSession,
+    isBusy: boolean,
+    isReady: boolean,
+  ): void {
+    if (isBusy || !isReady) return; // skip the fs stat on a busy / not-ready poll
     const transcriptPath = path.join(
       getClaudeProjectsRoot(),
       getClaudeProjectSlug(session.workDir),
       `${session.claudeSessionId}.jsonl`,
     );
-    let size: number;
+    let eof: number;
     try {
-      size = fs.statSync(transcriptPath).size;
+      eof = fs.statSync(transcriptPath).size;
     } catch {
       return;
     }
-    this.advanceSeenWatermark(key, { sessionId: session.claudeSessionId, claudeTranscriptOffset: size });
+    const shouldAdvance = checkShouldAdvanceWatermark({
+      isBusy,
+      isReady,
+      eof,
+      lastOffset: session.lastWatermarkOffset ?? -1,
+    });
+    if (!shouldAdvance) return;
+    this.advanceSeenWatermark(key, { sessionId: session.claudeSessionId, claudeTranscriptOffset: eof });
+    session.lastWatermarkOffset = eof;
   }
 
   /** @description Resolve the thread's full display prefs, defaulting every
@@ -2679,7 +2729,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'currentPollDelayMs'
       | 'unchangedPollStreak'
       | 'pendingEffortReapply'
-      | 'watermarkPendingActivity'
+      | 'lastWatermarkOffset'
       | 'recentRelayWindow'
       | 'subagentTail'
       | 'chunkContext'
@@ -2717,9 +2767,10 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S7: armed explicitly by `applyStoredEffortOnSpawn` after a fresh
       // start/resume spawn; adopt/reattach leaves it null (no re-apply).
       pendingEffortReapply: null,
-      // No turn activity seen yet — the first busy poll arms it; the first
-      // ready poll after that advances the seen-watermark.
-      watermarkPendingActivity: false,
+      // S3 seen-watermark anchor: no advance yet → the first idle+ready poll
+      // writes the current transcript EOF. Fresh per session object; cross-restart
+      // correctness is protected by the recap's PRE-adopt snapshot, not by seeding.
+      lastWatermarkOffset: undefined,
       // Every fresh session object (start / resume / adopt all flow through
       // here) begins with an EMPTY relay window — this IS the "reset on
       // session start"; stop deletes the session and the window with it.
@@ -3885,20 +3936,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       this.consumePendingEffortReapply(session);
     }
 
-    // Seen-watermark advance at turn end. While the turn is busy
-    // (`esc to interrupt`) we arm the gate; the first ready-prompt poll after
-    // that — the turn just finished — records the transcript size as "shown
-    // live up to here" and disarms, so exactly one write lands per turn (idle
-    // polls with no prior activity never fire). Runs every non-seeding poll;
-    // it is cheap (a regex test + a bool), the fs stat only fires on the gated
-    // turn-end poll. Lets a later bot restart count the assistant turns it
+    // S3 seen-watermark advance: on EVERY idle+ready poll (not just the single
+    // busy→ready edge) move the persisted watermark to the transcript's current
+    // EOF. Because a live Claude adapter relays the pane, an idle+ready moment
+    // genuinely means "everything on disk is shown live up to here", so tracking
+    // EOF here corrects a premature mid-turn idle advance and catches a final
+    // assistant line flushed just after the turn ends — both of which the old
+    // edge-only gate missed. Cheap: two regex tests every poll; the fs stat +
+    // write only fire at an idle+ready moment, and the write only when EOF
+    // actually grew. Lets a later bot restart count the assistant turns it
     // missed during downtime (the reattach recap).
-    if (checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: content })) {
-      session.watermarkPendingActivity = true;
-    } else if (session.watermarkPendingActivity && checkIsClaudePromptReady(content)) {
-      session.watermarkPendingActivity = false;
-      this.advanceClaudeWatermark(key, session);
-    }
+    const isBusy = checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: content });
+    this.advanceClaudeWatermarkIfGrown(key, session, isBusy, checkIsClaudePromptReady(content));
 
     // S1 idle-poll table flush: the change branch below never runs on a
     // byte-unchanged poll, so a table that is the LAST thing painted before the

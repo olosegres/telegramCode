@@ -1,4 +1,4 @@
-import { execSync, exec, spawn } from 'child_process';
+import { execSync, execFileSync, exec, spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import { sleep } from './utils';
@@ -116,31 +116,178 @@ export function onOpenCodeServerExit(callback: (code: number | null, signal: str
 }
 
 export async function checkIsOpenCodeServerRunning(): Promise<boolean> {
+  return (await getOpenCodeServerHealth()).healthy;
+}
+
+interface OpenCodeServerHealth {
+  healthy: boolean;
+  /** Version the running server reports, or null if unreachable / field absent. */
+  version: string | null;
+}
+
+/**
+ * @description Extract a bare semver (`1.17.11`; drops a leading `v`) from a
+ * version string — used for BOTH `opencode --version` output AND the
+ * `/global/health` `version` field, so the two comparison sides are normalized
+ * through the SAME rule. Without this, a future `v1.17.11` from one source vs
+ * `1.17.11` from the other would read as a false mismatch and churn the server
+ * once per boot. Returns null if no semver is present.
+ */
+export function extractOpenCodeVersion(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const match = raw.match(/\d+\.\d+\.\d+\S*/);
+  return match ? match[0] : null;
+}
+
+/**
+ * @description Probe /global/health for liveness AND the version the running
+ * server is actually executing. Detects a server still running an OLD binary
+ * after opencode was updated on disk: replacing the binary file does not change
+ * a live process (it keeps the old code in memory), and a newer opencode run
+ * can migrate the shared opencode.db underneath the old server — which then
+ * dies on every prompt (e.g. `no such column: replacement_seq`).
+ */
+async function getOpenCodeServerHealth(): Promise<OpenCodeServerHealth> {
   const url = process.env.OPENCODE_URL || 'http://localhost:4096';
   try {
     const response = await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(2000) });
-    return response.ok;
+    if (!response.ok) return { healthy: false, version: null };
+    const body = (await response.json().catch(() => null)) as { version?: string } | null;
+    return { healthy: true, version: extractOpenCodeVersion(body?.version) };
   } catch {
-    return false;
+    return { healthy: false, version: null };
   }
+}
+
+/** Cache so a boot-time reattach burst doesn't spawn `opencode --version` per call. */
+let installedOpenCodeVersionCache: { value: string | null; at: number } | null = null;
+const installedVersionCacheTtlMs = 10_000;
+
+/**
+ * @description Version of the opencode binary currently on disk
+ * (`opencode --version`). Short-TTL cached to coalesce bursts. Returns null if
+ * it can't be determined — an unknown version never forces a restart.
+ */
+function getInstalledOpenCodeVersion(): string | null {
+  const now = Date.now();
+  if (installedOpenCodeVersionCache && now - installedOpenCodeVersionCache.at < installedVersionCacheTtlMs) {
+    return installedOpenCodeVersionCache.value;
+  }
+  let value: string | null = null;
+  try {
+    const out = execFileSync(getToolCommand('opencode'), ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: { ...process.env, PATH: `${npmPrefix}/bin:${process.env.PATH}` },
+    });
+    value = extractOpenCodeVersion(out);
+  } catch {
+    value = null;
+  }
+  installedOpenCodeVersionCache = { value, at: now };
+  return value;
+}
+
+/**
+ * @description Stale IFF BOTH versions are known AND differ. An unknown running
+ * or installed version is treated as "not stale" (adopt the server) so a
+ * transient probe failure never churns a working server.
+ */
+export function checkIsOpenCodeServerStale(runningVersion: string | null, installedVersion: string | null): boolean {
+  return !!runningVersion && !!installedVersion && runningVersion !== installedVersion;
+}
+
+/** Find the PID LISTENING on a TCP port (lsof, with an ss fallback). */
+function getPidListeningOnPort(port: string): number | null {
+  try {
+    const out = execFileSync('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8', timeout: 3000 }).trim();
+    const pid = parseInt(out.split('\n')[0], 10);
+    if (Number.isFinite(pid)) return pid;
+  } catch {
+    // lsof missing / no match — fall through to ss
+  }
+  try {
+    const out = execFileSync('ss', ['-ltnpH', `sport = :${port}`], { encoding: 'utf8', timeout: 3000 });
+    const match = out.match(/pid=(\d+)/);
+    if (match) return parseInt(match[1], 10);
+  } catch {
+    // give up — caller proceeds to spawn regardless
+  }
+  return null;
+}
+
+/** Stale-server kill: poll health every {@link staleServerKillPollMs}; escalate to
+ * SIGKILL halfway, give up (and spawn anyway) after the full span. 16×500ms = 8s. */
+const staleServerKillPollMs = 500;
+const staleServerKillPollIterations = 16;
+const staleServerSigkillAfterIterations = 8;
+
+/**
+ * @description Stop an OpenCode server that may have been ADOPTED at boot (so the
+ * bot holds no child handle for it). Prefers the clean owned-process stop; else
+ * signals the PID listening on the port. Waits for the port to stop answering
+ * health, escalating SIGTERM → SIGKILL.
+ */
+async function stopAdoptedOpenCodeServer(port: string): Promise<void> {
+  if (openCodeProcess && !openCodeProcess.killed) {
+    stopOpenCodeServer();
+  } else {
+    const pid = getPidListeningOnPort(port);
+    if (pid) {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e;
+      }
+    }
+  }
+  for (let i = 0; i < staleServerKillPollIterations; i++) {
+    await sleep(staleServerKillPollMs);
+    if (!(await checkIsOpenCodeServerRunning())) return;
+    if (i === staleServerSigkillAfterIterations) {
+      const pid = getPidListeningOnPort(port);
+      if (pid) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+    }
+  }
+  console.warn(`[OpenCode] stale server on port ${port} did not exit after kill — spawning anyway`);
 }
 
 /**
  * @description Start opencode serve as a background process.
  * Waits until server responds to health check (up to 15s).
+ *
+ * If a server is already up but running an OUTDATED binary (version reported by
+ * /global/health differs from the on-disk `opencode --version`), it is restarted
+ * onto the current binary instead of being adopted — otherwise a stale server
+ * lingers across bot restarts (boot would adopt it on a bare liveness check) and
+ * keeps failing prompts after an opencode update.
  */
 export async function ensureOpenCodeServer(): Promise<void> {
-  if (await checkIsOpenCodeServerRunning()) {
-    return;
-  }
+  const port = new URL(process.env.OPENCODE_URL || 'http://localhost:4096').port || '4096';
 
-  if (openCodeProcess && !openCodeProcess.killed) {
+  const health = await getOpenCodeServerHealth();
+  if (health.healthy) {
+    const installedVersion = getInstalledOpenCodeVersion();
+    if (checkIsOpenCodeServerStale(health.version, installedVersion)) {
+      console.log(
+        `[OpenCode] Adopted server is stale (running v${health.version}, on-disk v${installedVersion}) — restarting onto current binary`,
+      );
+      await stopAdoptedOpenCodeServer(port);
+      // fall through to spawn a fresh server on the current binary
+    } else {
+      return; // healthy and current (or version unknown) → adopt as-is
+    }
+  } else if (openCodeProcess && !openCodeProcess.killed) {
     // Process exists but is not responding; stop only the process group we own.
     stopOpenCodeServer();
     await sleep(500);
   }
-
-  const port = new URL(process.env.OPENCODE_URL || 'http://localhost:4096').port || '4096';
 
   const opencodeCmd = getToolCommand('opencode');
   console.log(`[OpenCode] Starting server on port ${port}... (${opencodeCmd})`);

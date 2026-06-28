@@ -92,7 +92,15 @@ config/variants, not a per-message API field).
   Per-thread prefs (e.g. OpenCode model) live in `DATA_DIR` JSON files.
   If the `opencode serve` process crashes, the bot auto-restarts the server
   and **restores** each active session by re-resuming its persisted id
-  (sessions persist on opencode disk; the in-flight reply is lost). Explicit
+  (sessions persist on opencode disk; the in-flight reply is lost).
+  `ensureOpenCodeServer` also reconciles VERSION, not just liveness: if a server
+  is already up but running an OUTDATED binary (its `/global/health` version ≠
+  on-disk `opencode --version` — a stale long-lived process after opencode was
+  updated, whose old code dies on the migrated shared `opencode.db`, e.g. `no
+  such column: …`), it is killed (own child, else by PID on the port) and
+  respawned on the current binary instead of being adopted. Only a CONFIRMED
+  mismatch restarts (`checkIsOpenCodeServerStale`); an unknown version adopts as
+  before. Explicit
   `/quit`, `/quit-all`, and leaving a folder (the `/bind` «leave
   current dir» button) instead **release** the persisted session ids — so a
   later bot restart does NOT auto-reattach those sessions (they stay reachable

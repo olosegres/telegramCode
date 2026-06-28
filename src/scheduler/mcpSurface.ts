@@ -263,17 +263,29 @@ const scheduleCreateShape = {
   cron: z
     .string()
     .optional()
-    .describe('5-field host-local cron expression (e.g. "0 9 * * 1-5"). Mutually exclusive with onceAt.'),
+    .describe(
+      '5-field host-local cron expression for a RECURRING job (e.g. "0 9 * * 1-5"). ' +
+        'For a single future run use onceAt instead, NOT a cron (a cron has no year and would ' +
+        'fire on the same date every year). Omit onceAt when you pass cron.',
+    ),
   onceAt: z
     .string()
     .optional()
-    .describe('ISO 8601 instant for a one-shot run (e.g. "2026-06-07T09:00:00"). Mutually exclusive with cron.'),
+    .describe(
+      'ISO 8601 instant for a ONE-SHOT run (e.g. "2026-06-07T09:00:00"). This is the right field for ' +
+        '"run it once at <time>". Omit cron AND repeatCount when you pass onceAt — a one-shot always runs ' +
+        'exactly once.',
+    ),
   repeatCount: z
     .number()
     .int()
     .positive()
     .optional()
-    .describe('Total number of cron fires before the job auto-deletes (N-times). Only valid with cron.'),
+    .describe(
+      'Number of CRON fires before the job auto-deletes (N-times recurring). ONLY for cron jobs. ' +
+        'Do NOT set it for a one-shot (onceAt) — a one-shot already runs exactly once, so repeatCount ' +
+        'is ignored there.',
+    ),
   prompt: z
     .string()
     .min(1)
@@ -334,32 +346,68 @@ const sendFileShape = {
 };
 
 /**
+ * The three valid call shapes, appended to structural errors so a bad first call
+ * teaches the corrected next call (the model spirals when an error says only what
+ * is wrong, not what shape to use instead — observed in the live transcript).
+ */
+const scheduleRecipes =
+  'Recipes — one-shot: pass onceAt (ISO), omit cron and repeatCount. ' +
+  'Recurring: pass cron, omit onceAt. ' +
+  'Recurring N times: pass cron and repeatCount, omit onceAt.';
+
+/**
+ * @description Collapse an optional free-text field to `undefined` when it is
+ * absent OR blank (empty / whitespace-only). MCP bridges can render an omitted
+ * optional as an empty string (`cron=""` on a one-shot, `onceAt=""` on a cron),
+ * and an empty string must NOT count as a supplied value for the exactly-one-of
+ * check. Trimming also tolerates accidental surrounding whitespace.
+ */
+function normalizeOptionalArg(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
  * @name BuildSpecResult
  * @description Outcome of turning the create-tool args into a {@link ScheduleSpec}.
- * `error` is a readable validation message (exactly-one-of, repeatCount misuse,
- * bad cron / past one-shot) surfaced as an MCP tool error.
+ * `note` carries a non-fatal advisory surfaced alongside a successful create
+ * (e.g. a `repeatCount` ignored on a one-shot). `error` is a readable validation
+ * message (exactly-one-of, bad cron / past one-shot) surfaced as an MCP tool error.
  */
-type BuildSpecResult = { ok: true; spec: ScheduleSpec } | { ok: false; error: string };
+type BuildSpecResult = { ok: true; spec: ScheduleSpec; note?: string } | { ok: false; error: string };
 
 /**
  * @description Validate the create args and build a {@link ScheduleSpec}: exactly
- * one of `cron`/`onceAt`; `repeatCount` only with `cron`; then run the shared
- * {@link validateScheduleSpec} (cron parse + min-interval + past-one-shot). `nowMs`
- * is injected so the past-one-shot check is deterministic.
+ * one of `cron`/`onceAt` (empty/whitespace fields normalised away first); then run
+ * the shared {@link validateScheduleSpec} (cron parse + min-interval + past-one-shot).
+ * `nowMs` is injected so the past-one-shot check is deterministic.
+ *
+ * A `repeatCount` supplied alongside `onceAt` is IGNORED (not rejected): a one-shot
+ * is by definition a single run, so the count is meaningless there. The model
+ * naturally reaches for `repeatCount: 1` to express "run once" and, when that was
+ * a hard error, spiralled into absurd counts / a wrong-year cron workaround
+ * (live transcript). Accepting the natural call removes that failure mode; the
+ * returned `note` teaches the agent the field was redundant.
  */
 export function buildSpecFromCreateArgs(
   args: { cron?: string; onceAt?: string; repeatCount?: number },
   nowMs: number,
 ): BuildSpecResult {
-  const { cron, onceAt, repeatCount } = args;
+  const cron = normalizeOptionalArg(args.cron);
+  const onceAt = normalizeOptionalArg(args.onceAt);
+  const { repeatCount } = args;
+
   if (cron && onceAt) {
-    return { ok: false, error: 'pass either cron or onceAt, not both' };
+    return { ok: false, error: `Pass either cron OR onceAt, not both. ${scheduleRecipes}` };
   }
   if (!cron && !onceAt) {
-    return { ok: false, error: 'pass exactly one of cron or onceAt' };
+    return { ok: false, error: `Pass exactly one of cron or onceAt. ${scheduleRecipes}` };
   }
+
+  let note: string | undefined;
   if (onceAt && repeatCount !== undefined) {
-    return { ok: false, error: 'repeatCount is only valid with cron, not onceAt' };
+    note = 'repeatCount was ignored — a one-shot (onceAt) always runs exactly once.';
   }
 
   const spec: ScheduleSpec = cron
@@ -368,7 +416,7 @@ export function buildSpecFromCreateArgs(
 
   const validationError = validateScheduleSpec(spec, nowMs);
   if (validationError) return { ok: false, error: validationError };
-  return { ok: true, spec };
+  return { ok: true, spec, note };
 }
 
 // ─── tool result helpers ─────────────────────────────────────────────
@@ -406,9 +454,15 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
     {
       title: 'Create a scheduled prompt',
       description:
-        'Schedule a prompt to be delivered to this topic later. Provide a cron expression (recurring), ' +
-        'an ISO one-shot time, or a cron with repeatCount (N-times). The bot announces, pins, and ' +
+        'Schedule a prompt to be delivered to this topic later. The bot announces, pins, and ' +
         'forwards the prompt to the agent at fire time.\n\n' +
+        'Pick exactly ONE mode:\n' +
+        '• one-shot (run once at a time): pass onceAt (ISO 8601); omit cron and repeatCount.\n' +
+        '• recurring: pass cron (5-field); omit onceAt.\n' +
+        '• recurring N times: pass cron AND repeatCount; omit onceAt.\n' +
+        'For a single future run ALWAYS use onceAt — never a cron with repeatCount:1 ' +
+        '(a cron has no year, so it would fire on that date every year). repeatCount counts CRON ' +
+        'fires only and is ignored for a one-shot.\n\n' +
         'USE THIS whenever the user asks to schedule execution of a plan or task for later ' +
         "(e.g. \"schedule finishing plan X in 2h\", \"run this plan tomorrow morning\"). " +
         'Schedule IMMEDIATELY: write the request straight into `prompt` and create the job FIRST — ' +
@@ -447,7 +501,8 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
 
       const record = created.record;
       deps.armJob(record);
-      return textResult(`Scheduled "${record.name}".\n${summarizeRecord(record)}`);
+      const noteSuffix = built.note ? `\n\nℹ️ ${built.note}` : '';
+      return textResult(`Scheduled "${record.name}".\n${summarizeRecord(record)}${noteSuffix}`);
     },
   );
 

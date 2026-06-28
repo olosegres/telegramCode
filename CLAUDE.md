@@ -239,6 +239,14 @@ config/variants, not a per-message API field).
   starting one with the thread's last-used adapter. Created via `/schedule`
   (prompt wrapper) or by the agent itself (`schedule_create/list/cancel` MCP
   tools; cron / one-shot / N-times, min interval 5 min, ≤30 jobs per thread).
+  **`schedule_create` is agent-robust** (`buildSpecFromCreateArgs`): a one-shot
+  (`onceAt`) IGNORES a redundant `repeatCount` instead of erroring (a one-shot
+  always runs once — the agent naturally sends `repeatCount:1` to mean "run
+  once"; rejecting it made the model spiral into absurd counts / a wrong-year
+  cron), empty/whitespace `cron`/`onceAt` normalise to absent, and a structural
+  error (both/neither field) echoes the exact 3-mode recipe so a bad call teaches
+  the corrected next call. ALWAYS use `onceAt` for a single future run, never a
+  cron — cron has no year and would re-fire every year.
   Restart-safe: timers re-arm from `state.json` at boot and missed runs fire
   ONE catch-up annotated with the missed time. Leaving a folder (the `/bind`
   «leave current dir» button) pauses the thread's jobs (one notice); `/bind`

@@ -3,7 +3,9 @@
  *
  *   - token helpers: build/verify round-trip, tampered scope/signature rejected,
  *     malformed tokens rejected, timing-safe compare used (read from source).
- *   - buildSpecFromCreateArgs: exactly-one-of, repeatCount misuse, bad cron.
+ *   - buildSpecFromCreateArgs: exactly-one-of (+ recipe hint), one-shot tolerates
+ *     a redundant repeatCount (ignored, not an error), empty-string normalization,
+ *     bad cron.
  *   - resolveTargetThreadKey: thread scope (match/mismatch), dir scope
  *     (0 / 1 / >1 bound threads, threadKey requirement + validation).
  *   - END-TO-END over real HTTP: start the server on port 0, connect with the
@@ -147,23 +149,54 @@ describe('buildSpecFromCreateArgs', () => {
     assert.deepEqual(result.spec, { kind: 'once', onceAtIso: future });
   });
 
-  it('rejects cron + onceAt together', () => {
-    const result = buildSpecFromCreateArgs({ cron: '0 9 * * *', onceAt: '2026-06-07T09:00:00' }, nowMs);
+  it('rejects cron + onceAt together, with the recipe hint', () => {
+    const future = new Date(nowMs + 5 * 60_000).toISOString();
+    const result = buildSpecFromCreateArgs({ cron: '0 9 * * *', onceAt: future }, nowMs);
     assert.equal(result.ok, false);
-    if (!result.ok) assert.match(result.error, /not both/);
+    if (!result.ok) {
+      assert.match(result.error, /not both/);
+      assert.match(result.error, /Recipes/);
+    }
   });
 
-  it('rejects neither cron nor onceAt', () => {
+  it('rejects neither cron nor onceAt, with the recipe hint', () => {
     const result = buildSpecFromCreateArgs({}, nowMs);
     assert.equal(result.ok, false);
-    if (!result.ok) assert.match(result.error, /exactly one/);
+    if (!result.ok) {
+      assert.match(result.error, /exactly one/);
+      assert.match(result.error, /Recipes/);
+    }
   });
 
-  it('rejects repeatCount with onceAt', () => {
+  // The live bug: the agent reached for repeatCount:1 to mean "run once". That is
+  // now ACCEPTED (a one-shot always runs once) — repeatCount is ignored, not an error.
+  it('ignores repeatCount:1 on a one-shot (the natural "run once" call)', () => {
     const future = new Date(nowMs + 60_000).toISOString();
-    const result = buildSpecFromCreateArgs({ onceAt: future, repeatCount: 5 }, nowMs);
-    assert.equal(result.ok, false);
-    if (!result.ok) assert.match(result.error, /repeatCount is only valid with cron/);
+    const result = buildSpecFromCreateArgs({ onceAt: future, repeatCount: 1 }, nowMs);
+    assert.ok(result.ok);
+    assert.deepEqual(result.spec, { kind: 'once', onceAtIso: future });
+    assert.match(result.note ?? '', /ignored/i);
+  });
+
+  it('ignores an absurd repeatCount on a one-shot', () => {
+    const future = new Date(nowMs + 60_000).toISOString();
+    const result = buildSpecFromCreateArgs({ onceAt: future, repeatCount: 8842354424542 }, nowMs);
+    assert.ok(result.ok);
+    assert.deepEqual(result.spec, { kind: 'once', onceAtIso: future });
+  });
+
+  it('treats an empty-string cron on a one-shot as omitted', () => {
+    const future = new Date(nowMs + 60_000).toISOString();
+    const result = buildSpecFromCreateArgs({ onceAt: future, cron: '' }, nowMs);
+    assert.ok(result.ok);
+    assert.deepEqual(result.spec, { kind: 'once', onceAtIso: future });
+    assert.equal(result.note, undefined);
+  });
+
+  it('treats an empty/whitespace onceAt on a cron as omitted', () => {
+    const result = buildSpecFromCreateArgs({ cron: '0 9 * * *', onceAt: '   ' }, nowMs);
+    assert.ok(result.ok);
+    assert.deepEqual(result.spec, { kind: 'cron', cronExpr: '0 9 * * *' });
   });
 
   it('surfaces a bad cron message', () => {
@@ -448,6 +481,24 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     assert.notEqual(result.isError, true, firstText(result));
     assert.equal(fixture.armed.length, 1);
     assert.equal(fixture.armed[0].threadKey, threadAKey);
+    await client.close();
+  });
+
+  it('one-shot with a redundant repeatCount succeeds first-try (live transcript regression)', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    const futureIso = new Date(Date.now() + 60 * 60_000).toISOString();
+    const result = await client.callTool({
+      name: 'schedule_create',
+      arguments: { name: 'OnceTask', onceAt: futureIso, repeatCount: 1, prompt: 'do it once' },
+    });
+    assert.notEqual(result.isError, true, firstText(result));
+    assert.match(firstText(result), /ignored/i);
+    const record = fixture.armed.find((r) => r.name === 'OnceTask');
+    assert.ok(record);
+    assert.equal(record.spec.kind, 'once');
+    // No N-times remainingRuns leaked onto the one-shot.
+    assert.equal((record.spec as { remainingRuns?: number }).remainingRuns, undefined);
     await client.close();
   });
 

@@ -21,7 +21,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { StateStore } from '../state';
-import type { ThreadKey } from '../types';
+import { keyToString, type ThreadKey } from '../types';
 
 let dataDir: string;
 let fakeHome: string;
@@ -474,4 +474,64 @@ test('traceConfig: dedups + sorts thread keys and drops an empty thread list on 
   await store.flush();
   const rawOff = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
   assert.equal('tracedThreads' in rawOff, false, 'empty thread list must be absent on disk');
+});
+
+// ── setTransientFrames (transient status-frame ids — restart cleanup, S2) ──
+
+test('setTransientFrames: set → get round-trips the id list for a thread', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTransientFrames(key1, [101, 202, 303]);
+  assert.deepEqual(store.getTransientFrames(), { [keyToString(key1)]: [101, 202, 303] });
+});
+
+test('setTransientFrames: an empty list clears the key (clean state.json)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTransientFrames(key1, [101]);
+  // Intermediate state proves the first write landed (not a vacuous pass).
+  assert.equal(Object.keys(store.getTransientFrames()).length, 1, 'precondition: one key present');
+  await store.setTransientFrames(key1, []);
+  assert.deepEqual(store.getTransientFrames(), {}, 'empty list must drop the key');
+});
+
+test('setTransientFrames: survives a save/load round-trip from disk', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setTransientFrames(key1, [55, 66]);
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.deepEqual(second.getTransientFrames(), { [keyToString(key1)]: [55, 66] });
+});
+
+test('setTransientFrames: the empty-list clear is persisted to disk (no dangling key)', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setTransientFrames(key1, [7, 8]);
+  await first.setTransientFrames(key1, []);
+  await first.flush();
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal('transientFrames' in raw, false, 'empty map must be absent on disk');
+});
+
+test('setTransientFrames: does not touch agents or bindings', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setBinding(key1, 'proj');
+  await store.setAgent(key1, { name: 'claude', model: 'sonnet' });
+  await store.setTransientFrames(key1, [7]);
+  assert.equal(store.getBinding(key1)?.subdir, 'proj', 'binding untouched');
+  assert.equal(store.getAgent(key1)?.name, 'claude', 'agent name untouched');
+  assert.equal(store.getAgent(key1)?.model, 'sonnet', 'agent model untouched');
+});
+
+test('setTransientFrames: two threads are independent', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTransientFrames(key1, [1, 2]);
+  await store.setTransientFrames(key2, [3]);
+  await store.setTransientFrames(key1, []);
+  assert.deepEqual(store.getTransientFrames(), { [keyToString(key2)]: [3] });
 });

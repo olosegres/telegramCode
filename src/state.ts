@@ -210,6 +210,20 @@ export interface StateV1 {
    * concerns, NOT agent behavior — they never change what is sent to OpenCode.
    */
   displayPrefs?: Record<string, ThreadDisplayPrefs>;
+  /**
+   * Per-thread TRANSIENT status-frame message ids currently on screen (the
+   * "✽ working…" liveness frame, the live thinking indicator, the dedicated
+   * sub-agent status), keyed by {@link ThreadKey} string. Persisted ONLY so an
+   * UNGRACEFUL exit (crash / SIGKILL — the graceful shutdown sweep in `bot.ts`
+   * never ran) can delete whatever frame was on screen on the NEXT boot, after
+   * reattach (the reattached session is idle, so a leftover frame is stale by
+   * definition). Cosmetic, so it rides the debounced save — losing the last
+   * <=500ms window before a crash just falls back to the pre-fix orphan for that
+   * one frame (S1 covers every graceful path exactly). Optional so older state
+   * files stay valid — a missing value is an empty set; an empty list drops the
+   * key so an idle bot leaves a clean `state.json`.
+   */
+  transientFrames?: Record<string, number[]>;
 }
 
 /** Empty state used both for fresh installs and after a corruption-archive event. */
@@ -1188,6 +1202,50 @@ export class StateStore {
       if (Object.keys(this.state.apiRetries).length === 0) {
         delete this.state.apiRetries;
       }
+      this.scheduleSave();
+    });
+  }
+
+  // ── transient status-frame ids (restart cleanup) ──
+
+  /**
+   * @description Every persisted transient status-frame id list across all
+   * threads, keyed by {@link ThreadKey} string. Read at boot (after reattach) to
+   * delete any frame left on screen by an UNGRACEFUL exit. Returns a shallow copy
+   * so callers can't mutate the live state object.
+   */
+  getTransientFrames(): Record<string, number[]> {
+    return { ...(this.state.transientFrames ?? {}) };
+  }
+
+  /**
+   * @description Replace the persisted transient status-frame ids for `key`
+   * (the live "✽ working…" status frame, the thinking indicator, the sub-agent
+   * status — whichever are currently on screen). Mirrors the in-memory
+   * `ThreadMessageState` write in `bot.ts`'s frame-id setters so disk can clean
+   * up what the graceful sweep would have. Debounced (NOT flushed): the frames
+   * are cosmetic. An empty list drops the key (and the whole map once empty) so an
+   * idle bot leaves a clean `state.json`. A no-op (no save) when the id list is
+   * unchanged, so the per-turn create/delete churn doesn't reset the save timer
+   * on every identical re-persist.
+   */
+  async setTransientFrames(key: ThreadKey, ids: number[]): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.transientFrames?.[k];
+      if (ids.length === 0) {
+        if (!existing) return;
+        delete this.state.transientFrames![k];
+        if (Object.keys(this.state.transientFrames!).length === 0) {
+          delete this.state.transientFrames;
+        }
+        this.scheduleSave();
+        return;
+      }
+      if (existing && existing.length === ids.length && existing.every((v, i) => v === ids[i])) {
+        return;
+      }
+      (this.state.transientFrames ??= {})[k] = ids.slice();
       this.scheduleSave();
     });
   }

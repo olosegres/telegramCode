@@ -1223,6 +1223,42 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   return s;
 }
 
+/**
+ * @description Persist the thread's CURRENT transient status-frame ids (the
+ * non-null `statusMessageId` / `thinkingMessageId` / `subagentStatusMessageId`)
+ * so an UNGRACEFUL restart (crash / SIGKILL — no graceful sweep ran) can delete
+ * whatever frame was on screen on the next boot (S2). The in-memory
+ * `ThreadMessageState` is the live source of truth; this just keeps disk in step.
+ * Debounced + fire-and-forget. Single collection point shared by the three
+ * frame-id setters below so memory and disk never drift.
+ */
+function persistTransientFrames(key: ThreadKey): void {
+  const ids = getTransientFrameIds(getThreadMessageState(key));
+  state.setTransientFrames(key, ids).catch(e =>
+    console.error('[transientFrames] persist failed:', e),
+  );
+}
+
+/**
+ * @description The three choke points for mutating a transient frame id: assign
+ * the in-memory `ThreadMessageState` field AND mirror the resulting id set to the
+ * persisted store (S2). Callers keep their generation-guard checks (only null
+ * when the id still equals the one they created); the setter just routes the
+ * same write through one place.
+ */
+function setStatusFrameId(key: ThreadKey, id: number | null): void {
+  getThreadMessageState(key).statusMessageId = id;
+  persistTransientFrames(key);
+}
+function setThinkingFrameId(key: ThreadKey, id: number | null): void {
+  getThreadMessageState(key).thinkingMessageId = id;
+  persistTransientFrames(key);
+}
+function setSubagentFrameId(key: ThreadKey, id: number | null): void {
+  getThreadMessageState(key).subagentStatusMessageId = id;
+  persistTransientFrames(key);
+}
+
 function getOutputQueueState(key: ThreadKey): OutputQueueState {
   const k = keyToString(key);
   let s = outputQueues.get(k);
@@ -1292,7 +1328,7 @@ function clearThinkingMessage(key: ThreadKey): void {
   s.thinkingFrameGeneration += 1;
   if (s.thinkingMessageId === null) return;
   const id = s.thinkingMessageId;
-  s.thinkingMessageId = null;
+  setThinkingFrameId(key, null);
   deleteThreadMessage(key, id, 'status').catch(() => {});
 }
 
@@ -2678,7 +2714,7 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
   s.statusFrameGeneration += 1;
   if (s.statusMessageId === null) return;
   const id = s.statusMessageId;
-  s.statusMessageId = null;
+  setStatusFrameId(key, null);
   await deleteThreadMessage(key, id);
 }
 
@@ -2724,6 +2760,9 @@ async function sweepTransientFramesOnShutdown(): Promise<void> {
     msgState.statusMessageId = null;
     msgState.thinkingMessageId = null;
     msgState.subagentStatusMessageId = null;
+    // Clear the S2 persisted set too, so the next boot's reconciliation finds
+    // nothing to redo after a graceful exit.
+    state.setTransientFrames(key, []).catch(() => {});
   }
   if (deletes.length === 0) return;
   await Promise.race([
@@ -7115,7 +7154,7 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
       await deleteThreadMessage(key, createdId, 'status');
       return false;
     }
-    msgState.statusMessageId = createdId;
+    setStatusFrameId(key, createdId);
     return true;
   };
   let landed = false;
@@ -7134,7 +7173,7 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
         // Edit failed (e.g. the message was deleted under us). Only null it if it
         // still points at the message we tried to edit — a concurrent delete may
         // already have moved it. Then create a replacement under the gen guard.
-        if (msgState.statusMessageId === editId) msgState.statusMessageId = null;
+        if (msgState.statusMessageId === editId) setStatusFrameId(key, null);
         const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
         landed = await storeOrDiscardCreatedFrame(id);
       }
@@ -7239,7 +7278,7 @@ function handleAgentThinking(key: ThreadKey, payload: ThinkingEvent): void {
  * finishes against the right message.
  */
 function finishThinkingMessage(key: ThreadKey): void {
-  getThreadMessageState(key).thinkingMessageId = null;
+  setThinkingFrameId(key, null);
   const coalescer = thinkingCoalescers.get(keyToString(key));
   // Drop the dedup baseline so the NEXT response's first frame is never skipped
   // as "identical" against this response's last frame.
@@ -7302,7 +7341,7 @@ async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<
       // A clear (session end / takeover) may have nulled the id mid-edit — only
       // treat the edit as live if the id still points at the message we edited.
       if (ok && msgState.thinkingMessageId === editId) return true;
-      if (!ok && msgState.thinkingMessageId === editId) msgState.thinkingMessageId = null;
+      if (!ok && msgState.thinkingMessageId === editId) setThinkingFrameId(key, null);
       return false;
     }
     // Create the first frame. Capture the generation BEFORE the send: a
@@ -7316,7 +7355,7 @@ async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<
       await deleteThreadMessage(key, id, 'status');
       return false;
     }
-    msgState.thinkingMessageId = id;
+    setThinkingFrameId(key, id);
     return true;
   } catch (err) {
     console.error('[sendThinkingFrame] Failed:', err);
@@ -7574,7 +7613,7 @@ function clearSubagentStatus(key: ThreadKey): void {
     state.subagentTimer = null;
   }
   const id = state.subagentStatusMessageId;
-  state.subagentStatusMessageId = null;
+  setSubagentFrameId(key, null);
   state.subagentStartedAt = null;
   state.subagentTitle = null;
   if (id !== null) deleteThreadMessage(key, id, 'status').catch(() => {});
@@ -7623,7 +7662,7 @@ function handleSubagentStatus(key: ThreadKey, payload: SubagentStatusEvent): voi
           deleteThreadMessage(key, id, 'status').catch(() => {});
           return;
         }
-        state.subagentStatusMessageId = id;
+        setSubagentFrameId(key, id);
         armSubagentTimer(key, state);
         return;
       }
@@ -8338,6 +8377,44 @@ function restoreApiRetries(): void {
 }
 
 /**
+ * @description Delete transient status frames left on screen by an UNGRACEFUL
+ * exit (crash / SIGKILL — the graceful shutdown sweep never ran), so a
+ * "✽ working…" / thinking / sub-agent frame doesn't stick forever in a topic
+ * (S2, the crash safety net behind S1). Deletes every id in the `orphaned`
+ * snapshot best-effort (swallowing "message not found" / too-old). The snapshot
+ * MUST be captured BEFORE reattach (see {@link startBot}): a reattached
+ * session's frame setters persist the fresh in-memory state and would clobber
+ * the live persisted set first. Every snapshot id is stale by definition (the
+ * fresh process holds no handle to it; a still-busy reattached session repaints
+ * its OWN fresh frame), so deleting is always safe. After deleting, re-persist
+ * the CURRENT live frame ids per thread so disk reflects post-reattach truth
+ * (the repainted frame's id, or empty) instead of the consumed stale ids. A
+ * graceful exit already cleared the set in its sweep, so this is normally a
+ * no-op.
+ */
+function reconcileTransientFrames(orphaned: Record<string, number[]>): void {
+  let deleted = 0;
+  for (const [keyStr, ids] of Object.entries(orphaned)) {
+    let key: ThreadKey;
+    try {
+      key = keyFromString(keyStr);
+    } catch {
+      // Hand-edited / corrupt key (can't come from `keyToString`): skip it,
+      // keep booting. Tolerated-and-skipped, like restorePendingQuestions.
+      continue;
+    }
+    for (const id of ids) {
+      void bot.telegram.deleteMessage(key.chatId, id).catch(() => {});
+      deleted += 1;
+    }
+    // Sync disk to the LIVE in-memory frames (post-reattach): a still-busy
+    // session that repainted a fresh frame keeps its new id; an idle one clears.
+    persistTransientFrames(key);
+  }
+  if (deleted > 0) console.log(`[reattach] transient frames: deleted ${deleted} stale`);
+}
+
+/**
  * @description The bot side of the agent's `send_file` MCP tool: resolve the
  * thread's bound folder, path-check each file against it, decide the send
  * plan (single method / album / error), and dispatch through `enqueueSend`
@@ -8512,6 +8589,13 @@ export async function startBot(): Promise<void> {
   state = await getStateStore();
   console.log(`Data dir:         ${path.dirname(state.stateFilePath)}`);
 
+  // Snapshot the persisted transient status-frame ids (S2) NOW, before reattach
+  // can run any frame-id setter. A reattached session's first frame lifecycle
+  // call persists the FRESH (all-null) in-memory state and would otherwise
+  // clobber this crash-recovery set to empty before `reconcileTransientFrames`
+  // reads it. Captured into a local so the orphans survive that clobber.
+  const orphanedTransientFrames = state.getTransientFrames();
+
   // Seed the output-trace toggle from persisted state so a `/trace` setting
   // survives a hot rebuild mid-debug (the writer state lives in outputTrace.ts).
   setTraceConfig(state.getTraceConfig());
@@ -8655,6 +8739,13 @@ export async function startBot(): Promise<void> {
   //     restart. AFTER reattach (and restorePendingQuestions) so the kick lands
   //     in a live session; a past fireAt fires one delayed catch-up.
   restoreApiRetries();
+
+  // 5d. Delete transient status frames orphaned by an UNGRACEFUL exit (S2). AFTER
+  //     reattach so each leftover frame is provably stale (the session is idle /
+  //     will repaint). A graceful exit already cleared the set in its sweep, so
+  //     this is normally a no-op. Uses the pre-reattach snapshot (the setters
+  //     clobber the live persisted set during reattach).
+  reconcileTransientFrames(orphanedTransientFrames);
 
   // 5-scheduler. Wire the scheduler (S8): run ledger → delivery (thin lambdas
   //    over existing bot functions) → timer engine → bot-owned MCP server →

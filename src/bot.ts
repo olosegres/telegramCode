@@ -120,6 +120,7 @@ import {
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import { stripLeadingSpinnerGlyph } from './utils/claudeScrapeShapes';
 import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
+import { getTransientFrameIds } from './utils/transientFrames';
 import {
   getThinkingEventAction,
   getThinkingAnswerStartAction,
@@ -2679,6 +2680,59 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
   const id = s.statusMessageId;
   s.statusMessageId = null;
   await deleteThreadMessage(key, id);
+}
+
+/**
+ * Internal bound (ms) on the graceful-shutdown transient-frame sweep. Well under
+ * the 3s shutdown watchdog so a slow Telegram API can't eat into the budget
+ * `state.flush()` needs to land the last state to disk.
+ */
+const shutdownFrameSweepMs = 1500;
+
+/**
+ * @description Best-effort delete of every TRANSIENT status frame still on
+ * screen at graceful shutdown — the "✽ working…" liveness frame, the live
+ * thinking indicator, and the dedicated sub-agent status. Their ids live ONLY in
+ * volatile in-memory {@link ThreadMessageState}, so a restart that doesn't clean
+ * them up orphans the messages forever in the topic (the reported incident:
+ * ~25 hot reloads left "✽ работаю…" frames stuck). Iterates every tracked
+ * thread, collects its non-null frame ids ({@link getTransientFrameIds}), fires
+ * the deletes in parallel, and nulls the in-memory ids so a racing per-thread
+ * tick can't re-edit a just-deleted message.
+ *
+ * Wired into {@link gracefulShutdown} as `clearTransientFrames`: runs AFTER
+ * `cleanupTimers()` (no interval re-creates a frame mid-sweep) and BEFORE
+ * `bot.stop()` (the Telegram client must still send the deletes). Self-bounded by
+ * {@link shutdownFrameSweepMs} — a slow API must not starve `state.flush()`.
+ */
+async function sweepTransientFramesOnShutdown(): Promise<void> {
+  const deletes: Promise<unknown>[] = [];
+  for (const [keyStr, msgState] of threadMessageStates) {
+    const ids = getTransientFrameIds(msgState);
+    if (ids.length === 0) continue;
+    let key: ThreadKey;
+    try {
+      key = keyFromString(keyStr);
+    } catch {
+      continue;
+    }
+    for (const id of ids) {
+      deletes.push(bot.telegram.deleteMessage(key.chatId, id).catch(() => {}));
+    }
+    // Null the in-memory ids so a racing unref'd liveness/sub-agent tick can't
+    // re-edit (or re-track) a message we're deleting.
+    msgState.statusMessageId = null;
+    msgState.thinkingMessageId = null;
+    msgState.subagentStatusMessageId = null;
+  }
+  if (deletes.length === 0) return;
+  await Promise.race([
+    Promise.allSettled(deletes),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, shutdownFrameSweepMs);
+      timer.unref?.();
+    }),
+  ]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -8787,6 +8841,7 @@ export async function startBot(): Promise<void> {
       state,
       releaseLock,
       exit: (code) => process.exit(code),
+      clearTransientFrames: () => sweepTransientFramesOnShutdown(),
       cleanupTimers: () => {
         clearInterval(inMemoryGcInterval);
         clearInterval(heartbeatInterval);

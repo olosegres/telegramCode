@@ -199,6 +199,55 @@ test('error thrown by bot.stop does NOT skip state.flush or releaseLock', async 
   assert.equal(exitCode(), 0);
 });
 
+test('clearTransientFrames runs after cleanupTimers and before state.flush / releaseLock', async () => {
+  // The frame sweep must run while Telegram is still up (before bot.stop / the
+  // flush) but after the timers are stopped (so no tick re-creates a frame).
+  const { deps, events, drained } = makeDeps({
+    flushDelayMs: 20,
+    clearTransientFrames: async () => {
+      events.push('clearTransientFrames');
+    },
+  });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  const sweepIdx = events.indexOf('clearTransientFrames');
+  const cleanupIdx = events.indexOf('cleanupTimers');
+  const flushStartIdx = events.indexOf('state.flush:start');
+  const releaseIdx = events.indexOf('releaseLock');
+  assert.notEqual(sweepIdx, -1, 'clearTransientFrames must run');
+  assert.ok(cleanupIdx !== -1 && cleanupIdx < sweepIdx, 'must run AFTER cleanupTimers');
+  assert.ok(sweepIdx < flushStartIdx, 'must run BEFORE state.flush');
+  assert.ok(sweepIdx < releaseIdx, 'must run BEFORE releaseLock');
+});
+
+test('a slow clearTransientFrames still hits the watchdog and forces exit', async () => {
+  // A frame sweep slower than the watchdog (e.g. wedged Telegram API) must NOT
+  // strand the shutdown: the outer watchdog wins and we still exit(0) +
+  // releaseLock, even though the flush is blocked behind the sweep at that point.
+  const { deps, events, exitCode, drained } = makeDeps({
+    watchdogMs: 50,
+    clearTransientFrames: () => new Promise<void>((resolve) => setTimeout(resolve, 200)),
+  });
+
+  const start = Date.now();
+  await gracefulShutdown(deps);
+  const elapsed = Date.now() - start;
+
+  assert.ok(elapsed < 180, `watchdog should return promptly; got ${elapsed}ms`);
+  assert.equal(exitCode(), 0, 'watchdog must still exit(0) so nodemon respawns');
+  assert.ok(events.includes('releaseLock'), `releaseLock must fire; events=${JSON.stringify(events)}`);
+  assert.ok(
+    !events.includes('state.flush:start'),
+    'flush is blocked behind the slow sweep when the watchdog fires',
+  );
+
+  // Let the orphan sweep + its trailing flush settle so node:test doesn't flag a
+  // pending promise.
+  await drained();
+});
+
 test('error thrown by state.flush does NOT skip releaseLock or exit', async () => {
   // Custom state.flush below replaces the default, so its `drained()`
   // contract no longer applies — we hand-await the orchestrator and

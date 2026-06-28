@@ -44,6 +44,17 @@ export interface ShutdownDeps {
   exit: (code: number) => void;
   /** Optional: clear any setInterval handles the bot kept (GC sweep, etc.). */
   cleanupTimers?: () => void;
+  /**
+   * Optional: best-effort delete of any TRANSIENT status frames (the
+   * "✽ working…" liveness frame, the live thinking indicator, the dedicated
+   * sub-agent status) still on screen, so a graceful exit doesn't leave them
+   * orphaned in a topic forever (their ids live only in volatile in-memory
+   * state). Runs AFTER {@link cleanupTimers} (so no tick re-creates a frame
+   * mid-sweep) and BEFORE `bot.stop()` (the Telegram client must still send the
+   * deletes). MUST self-bound (see the bot-side sweep) so a slow API can't eat
+   * into `state.flush()`'s watchdog budget; the outer watchdog is the backstop.
+   */
+  clearTransientFrames?: () => Promise<void>;
   /** Logger; defaults to `console.log`. Tests pass a sink to silence output. */
   log?: (msg: string) => void;
   /** Override the watchdog for tests. */
@@ -55,6 +66,10 @@ export interface ShutdownDeps {
  *
  *   1. `cleanupTimers()` — drop any background `setInterval`s so they
  *      don't fire mid-shutdown and re-dirty state.
+ *   1b. `await clearTransientFrames()` — best-effort delete of the
+ *      "✽ working…" / thinking / sub-agent status frames still on screen,
+ *      while the Telegram client is still up. Self-bounded so it can't
+ *      starve the flush.
  *   2. `bot.stop(signal)` — Telegraf stops long-polling. Synchronous in
  *      Telegraf 4.x, so safe to call before the flush.
  *   3. `await state.flush()` — atomic-write any pending state changes.
@@ -102,6 +117,13 @@ export async function gracefulShutdown(deps: ShutdownDeps): Promise<void> {
         deps.cleanupTimers();
       } catch (e) {
         console.error('[shutdown] cleanupTimers failed:', e);
+      }
+    }
+    if (deps.clearTransientFrames) {
+      try {
+        await deps.clearTransientFrames();
+      } catch (e) {
+        console.error('[shutdown] clearTransientFrames failed:', e);
       }
     }
     try {

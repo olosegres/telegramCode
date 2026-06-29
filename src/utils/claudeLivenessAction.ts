@@ -70,6 +70,30 @@ export function getClaudeLivenessAction(input: ClaudeLivenessActionInput): Claud
 }
 
 /**
+ * @description Whether the liveness loop may STOP after this tick. Kept separate
+ * from the create/tick/delete action because the stop decision must ALSO weigh
+ * the status COALESCER: `sendStatusFrame` stores `statusMessageId` only AFTER its
+ * network await, so a frame create can still be in flight on a tick that reads
+ * `hasStatusFrame === false`. Stopping then strands the just-sent frame with no
+ * loop left to delete it on idle — an orphan that lingers until the next message
+ * (live 2026-06-29: a hung "☁️ thinking …" whose final frame landed exactly as
+ * the agent went idle, so the idle tick saw no frame, stopped, and the send then
+ * resurrected one with nothing watching it).
+ *
+ * Stop ONLY when idle, no frame tracked, AND the coalescer is fully drained
+ * (nothing in flight, queued, or deferred behind a 429 cooldown). While any of
+ * those hold, keep ticking: the pending send lands, the next idle tick deletes
+ * the frame, and the loop then stops cleanly.
+ */
+export function getClaudeLivenessShouldStop(input: {
+  isBusy: boolean;
+  hasStatusFrame: boolean;
+  statusSendPending: boolean;
+}): boolean {
+  return !input.isBusy && !input.hasStatusFrame && !input.statusSendPending;
+}
+
+/**
  * @description Resolve what `sendStatusFrame` must do with a status message it
  * just CREATED (a brand-new Telegram message id, from the no-existing-frame
  * branch), once the create's `await` resolves.

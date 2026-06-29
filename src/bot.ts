@@ -143,7 +143,7 @@ import {
 import { getUniformVerbosityLevel } from './utils/verbosityRender';
 import { createSerialQueue, type SerialQueue } from './utils/serialQueue';
 import { getVoiceTranscriptionQueue } from './voiceQueue';
-import { getClaudeLivenessAction, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
+import { getClaudeLivenessAction, getClaudeLivenessShouldStop, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
   buildThreadContextPreamble,
@@ -7488,10 +7488,18 @@ function runClaudeLivenessTick(key: ThreadKey): void {
       break;
   }
 
-  // Stop only when the session is truly idle (no frame left to keep alive);
-  // while busy OR a frame still lingers (mid-delete), keep ticking so the next
-  // poll either refreshes it or removes it. Never leave a frame stuck post-idle.
-  if (!isBusy && state.statusMessageId === null) {
+  // Stop only when the session is truly idle, no frame is tracked, AND the status
+  // coalescer is fully drained. A coalescer send sets `statusMessageId` only after
+  // its network await, so stopping while one is in flight (or queued / deferred
+  // behind a 429) would strand the just-sent frame with no loop to delete it on
+  // idle — the orphan that lingers until the next message (live 2026-06-29: a hung
+  // "☁️ thinking …" whose final frame landed exactly as the agent went idle).
+  // While busy, a frame lingers (mid-delete), or a send is pending, keep ticking
+  // so the next tick refreshes / removes it. Never leave a frame stuck post-idle.
+  const coalescer = getStatusCoalesceState(key);
+  const statusSendPending =
+    coalescer.inFlight || coalescer.pendingText !== null || coalescer.deferRetryTimer !== null;
+  if (getClaudeLivenessShouldStop({ isBusy, hasStatusFrame: state.statusMessageId !== null, statusSendPending })) {
     stopClaudeLiveness(key);
   } else {
     armClaudeLivenessTimer(key, state);

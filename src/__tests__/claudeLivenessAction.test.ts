@@ -13,7 +13,11 @@
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { getClaudeLivenessAction, getStatusFrameStoreDecision } from '../utils/claudeLivenessAction';
+import {
+  getClaudeLivenessAction,
+  getClaudeLivenessShouldStop,
+  getStatusFrameStoreDecision,
+} from '../utils/claudeLivenessAction';
 
 test('create: busy, no frame, not streaming — the #11 gap', () => {
   assert.equal(
@@ -189,6 +193,78 @@ test('lifecycle: idle delete removes the on-screen frame (no leftover spinner)',
   model.deleteFrame();
   assert.equal(model.state.statusMessageId, null);
   assert.equal(model.onScreen.size, 0);
+});
+
+// ── Stop decision (orphan-on-idle race, live 2026-06-29) ─────────────────────
+//
+// The loop must NOT stop while a status-frame send is still pending in the
+// coalescer: `sendStatusFrame` stores `statusMessageId` only AFTER its network
+// await, so stopping on a tick that reads `hasStatusFrame === false` would
+// strand the just-landed frame with no loop to delete it on idle — a hung
+// "☁️ thinking …" that lingers until the next message.
+
+test('stop: idle, no frame, coalescer drained → loop stops', () => {
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false }),
+    true,
+  );
+});
+
+test('no-stop: still busy → keep ticking', () => {
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: true, hasStatusFrame: false, statusSendPending: false }),
+    false,
+  );
+});
+
+test('no-stop: a tracked frame is still up → keep ticking so idle can delete it', () => {
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: true, statusSendPending: false }),
+    false,
+  );
+});
+
+test('no-stop: idle + no frame BUT a status send is pending → keep ticking (THE race)', () => {
+  // The final frame is mid-create (id not yet stored). The OLD rule
+  // (`statusMessageId === null`) stopped here and the landing send orphaned the
+  // frame; the coalescer-aware rule keeps the loop alive until the send lands.
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: true }),
+    false,
+  );
+});
+
+test('lifecycle: a frame landing AS the loop reaches idle is NOT orphaned (race fix)', () => {
+  const model = createStatusFrameModel();
+
+  // The final thinking frame's coalescer send is in flight: statusMessageId is
+  // still null, but a message WILL appear. Old loop stopped here (orphan); the
+  // new rule refuses to stop while the send is pending.
+  assert.equal(
+    getClaudeLivenessShouldStop({
+      isBusy: false,
+      hasStatusFrame: model.state.statusMessageId !== null,
+      statusSendPending: true,
+    }),
+    false,
+    'must not stop while a send is in flight',
+  );
+
+  // The send lands → a frame is now tracked and on screen.
+  model.sendFrame();
+  assert.equal(model.onScreen.size, 1);
+  assert.notEqual(model.state.statusMessageId, null);
+
+  // The loop is still alive; the next idle tick deletes the landed frame.
+  model.deleteFrame();
+  assert.equal(model.onScreen.size, 0, 'idle tick removed the landed frame — no orphan');
+  assert.equal(model.state.statusMessageId, null);
+
+  // Nothing pending now → loop stops cleanly.
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false }),
+    true,
+  );
 });
 
 test('lifecycle: rapid send/delete cycles never accumulate more than one frame', () => {

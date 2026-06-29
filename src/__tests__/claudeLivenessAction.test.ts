@@ -14,6 +14,8 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
+  buildClaudeLivenessFrameText,
+  checkShouldForceIdleRemoval,
   getClaudeLivenessAction,
   getClaudeLivenessShouldStop,
   getStatusFrameStoreDecision,
@@ -21,28 +23,28 @@ import {
 
 test('create: busy, no frame, not streaming — the #11 gap', () => {
   assert.equal(
-    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: false, isOutputStreaming: false, idleTransition: false }),
+    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: false, isOutputStreaming: false, idleTransition: false, isSuppressed: false }),
     'create',
   );
 });
 
 test('tick: busy, frame already up, not streaming — keep it visibly alive', () => {
   assert.equal(
-    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: true, isOutputStreaming: false, idleTransition: false }),
+    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: true, isOutputStreaming: false, idleTransition: false, isSuppressed: false }),
     'tick',
   );
 });
 
 test('delete: busy→idle edge with a frame still on screen', () => {
   assert.equal(
-    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: true, isOutputStreaming: false, idleTransition: true }),
+    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: true, isOutputStreaming: false, idleTransition: true, isSuppressed: false }),
     'delete',
   );
 });
 
 test('delete: simply not busy with a frame still up (no explicit edge)', () => {
   assert.equal(
-    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: true, isOutputStreaming: false, idleTransition: false }),
+    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: true, isOutputStreaming: false, idleTransition: false, isSuppressed: false }),
     'delete',
   );
 });
@@ -51,14 +53,14 @@ test('delete: idleTransition removes the frame even if busy flickered back on', 
   // The explicit edge wins over a same-tick busy reading so a brief busy
   // flicker can't strand the frame past the user-visible idle.
   assert.equal(
-    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: true, isOutputStreaming: false, idleTransition: true }),
+    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: true, isOutputStreaming: false, idleTransition: true, isSuppressed: false }),
     'delete',
   );
 });
 
 test('noop: streaming output owns the message — never fight it (create suppressed)', () => {
   assert.equal(
-    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: false, isOutputStreaming: true, idleTransition: false }),
+    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: false, isOutputStreaming: true, idleTransition: false, isSuppressed: false }),
     'noop',
   );
 });
@@ -67,16 +69,110 @@ test('noop: streaming output owns the message — never fight it (delete suppres
   // Even on an idle edge, if output is streaming we leave the message to the
   // output path; the next non-streaming tick handles removal.
   assert.equal(
-    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: true, isOutputStreaming: true, idleTransition: true }),
+    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: true, isOutputStreaming: true, idleTransition: true, isSuppressed: false }),
     'noop',
   );
 });
 
 test('noop: idle with no frame — nothing to do, loop self-disarms', () => {
   assert.equal(
-    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: false, isOutputStreaming: false, idleTransition: false }),
+    getClaudeLivenessAction({ isBusy: false, hasStatusFrame: false, isOutputStreaming: false, idleTransition: false, isSuppressed: false }),
     'noop',
   );
+});
+
+// ── S2 idle-suppress latch: no fresh frame after a pane-static force-removal ──
+
+test('noop: busy + no frame but SUPPRESSED — never recreate the force-removed frame', () => {
+  // After the 30s pane-static net removed the frame, a busy footer reading must
+  // NOT resurrect it; only the next prompt (which clears the latch) re-arms.
+  assert.equal(
+    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: false, isOutputStreaming: false, idleTransition: false, isSuppressed: true }),
+    'noop',
+  );
+});
+
+test('delete: SUPPRESSED with a stray frame still tracked — clean it up, never tick', () => {
+  assert.equal(
+    getClaudeLivenessAction({ isBusy: true, hasStatusFrame: true, isOutputStreaming: false, idleTransition: false, isSuppressed: true }),
+    'delete',
+  );
+});
+
+// ── S2 force-idle removal: pane static ≥ threshold ───────────────────────────
+
+test('force-remove: pane static for exactly the threshold → true', () => {
+  assert.equal(checkShouldForceIdleRemoval({ msSincePaneChange: 30000, idlePaneThresholdMs: 30000 }), true);
+});
+
+test('force-remove: pane static beyond the threshold → true', () => {
+  assert.equal(checkShouldForceIdleRemoval({ msSincePaneChange: 45000, idlePaneThresholdMs: 30000 }), true);
+});
+
+test('keep: pane changed recently (under threshold) — a genuine think never trips it', () => {
+  // A working agent repaints the pane every second, so msSincePaneChange stays
+  // tiny; this is the non-regression guard for a long xhigh thinking phase.
+  assert.equal(checkShouldForceIdleRemoval({ msSincePaneChange: 1200, idlePaneThresholdMs: 30000 }), false);
+});
+
+test('keep: no live session (null age) is never treated as idle', () => {
+  assert.equal(checkShouldForceIdleRemoval({ msSincePaneChange: null, idlePaneThresholdMs: 30000 }), false);
+});
+
+// ── S1 working-frame text: a live elapsed survives the dedup glyph-strip ──────
+
+test('frame text: scraped activity word + advancing m:ss tail (the un-freeze)', () => {
+  const base = 1_000_000;
+  const at42 = buildClaudeLivenessFrameText({
+    glyph: '✻',
+    activityText: '🔧 working on it',
+    fallbackText: '✻ working…',
+    workingSince: base,
+    nowMs: base + 42000,
+  });
+  assert.equal(at42, '✻ 🔧 working on it · 0:42');
+  // 3s later the elapsed advances even though the activity word is unchanged.
+  const at45 = buildClaudeLivenessFrameText({
+    glyph: '✽',
+    activityText: '🔧 working on it',
+    fallbackText: '✽ working…',
+    workingSince: base,
+    nowMs: base + 45000,
+  });
+  assert.equal(at45, '✽ 🔧 working on it · 0:45');
+});
+
+test('frame text: swaps the scrape’s OWN leading spinner glyph for the rotating one', () => {
+  const text = buildClaudeLivenessFrameText({
+    glyph: '✶',
+    activityText: '✻ Clauding…',
+    fallbackText: '✶ working…',
+    workingSince: 0,
+    nowMs: 8000,
+  });
+  assert.equal(text, '✶ Clauding… · 0:08');
+});
+
+test('frame text: no activity → neutral fallback + elapsed tail', () => {
+  const text = buildClaudeLivenessFrameText({
+    glyph: '✢',
+    activityText: null,
+    fallbackText: '✢ working…',
+    workingSince: 0,
+    nowMs: 63000,
+  });
+  assert.equal(text, '✢ working… · 1:03');
+});
+
+test('frame text: workingSince null → no tail (defensive)', () => {
+  const text = buildClaudeLivenessFrameText({
+    glyph: '✻',
+    activityText: '🔧 tool',
+    fallbackText: '✻ working…',
+    workingSince: null,
+    nowMs: 5000,
+  });
+  assert.equal(text, '✻ 🔧 tool');
 });
 
 // ── Status-frame store/discard generation guard (orphan/duplicate fix) ───────

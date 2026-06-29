@@ -1,3 +1,6 @@
+import { stripLeadingSpinnerGlyph } from './claudeScrapeShapes';
+import { formatElapsed } from './subagentStatusRender';
+
 /**
  * @description Pure decision for the Claude per-thread liveness loop: given the
  * session's current busy state, whether a rolling status frame is on screen,
@@ -19,6 +22,12 @@
  * Telegraf / tmux machinery (same pattern as `statusFlushDecision.ts`).
  *
  * @name ClaudeLivenessAction
+ *
+ * (S1/S2 — working-status un-freeze + pane-static idle removal, plan
+ * `2026-06-29-claude-working-status-liveness-and-idle-removal.md`: this module
+ * also owns {@link buildClaudeLivenessFrameText} — the frame text carries a live
+ * elapsed `m:ss` so a glyph-only tick is no longer the ONLY change the dedup
+ * strips — and {@link checkShouldForceIdleRemoval} — the 30s pane-static net.)
  * @description
  * - `create` — busy, no frame on screen, output not streaming: send a fresh
  *   activity frame to the bottom of the topic (THE bug — recreate after an
@@ -46,6 +55,15 @@ export interface ClaudeLivenessActionInput {
    * back on.
    */
   idleTransition: boolean;
+  /**
+   * Idle-removal latch (S2): a previous tick force-removed the frame because
+   * the scraped pane went static for ≥ the idle threshold, so the agent is
+   * treated as idle until the next prompt re-arms activity. While latched the
+   * loop must NEVER `create`/`tick` a fresh working frame (it would resurrect
+   * the very status the 30s net just removed); a stray frame is cleaned up.
+   * Cleared on a new prompt / the next fresh liveness arm.
+   */
+  isSuppressed: boolean;
 }
 
 /**
@@ -66,6 +84,10 @@ export function getClaudeLivenessAction(input: ClaudeLivenessActionInput): Claud
   if (!input.isBusy || input.idleTransition) {
     return input.hasStatusFrame ? 'delete' : 'noop';
   }
+  // Idle-removal latch (S2): the pane went static ≥ threshold this turn, so the
+  // agent is treated as idle until the next prompt. Never create/tick a fresh
+  // working frame while latched; clean up a stray one if it somehow exists.
+  if (input.isSuppressed) return input.hasStatusFrame ? 'delete' : 'noop';
   return input.hasStatusFrame ? 'tick' : 'create';
 }
 
@@ -126,4 +148,66 @@ export function getStatusFrameStoreDecision(
   generationNow: number,
 ): StatusFrameStoreDecision {
   return generationAtCreateStart === generationNow ? 'store' : 'discard';
+}
+
+/**
+ * @description Build the Claude working-status frame text (S1 un-freeze).
+ *
+ * Root cause of the freeze: the loop rotated a leading spinner glyph each tick
+ * to look alive, but `getStatusFlushAction` STRIPS that lead glyph before its
+ * dedup compare — so when the scraped activity line had no ticking tail (a
+ * generic tool / "working…" indicator), the only thing changing was the part
+ * the dedup removed → every tick `skip`ped → the frame sat static for minutes,
+ * indistinguishable from a hung agent.
+ *
+ * Fix: append a live elapsed `m:ss` tail (reusing the shared {@link formatElapsed}
+ * the sub-agent status uses) anchored at `workingSince`. The elapsed advances
+ * every second and is NOT stripped by `stripLeadingSpinnerGlyph`, so a re-render
+ * a few seconds later differs after the glyph strip → the coalescer `send`s it →
+ * the frame visibly ticks. Prefers the scraped activity word (e.g. "Clauding…",
+ * lead glyph swapped for our rotating one) over `fallbackText` (a neutral
+ * localized "working…"). `workingSince === null` ⇒ no tail (defensive; the loop
+ * always sets it on a fresh turn).
+ */
+export function buildClaudeLivenessFrameText(input: {
+  /** Rotating heartbeat glyph for this tick (from `CLAUDE_LIVENESS_GLYPHS`). */
+  glyph: string;
+  /** Latest scraped activity line, or null when none has been seen this turn. */
+  activityText: string | null;
+  /** Already-localized neutral fallback (i18n `agent.workingIndicator`). */
+  fallbackText: string;
+  /** Epoch ms the current busy turn started, or null when not tracking. */
+  workingSince: number | null;
+  /** Now, epoch ms — the elapsed base for `m:ss`. */
+  nowMs: number;
+}): string {
+  const elapsedSuffix =
+    input.workingSince === null ? '' : ` · ${formatElapsed(input.nowMs - input.workingSince)}`;
+  const activity = input.activityText?.trim();
+  if (activity) {
+    // Swap the scrape's own leading spinner glyph for our rotating one so the
+    // heartbeat shows while preserving the activity word + any scraped tail.
+    return `${input.glyph} ${stripLeadingSpinnerGlyph(activity)}${elapsedSuffix}`;
+  }
+  return `${input.fallbackText}${elapsedSuffix}`;
+}
+
+/**
+ * @description S2 hard anti-hang net: should the liveness loop FORCE-remove the
+ * working-status frame because the scraped TUI pane has gone static for too long?
+ *
+ * The frame is normally removed on the busy→idle edge (`getClaudeLivenessAction`
+ * `delete`), but that anchors on Claude's footer busy signal, which can wrongly
+ * stay "busy" after a turn ends — leaving a working status hanging for minutes
+ * (live 2026-06-29). A genuinely working agent keeps the pane changing every
+ * second (animated spinner + the TUI's own elapsed timer), so a pane that has
+ * NOT changed for `idlePaneThresholdMs` is idle regardless of the footer: remove
+ * the frame and stop the loop. `null` age (no live session) never triggers it.
+ */
+export function checkShouldForceIdleRemoval(input: {
+  msSincePaneChange: number | null;
+  idlePaneThresholdMs: number;
+}): boolean {
+  if (input.msSincePaneChange === null) return false;
+  return input.msSincePaneChange >= input.idlePaneThresholdMs;
 }

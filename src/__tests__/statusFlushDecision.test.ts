@@ -47,6 +47,25 @@ test('send: a REAL activity-text change still sends even though the glyph also r
   );
 });
 
+test('send: only the live elapsed m:ss tail advanced — the S1 un-freeze (survives glyph-strip)', () => {
+  // The freeze bug: a static activity word + a rotating glyph dedups to a skip,
+  // so the frame never re-sends. The elapsed tail is NOT stripped, so an
+  // advancing counter (even with the same word + a rotated glyph) still sends.
+  assert.equal(
+    getStatusFlushAction({ nextText: '✽ 🔧 working… · 0:45', lastSentText: '✻ 🔧 working… · 0:42', isRateLimited: false }),
+    'send',
+  );
+});
+
+test('skip: same elapsed, only the glyph rotated — still no per-second edit', () => {
+  // Within one 3s send-throttle window the elapsed (whole seconds) can repeat;
+  // a glyph-only difference must still dedup to skip so we never flood.
+  assert.equal(
+    getStatusFlushAction({ nextText: '✽ 🔧 working… · 0:42', lastSentText: '✻ 🔧 working… · 0:42', isRateLimited: false }),
+    'skip',
+  );
+});
+
 test('send: first frame (no lastSentText) sends regardless of glyph stripping', () => {
   assert.equal(
     getStatusFlushAction({ nextText: '✻ 🔧 Update', lastSentText: null, isRateLimited: false }),

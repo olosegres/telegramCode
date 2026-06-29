@@ -205,6 +205,16 @@ interface ClaudeSession {
   /** Consecutive unchanged polls — drives {@link getNextPollDelay}'s backoff. */
   unchangedPollStreak: number;
   /**
+   * Epoch ms of the last poll whose raw `capture-pane` DIFFERED from the
+   * previous one (i.e. the TUI pane actually changed). Drives the bot's
+   * pane-static idle net via {@link ClaudeCliAdapter.getMsSincePaneChange}: a
+   * genuinely working agent repaints the pane every second (animated spinner +
+   * the TUI's own elapsed timer), so a long gap since the last change means the
+   * agent is idle even if the footer busy signal is stuck. Seeded to "now" at
+   * session creation / adopt so a fresh session never reads as instantly stale.
+   */
+  lastContentChangeAt: number;
+  /**
    * S7 one-shot: the stored `/effort` level to re-type ONCE the TUI input box
    * first appears, so a fresh spawn doesn't inherit claude's GLOBAL effort
    * state (possibly set in another topic). Set at spawn from the per-thread
@@ -2751,6 +2761,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'lastRawCapture'
       | 'currentPollDelayMs'
       | 'unchangedPollStreak'
+      | 'lastContentChangeAt'
       | 'pendingEffortReapply'
       | 'lastWatermarkOffset'
       | 'recentRelayWindow'
@@ -2787,6 +2798,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // No timer is armed yet, so an explicit resetPollCadence would be a no-op.
       currentPollDelayMs: basePollIntervalMs,
       unchangedPollStreak: 0,
+      // Seed the pane-change clock to "now" so a freshly-created/adopted session
+      // (its first poll hasn't run yet) never reads as 30s-static immediately.
+      lastContentChangeAt: Date.now(),
       // S7: armed explicitly by `applyStoredEffortOnSpawn` after a fresh
       // start/resume spawn; adopt/reattach leaves it null (no re-apply).
       pendingEffortReapply: null,
@@ -3105,6 +3119,19 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session) return false;
     return checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: session.lastContent });
+  }
+
+  /**
+   * @description Ms since the TUI pane last actually changed (raw `capture-pane`
+   * differed), or `null` when there is no live session for this thread. Feeds
+   * the bot's S2 pane-static idle net: a genuinely working agent repaints the
+   * pane every second, so a large value means the agent is idle even if the
+   * footer busy signal is stuck. `null` is never treated as idle.
+   */
+  getMsSincePaneChange(key: ThreadKey): number | null {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return null;
+    return Date.now() - session.lastContentChangeAt;
   }
 
   sendInput(key: ThreadKey, input: string, options?: SendInputOptions): void {
@@ -3898,6 +3925,8 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     let content: string;
     if (isRawChanged) {
       session.lastRawCapture = raw;
+      // Pane changed → reset the idle clock the bot's 30s pane-static net reads.
+      session.lastContentChangeAt = Date.now();
       content = cleanOutput(raw);
     } else {
       content = session.lastContent;

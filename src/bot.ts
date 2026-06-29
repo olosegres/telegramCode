@@ -118,7 +118,6 @@ import {
   type FileSendItem,
 } from './utils/fileSendPlan';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
-import { stripLeadingSpinnerGlyph } from './utils/claudeScrapeShapes';
 import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
 import { getTransientFrameIds } from './utils/transientFrames';
 import {
@@ -143,7 +142,13 @@ import {
 import { getUniformVerbosityLevel } from './utils/verbosityRender';
 import { createSerialQueue, type SerialQueue } from './utils/serialQueue';
 import { getVoiceTranscriptionQueue } from './voiceQueue';
-import { getClaudeLivenessAction, getClaudeLivenessShouldStop, getStatusFrameStoreDecision } from './utils/claudeLivenessAction';
+import {
+  buildClaudeLivenessFrameText,
+  checkShouldForceIdleRemoval,
+  getClaudeLivenessAction,
+  getClaudeLivenessShouldStop,
+  getStatusFrameStoreDecision,
+} from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import {
   buildThreadContextPreamble,
@@ -515,6 +520,26 @@ function getOutputDebounceMs(): number {
 const CLAUDE_LIVENESS_TICK_MS = 1000;
 
 /**
+ * S1: how often the liveness loop actually RE-RENDERS+SENDS the working-status
+ * frame (its live `m:ss` elapsed). Decoupled from {@link CLAUDE_LIVENESS_TICK_MS}
+ * (the 1s idle-CHECK cadence) so the elapsed advances visibly — proving "working"
+ * vs "hung" — without a per-second `editMessageText` flood near Telegram's
+ * ~1 edit/sec/chat budget. A `create` (no frame yet) bypasses this and shows
+ * immediately; the coalescer's 429-defer still applies on top.
+ */
+const claudeWorkingStatusRefreshMs = 3000;
+
+/**
+ * S2: how long the scraped TUI pane may stay byte-identical before the liveness
+ * loop treats the agent as idle and FORCE-removes the working-status frame
+ * (the hard anti-hang net). A genuinely working agent repaints the pane every
+ * second (animated spinner + the TUI's own elapsed timer), so 30s of a static
+ * pane means the turn is over even if Claude's footer busy signal is stuck —
+ * never trips mid-think. See {@link checkShouldForceIdleRemoval}.
+ */
+const claudeIdlePaneMs = 30_000;
+
+/**
  * Cadence of the dedicated OpenCode sub-agent status message's elapsed-counter
  * tick. One `editMessageText` per active delegation every 10 s — far under
  * Telegram's ~1 edit/sec/chat budget, so the live "m:ss" counter never costs a
@@ -647,6 +672,31 @@ interface ThreadMessageState {
   livenessGlyphIndex: number;
   /** Last `checkIsBusy` reading, so the loop can detect a busy→idle edge. */
   wasBusy: boolean;
+  /**
+   * Epoch ms the current busy turn started — the base for the working-status
+   * frame's live `m:ss` elapsed (S1 un-freeze). Set when the liveness loop arms
+   * a FRESH turn (idle→busy edge) and reset when a new prompt is forwarded;
+   * cleared (`null`) when the loop stops, so the next turn restarts at 0:00.
+   * Held STABLE across a turn's output-delete→recreate churn so the counter
+   * stays monotonic within the turn.
+   */
+  workingSince: number | null;
+  /**
+   * Epoch ms the liveness loop last RE-RENDERED+SENT the working frame, gating
+   * the {@link claudeWorkingStatusRefreshMs} send throttle so the 1s idle-CHECK
+   * tick does not push a per-second `editMessageText`. `0` = never sent this
+   * process; a fresh turn's first tick always passes (its base is far in the past).
+   */
+  lastLivenessSentAt: number;
+  /**
+   * Idle-removal latch (S2): set true when the loop force-removed the frame
+   * because the scraped pane went static for ≥ {@link claudeIdlePaneMs}. While
+   * latched the loop must NOT recreate a working frame (the hard guarantee: a
+   * finished/idle agent never leaves a status hanging). Cleared when a new
+   * prompt is forwarded / the loop next arms a fresh turn — so the status is
+   * not recreated until genuine new activity re-arms it.
+   */
+  statusIdleSuppressed: boolean;
   /**
    * Dedicated OpenCode sub-agent (delegation) status message id, owned
    * INDEPENDENTLY of {@link statusMessageId} (the fix for the flood bug — the
@@ -1217,7 +1267,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -3367,6 +3417,14 @@ async function forwardPromptToAgent(
   // post-`/clear` marker reset). See `threadContextPreamble.ts`.
   const promptText = getPromptWithThreadContext(key, text);
   markNeedsNewMessage(key);
+  // A new prompt is a new turn: lift the S2 idle-suppress latch and re-base the
+  // working-status elapsed so the next busy period shows a fresh 0:00 counter
+  // (the single prompt-forward choke point — covers user text, scheduled runs,
+  // and the auto-retry "continue" nudge). Harmless for OpenCode threads (they
+  // never arm the Claude liveness loop, so these fields stay unread).
+  const msgState = getThreadMessageState(key);
+  msgState.statusIdleSuppressed = false;
+  msgState.workingSince = Date.now();
   // The native typing indicator is the loader: it shows immediately, can't be
   // delayed behind a chat-wide 429 cooldown (unlike a sent message), and clears
   // on the agent's first output via `handleAgentOutput`'s `stopTypingLoader`.
@@ -7428,22 +7486,22 @@ async function sendStandaloneAgentMessage(key: ThreadKey, text: string): Promise
 // 429-aware defer/dedup machinery applies unchanged — no second send path.
 
 /**
- * @description Build the liveness frame text. Prefers the latest scraped
- * activity line (the whimsical `✻ Verb… (Ns · tokens)` the adapter still emits
- * as `status`), else a neutral localized fallback. A rotating leading glyph
- * makes the frame visibly alive on each tick even when the underlying activity
- * text is momentarily static (a quiet thinking stretch during the poll backoff).
+ * @description Build the liveness frame text via the pure
+ * {@link buildClaudeLivenessFrameText}. Prefers the latest scraped activity line
+ * (the whimsical `✻ Verb… (Ns · tokens)` the adapter emits as `status`), else a
+ * neutral localized fallback, plus a live `m:ss` elapsed tail (S1 un-freeze) so
+ * the frame visibly advances even when the scraped text is static — the elapsed
+ * is the part the dedup's glyph-strip does NOT remove.
  */
-function getClaudeLivenessFrameText(state: ThreadMessageState): string {
+function getClaudeLivenessFrameText(state: ThreadMessageState, nowMs: number): string {
   const glyph = CLAUDE_LIVENESS_GLYPHS[state.livenessGlyphIndex % CLAUDE_LIVENESS_GLYPHS.length];
-  const activity = state.lastActivityText?.trim();
-  if (activity) {
-    // Swap the scrape's own leading spinner glyph for our rotating one so the
-    // heartbeat shows while preserving the activity word + elapsed/token tail.
-    const withoutLeadGlyph = stripLeadingSpinnerGlyph(activity);
-    return `${glyph} ${withoutLeadGlyph}`;
-  }
-  return t('agent.workingIndicator', { glyph });
+  return buildClaudeLivenessFrameText({
+    glyph,
+    activityText: state.lastActivityText,
+    fallbackText: t('agent.workingIndicator', { glyph }),
+    workingSince: state.workingSince,
+    nowMs,
+  });
 }
 
 /**
@@ -7462,6 +7520,28 @@ function runClaudeLivenessTick(key: ThreadKey): void {
     stopClaudeLiveness(key);
     return;
   }
+
+  // S2 hard anti-hang net: the scraped TUI pane has not changed for ≥30s ⇒ the
+  // agent is idle no matter what the footer busy signal says. Force-remove the
+  // working frame, stop the loop, and LATCH suppression so no fresh frame is
+  // created until the next prompt re-arms activity. A genuine long think keeps
+  // the pane changing every second, so this never trips mid-think. Mirror the
+  // proven question-takeover teardown (stop → clear pending → delete) so no
+  // in-flight coalescer frame is stranded with no loop left to remove it.
+  if (
+    adapter.getMsSincePaneChange &&
+    checkShouldForceIdleRemoval({
+      msSincePaneChange: adapter.getMsSincePaneChange(key),
+      idlePaneThresholdMs: claudeIdlePaneMs,
+    })
+  ) {
+    state.statusIdleSuppressed = true;
+    stopClaudeLiveness(key);
+    getStatusCoalesceState(key).pendingText = null;
+    void deleteStatusMessage(key).catch(() => {});
+    return;
+  }
+
   const isBusy = adapter.checkIsBusy(key);
   const idleTransition = state.wasBusy && !isBusy;
   state.wasBusy = isBusy;
@@ -7471,16 +7551,26 @@ function runClaudeLivenessTick(key: ThreadKey): void {
     hasStatusFrame: state.statusMessageId !== null,
     isOutputStreaming: checkIsOutputStreaming(key),
     idleTransition,
+    isSuppressed: state.statusIdleSuppressed,
   });
 
   switch (action) {
     case 'create':
-    case 'tick':
-      // Advance the heartbeat glyph, then push the frame through the same
-      // coalescer scraped ticks use (429-aware, dedups identical text).
-      state.livenessGlyphIndex = (state.livenessGlyphIndex + 1) % CLAUDE_LIVENESS_GLYPHS.length;
-      void handleAgentStatus(key, getClaudeLivenessFrameText(state));
+    case 'tick': {
+      // Decouple the SEND cadence from the 1s idle-CHECK cadence: re-render the
+      // working frame at most every `claudeWorkingStatusRefreshMs` so the live
+      // `m:ss` elapsed advances visibly without a per-second editMessageText
+      // flood. A `create` (no frame yet) always sends so the frame appears
+      // immediately. The push rides the SAME coalescer scraped ticks use
+      // (429-aware, dedups identical text) — no second send path.
+      const now = Date.now();
+      if (action === 'create' || now - state.lastLivenessSentAt >= claudeWorkingStatusRefreshMs) {
+        state.livenessGlyphIndex = (state.livenessGlyphIndex + 1) % CLAUDE_LIVENESS_GLYPHS.length;
+        state.lastLivenessSentAt = now;
+        void handleAgentStatus(key, getClaudeLivenessFrameText(state, now));
+      }
       break;
+    }
     case 'delete':
       void deleteStatusMessage(key).catch(() => {});
       break;
@@ -7530,6 +7620,10 @@ function armClaudeLivenessTimer(key: ThreadKey, state: ThreadMessageState): void
  * just observed activity, so the next tick should treat an idle reading as a
  * genuine busy→idle transition. The first tick runs on the NEXT cadence, not
  * immediately — the triggering event already painted the frame.
+ *
+ * Arming a FRESH timer is a new busy turn, so it (re)bases the working-status
+ * elapsed (`workingSince`) and clears the S2 idle-suppress latch — genuine new
+ * activity re-enables the working frame after a pane-static force-removal.
  */
 function startClaudeLiveness(key: ThreadKey): void {
   const adapter = getThreadAdapter(key);
@@ -7537,6 +7631,8 @@ function startClaudeLiveness(key: ThreadKey): void {
   const state = getThreadMessageState(key);
   if (state.livenessTimer) return;
   state.wasBusy = true;
+  state.workingSince = Date.now();
+  state.statusIdleSuppressed = false;
   armClaudeLivenessTimer(key, state);
 }
 
@@ -7552,6 +7648,8 @@ function stopClaudeLiveness(key: ThreadKey): void {
   clearTimeout(state.livenessTimer);
   state.livenessTimer = null;
   state.wasBusy = false;
+  // The turn is over — clear the elapsed base so the next turn restarts at 0:00.
+  state.workingSince = null;
 }
 
 // ── Sub-agent status (OpenCode minimal/short) — dedicated self-updating message ─

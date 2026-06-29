@@ -535,3 +535,39 @@ test('setTransientFrames: two threads are independent', async () => {
   await store.setTransientFrames(key1, []);
   assert.deepEqual(store.getTransientFrames(), { [keyToString(key2)]: [3] });
 });
+
+// The boot-reconcile crash-recovery guard (S2): `startBot` captures
+// `getTransientFrames()` BEFORE reattach, then a reattached session's first frame
+// setter clobbers the LIVE set. The captured snapshot must survive that clobber,
+// otherwise the orphaned frame is never deleted (the bug found in live testing).
+// This holds because `getTransientFrames` returns a shallow copy and
+// `setTransientFrames` never mutates an existing array in place — it deletes the
+// key or assigns a fresh `.slice()`.
+
+test('getTransientFrames: a captured snapshot survives a later CLEAR clobber', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTransientFrames(key1, [101]);
+  const snapshot = store.getTransientFrames(); // captured "before reattach"
+  await store.setTransientFrames(key1, []); // reattach clears the live set
+  assert.deepEqual(
+    snapshot,
+    { [keyToString(key1)]: [101] },
+    'snapshot must still carry the stale id for boot reconcile to delete',
+  );
+  assert.deepEqual(store.getTransientFrames(), {}, 'live set is now empty');
+});
+
+test('getTransientFrames: a captured snapshot survives a later REPLACE clobber', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTransientFrames(key1, [101]);
+  const snapshot = store.getTransientFrames();
+  await store.setTransientFrames(key1, [999]); // reattach repaints → new id
+  assert.deepEqual(
+    snapshot,
+    { [keyToString(key1)]: [101] },
+    'replace assigns a fresh array, never mutates the snapshot in place',
+  );
+  assert.deepEqual(store.getTransientFrames(), { [keyToString(key1)]: [999] });
+});

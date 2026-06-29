@@ -8377,6 +8377,24 @@ function restoreApiRetries(): void {
 }
 
 /**
+ * @description Injected collaborators for {@link reconcileTransientFrames}, so the
+ * boot reconciliation is unit-testable without a live Telegram client or
+ * StateStore (mirrors the `deps` seam {@link postReattachRecap} uses). Defaults
+ * wire the real bot client + the persist choke point.
+ */
+export interface ReconcileTransientFramesDeps {
+  /** Best-effort delete of one Telegram message (Telegraf resolves `true`). */
+  deleteMessage: (chatId: number, messageId: number) => Promise<boolean>;
+  /** Re-sync disk to the thread's LIVE in-memory frame ids after the stale deletes. */
+  persistFrames: (key: ThreadKey) => void;
+}
+
+const defaultReconcileTransientFramesDeps: ReconcileTransientFramesDeps = {
+  deleteMessage: (chatId, messageId) => bot.telegram.deleteMessage(chatId, messageId),
+  persistFrames: persistTransientFrames,
+};
+
+/**
  * @description Delete transient status frames left on screen by an UNGRACEFUL
  * exit (crash / SIGKILL — the graceful shutdown sweep never ran), so a
  * "✽ working…" / thinking / sub-agent frame doesn't stick forever in a topic
@@ -8392,7 +8410,10 @@ function restoreApiRetries(): void {
  * graceful exit already cleared the set in its sweep, so this is normally a
  * no-op.
  */
-function reconcileTransientFrames(orphaned: Record<string, number[]>): void {
+export function reconcileTransientFrames(
+  orphaned: Record<string, number[]>,
+  deps: ReconcileTransientFramesDeps = defaultReconcileTransientFramesDeps,
+): number {
   let deleted = 0;
   for (const [keyStr, ids] of Object.entries(orphaned)) {
     let key: ThreadKey;
@@ -8404,14 +8425,15 @@ function reconcileTransientFrames(orphaned: Record<string, number[]>): void {
       continue;
     }
     for (const id of ids) {
-      void bot.telegram.deleteMessage(key.chatId, id).catch(() => {});
+      void deps.deleteMessage(key.chatId, id).catch(() => {});
       deleted += 1;
     }
     // Sync disk to the LIVE in-memory frames (post-reattach): a still-busy
     // session that repainted a fresh frame keeps its new id; an idle one clears.
-    persistTransientFrames(key);
+    deps.persistFrames(key);
   }
   if (deleted > 0) console.log(`[reattach] transient frames: deleted ${deleted} stale`);
+  return deleted;
 }
 
 /**

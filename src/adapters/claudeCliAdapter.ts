@@ -2293,20 +2293,43 @@ const CLAUDE_PASTE_RACE_MIN_LENGTH = 8;
 const CLAUDE_ENTER_VERIFY_DELAY_MS = 600;
 
 /**
- * @description The TUI footer shows this hint exactly while a turn is in
- * flight (thinking or running a tool) and drops it the instant Claude returns
- * to idle. It's our single reliable "still busy" signal scraped from the pane.
+ * @description How many trailing pane lines form Claude's live footer/status
+ * region. The `esc to interrupt` busy hint renders ONLY here — on the
+ * `⏵⏵ bypass permissions…` footer line, or the spinner status line a row or two
+ * above the input box. `checkIsClaudeBusy` reads `session.lastContent`, which is
+ * the FULL `capture-pane -S -2000` scrollback; bounding the busy match to this
+ * tail stops a transcript that merely TALKS about "esc to interrupt" from
+ * pinning the session busy forever. Live 2026-06-29: the bot's own dev topic
+ * (its conversation is full of the phrase) froze a "🔧 working" status frame
+ * because the regex matched scrollback prose, not the live footer — the genuine
+ * footer sat on the bottom line while the nearest prose hit was 17 lines above.
  */
-const CLAUDE_BUSY_FOOTER_RE = /esc to interrupt/i;
+const CLAUDE_BUSY_FOOTER_TAIL_LINES = 8;
+
+/**
+ * @description The busy hint as Claude's footer/spinner CHROME renders it:
+ * bracketed by the `·` hint separator (`… · esc to interrupt · ← for agents`)
+ * or the spinner-stats parens (`(12s · ↓ tokens · esc to interrupt)` /
+ * `(esc to interrupt)`), never as bare prose. Requiring that bracketing keeps a
+ * transcript line like `const RE = /esc to interrupt/i` or "the footer shows esc
+ * to interrupt" — which can land in the inspected tail of an idle dev topic —
+ * from reading as busy. Matched against CLEANED pane text (ANSI stripped) so the
+ * marker is never split mid-word.
+ */
+const CLAUDE_BUSY_FOOTER_RE = /[·(]\s*esc to interrupt|esc to interrupt\s*[·)]/i;
 
 /**
  * @description Whether Claude is mid-turn, judged from a captured pane. A
  * selector/permission prompt shows `Esc to cancel`, NOT `esc to interrupt`, so
- * it reads as idle here (correct — we only wait out a running turn). Exported
- * so the busy detection is unit-testable without a live tmux session.
+ * it reads as idle here (correct — we only wait out a running turn). Only the
+ * footer tail is inspected ({@link CLAUDE_BUSY_FOOTER_TAIL_LINES}) and the hint
+ * must carry footer chrome ({@link CLAUDE_BUSY_FOOTER_RE}), so scrollback prose
+ * mentioning the phrase can't false-positive. Exported so the busy detection is
+ * unit-testable without a live tmux session.
  */
 export function checkIsClaudeBusy(paneText: string): boolean {
-  return CLAUDE_BUSY_FOOTER_RE.test(paneText);
+  const footer = paneText.replace(/\s+$/, '').split('\n').slice(-CLAUDE_BUSY_FOOTER_TAIL_LINES);
+  return footer.some((line) => CLAUDE_BUSY_FOOTER_RE.test(line));
 }
 
 /**

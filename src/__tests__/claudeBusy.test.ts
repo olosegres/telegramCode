@@ -35,6 +35,54 @@ test('idle: no interrupt hint means the turn finished', () => {
   }
 });
 
+test('regression: scrollback prose mentioning the hint must NOT read as busy', () => {
+  // Live 2026-06-29: `checkIsClaudeBusy` reads `session.lastContent` — the FULL
+  // `capture-pane -S -2000`. The bot's own dev topic discusses the busy footer,
+  // so the phrase litters the transcript; the regex matched that prose and the
+  // session was pinned busy forever (a frozen "🔧 working" status frame). The
+  // live footer is IDLE here; only the scrollback says the phrase.
+  const scrollbackProse = [
+    '● Footer сейчас НЕ показывает esc to interrupt → значит checkIsBusy должен быть false.',
+    '     2300:const CLAUDE_BUSY_FOOTER_RE = /esc to interrupt/i;',
+    '  the predicate keys on the `esc to interrupt` footer marker.',
+    '  увидел esc to interrupt (busy) → увидел готовый prompt → stat.',
+  ];
+  const idleFooter = [
+    '✻ Brewed for 25s',
+    '─────',
+    '❯ ',
+    '─────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents          300491 tokens',
+    '                                       new task? /clear to save 300.6k tokens',
+  ];
+  // Many prose lines + an idle footer: the phrase is far up in scrollback.
+  const pane = [...scrollbackProse, ...Array(40).fill('  ...transcript line...'), ...scrollbackProse, ...idleFooter].join('\n');
+  assert.equal(checkIsClaudeBusy(pane), false, 'scrollback prose must not pin the session busy');
+});
+
+test('busy is still detected when the live footer carries the hint below prose scrollback', () => {
+  const prose = Array(50).fill('  the footer shows esc to interrupt while busy').join('\n');
+  // Genuine bypass footer (real capture shape) as the live bottom line.
+  const bypassFooter = '✶ Channelling… (11m 45s · ↓ 43.5k tokens)\n  ⎿  Tip: …\n────\n❯ \n────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents      213387 tokens';
+  assert.equal(checkIsClaudeBusy(`${prose}\n${bypassFooter}`), true);
+  // Spinner-stats variant (non-bypass): the hint lives inside the parens.
+  assert.equal(checkIsClaudeBusy(`${prose}\n✻ Working… (12s · ↓ 1.2k tokens · esc to interrupt)`), true);
+  // Standalone parenthesised hint, no stats yet.
+  assert.equal(checkIsClaudeBusy(`${prose}\n✻ Working… (esc to interrupt)`), true);
+});
+
+test('idle: prose mentioning the hint in the footer tail without chrome is not busy', () => {
+  // The agent's last answer line sits just above an idle footer and literally
+  // names the phrase — but without the `·`/`(` footer chrome, so it is prose.
+  const pane = [
+    '● Готово: правлю детект, маркер esc to interrupt теперь мерим по хвосту.',
+    'see `/esc to interrupt/i` in the source',
+    '❯ ',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+  ].join('\n');
+  assert.equal(checkIsClaudeBusy(pane), false);
+});
+
 test('selector on screen reads as idle (Esc to cancel, not esc to interrupt)', () => {
   const selectorPane =
     '  1. Option one\n  2. Option two\n  3. Chat about this\n\nEnter to select · ↑/↓ to navigate · Esc to cancel';

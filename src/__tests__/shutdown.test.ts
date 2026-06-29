@@ -248,6 +248,62 @@ test('a slow clearTransientFrames still hits the watchdog and forces exit', asyn
   await drained();
 });
 
+test('drainPendingUpdates runs AFTER bot.stop and BEFORE state.flush', async () => {
+  // The off-loop update queues must drain while polling is already halted
+  // (after bot.stop → no new enqueue) but before the flush (so the drained
+  // handlers' state writes land in it). Pin that exact slot.
+  const { deps, events, exitCode, drained } = makeDeps({
+    flushDelayMs: 10,
+    drainPendingUpdates: async () => {
+      events.push('drainPendingUpdates');
+    },
+  });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  const stopIdx = events.indexOf('bot.stop(SIGTERM)');
+  const drainIdx = events.indexOf('drainPendingUpdates');
+  const flushStartIdx = events.indexOf('state.flush:start');
+  assert.notEqual(drainIdx, -1, 'drainPendingUpdates must run');
+  assert.ok(stopIdx !== -1 && stopIdx < drainIdx, 'must run AFTER bot.stop');
+  assert.ok(drainIdx < flushStartIdx, 'must run BEFORE state.flush');
+  assert.equal(exitCode(), 0);
+});
+
+test('drainPendingUpdates is optional — orchestrator copes when it is absent', async () => {
+  // Back-compat: a deps object without the new hook still shuts down cleanly.
+  const { deps, events, exitCode, drained } = makeDeps({ flushDelayMs: 5 });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  assert.ok(!events.includes('drainPendingUpdates'));
+  assert.ok(events.includes('bot.stop(SIGTERM)'));
+  assert.ok(events.includes('state.flush:resolved'));
+  assert.equal(exitCode(), 0);
+});
+
+test('a thrown drainPendingUpdates does NOT skip state.flush or releaseLock', async () => {
+  // A wedged drain must not strand the flush/lock — same defensive contract as
+  // the other steps.
+  const { deps, events, exitCode, drained } = makeDeps({
+    flushDelayMs: 5,
+    drainPendingUpdates: async () => {
+      events.push('drainPendingUpdates:threw');
+      throw new Error('drain failure');
+    },
+  });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  assert.ok(events.includes('state.flush:start'), 'flush must still run');
+  assert.ok(events.includes('state.flush:resolved'), 'flush must still resolve');
+  assert.ok(events.includes('releaseLock'), 'lock must still be released');
+  assert.equal(exitCode(), 0);
+});
+
 test('error thrown by state.flush does NOT skip releaseLock or exit', async () => {
   // Custom state.flush below replaces the default, so its `drained()`
   // contract no longer applies — we hand-await the orchestrator and

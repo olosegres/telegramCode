@@ -66,6 +66,11 @@ import {
 import { getStateStore, KeyLock, type StateStore } from './state';
 import { releaseLock } from './cli/lock';
 import { gracefulShutdown } from './shutdown';
+import {
+  createUpdateDispatcher,
+  installUpdateDispatcher,
+  getUpdateQueueKey,
+} from './updateDispatcher';
 import { classifyBoot } from './bootClassifier';
 import { t } from './i18n';
 import { validateSubdir, resolveBoundWorkDir, BindError, findAutobindSubdir, paginateBindList } from './validation';
@@ -396,6 +401,22 @@ const telegramAgent = new https.Agent({
   family: 4,
 });
 const bot = new Telegraf(ENV.botToken, { telegram: { agent: telegramAgent } });
+
+// Decouple the long-polling intake/ACK from per-handler latency: wrap
+// `bot.handleUpdate` so each update is enqueued into its thread's serial queue
+// and the loop's `Promise.all` resolves at once (next `getUpdates` = ACK + new
+// batch fires now). The real middleware chain — the two `bot.use` middlewares,
+// every command/`on`/action, `bot.catch` — runs unchanged inside the captured
+// original, just off-loop and per-thread-serial. MUST be installed before
+// `bot.launch`. The graceful-shutdown path drains it (see `updateDrainTimeoutMs`).
+const updateDispatcher = createUpdateDispatcher({
+  getKey: getUpdateQueueKey,
+  onError: (error, update) =>
+    console.error(`[dispatch] unhandled error for update ${update.update_id}:`, error),
+});
+installUpdateDispatcher(bot, updateDispatcher);
+/** Bound (< the 3s shutdown watchdog) for draining queued updates on shutdown. */
+const updateDrainTimeoutMs = 2000;
 
 // Output-trace mode (toggled at runtime via `/trace`): record every outgoing
 // Bot API call with its outcome at the single `callApi` chokepoint. Installed
@@ -9060,6 +9081,7 @@ export async function startBot(): Promise<void> {
       state,
       releaseLock,
       exit: (code) => process.exit(code),
+      drainPendingUpdates: () => updateDispatcher.drainIdle(updateDrainTimeoutMs),
       clearTransientFrames: () => sweepTransientFramesOnShutdown(),
       cleanupTimers: () => {
         clearInterval(inMemoryGcInterval);

@@ -38,6 +38,16 @@ export interface ShutdownDeps {
   bot: { stop: (signal?: string) => void };
   /** State store; only `.flush()` is awaited. */
   state: { flush: () => Promise<void> };
+  /**
+   * Optional: drain the off-loop update dispatcher's per-thread queues so
+   * updates enqueued during the ~1s hot-reload window still finish routing to
+   * their live agent (the `dropPendingUpdates:false` guarantee). Runs AFTER
+   * `bot.stop()` (polling halted → no new enqueue) and BEFORE `state.flush()`
+   * (so the drained handlers' state writes land in the flush). MUST self-bound
+   * (the dispatcher races its own timeout) so it can't eat the flush's watchdog
+   * budget; the outer watchdog is the backstop.
+   */
+  drainPendingUpdates?: () => Promise<void>;
   /** Release the single-instance lockfile (idempotent — owner-checked inside). */
   releaseLock: () => void;
   /** Terminate the process. Real prod value: `(code) => process.exit(code)`. */
@@ -72,6 +82,9 @@ export interface ShutdownDeps {
  *      starve the flush.
  *   2. `bot.stop(signal)` — Telegraf stops long-polling. Synchronous in
  *      Telegraf 4.x, so safe to call before the flush.
+ *   2b. `await drainPendingUpdates()` — drain the off-loop update queues so
+ *      updates enqueued during a hot-reload still route to their live agent.
+ *      Self-bounded, so it can't starve the flush's watchdog budget.
  *   3. `await state.flush()` — atomic-write any pending state changes.
  *      THIS is the step the old `releaseLock(); process.exit(0)` raced;
  *      we wait for the on-disk rename to land here.
@@ -130,6 +143,13 @@ export async function gracefulShutdown(deps: ShutdownDeps): Promise<void> {
       deps.bot.stop(deps.signal);
     } catch (e) {
       console.error('[shutdown] bot.stop failed:', e);
+    }
+    if (deps.drainPendingUpdates) {
+      try {
+        await deps.drainPendingUpdates();
+      } catch (e) {
+        console.error('[shutdown] drainPendingUpdates failed:', e);
+      }
     }
     try {
       await deps.state.flush();

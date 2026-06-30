@@ -8,7 +8,6 @@ import type {
   AgentAdapter,
   AgentApiErrorClass,
   AgentSession,
-  ClaudeSurveyEvent,
   ClaudeSurveyOption,
   DisplayPrefsReader,
   DisplayVerbosityMode,
@@ -1096,6 +1095,40 @@ export function extractClaudeSurvey(text: string): ClaudeSurvey | null {
 /** Whether `text` is confidently showing a Claude CLI bare-digit survey. */
 export function checkIsClaudeSurvey(text: string): boolean {
   return extractClaudeSurvey(text) !== null;
+}
+
+/**
+ * @description Whether the poll loop should AUTO-DISMISS the survey on screen
+ * this poll (S4). True only when a survey is present AND its signature differs
+ * from the one we last dismissed — the survey repaints every poll, so the
+ * signature dedup makes us send the dismiss keystroke exactly ONCE per
+ * appearance, and re-dismiss a genuinely new survey later (the caller clears the
+ * stored signature when the survey leaves the pane). Pure + exported so the
+ * once-per-appearance rule is unit-testable without a live session.
+ */
+export function checkShouldDismissSurvey(
+  surveySignature: string | null,
+  lastDismissedSignature: string,
+): boolean {
+  return surveySignature !== null && surveySignature !== lastDismissedSignature;
+}
+
+/**
+ * @description Drop the survey's header + option-row lines from a relay chunk
+ * (S4) so the auto-dismissed survey's chrome never leaks into the topic — those
+ * lines match no tool/spinner/chrome rule and would otherwise classify as prose
+ * and post as a stray message. The CALLER gates this on a survey actually being
+ * detected on the pane this poll, so a legitimate "1: Yes  2: No" list in normal
+ * agent output is never stripped. Pure + exported for unit testing.
+ */
+export function stripSurveyChromeLines(text: string): string {
+  return text
+    .split('\n')
+    .filter(
+      (line) =>
+        !CLAUDE_SURVEY_HEADER_REGEX.test(line) && !CLAUDE_SURVEY_OPTION_ROW_REGEX.test(line),
+    )
+    .join('\n');
 }
 
 /**
@@ -3375,6 +3408,22 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     });
   }
 
+  /**
+   * @description S4: auto-dismiss the native Claude session-feedback survey by
+   * sending a single Escape into the pane (Escape clears the survey overlay the
+   * same way it dismisses a selector). Fire-and-forget through the session queue,
+   * like {@link sendEscape}; the caller's {@link checkShouldDismissSurvey}
+   * signature dedup guarantees it fires once per appearance. Never surfaced to
+   * the topic — the survey must not occupy input / disrupt the scrape.
+   */
+  private dismissClaudeSurvey(session: ClaudeSession): void {
+    console.log('[Claude] auto-dismissing session survey (Escape)');
+    this.enqueueTmuxBestEffort(session, async () => {
+      if (!session.isActive) return '';
+      return tmuxAsync('send-keys', '-t', session.sessionName, 'Escape');
+    });
+  }
+
   // Fire-and-forget single Escape keystroke (interrupt the current turn /
   // dismiss a selector). Deliberately distinct from `interruptAndWaitIdle`:
   // this is a raw one-shot key, NOT a wait-for-idle interrupt.
@@ -4199,19 +4248,23 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
             session.questionAbsentPolls = 0;
           }
 
-          // Claude CLI bare-digit survey (the periodic session-feedback prompt):
-          // arm the answerable state + emit tappable buttons ONCE per signature.
-          // Side-channel only — the survey chrome itself still flows through the
-          // normal output path below (we do NOT strip it). The signature is
-          // header + option digits/labels (no volatile chrome), so the survey
-          // repainting every poll de-dups to a single emit; cleared when it
-          // leaves the pane so a genuinely new survey later re-emits.
+          // S4: AUTO-DISMISS the native Claude session-feedback survey (the
+          // periodic "How is Claude doing this session?" bare-digit prompt). It
+          // lands on the pane mid-turn, occupies the input box and disrupts the
+          // scrape (it contributed to the "status never appeared" hang, live
+          // 2026-06-29). Never surface it to the topic — send a one-shot Escape
+          // to clear it. The signature (header + option digits/labels, no
+          // volatile chrome) is stable across the survey's per-poll repaints, so
+          // we dismiss ONCE per appearance; cleared when it leaves the pane so a
+          // genuinely new survey later is dismissed again. While a survey is on
+          // the pane its header/option lines are ALSO stripped from the relay
+          // chunk below (gated on this `survey`), so the dismissed survey's
+          // chrome never leaks into the topic as a stray prose message.
           const survey = extractClaudeSurvey(content);
           if (survey) {
-            if (survey.signature !== session.lastSurveySignature) {
+            if (checkShouldDismissSurvey(survey.signature, session.lastSurveySignature)) {
               session.lastSurveySignature = survey.signature;
-              const surveyEvent: ClaudeSurveyEvent = { header: survey.header, options: survey.options };
-              this.emit('survey', key, surveyEvent);
+              this.dismissClaudeSurvey(session);
             }
           } else {
             session.lastSurveySignature = '';
@@ -4224,7 +4277,14 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           // redrawn lines arrive here as "new" and would be re-relayed as a
           // duplicate flood. Drop every line already relayed to this topic;
           // when nothing survives, skip the poll's emit entirely.
-          const relayablePart = getRelayDedupedChunk(session.recentRelayWindow, newPart);
+          let relayablePart = getRelayDedupedChunk(session.recentRelayWindow, newPart);
+          if (relayablePart && survey) {
+            // S4: a survey is on the pane this poll — drop its header/option
+            // lines so the auto-dismissed survey's chrome never leaks (it would
+            // otherwise classify as prose). Gated on a detected `survey` so a
+            // legitimate "1: x  2: y" list in normal output is never touched.
+            relayablePart = stripSurveyChromeLines(relayablePart);
+          }
           if (!relayablePart) {
             console.log(`[Claude] already-relayed re-render suppressed (${newPart.length} chars)`);
           } else {

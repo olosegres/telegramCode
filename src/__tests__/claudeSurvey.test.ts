@@ -23,6 +23,8 @@ import * as assert from 'node:assert/strict';
 import {
   extractClaudeSurvey,
   checkIsClaudeSurvey,
+  checkShouldDismissSurvey,
+  stripSurveyChromeLines,
   getClaudeSendKeysPlan,
   getClaudeReplyRoute,
   checkIsClaudeLoginPaste,
@@ -242,6 +244,64 @@ test('checkIsClaudeLoginPaste matches the /login paste screen, not normal panes'
   assert.equal(checkIsClaudeLoginPaste('❯ normal input box'), false);
   assert.equal(checkIsClaudeLoginPaste('Select login method:'), false);
   assert.equal(checkIsClaudeLoginPaste(''), false);
+});
+
+// ── S4 — auto-dismiss the survey once per appearance (never relay it) ──
+//
+// The adapter no longer EMITS the survey as a question; it sends one Escape to
+// dismiss it, deduped by signature so the per-poll repaints don't re-send the
+// keystroke, and re-dismisses a genuinely new survey after the old one cleared
+// (caller resets the stored signature to '' when the survey leaves the pane).
+
+test('checkShouldDismissSurvey: a freshly-appeared survey (signature differs) → dismiss', () => {
+  const survey = extractClaudeSurvey(capturedSurveyFrame)!;
+  assert.equal(checkShouldDismissSurvey(survey.signature, ''), true);
+});
+
+test('checkShouldDismissSurvey: the SAME survey repainting next poll → do NOT re-dismiss', () => {
+  const survey = extractClaudeSurvey(capturedSurveyFrame)!;
+  assert.equal(checkShouldDismissSurvey(survey.signature, survey.signature), false);
+});
+
+test('checkShouldDismissSurvey: no survey on screen (null) → nothing to dismiss', () => {
+  assert.equal(checkShouldDismissSurvey(null, ''), false);
+  assert.equal(checkShouldDismissSurvey(null, 'some-old-signature'), false);
+});
+
+test('checkShouldDismissSurvey: a genuinely NEW survey after the old one cleared → dismiss again', () => {
+  // After the first survey left the pane the caller reset the stored signature to
+  // '', so a later different survey is dismissed afresh.
+  const other = extractClaudeSurvey(
+    ['How is Claude doing this session?', '1: Poor   2: Okay   3: Great'].join('\n'),
+  )!;
+  assert.equal(checkShouldDismissSurvey(other.signature, ''), true);
+});
+
+// ── S4 — survey chrome must not leak as prose (gated suppression) ──
+//
+// When a survey is on the pane the caller strips its header + option lines from
+// the relay chunk so the auto-dismissed survey never posts as a stray message.
+
+test('stripSurveyChromeLines: removes the survey header AND the inline option row', () => {
+  const stripped = stripSurveyChromeLines(capturedSurveyFrame);
+  assert.equal(stripped.includes('How is Claude doing this session?'), false);
+  assert.equal(stripped.includes('1: Bad'), false);
+  // Nothing else was in the frame, so the result is empty (no chrome leaks).
+  assert.equal(stripped.trim(), '');
+});
+
+test('stripSurveyChromeLines: keeps real agent prose interleaved with the survey', () => {
+  const chunk = [
+    'Here is the summary you asked for.',
+    '● How is Claude doing this session? (optional)',
+    '  1: Bad    2: Fine   3: Good   0: Dismiss',
+    'Done.',
+  ].join('\n');
+  const stripped = stripSurveyChromeLines(chunk);
+  assert.equal(stripped.includes('Here is the summary you asked for.'), true);
+  assert.equal(stripped.includes('Done.'), true);
+  assert.equal(stripped.includes('How is Claude doing this session?'), false);
+  assert.equal(stripped.includes('1: Bad'), false);
 });
 
 test('checkIsClaudeLoginPaste keys off the live bottom input row, not the marker in scrollback', () => {

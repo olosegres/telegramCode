@@ -301,21 +301,21 @@ test('lifecycle: idle delete removes the on-screen frame (no leftover spinner)',
 
 test('stop: idle, no frame, coalescer drained → loop stops', () => {
   assert.equal(
-    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false }),
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false, withinArmingGrace: false }),
     true,
   );
 });
 
 test('no-stop: still busy → keep ticking', () => {
   assert.equal(
-    getClaudeLivenessShouldStop({ isBusy: true, hasStatusFrame: false, statusSendPending: false }),
+    getClaudeLivenessShouldStop({ isBusy: true, hasStatusFrame: false, statusSendPending: false, withinArmingGrace: false }),
     false,
   );
 });
 
 test('no-stop: a tracked frame is still up → keep ticking so idle can delete it', () => {
   assert.equal(
-    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: true, statusSendPending: false }),
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: true, statusSendPending: false, withinArmingGrace: false }),
     false,
   );
 });
@@ -325,7 +325,36 @@ test('no-stop: idle + no frame BUT a status send is pending → keep ticking (TH
   // (`statusMessageId === null`) stopped here and the landing send orphaned the
   // frame; the coalescer-aware rule keeps the loop alive until the send lands.
   assert.equal(
-    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: true }),
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: true, withinArmingGrace: false }),
+    false,
+  );
+});
+
+// ── S2 busy-onset arming grace ────────────────────────────────────────────────
+//
+// A prompt was just forwarded so the loop is armed, but Claude's footer busy
+// signal has not flipped yet → the first tick reads idle/no-frame/nothing-pending.
+// Without the grace that is the STOP condition and the loop dies before the think
+// even starts (the muted-topic "looks hung" bug). While in grace, never stop.
+
+test('no-stop: idle within the arming grace → keep ticking until Claude goes busy', () => {
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false, withinArmingGrace: true }),
+    false,
+  );
+});
+
+test('stop: idle AFTER the arming grace expired → the normal idle stop applies', () => {
+  // Grace lapsed and Claude never went busy (e.g. a no-op slash) → stop cleanly.
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false, withinArmingGrace: false }),
+    true,
+  );
+});
+
+test('grace short-circuits regardless of frame/pending state (always keep ticking)', () => {
+  assert.equal(
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: true, statusSendPending: true, withinArmingGrace: true }),
     false,
   );
 });
@@ -341,6 +370,7 @@ test('lifecycle: a frame landing AS the loop reaches idle is NOT orphaned (race 
       isBusy: false,
       hasStatusFrame: model.state.statusMessageId !== null,
       statusSendPending: true,
+      withinArmingGrace: false,
     }),
     false,
     'must not stop while a send is in flight',
@@ -358,7 +388,7 @@ test('lifecycle: a frame landing AS the loop reaches idle is NOT orphaned (race 
 
   // Nothing pending now → loop stops cleanly.
   assert.equal(
-    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false }),
+    getClaudeLivenessShouldStop({ isBusy: false, hasStatusFrame: false, statusSendPending: false, withinArmingGrace: false }),
     true,
   );
 });

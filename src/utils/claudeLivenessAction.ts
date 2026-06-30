@@ -106,12 +106,22 @@ export function getClaudeLivenessAction(input: ClaudeLivenessActionInput): Claud
  * (nothing in flight, queued, or deferred behind a 429 cooldown). While any of
  * those hold, keep ticking: the pending send lands, the next idle tick deletes
  * the frame, and the loop then stops cleanly.
+ *
+ * S2 busy-onset arming grace: when the loop is armed by a freshly-forwarded
+ * prompt (not by a scrape emit), Claude has not flipped its footer busy signal
+ * yet, so the first tick reads idle. Without the grace the loop would self-stop
+ * immediately (idle, no frame, nothing pending) and never show a working frame
+ * for a long quiet think. While `withinArmingGrace`, NEVER stop — keep ticking
+ * until Claude goes busy (normal flow takes over) or the grace expires (then the
+ * idle stop applies as usual).
  */
 export function getClaudeLivenessShouldStop(input: {
   isBusy: boolean;
   hasStatusFrame: boolean;
   statusSendPending: boolean;
+  withinArmingGrace: boolean;
 }): boolean {
+  if (input.withinArmingGrace) return false;
   return !input.isBusy && !input.hasStatusFrame && !input.statusSendPending;
 }
 

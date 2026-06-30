@@ -561,6 +561,17 @@ const claudeWorkingStatusRefreshMs = 3000;
 const claudeIdlePaneMs = 30_000;
 
 /**
+ * S2: how long the liveness loop keeps ticking after a busy-ONSET arm (a prompt
+ * was just forwarded) while Claude's footer busy signal has not flipped yet.
+ * Without this grace the first idle tick would self-stop the loop (idle, no
+ * frame, nothing pending) before Claude starts thinking, so a long quiet think
+ * would show NO working frame (the muted-topic "looks hung" bug). ~8s comfortably
+ * spans the gap between submit and Claude going busy; once busy is observed the
+ * grace is cleared and normal busy ticking owns the frame.
+ */
+const claudeBusyOnsetGraceMs = 8_000;
+
+/**
  * Cadence of the dedicated OpenCode sub-agent status message's elapsed-counter
  * tick. One `editMessageText` per active delegation every 10 s — far under
  * Telegram's ~1 edit/sec/chat budget, so the live "m:ss" counter never costs a
@@ -718,6 +729,15 @@ interface ThreadMessageState {
    * not recreated until genuine new activity re-arms it.
    */
   statusIdleSuppressed: boolean;
+  /**
+   * Busy-onset arming grace deadline (epoch ms), S2: set when the liveness loop
+   * is armed by a freshly-forwarded prompt (not a scrape emit). Until Claude's
+   * footer busy signal flips — or this deadline passes — the loop keeps ticking
+   * instead of self-stopping on the first idle reading, so a long quiet think
+   * still shows a working frame. `0` = not in a busy-onset grace. Cleared the
+   * moment busy is observed and on teardown.
+   */
+  busyOnsetArmedUntil: number;
   /**
    * Dedicated OpenCode sub-agent (delegation) status message id, owned
    * INDEPENDENTLY of {@link statusMessageId} (the fix for the flood bug — the
@@ -1288,7 +1308,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, busyOnsetArmedUntil: 0, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -3454,6 +3474,14 @@ async function forwardPromptToAgent(
     await adapter.interruptAndWaitIdle(key);
   }
   adapter.sendInput(key, promptText);
+  // S2 busy-onset arm: start the Claude liveness loop the moment the prompt is
+  // forwarded — driven by `checkIsBusy`, not by waiting for an opportunistic
+  // scrape emit that may never come during a long quiet think. The arming grace
+  // keeps the loop alive until Claude flips busy. Claude-only + idempotent
+  // (no-op for OpenCode / an already-armed loop). This is the single prompt
+  // choke point (user text, voice, scheduled run, api-retry continue, buffered
+  // replay), so every path that makes Claude busy now raises the working frame.
+  startClaudeLiveness(key, 'busyOnset');
 }
 
 /**
@@ -7563,7 +7591,13 @@ function runClaudeLivenessTick(key: ThreadKey): void {
     return;
   }
 
+  const now = Date.now();
   const isBusy = adapter.checkIsBusy(key);
+  // S2: once Claude actually goes busy the busy-onset grace has served its
+  // purpose — normal busy ticking owns the frame from here. Clearing it lets the
+  // loop stop cleanly when the turn ends instead of lingering for the full grace.
+  if (isBusy) state.busyOnsetArmedUntil = 0;
+  const withinArmingGrace = !isBusy && state.busyOnsetArmedUntil > now;
   const idleTransition = state.wasBusy && !isBusy;
   state.wasBusy = isBusy;
 
@@ -7584,7 +7618,6 @@ function runClaudeLivenessTick(key: ThreadKey): void {
       // flood. A `create` (no frame yet) always sends so the frame appears
       // immediately. The push rides the SAME coalescer scraped ticks use
       // (429-aware, dedups identical text) — no second send path.
-      const now = Date.now();
       if (action === 'create' || now - state.lastLivenessSentAt >= claudeWorkingStatusRefreshMs) {
         state.livenessGlyphIndex = (state.livenessGlyphIndex + 1) % CLAUDE_LIVENESS_GLYPHS.length;
         state.lastLivenessSentAt = now;
@@ -7610,7 +7643,14 @@ function runClaudeLivenessTick(key: ThreadKey): void {
   const coalescer = getStatusCoalesceState(key);
   const statusSendPending =
     coalescer.inFlight || coalescer.pendingText !== null || coalescer.deferRetryTimer !== null;
-  if (getClaudeLivenessShouldStop({ isBusy, hasStatusFrame: state.statusMessageId !== null, statusSendPending })) {
+  if (
+    getClaudeLivenessShouldStop({
+      isBusy,
+      hasStatusFrame: state.statusMessageId !== null,
+      statusSendPending,
+      withinArmingGrace,
+    })
+  ) {
     stopClaudeLiveness(key);
   } else {
     armClaudeLivenessTimer(key, state);
@@ -7645,13 +7685,30 @@ function armClaudeLivenessTimer(key: ThreadKey, state: ThreadMessageState): void
  * Arming a FRESH timer is a new busy turn, so it (re)bases the working-status
  * elapsed (`workingSince`) and clears the S2 idle-suppress latch — genuine new
  * activity re-enables the working frame after a pane-static force-removal.
+ *
+ * `reason` (S2) distinguishes the two arm triggers:
+ *  - `'activity'` (default; scrape `output`/`status`) — busy work was just
+ *    observed, so seed `wasBusy = true` (the next idle reading is a real
+ *    busy→idle edge) and no grace is needed.
+ *  - `'busyOnset'` (a prompt was just forwarded) — Claude may not have flipped
+ *    busy yet, so seed `wasBusy = false` and open a {@link claudeBusyOnsetGraceMs}
+ *    arming grace so the first idle tick does not self-stop the loop before the
+ *    think starts.
  */
-function startClaudeLiveness(key: ThreadKey): void {
+type ClaudeLivenessArmReason = 'activity' | 'busyOnset';
+
+function startClaudeLiveness(key: ThreadKey, reason: ClaudeLivenessArmReason = 'activity'): void {
   const adapter = getThreadAdapter(key);
   if (!(adapter instanceof ClaudeCliAdapter) || !adapter.checkIsBusy) return;
   const state = getThreadMessageState(key);
   if (state.livenessTimer) return;
-  state.wasBusy = true;
+  if (reason === 'busyOnset') {
+    state.wasBusy = false;
+    state.busyOnsetArmedUntil = Date.now() + claudeBusyOnsetGraceMs;
+  } else {
+    state.wasBusy = true;
+    state.busyOnsetArmedUntil = 0;
+  }
   state.workingSince = Date.now();
   state.statusIdleSuppressed = false;
   armClaudeLivenessTimer(key, state);
@@ -7669,8 +7726,10 @@ function stopClaudeLiveness(key: ThreadKey): void {
   clearTimeout(state.livenessTimer);
   state.livenessTimer = null;
   state.wasBusy = false;
-  // The turn is over — clear the elapsed base so the next turn restarts at 0:00.
+  // The turn is over — clear the elapsed base so the next turn restarts at 0:00,
+  // and drop any busy-onset arming grace so a teardown can't leave it armed.
   state.workingSince = null;
+  state.busyOnsetArmedUntil = 0;
 }
 
 // ── Sub-agent status (OpenCode minimal/short) — dedicated self-updating message ─

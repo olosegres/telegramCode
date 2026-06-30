@@ -731,6 +731,14 @@ rather than typed into the agent.)
   button presses to any other topic — those are the user's working threads with
   live agent sessions. (User instruction, 2026-06-04.)
 
+- **Decode a `t.me/c/<internalId>/…` link the user pastes → query directly, no
+  `list_topics`/guessing.** `chat_id` = `-100` + `<internalId>` (e.g.
+  `1111111111` → `-1001111111111`). Two segments `t.me/c/<id>/<msgId>`: last is
+  the `message_id` → `get_message_context(chat_id, message_id, context_size=N)`.
+  Three segments `t.me/c/<id>/<topicId>/<msgId>`: middle is the topic (thread)
+  root id, last is the `message_id` inside it. A topic's `threadId` (for
+  `ThreadKey`/trace lookups) IS that topic root id. (User instruction, 2026-06-30.)
+
 - **For send-path / responsiveness / ordering verification, use the output
   trace** — it is ON for all threads BY DEFAULT now (no `/trace on` needed),
   recorded into hourly bucket files `DATA_DIR/output-trace-*.jsonl` (read the

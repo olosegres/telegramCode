@@ -21,6 +21,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
+  checkIsForwardedEcho,
   checkIsInputEchoFrame,
   checkIsStatusOutput,
   cleanOutput,
@@ -537,4 +538,74 @@ test('checkIsInputEchoFrame: frame with a ❯ first line but a ● tool line lat
   // marker (●) — real agent output, must NOT be classified as a pure echo.
   const input = '❯ fix the bug\n  in file x\n● Done, fixed it.';
   assert.equal(checkIsInputEchoFrame(input), false);
+});
+
+// ─── S1 — CONTENT-based echo gate for the no-`❯` variants (live 2026-06-28) ──
+//
+// Claude echoes typed input back in the pane; when the echo carries NO `❯` (the
+// thread-context preamble, a wrapped continuation, a voice-transcript tail) the
+// shape gate above misses it. `checkIsForwardedEcho(frame, forwarded)` suppresses
+// it by content: the preamble signature, OR the frame being a contiguous slice of
+// what we just typed.
+
+const forwardedWithPreamble = [
+  '[Telegram thread context]',
+  'topic: "Telegram code testing" | group: "ExampleGroup"',
+  'thread: -1001111111111:9085 | folder: telegramCode',
+  '',
+  'please summarise the relay module and list its exports',
+].join('\n');
+
+test('checkIsForwardedEcho: a preamble echo (no ❯, msg 39952 shape) is an echo', () => {
+  // The whole preamble + prompt echoed back with no ❯ — the leak from the incident.
+  assert.equal(checkIsForwardedEcho(forwardedWithPreamble, forwardedWithPreamble), true);
+});
+
+test('checkIsForwardedEcho: just the preamble header line is an echo (split across polls)', () => {
+  // The scrape may catch only the header line in one poll — the deterministic
+  // signature alone is enough; the agent never emits that marker itself.
+  assert.equal(checkIsForwardedEcho('[Telegram thread context]', ''), true);
+});
+
+test('checkIsForwardedEcho: the thread/folder preamble line alone is a contained slice', () => {
+  assert.equal(
+    checkIsForwardedEcho('thread: -1001111111111:9085 | folder: telegramCode', forwardedWithPreamble),
+    true,
+  );
+});
+
+test('checkIsForwardedEcho: a voice-transcript tail (suffix of the forwarded text) is an echo', () => {
+  // msg 39963: the bot relayed the TAIL of a forwarded voice transcription.
+  const forwarded = 'check the build, run the tests, and then commit the change for me please';
+  const tail = 'and then commit the change for me please';
+  assert.equal(checkIsForwardedEcho(tail, forwarded), true);
+});
+
+test('checkIsForwardedEcho: a wrapped multi-line echo (no ❯) realigns after whitespace flatten', () => {
+  const forwarded = 'refactor the parser module and add a unit test for the edge case';
+  const echo = ['refactor the parser module and add', 'a unit test for the edge case'].join('\n');
+  assert.equal(checkIsForwardedEcho(echo, forwarded), true);
+});
+
+test('checkIsForwardedEcho: a genuine reply that QUOTES the prompt then answers is NOT an echo', () => {
+  // The frame is NOT a substring of the prompt (it adds an answer) → kept. This is
+  // the load-bearing false-positive guard: real prose is never suppressed.
+  const forwarded = 'how many functions does src/state.ts export?';
+  const reply = 'src/state.ts exports 7 functions, listed below.';
+  assert.equal(checkIsForwardedEcho(reply, forwarded), false);
+});
+
+test('checkIsForwardedEcho: a short coincidental word repeat is below the min match → NOT an echo', () => {
+  const forwarded = 'please fix the failing build on main';
+  assert.equal(checkIsForwardedEcho('build', forwarded), false);
+});
+
+test('checkIsForwardedEcho: unrelated agent prose with no forwarded text is NOT an echo', () => {
+  assert.equal(checkIsForwardedEcho('Here is the answer you asked for.', ''), false);
+});
+
+test('checkIsForwardedEcho: case/whitespace drift in the echo still matches', () => {
+  const forwarded = 'Summarise The Relay Module And List Its Exports';
+  const echo = 'summarise   the relay module\n  and list its exports';
+  assert.equal(checkIsForwardedEcho(echo, forwarded), true);
 });

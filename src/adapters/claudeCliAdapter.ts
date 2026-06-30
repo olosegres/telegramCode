@@ -27,6 +27,7 @@ import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
+import { threadContextPreambleHeader } from '../threadContextPreamble';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
 import {
   SPINNER_TICK_RE,
@@ -117,6 +118,23 @@ interface ClaudeSession {
   handledApiError: boolean;
   /** Normalized text of last emitted status (for deduplication of spinner updates) */
   lastStatusText: string;
+  /**
+   * The last text the bot typed into this session via {@link ClaudeCliAdapter.sendInput}
+   * (the preamble-glued prompt, a `/c continue` nudge, a buffered replay — every
+   * typed path). Used by the CONTENT-based echo gate (S1): Claude echoes typed
+   * input back in the pane, and when that echo carries no `❯` (a wrapped row, the
+   * `[Telegram thread context]` preamble, a voice-transcript tail) the shape-only
+   * {@link checkIsInputEchoFrame} misses it and it leaks into the topic. Empty
+   * until the first send.
+   */
+  lastForwardedText: string;
+  /**
+   * Epoch ms of the last {@link lastForwardedText} capture. The content echo gate
+   * only fires within a short window after a send (the echo appears right at
+   * submit), so a much later real reply that coincidentally repeats prompt words
+   * is never suppressed.
+   */
+  lastForwardedTextAt: number;
   /**
    * Signature of the last emitted interactive-question block (the option-label
    * set, ignoring which option is highlighted). Moving the `❯` cursor repaints
@@ -2399,6 +2417,67 @@ export function checkIsInputEchoFrame(frameText: string): boolean {
 }
 
 /**
+ * @description Min normalized chars a frame must share with the last forwarded
+ * text before the content gate calls it an echo. Keeps a short reply that merely
+ * coincides with a word of the prompt from being eaten — only a real echo of the
+ * substance is suppressed. Below it, only the deterministic preamble signature
+ * (which the agent never produces itself) can suppress.
+ */
+const claudeEchoMinMatchChars = 16;
+
+/**
+ * @description How long after a {@link ClaudeCliAdapter.sendInput} the content
+ * echo gate stays armed. Claude echoes the typed text right at submit, so a short
+ * window catches every echo variant while bounding false positives: a much later
+ * real reply that happens to repeat prompt text is outside the window and kept.
+ */
+const claudeInputEchoContentWindowMs = 30_000;
+
+/**
+ * @description Collapse a frame / forwarded prompt to a whitespace-insensitive,
+ * case-folded form for echo comparison. The TUI wraps a long input across rows
+ * and pads differently between redraws, so runs of whitespace (incl. newlines)
+ * flatten to a single space — the words survive, the layout noise does not.
+ */
+function normalizeEchoText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * @description CONTENT-based echo gate (S1), complementing the shape-only
+ * {@link checkIsInputEchoFrame}. The bot types the user's prompt into the Claude
+ * TUI and Claude echoes it back in the pane; when that echo carries NO `❯`
+ * (a wrapped continuation row, the `[Telegram thread context]` preamble, or the
+ * tail of a long voice transcript) the shape gate misses it and it leaks into
+ * the topic as a ghost "bot message" (live 2026-06-28, topic 39933).
+ *
+ * A cleaned frame is the user's own echo when EITHER:
+ *  - it carries the deterministic thread-context preamble signature (the
+ *    `[Telegram thread context]` header — the agent never emits that itself), OR
+ *  - its normalized text is a contiguous slice of the normalized forwarded text
+ *    (a prefix, suffix, or interior run) of at least
+ *    {@link claudeEchoMinMatchChars} — i.e. the whole frame is nothing but a
+ *    chunk of what we just typed.
+ *
+ * The containment DIRECTION is load-bearing: the FRAME must be contained in the
+ * forwarded text, never the reverse — so a genuine reply that QUOTES part of the
+ * prompt and then adds an answer is NOT a substring of the prompt and is kept.
+ * The caller additionally gates this on a short post-forward time window.
+ *
+ * Pure + exported so every observed echo variant is unit-testable. MAINTENANCE:
+ * like {@link checkIsInputEchoFrame}, WIDEN (never swap) when a new echo shape
+ * leaks — keep the old variants.
+ */
+export function checkIsForwardedEcho(frameText: string, forwardedText: string): boolean {
+  const frame = normalizeEchoText(frameText);
+  if (!frame) return false;
+  if (frame.includes(normalizeEchoText(threadContextPreambleHeader))) return true;
+  const forwarded = normalizeEchoText(forwardedText);
+  if (!forwarded || frame.length < claudeEchoMinMatchChars) return false;
+  return forwarded.includes(frame);
+}
+
+/**
  * @description Min chars of the typed prompt that must still sit in the live
  * input box for {@link checkLooksUnsubmitted} to call it unsubmitted. A short
  * prefix (vs the whole prompt) is enough — the input box shows only the first
@@ -2747,6 +2826,8 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'lastContent'
       | 'handledApiError'
       | 'lastStatusText'
+      | 'lastForwardedText'
+      | 'lastForwardedTextAt'
       | 'lastQuestionSignature'
       | 'questionAbsentPolls'
       | 'lastSurveySignature'
@@ -2779,6 +2860,8 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // adopt) begins un-armed; armed on the first retryable `API Error:` line.
       handledApiError: false,
       lastStatusText: '',
+      lastForwardedText: '',
+      lastForwardedTextAt: 0,
       lastQuestionSignature: '',
       questionAbsentPolls: 0,
       lastSurveySignature: '',
@@ -3143,6 +3226,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
 
     const appendEnter = options?.appendEnter ?? true;
     console.log(`[Claude] sendInput: "${input}"${appendEnter ? '' : ' (no Enter)'}`);
+    // S1: remember what we just typed (every path — forward, `/c continue`,
+    // buffered replay, control replies) so the content-based echo gate can
+    // recognise Claude's pane echo of it, even when the echo carries no `❯`.
+    session.lastForwardedText = input;
+    session.lastForwardedTextAt = Date.now();
     this.resetPollCadence(key, session);
 
     // The ordered keystroke plan is pure (getClaudeSendKeysPlan) so the "no
@@ -4189,10 +4277,19 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
             const stripped = stripTuiElementsWithContext(stripInput, session.openToolKind);
             session.openToolKind = stripped.toolKind;
             const cleanedOutput = stripped.text;
-            if (cleanedOutput && checkIsInputEchoFrame(cleanedOutput)) {
-              // B7: the frame is just the input box echoing a typed draft —
+            // B7 shape gate (the `❯` input-box draft) FIRST; then the S1
+            // content gate for the no-`❯` echo variants (preamble / wrapped
+            // continuation / voice-transcript tail), armed only briefly after a
+            // send so a later real reply that repeats prompt words is never eaten.
+            const isShapeEcho = checkIsInputEchoFrame(cleanedOutput);
+            const isContentEcho =
+              !isShapeEcho &&
+              Date.now() - session.lastForwardedTextAt < claudeInputEchoContentWindowMs &&
+              checkIsForwardedEcho(cleanedOutput, session.lastForwardedText);
+            if (cleanedOutput && (isShapeEcho || isContentEcho)) {
+              // The frame is just Claude echoing the user's own typed input —
               // relaying it reads as a ghost message in the topic.
-              console.log(`[Claude] input-echo frame filtered`);
+              console.log(`[Claude] input-echo frame filtered${isContentEcho ? ' (content match)' : ''}`);
             } else if (cleanedOutput) {
               // S4: gated full body (see the RAW dump above for the rationale).
               console.log(

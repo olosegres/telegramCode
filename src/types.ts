@@ -533,28 +533,14 @@ export interface ClaudeSurveyOption {
 }
 
 /**
- * @description Payload of the adapter `survey` event — a Claude CLI fixed-shape
- * bare-digit prompt the bot should render with tappable buttons. Distinct from
- * the OpenCode `question` event (a real AskUserQuestion); a survey is lighter
- * and answered by a single keystroke with NO Enter.
- */
-export interface ClaudeSurveyEvent {
-  /** The survey header line (e.g. `How is Claude doing this session?`). */
-  header: string;
-  /** Each selectable option, in display order. */
-  options: ClaudeSurveyOption[];
-}
-
-/**
  * @description Per-call options for {@link AgentAdapter.sendInput}.
  */
 export interface SendInputOptions {
   /**
    * Whether the adapter appends an Enter after the literal keystrokes. Defaults
-   * to `true` so every existing caller is byte-for-byte unchanged. A Claude CLI
-   * bare-digit survey auto-submits on the keypress, so the survey answer path
-   * passes `false` to suppress the spurious Enter (which would otherwise submit
-   * an empty prompt line after the survey resolved).
+   * to `true` so every existing caller is byte-for-byte unchanged. Pass `false`
+   * for a keystroke that auto-submits on its own (no Enter needed) — appending
+   * one would otherwise submit a spurious empty prompt line afterwards.
    */
   appendEnter?: boolean;
 }
@@ -567,7 +553,6 @@ export interface SendInputOptions {
  * - 'output'   (key: ThreadKey, text: string, meta?: OutputEventMeta) — permanent text response
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
- * - 'survey'   (key: ThreadKey, survey: ClaudeSurveyEvent) — Claude CLI bare-digit survey to render with answerable buttons
  * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread thinking {@link DisplayVerbosityMode}
  * - 'toolResult' (key: ThreadKey, payload: ToolResultEvent) — a completed tool call's output (OpenCode); the bot applies the per-thread tool-results {@link DisplayVerbosityMode}
  * - 'subagentStatus' (key: ThreadKey, payload: SubagentStatusEvent) — OpenCode delegation lifecycle for `minimal`/`short` `/subagent` modes; the bot owns a dedicated self-updating status message with a ticking elapsed timer
@@ -827,15 +812,6 @@ export interface AgentAdapter extends EventEmitter {
    * should break out of it (Escape + send as a fresh instruction).
    */
   isQuestionPending?(key: ThreadKey): boolean;
-
-  /**
-   * @description Whether a Claude CLI bare-digit survey (the periodic
-   * session-feedback prompt) is currently on the TUI screen. Distinct from
-   * {@link isQuestionPending} (a real AskUserQuestion selector). A real
-   * question takes PRECEDENCE: when both could match, the bot treats the reply
-   * as a selector answer, not a survey answer. Only Claude implements it.
-   */
-  isSurveyPending?(key: ThreadKey): boolean;
 
   /**
    * @description Whether Claude's `/login` OAuth "Paste code here" box is on

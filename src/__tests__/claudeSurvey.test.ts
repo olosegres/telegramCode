@@ -1,4 +1,6 @@
 /**
+ * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ *
  * @description Bug #12. Claude CLI renders a periodic session-feedback SURVEY
  * that takes a BARE digit with NO Enter:
  *
@@ -11,11 +13,19 @@
  * message that merely QUOTED the survey text — spamming the live topic with
  * bogus surveys + duplicates (the incident this test guards against).
  *
+ * The adapter AUTO-DISMISSES the survey (S4) and never surfaces it to the user,
+ * so there is no bot-facing survey reply route. A bare digit typed during a
+ * survey window must therefore fall through to the NORMAL prompt path (or a real
+ * selector when one is up) — never silently dropped (the bug this guards
+ * against: removing the dormant survey route left a window where a digit was
+ * neither answered nor forwarded).
+ *
  * Also covered:
- *  - de-dup: the same survey across polls yields a STABLE signature → one emit;
+ *  - de-dup: the same survey across polls yields a STABLE signature → one dismiss;
  *  - no-Enter send plan: `appendEnter:false` enqueues NO Enter step, while the
  *    default still appends Enter (no regression);
- *  - reply routing precedence: a real AskUserQuestion selector beats a survey.
+ *  - reply routing: a real AskUserQuestion selector still wins for a control
+ *    reply; a bare digit otherwise routes to a normal prompt, not a survey.
  */
 
 import { test } from 'node:test';
@@ -130,7 +140,7 @@ test('a DIFFERENT survey (different options) gets a different signature → re-e
 
 // ── No-Enter send plan ──
 
-test('appendEnter:false → NO Enter step is enqueued (survey auto-submits on the digit)', () => {
+test('appendEnter:false → NO Enter step is enqueued (a keystroke that auto-submits on its own)', () => {
   const plan = getClaudeSendKeysPlan('2', false);
   assert.deepEqual(plan, ['literal']);
   assert.equal(plan.some(step => step !== 'literal'), false);
@@ -151,44 +161,44 @@ test('default still appends a paste-race-verified Enter for a plain prompt — n
   assert.deepEqual(plan, ['literal', 'verifiedEnter']);
 });
 
-// ── Reply routing precedence ──
+// ── Reply routing (survey is NOT a route — the adapter auto-dismisses it) ──
 
-test('a pending AskUserQuestion selector BEATS a survey for a digit reply', () => {
-  // Both pending + a digit → the real question wins (it is the user's actual
-  // decision); the survey must not hijack the keystroke.
+test('a pending AskUserQuestion selector + a bare digit → drives the selector', () => {
   const route = getClaudeReplyRoute({
     isQuestionPending: true,
-    isSurveyPending: true,
     isLoginPastePending: false,
     text: '2',
   });
   assert.equal(route, 'selector');
 });
 
-test('a survey + a bare digit → answers the survey', () => {
+// Regression for the S4 silent-drop window: S4 made the adapter auto-dismiss
+// Claude's native session survey but left the bot's dormant survey reply route
+// wired, so a bare digit typed while a survey was on screen routed to a survey
+// handler that no longer had any state → it was neither answered NOR forwarded
+// (silently dropped). With the survey route removed, that bare digit must fall
+// through to a normal prompt and reach the agent.
+test('a bare digit with NO selector/login pending → a normal prompt (never dropped as a survey)', () => {
   const route = getClaudeReplyRoute({
     isQuestionPending: false,
-    isSurveyPending: true,
     isLoginPastePending: false,
     text: '0',
   });
-  assert.equal(route, 'survey');
+  assert.equal(route, 'prompt');
 });
 
-test('a survey + a y/n reply → answers the survey', () => {
+test('a bare y/n with nothing pending → a normal prompt', () => {
   const route = getClaudeReplyRoute({
     isQuestionPending: false,
-    isSurveyPending: true,
     isLoginPastePending: false,
     text: 'y',
   });
-  assert.equal(route, 'survey');
+  assert.equal(route, 'prompt');
 });
 
-test('a survey + free-form prose → breaks out as a normal prompt', () => {
+test('free-form prose with nothing pending → a normal prompt', () => {
   const route = getClaudeReplyRoute({
     isQuestionPending: false,
-    isSurveyPending: true,
     isLoginPastePending: false,
     text: 'actually, do something else',
   });
@@ -198,7 +208,6 @@ test('a survey + free-form prose → breaks out as a normal prompt', () => {
 test('nothing pending + a digit → a normal prompt (a bare "1" is never hijacked)', () => {
   const route = getClaudeReplyRoute({
     isQuestionPending: false,
-    isSurveyPending: false,
     isLoginPastePending: false,
     text: '1',
   });
@@ -214,7 +223,6 @@ test('login paste box up + a pasted code → routes verbatim into the box', () =
   // via the bot" bug).
   const route = getClaudeReplyRoute({
     isQuestionPending: false,
-    isSurveyPending: false,
     isLoginPastePending: true,
     text: 'abc123XYZ#def456-the-oauth-code',
   });
@@ -226,7 +234,6 @@ test('a real selector still beats the login-paste route for a control reply', ()
   // flags were ever set a bare digit must still drive the selector.
   const route = getClaudeReplyRoute({
     isQuestionPending: true,
-    isSurveyPending: false,
     isLoginPastePending: true,
     text: '1',
   });

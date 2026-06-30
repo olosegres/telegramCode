@@ -31,7 +31,7 @@ import {
   getKnownAdapterNames,
 } from './adapters/createAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
-import type { ThreadKey, AgentAdapter, AgentSession, ClaudeSurveyEvent, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
+import type { ThreadKey, AgentAdapter, AgentSession, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { createOutputTransport } from './output/createOutputTransport';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
@@ -871,15 +871,6 @@ const pendingQuestions = new Map<string, PendingQuestionState>();
  * and Claude's live re-scrape, so it needs no persistence of its own.
  */
 const questionPinnedMessageId = new Map<string, number>();
-/**
- * @description Per-thread live Claude survey button message (in-memory only).
- * The adapter's `lastSurveySignature` is the source of truth for "a survey is
- * pending"; this map just remembers the message id + parsed options so a
- * button press / digit reply can edit the message to show the chosen answer
- * and look up the option label. Ephemeral on purpose — a survey repaints in the
- * live pane, so it re-emits after a restart; nothing to persist.
- */
-const pendingSurveys = new Map<string, { messageId: number; options: ClaudeSurveyEvent['options'] }>();
 const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
@@ -5709,28 +5700,23 @@ bot.on(message('text'), async (ctx) => {
 
   // Claude TUI prompt on screen + a bare control reply (option digit or y/n)
   // → drive it in place. `getClaudeReplyRoute` decides precedence: a real
-  // AskUserQuestion SELECTOR always wins over a survey; free-form prose breaks
+  // AskUserQuestion SELECTOR wins for a control reply; free-form prose breaks
   // out as a fresh prompt. Forwarding a digit as a prompt would first send
   // Escape (interruptAndWaitIdle) and cancel the menu — live-caught with
   // /login: the user replied "1" and got "⎿ Login interrupted".
   //   • selector → sendInput(digit) types the digit + an instant Enter, which
   //     jumps the selector to that option and confirms it.
-  //   • survey   → answerClaudeSurvey sends the BARE digit with NO Enter (the
-  //     survey auto-submits) and edits the survey message to show the answer.
-  // OpenCode never exposes `isSurveyPending`, so the survey branch is Claude-only.
+  // Claude's native session SURVEY is auto-dismissed by the adapter (Escape) and
+  // never surfaced, so a bare digit during a survey window is NOT a route here —
+  // it falls through to the normal prompt path instead of being dropped.
   const replyRoute = getClaudeReplyRoute({
     isQuestionPending: adapter.isQuestionPending?.(key) ?? false,
-    isSurveyPending: adapter.isSurveyPending?.(key) ?? false,
     isLoginPastePending: adapter.isLoginPastePending?.(key) ?? false,
     text,
   });
   if (replyRoute === 'selector') {
     markNeedsNewMessage(key);
     adapter.sendInput(key, text);
-    return;
-  }
-  if (replyRoute === 'survey') {
-    await answerClaudeSurvey(key, adapter, text.trim());
     return;
   }
   // Claude `/login` OAuth code paste: type the code VERBATIM into the box (no
@@ -6757,41 +6743,6 @@ bot.action(/^opt_(\d+)$/, async (ctx) => {
   } else {
     await ctx.answerCbQuery(t('cb.agent_not_running'));
   }
-});
-
-/**
- * @description Answer a Claude bare-digit survey: send the bare keypress to the
- * TUI with NO Enter (the survey auto-submits on the digit), then edit the
- * survey message to show the chosen answer (`✓ <label>`) and REMOVE the
- * keyboard — so the user gets clear feedback the answer landed and the block
- * stops looking unanswered. Shared by the button and the digit-text reply
- * paths. Returns the chosen option's label, or `null` if the digit is unknown.
- */
-async function answerClaudeSurvey(key: ThreadKey, adapter: AgentAdapter, digit: string): Promise<string | null> {
-  const pending = pendingSurveys.get(keyToString(key));
-  const option = pending?.options.find(candidate => candidate.digit === digit);
-  // The bare digit submits with no Enter — the survey resolves on the keypress.
-  markNeedsNewMessage(key);
-  adapter.sendInput(key, digit, { appendEnter: false });
-  if (pending) {
-    pendingSurveys.delete(keyToString(key));
-    const label = option?.label ?? digit;
-    await editThreadMessage(key, pending.messageId, t('survey.answered', { label }), {});
-  }
-  return option?.label ?? null;
-}
-
-bot.action(/^survey_(\d+)$/, async (ctx) => {
-  const key = await authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  const digit = ctx.match[1];
-  const adapter = getThreadAdapter(key);
-  if (!adapter.checkIsActive(key)) {
-    await ctx.answerCbQuery(t('cb.agent_not_running'));
-    return;
-  }
-  const label = await answerClaudeSurvey(key, adapter, digit);
-  await ctx.answerCbQuery(t('cb.survey_answered', { label: label ?? digit }));
 });
 
 bot.action(/^qa_(\d+)_(\d+)$/, async (ctx) => {
@@ -7835,7 +7786,7 @@ function clearSubagentStatus(key: ThreadKey): void {
  * - `noop`    — a defensive `active:false` with nothing open; do nothing.
  *
  * Wrapped so async sends never throw back into the EventEmitter (mirrors
- * `handleAgentSurvey`).
+ * `handleAgentQuestion`).
  */
 function handleSubagentStatus(key: ThreadKey, payload: SubagentStatusEvent): void {
   const state = getThreadMessageState(key);
@@ -8034,35 +7985,6 @@ async function postPendingQuestionAt(key: ThreadKey): Promise<void> {
 }
 
 /**
- * @description `survey` from the Claude adapter — render the bare-digit survey
- * (the periodic session-feedback prompt) as ONE message with tappable buttons,
- * one per option (`1: Bad … 0: Dismiss`). The button callback is `survey_<digit>`
- * (a distinct prefix so it never collides with `opt_<n>`). The survey chrome
- * itself still flows through the normal output path; this only ADDS the
- * answerable buttons. De-dup is the adapter's job (one emit per signature), so
- * we always (re)render the live button message and remember its id/options for
- * the answer-edit UX.
- */
-function handleAgentSurvey(key: ThreadKey, survey: ClaudeSurveyEvent): void {
-  console.log(`[Bot] survey ${keyToString(key)} (${survey.options.length} options)`);
-  (async () => {
-    try {
-      const buttons = survey.options.map(option =>
-        [Markup.button.callback(`${option.digit}: ${option.label}`, `survey_${option.digit}`)],
-      );
-      const keyboard = Markup.inlineKeyboard(buttons);
-      const body = t('survey.message', { header: survey.header, hint: t('agent.survey_hint') });
-      const messageId = await replyToThread(key, body, keyboard);
-      if (messageId !== null) {
-        pendingSurveys.set(keyToString(key), { messageId, options: survey.options });
-      }
-    } catch (err) {
-      console.error('[handleAgentSurvey] Failed:', err);
-    }
-  })();
-}
-
-/**
  * @description Claude `questionGone` event — the scraped TUI selector left the
  * screen (answered / dismissed), so remove its pin. This is Claude's unpin path
  * for the normal answer case: Claude has no `pendingQuestions` entry, so it can't
@@ -8089,7 +8011,6 @@ function handleAgentClosed(key: ThreadKey): void {
   // A closed session has no running delegation — remove the sub-agent status.
   clearSubagentStatus(key);
   clearPendingQuestion(key);
-  pendingSurveys.delete(keyToString(key));
   // A closed session has nothing to resume — drop any armed retry silently.
   cancelApiRetry(key);
   const adapter = getThreadAdapter(key);
@@ -8149,8 +8070,6 @@ function handleAgentStopped(key: ThreadKey): void {
   // Session ended — a future session starts with empty context, so forget the
   // last-injected thread-context preamble; the next prompt re-carries it.
   clearThreadContextMarker(key);
-  // A stopped session can't answer a survey — drop the stale button state.
-  pendingSurveys.delete(keyToString(key));
   // A stopped session has nothing to resume — drop any armed retry silently.
   cancelApiRetry(key);
   updatePinnedStatus(key).catch(() => {});
@@ -8881,7 +8800,6 @@ export async function startBot(): Promise<void> {
     onOutput: handleAgentOutput,
     onStatus: handleAdapterStatus,
     onQuestion: handleAgentQuestion,
-    onSurvey: handleAgentSurvey,
     onThinking: handleAgentThinking,
     onToolResult: handleAgentToolResult,
     onSubagentStatus: handleSubagentStatus,

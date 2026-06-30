@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, ClaudeSurveyEvent, DisplayPrefsReader, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, DisplayPrefsReader, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -28,7 +28,6 @@ const threadAdapterNames = new Map<string, string>();
 type OutputHandler = (key: ThreadKey, output: string, meta?: OutputEventMeta) => void;
 type StatusHandler = (key: ThreadKey, status: string) => void;
 type QuestionHandler = (key: ThreadKey, question: OpenCodePendingQuestion) => void;
-type SurveyHandler = (key: ThreadKey, survey: ClaudeSurveyEvent) => void;
 type ThinkingHandler = (key: ThreadKey, payload: ThinkingEvent) => void;
 type ToolResultHandler = (key: ThreadKey, payload: ToolResultEvent) => void;
 type SubagentStatusHandler = (key: ThreadKey, payload: SubagentStatusEvent) => void;
@@ -39,7 +38,6 @@ type ErrorHandler = (key: ThreadKey, error: Error) => void;
 let onOutput: OutputHandler | null = null;
 let onStatus: StatusHandler | null = null;
 let onQuestion: QuestionHandler | null = null;
-let onSurvey: SurveyHandler | null = null;
 let onThinking: ThinkingHandler | null = null;
 let onToolResult: ToolResultHandler | null = null;
 let onSubagentStatus: SubagentStatusHandler | null = null;
@@ -96,7 +94,6 @@ function wireAdapterEvents(adapter: AgentAdapter): void {
   if (onOutput) adapter.on('output', onOutput);
   if (onStatus) adapter.on('status', onStatus);
   if (onQuestion) adapter.on('question', onQuestion);
-  if (onSurvey) adapter.on('survey', onSurvey);
   if (onThinking) adapter.on('thinking', onThinking);
   if (onToolResult) adapter.on('toolResult', onToolResult);
   if (onSubagentStatus) adapter.on('subagentStatus', onSubagentStatus);
@@ -123,7 +120,6 @@ export function registerAdapterEventHandlers(handlers: {
   onOutput: OutputHandler;
   onStatus?: StatusHandler;
   onQuestion?: QuestionHandler;
-  onSurvey?: SurveyHandler;
   onThinking?: ThinkingHandler;
   onToolResult?: ToolResultHandler;
   onSubagentStatus?: SubagentStatusHandler;
@@ -137,7 +133,6 @@ export function registerAdapterEventHandlers(handlers: {
   onOutput = handlers.onOutput;
   onStatus = handlers.onStatus ?? null;
   onQuestion = handlers.onQuestion ?? null;
-  onSurvey = handlers.onSurvey ?? null;
   onThinking = handlers.onThinking ?? null;
   onToolResult = handlers.onToolResult ?? null;
   onSubagentStatus = handlers.onSubagentStatus ?? null;

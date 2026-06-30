@@ -154,12 +154,13 @@ interface ClaudeSession {
    */
   questionAbsentPolls: number;
   /**
-   * Signature of the last emitted Claude CLI bare-digit survey (header +
+   * Signature of the last AUTO-DISMISSED Claude CLI bare-digit survey (header +
    * option digits/labels). Same de-dup mechanism as
    * {@link lastQuestionSignature}: the survey repaints every poll while on
-   * screen, so comparing signatures delivers it once. Cleared when the survey
-   * leaves the pane, so a genuinely new survey later re-emits. Drives
-   * {@link ClaudeCliAdapter.isSurveyPending}. See {@link extractClaudeSurvey}.
+   * screen, so comparing signatures sends the dismiss keystroke exactly once.
+   * Cleared when the survey leaves the pane, so a genuinely new survey later is
+   * re-dismissed. Drives {@link checkShouldDismissSurvey}. See
+   * {@link extractClaudeSurvey}.
    */
   lastSurveySignature: string;
   /**
@@ -1149,10 +1150,10 @@ export type ClaudeSendKeyStep = 'literal' | 'instantEnter' | 'slashEnter' | 'ver
  *
  * Mirrors the three historical Enter branches (bare slash command → deferred
  * Enter; short control reply → instant Enter; plain prompt → paste-race
- * deferred Enter + verification). When `appendEnter === false` (the survey
- * answer) ONLY the literal keystrokes are sent — every Enter branch is skipped,
- * since the survey auto-submits on the bare digit. `appendEnter` defaults to
- * `true`, so every existing caller's plan is byte-for-byte unchanged.
+ * deferred Enter + verification). When `appendEnter === false` ONLY the literal
+ * keystrokes are sent — every Enter branch is skipped (for a keystroke that
+ * auto-submits on its own). `appendEnter` defaults to `true`, so every existing
+ * caller's plan is byte-for-byte unchanged.
  */
 export function getClaudeSendKeysPlan(
   input: string,
@@ -1172,7 +1173,7 @@ export function getClaudeSendKeysPlan(
 }
 
 /** Where a Claude text reply should be routed while a prompt may be on screen. */
-export type ClaudeReplyRoute = 'selector' | 'survey' | 'loginPaste' | 'prompt';
+export type ClaudeReplyRoute = 'selector' | 'loginPaste' | 'prompt';
 
 /**
  * @description Decide how to route a user TEXT reply for a Claude thread,
@@ -1182,25 +1183,26 @@ export type ClaudeReplyRoute = 'selector' | 'survey' | 'loginPaste' | 'prompt';
  * Precedence (a real AskUserQuestion always wins):
  *   1. A selector (AskUserQuestion) pending + a bare control reply
  *      (digit / y / n) → `'selector'` (drive the menu in place).
- *   2. Else a survey pending + a bare control reply → `'survey'`
- *      (answer the bare-digit survey).
- *   3. Else the `/login` "Paste code here" box is on screen → `'loginPaste'`:
+ *   2. Else the `/login` "Paste code here" box is on screen → `'loginPaste'`:
  *      the OAuth code is a long free-form string, so route it VERBATIM into
  *      the box (see {@link checkIsClaudeLoginPaste}). Without this it falls to
  *      `'prompt'`, whose Escape cancels the login flow and whose preamble
  *      corrupts the code (live bug: "login can't be done via the bot").
- *   4. Else → `'prompt'` (a fresh turn; free-form prose breaks out of any
+ *   3. Else → `'prompt'` (a fresh turn; free-form prose breaks out of any
  *      pending prompt, mirroring the existing selector break-out behavior).
+ *
+ * Claude's native session SURVEY is NOT routed here: the adapter auto-dismisses
+ * it (Escape) and never surfaces it to the user, so a bare digit typed during a
+ * survey window falls through to `'prompt'` (or `'selector'` when a real
+ * question is also up) — never silently dropped.
  */
 export function getClaudeReplyRoute(input: {
   isQuestionPending: boolean;
-  isSurveyPending: boolean;
   isLoginPastePending: boolean;
   text: string;
 }): ClaudeReplyRoute {
   const isControlReply = checkIsSelectorControlReply(input.text);
   if (input.isQuestionPending && isControlReply) return 'selector';
-  if (input.isSurveyPending && isControlReply) return 'survey';
   if (input.isLoginPastePending) return 'loginPaste';
   return 'prompt';
 }
@@ -3497,18 +3499,6 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
   isQuestionPending(key: ThreadKey): boolean {
     const session = this.sessions.get(keyToString(key));
     return Boolean(session?.isActive && session.lastQuestionSignature);
-  }
-
-  /**
-   * @description Whether a bare-digit survey is currently on screen. Backed by
-   * `lastSurveySignature` the poll loop sets when it scrapes a survey (see the
-   * `extractClaudeSurvey` call). A real AskUserQuestion takes precedence — when
-   * one is pending the bot routes a digit to the SELECTOR, not the survey — so
-   * callers must check {@link isQuestionPending} first.
-   */
-  isSurveyPending(key: ThreadKey): boolean {
-    const session = this.sessions.get(keyToString(key));
-    return Boolean(session?.isActive && session.lastSurveySignature);
   }
 
   /**

@@ -161,6 +161,35 @@ export function getStatusFrameStoreDecision(
 }
 
 /**
+ * @description Decide whether the liveness loop should RE-RENDER+SEND the
+ * working-status frame on this tick (S3 — cooldown-scaled throttle).
+ *
+ * Mirrors the relay output debounce ({@link ./outputFlushTiming.ts}): the 1s
+ * idle-CHECK tick must not turn into a per-second `editMessageText`, so a `tick`
+ * (frame already on screen) only re-sends after the throttle window. The window
+ * is the LONGER of the base refresh floor and the live remaining 429 cooldown —
+ * so while the chat is throttling, the status frame coalesces into one larger,
+ * later edit instead of piling more requests onto the storm (the status frame was
+ * ~half the 429-storm traffic, live 2026-06-29). A `create` (no frame yet) always
+ * sends so the indicator appears immediately, regardless of cooldown.
+ *
+ * Pure so the cadence rule is unit-testable without the Telegraf/tmux stack.
+ */
+export function checkShouldSendLivenessFrame(input: {
+  /** Is this a `create` (no frame on screen yet)? Then always send. */
+  isCreate: boolean;
+  /** Ms since the loop last sent the frame. */
+  msSinceLastSent: number;
+  /** Base refresh floor (`claudeWorkingStatusRefreshMs`). */
+  refreshMs: number;
+  /** Live remaining 429 cooldown for the chat, ms (0 when not limited). */
+  remainingCooldownMs: number;
+}): boolean {
+  if (input.isCreate) return true;
+  return input.msSinceLastSent >= Math.max(input.refreshMs, input.remainingCooldownMs);
+}
+
+/**
  * @description Build the Claude working-status frame text (S1 un-freeze).
  *
  * Root cause of the freeze: the loop rotated a leading spinner glyph each tick

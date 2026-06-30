@@ -150,6 +150,7 @@ import { getVoiceTranscriptionQueue } from './voiceQueue';
 import {
   buildClaudeLivenessFrameText,
   checkShouldForceIdleRemoval,
+  checkShouldSendLivenessFrame,
   getClaudeLivenessAction,
   getClaudeLivenessShouldStop,
   getStatusFrameStoreDecision,
@@ -541,14 +542,21 @@ function getOutputDebounceMs(): number {
 const CLAUDE_LIVENESS_TICK_MS = 1000;
 
 /**
- * S1: how often the liveness loop actually RE-RENDERS+SENDS the working-status
- * frame (its live `m:ss` elapsed). Decoupled from {@link CLAUDE_LIVENESS_TICK_MS}
- * (the 1s idle-CHECK cadence) so the elapsed advances visibly — proving "working"
- * vs "hung" — without a per-second `editMessageText` flood near Telegram's
- * ~1 edit/sec/chat budget. A `create` (no frame yet) bypasses this and shows
- * immediately; the coalescer's 429-defer still applies on top.
+ * S1/S3: the BASE floor for how often the liveness loop RE-RENDERS+SENDS the
+ * working-status frame (its live `m:ss` elapsed). Decoupled from
+ * {@link CLAUDE_LIVENESS_TICK_MS} (the 1s idle-CHECK cadence) so the elapsed
+ * advances visibly — proving "working" vs "hung" — without a per-second
+ * `editMessageText` flood near Telegram's ~1 edit/sec/chat budget. A `create`
+ * (no frame yet) bypasses this and shows immediately.
+ *
+ * S3: under a live 429 cooldown the actual throttle scales UP to the remaining
+ * cooldown (`max(this, getRateLimitRemainingMs)` in {@link checkShouldSendLivenessFrame}),
+ * mirroring the relay output debounce, so the status frame stops adding
+ * `editMessageText` traffic to an already-throttling chat. The 3s→5s floor bump
+ * further cuts the frame's baseline edit rate (the status frame was ~half the
+ * 429-storm traffic, live 2026-06-29).
  */
-const claudeWorkingStatusRefreshMs = 3000;
+const claudeWorkingStatusRefreshMs = 5000;
 
 /**
  * S2: how long the scraped TUI pane may stay byte-identical before the liveness
@@ -7617,8 +7625,18 @@ function runClaudeLivenessTick(key: ThreadKey): void {
       // `m:ss` elapsed advances visibly without a per-second editMessageText
       // flood. A `create` (no frame yet) always sends so the frame appears
       // immediately. The push rides the SAME coalescer scraped ticks use
-      // (429-aware, dedups identical text) — no second send path.
-      if (action === 'create' || now - state.lastLivenessSentAt >= claudeWorkingStatusRefreshMs) {
+      // (429-aware, dedups identical text) — no second send path. S3: under a
+      // live 429 cooldown the throttle stretches to the remaining cooldown so the
+      // frame stops adding edits to an already-throttling chat (it was ~half the
+      // 429-storm traffic).
+      if (
+        checkShouldSendLivenessFrame({
+          isCreate: action === 'create',
+          msSinceLastSent: now - state.lastLivenessSentAt,
+          refreshMs: claudeWorkingStatusRefreshMs,
+          remainingCooldownMs: getRateLimitRemainingMs(key.chatId),
+        })
+      ) {
         state.livenessGlyphIndex = (state.livenessGlyphIndex + 1) % CLAUDE_LIVENESS_GLYPHS.length;
         state.lastLivenessSentAt = now;
         void handleAgentStatus(key, getClaudeLivenessFrameText(state, now));

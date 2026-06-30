@@ -16,6 +16,7 @@ import * as assert from 'node:assert/strict';
 import {
   buildClaudeLivenessFrameText,
   checkShouldForceIdleRemoval,
+  checkShouldSendLivenessFrame,
   getClaudeLivenessAction,
   getClaudeLivenessShouldStop,
   getStatusFrameStoreDecision,
@@ -406,4 +407,50 @@ test('lifecycle: rapid send/delete cycles never accumulate more than one frame',
   model.deleteFrame();
   assert.equal(model.state.statusMessageId, null);
   assert.equal(model.onScreen.size, 0);
+});
+
+// ── S3 send throttle: cooldown-scaled, create-immediate ──────────────────────
+//
+// The 1s liveness tick must not become a per-second editMessageText. A `tick`
+// only re-sends after the throttle window, which stretches to the live 429
+// cooldown so the status frame stops adding traffic to an already-throttling
+// chat (it was ~half the 429-storm traffic, live 2026-06-29).
+
+const refreshFloorMs = 5000;
+
+test('throttle: a create always sends immediately, even under a long cooldown', () => {
+  assert.equal(
+    checkShouldSendLivenessFrame({ isCreate: true, msSinceLastSent: 0, refreshMs: refreshFloorMs, remainingCooldownMs: 40000 }),
+    true,
+  );
+});
+
+test('throttle: a tick under the base refresh floor (no cooldown) does NOT send', () => {
+  assert.equal(
+    checkShouldSendLivenessFrame({ isCreate: false, msSinceLastSent: 3000, refreshMs: refreshFloorMs, remainingCooldownMs: 0 }),
+    false,
+  );
+});
+
+test('throttle: a tick past the base refresh floor (no cooldown) sends', () => {
+  assert.equal(
+    checkShouldSendLivenessFrame({ isCreate: false, msSinceLastSent: 5000, refreshMs: refreshFloorMs, remainingCooldownMs: 0 }),
+    true,
+  );
+});
+
+test('throttle: a tick past the floor but WITHIN a longer 429 cooldown does NOT send', () => {
+  // The cooldown scales the throttle up: 6s since last < 30s remaining cooldown,
+  // so the frame coalesces instead of editing into the storm.
+  assert.equal(
+    checkShouldSendLivenessFrame({ isCreate: false, msSinceLastSent: 6000, refreshMs: refreshFloorMs, remainingCooldownMs: 30000 }),
+    false,
+  );
+});
+
+test('throttle: a tick past the live cooldown sends (cooldown lifted)', () => {
+  assert.equal(
+    checkShouldSendLivenessFrame({ isCreate: false, msSinceLastSent: 31000, refreshMs: refreshFloorMs, remainingCooldownMs: 30000 }),
+    true,
+  );
 });

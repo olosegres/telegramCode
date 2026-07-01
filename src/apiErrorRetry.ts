@@ -64,13 +64,22 @@ const hoursPerDay = 24;
 const minutesPerHour = 60;
 
 /**
- * @description Classify a backend error string into a retry class, or `null`
- * when it must NOT be auto-retried.
+ * @description The auth / logged-out phrases (`please run /login`, `not logged
+ * in`, `invalid authentication credentials`). Shared with the Claude scrape
+ * detector (`getClaudeAgentErrorLine`) so the two never drift. NOT global — used
+ * with `.test()`, so lastIndex never carries between calls.
+ */
+export const authErrorPhrasesRe = /please run \/login|not logged in|invalid authentication credentials/i;
+
+/**
+ * @description Classify a backend error string into an error class, or `null`
+ * when it is not a recognised provider error.
  *
  * ORDER IS LOAD-BEARING — branches are evaluated top to bottom and return on
  * first match:
- *  1. auth / non-retryable (login, bad credentials) → `null`. Must win: a wait
- *     never fixes these (they need a re-login or server restart).
+ *  1. auth / logged out (login, bad credentials) → `{ kind: 'auth' }`. Must win:
+ *     a wait never fixes these (they need a re-login or server restart), so they
+ *     are SURFACED (a pinned notice), never auto-retried. Used to return `null`.
  *  2. transient (rate-limited, overloaded, 429/503/529) → `{ kind: 'transient' }`.
  *     Tested BEFORE usage on purpose: the live transient string literally reads
  *     "...(not your usage limit)...", so a naive usage check would false-match it.
@@ -82,8 +91,8 @@ const minutesPerHour = 60;
  *   reset time for the usage class; the transient/auth branches ignore it.
  */
 export function classifyAgentApiError(text: string, now: number): AgentApiErrorClass | null {
-  if (/please run \/login|not logged in|invalid authentication credentials/i.test(text)) {
-    return null;
+  if (authErrorPhrasesRe.test(text)) {
+    return { kind: 'auth' };
   }
   if (/rate.?limited?|temporarily limiting requests|too many requests|overloaded|\b(429|503|529)\b/i.test(text)) {
     return { kind: 'transient' };
@@ -182,6 +191,10 @@ export type RetryPlan = { delayMs: number } | { giveUp: true };
  *    {@link usageLimitMaxAttempts}.
  */
 export function getRetryPlan(args: RetryPlanArgs): RetryPlan {
+  // auth is never retried (it is surfaced by `decideRetryAction` before this is
+  // reached); guard so it can never fall through into the usageLimit branch.
+  if (args.kind === 'auth') return { giveUp: true };
+
   if (args.kind === 'transient') {
     if (args.attempt > transientMaxAttempts) return { giveUp: true };
     const minutes = transientBackoffMinutes[args.attempt - 1];
@@ -215,6 +228,9 @@ export interface RetryEntrySnapshot {
 
 /**
  * @description The action the bot must take in response to one `apiError`:
+ *  - `surface` — an auth / logged-out error: post a pinned notice, arm NO timer
+ *    (a wait never fixes it). The bot dedups repeats via its own per-thread
+ *    auth-notice flag, so no attempt bookkeeping is needed here.
  *  - `ignore`  — a retry is already armed and waiting; dedup this duplicate
  *    error frame (Claude re-scrapes the same line; OpenCode can repeat
  *    `session.error`).
@@ -223,6 +239,7 @@ export interface RetryEntrySnapshot {
  *    made before giving up.
  */
 export type RetryAction =
+  | { action: 'surface' }
   | { action: 'ignore' }
   | { action: 'arm'; attempt: number; delayMs: number; fireAt: number }
   | { action: 'giveUp'; attempts: number };
@@ -243,6 +260,8 @@ export interface DecideRetryActionArgs {
  * passes `now` and the `prev` snapshot, so the decision is deterministic.
  *
  * Rules (evaluated in order):
+ *  0. `auth` → `surface` (never a timer, no attempt bookkeeping — the bot posts
+ *     a deduped pinned notice; a wait can't recover a logged-out session).
  *  1. `prev.pending` → `ignore` (a retry is already armed — dedup the episode;
  *     this is what stops Claude's repeated scrape frames AND any duplicate
  *     `session.error` from re-arming).
@@ -253,6 +272,7 @@ export interface DecideRetryActionArgs {
  */
 export function decideRetryAction(args: DecideRetryActionArgs): RetryAction {
   const { kind, resetAt, now, prev } = args;
+  if (kind === 'auth') return { action: 'surface' };
   if (prev?.pending) return { action: 'ignore' };
 
   const sameEpisode = !!prev && prev.firedAt != null && now - prev.firedAt <= retryRecurrenceGraceMs;

@@ -192,7 +192,7 @@ import { configureSchedulerMcpInjection } from './scheduler/injection';
 import { getThreadKeysForDirectory } from './scheduler/directoryThreads';
 import { getRebindResumeAction } from './scheduler/rebindResume';
 import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/types';
-import { decideRetryAction } from './apiErrorRetry';
+import { decideRetryAction, classifyAgentApiError } from './apiErrorRetry';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -871,6 +871,23 @@ const pendingQuestions = new Map<string, PendingQuestionState>();
  * and Claude's live re-scrape, so it needs no persistence of its own.
  */
 const questionPinnedMessageId = new Map<string, number>();
+/**
+ * @description Placeholder stored in {@link authNoticePinnedMessageId} between
+ * reserving the one-notice slot and the pin landing, so a burst of auth errors
+ * can't race two notices out. A real Telegram message id is always positive, so
+ * `-1` can never collide with one.
+ */
+const authNoticePendingSentinel = -1;
+/**
+ * @description Per-thread id of the PINNED "logged-out" notice (in-memory). Its
+ * presence is ALSO the one-notice-per-logout-episode guard: while set, a repeat
+ * `apiError('auth')` is a no-op. Deliberately SEPARATE from
+ * {@link questionPinnedMessageId} — an auth notice must never clobber a real
+ * pending question's pin. Cleared (and the message unpinned) on recovery (the
+ * first real output after re-login) and at every {@link cancelApiRetry} site
+ * (session stop / `/new` / `/quit` / leaving the folder).
+ */
+const authNoticePinnedMessageId = new Map<string, number>();
 const threadModelLists = new Map<string, string[]>();
 const awaitingModelSelection = new Set<string>();
 const statusCoalescers = new Map<string, StatusCoalesceState>();
@@ -1119,6 +1136,13 @@ function handleApiError(key: ThreadKey, cls: AgentApiErrorClass): void {
     prev,
   });
 
+  // auth / logged out → surface a pinned notice (never a timer). Deduped to one
+  // notice per episode inside `surfaceLoggedOutNotice`.
+  if (action.action === 'surface') {
+    void surfaceLoggedOutNotice(key);
+    return;
+  }
+
   if (action.action === 'ignore') return;
 
   if (action.action === 'giveUp') {
@@ -1206,6 +1230,59 @@ function cancelApiRetry(key: ThreadKey): void {
   if (entry?.timer) clearTimeout(entry.timer);
   apiRetryTimers.delete(k);
   void state.clearApiRetry(key).catch(e => console.error('[apiRetry] clear failed:', e));
+  // NOTE: intentionally does NOT touch the logged-out notice. `cancelApiRetry`
+  // fires on EVERY inbound message (user takeover); clearing the auth notice here
+  // would drop the one-notice guard so the user's next prompt (into the STILL
+  // logged-out session) re-pins and re-notifies — the exact "notifies per
+  // message" bug. The notice is retired only on genuine teardown (the explicit
+  // `clearAuthNotice` calls at session-end sites) and on recovery (first real
+  // output, in `handleAgentOutput`).
+}
+
+/**
+ * @description Surface a logged-out / bad-credentials error as ONE PINNED notice
+ * (a pin pierces the muted topic → a Telegram notification), backend-aware
+ * (Claude → re-`/login`; OpenCode → restart the server). No timer, no persisted
+ * retry record — a wait never recovers auth. Deduped to exactly one notice per
+ * logout episode via {@link authNoticePinnedMessageId}; the slot is reserved with
+ * {@link authNoticePendingSentinel} BEFORE the awaits so a burst of `apiError`
+ * frames can't race two notices out. The pin is removed on recovery — the first
+ * real output after re-login ({@link clearAuthNotice}, wired in
+ * {@link handleAgentOutput}) — and at every {@link cancelApiRetry} site.
+ */
+async function surfaceLoggedOutNotice(key: ThreadKey): Promise<void> {
+  const k = keyToString(key);
+  if (authNoticePinnedMessageId.has(k)) return; // already surfaced this episode
+  authNoticePinnedMessageId.set(k, authNoticePendingSentinel);
+
+  const messageKey =
+    getThreadAdapterName(key) === 'opencode' ? 'apiRetry.loggedOutOpenCode' : 'apiRetry.loggedOutClaude';
+  const id = await replyToThread(key, t(messageKey));
+  if (id === null) {
+    // Send failed — release the reservation so a later error can retry surfacing.
+    if (authNoticePinnedMessageId.get(k) === authNoticePendingSentinel) authNoticePinnedMessageId.delete(k);
+    return;
+  }
+  // A concurrent teardown (clearAuthNotice) may have dropped the reservation
+  // mid-send; don't resurrect it — leave the message unpinned in that case.
+  if (!authNoticePinnedMessageId.has(k)) return;
+  authNoticePinnedMessageId.set(k, id);
+  // First pin of the episode notifies (disableNotification: false).
+  await pinMessageQuiet(key, id, { disableNotification: false });
+}
+
+/**
+ * @description Retire a thread's pinned logged-out notice: unpin it (if a real
+ * message was pinned — the sentinel means the pin hadn't landed yet) and drop the
+ * one-notice guard so a LATER logout notifies again. Called on recovery (first
+ * real output) and folded into {@link cancelApiRetry}. No-op when none is active.
+ */
+function clearAuthNotice(key: ThreadKey): void {
+  const k = keyToString(key);
+  const pinnedId = authNoticePinnedMessageId.get(k);
+  if (pinnedId === undefined) return;
+  authNoticePinnedMessageId.delete(k);
+  if (pinnedId !== authNoticePendingSentinel) void unpinMessageQuiet(key, pinnedId);
 }
 
 /** Host-local `HH:MM` of an epoch-ms instant, for the usage-limit reset notice. */
@@ -1685,6 +1762,7 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   // The thread is going away (/unbind, topic deleted) → cancel any pending
   // API-error retry silently; there's nothing left to resume into.
   cancelApiRetry(key);
+  clearAuthNotice(key); // teardown → retire any pinned logged-out notice
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
   threadSessionLists.delete(k);
@@ -3181,6 +3259,7 @@ async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof s
   // before the session is released, so the kick never lands in a torn-down
   // session.
   cancelApiRetry(key);
+  clearAuthNotice(key); // session released → retire any pinned logged-out notice
   // Session is going away → no output is coming, so stop the "working" loader
   // (covers the release half of /new before its fresh start re-arms it).
   stopTypingLoader(key);
@@ -5193,6 +5272,7 @@ command(['quit', 'q'], async (_ctx, key) => {
   // does NOT go through releaseThreadSession (it stops adapters + clears ids
   // inline), so the cancel is wired here explicitly.
   cancelApiRetry(key);
+  clearAuthNotice(key); // /quit teardown → retire any pinned logged-out notice
   const adapter = getThreadAdapter(key);
   const adapterName = getThreadAdapterName(key);
   const primaryActive = adapter.checkIsActive(key);
@@ -7004,6 +7084,16 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     return;
   }
 
+  // Recovery: a real answer means the session is working again → retire any
+  // pinned logged-out notice and clear its one-notice guard so a LATER logout
+  // notifies afresh. Placed AFTER the sub-agent / question / progress-chunk
+  // early-returns. Also SKIP when this output is itself an error surface (Claude
+  // `⎿ … /login` under `/tool_results full`, or OpenCode's `OpenCode error: …`
+  // line): those flow as `output` too, and clearing on them would let a repeated
+  // `session.error` clear-then-repin-and-RE-NOTIFY — the very double-notification
+  // the one-per-episode guard exists to prevent.
+  if (classifyAgentApiError(output, Date.now()) === null) clearAuthNotice(key);
+
   // The real answer is starting → resolve the thinking message per mode. Only
   // `minimal` removes its live indicator now (nothing should remain); `full` /
   // `short` leave their persisted message in place. No-op when no thinking
@@ -8013,6 +8103,7 @@ function handleAgentClosed(key: ThreadKey): void {
   clearPendingQuestion(key);
   // A closed session has nothing to resume — drop any armed retry silently.
   cancelApiRetry(key);
+  clearAuthNotice(key); // session closed → retire any pinned logged-out notice
   const adapter = getThreadAdapter(key);
   replyToThread(key, t('agent.session_ended', { label: adapter.label })).catch(() => {});
   // Banner now reads `idle`; closed sessions may also persist with the
@@ -8072,6 +8163,7 @@ function handleAgentStopped(key: ThreadKey): void {
   clearThreadContextMarker(key);
   // A stopped session has nothing to resume — drop any armed retry silently.
   cancelApiRetry(key);
+  clearAuthNotice(key); // session stopped → retire any pinned logged-out notice
   updatePinnedStatus(key).catch(() => {});
 }
 

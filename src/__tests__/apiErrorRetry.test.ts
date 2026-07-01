@@ -6,6 +6,8 @@
  *
  * A FIXED `now` is used everywhere (no `Date.now()`), so the relative/absolute
  * time math is deterministic.
+ *
+ * Test case: <unknown — ask user>
  */
 
 import { test } from 'node:test';
@@ -57,10 +59,30 @@ test('classify: usage / credit / quota phrasings → usageLimit', () => {
   assert.equal(classifyAgentApiError('monthly quota exhausted', fixedNow)?.kind, 'usageLimit');
 });
 
-test('classify: auth / non-retryable strings → null (must never be retried)', () => {
-  assert.equal(classifyAgentApiError('Please run /login to continue', fixedNow), null);
-  assert.equal(classifyAgentApiError('Invalid authentication credentials', fixedNow), null);
-  assert.equal(classifyAgentApiError('You are not logged in', fixedNow), null);
+test('classify: auth / logged-out strings → auth (surfaced, never retried)', () => {
+  assert.deepEqual(classifyAgentApiError('Please run /login to continue', fixedNow), { kind: 'auth' });
+  assert.deepEqual(classifyAgentApiError('Invalid authentication credentials', fixedNow), { kind: 'auth' });
+  assert.deepEqual(classifyAgentApiError('You are not logged in', fixedNow), { kind: 'auth' });
+});
+
+test('classify: REAL scraped Claude logged-out lines → auth', () => {
+  // The exact TUI renders reported live 2026-07-01 (topic 434): the bare
+  // "Not logged in" line, and the mixed "…/login · API Error: 401 …" render.
+  assert.deepEqual(
+    classifyAgentApiError('⎿  Not logged in · Please run /login', fixedNow),
+    { kind: 'auth' },
+  );
+  assert.deepEqual(
+    classifyAgentApiError('⎿  Please run /login · API Error: 401 Invalid authentication credentials', fixedNow),
+    { kind: 'auth' },
+  );
+});
+
+test('classify: REAL scraped transient line (⎿ … · API Error: 429) → transient', () => {
+  assert.deepEqual(
+    classifyAgentApiError('⎿  overloaded · API Error: 429', fixedNow),
+    { kind: 'transient' },
+  );
 });
 
 test('classify: ordinary sentence containing "limit" → null (load-bearing: regex must not be greedy)', () => {
@@ -211,4 +233,25 @@ test('decideRetryAction: usageLimit escalation past the cap → giveUp with atte
     prev: { attempt: 6, firedAt: fixedNow - 1, pending: false },
   });
   assert.deepEqual(result, { action: 'giveUp', attempts: 6 });
+});
+
+test('decideRetryAction: auth → surface (never arms a timer, ignores prior record)', () => {
+  // No prior record.
+  assert.deepEqual(decideRetryAction({ kind: 'auth', now: fixedNow, prev: null }), {
+    action: 'surface',
+  });
+  // Even with a pending prior retry, auth still surfaces (it is decided FIRST,
+  // before the pending-dedup branch).
+  assert.deepEqual(
+    decideRetryAction({
+      kind: 'auth',
+      now: fixedNow,
+      prev: { attempt: 2, firedAt: fixedNow - 1, pending: true },
+    }),
+    { action: 'surface' },
+  );
+});
+
+test('getRetryPlan: auth → giveUp (defensive guard — never falls into the usage branch)', () => {
+  assert.deepEqual(getRetryPlan({ kind: 'auth', attempt: 1, now: fixedNow }), { giveUp: true });
 });

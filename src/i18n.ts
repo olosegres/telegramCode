@@ -441,6 +441,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'apiRetry.giveUp':
       '⚠️ Не смог возобновить после {attempts} попыток. Напиши, когда продолжить.',
     'apiRetry.continueNudge': 'Продолжай с того места, где ты остановился.',
+    // ── logged-out / bad-credentials notice (pinned so the muted topic notifies;
+    //    posted once per logout episode, never auto-retried). Remediation differs
+    //    per backend: Claude needs a user /login, OpenCode a server restart. ──
+    'apiRetry.loggedOutClaude':
+      '⚠️ Claude разлогинен — отправь /login, чтобы продолжить.',
+    'apiRetry.loggedOutOpenCode':
+      '⚠️ OpenCode: неверные учётные данные — перезапусти opencode-сервер.',
 
     // ── delivery degraded under sustained Telegram 429 (S1/D2). Posted ONCE
     //    per congestion window when a recoverable send's bounded redelivery is
@@ -841,6 +848,13 @@ const dict: Record<Lang, Record<string, string>> = {
     'apiRetry.giveUp':
       "⚠️ Couldn't resume after {attempts} attempts. Message me when to continue.",
     'apiRetry.continueNudge': 'Continue from where you left off.',
+    // ── logged-out / bad-credentials notice (pinned so the muted topic notifies;
+    //    posted once per logout episode, never auto-retried). Remediation differs
+    //    per backend: Claude needs a user /login, OpenCode a server restart. ──
+    'apiRetry.loggedOutClaude':
+      '⚠️ Claude is logged out — run /login to continue.',
+    'apiRetry.loggedOutOpenCode':
+      '⚠️ OpenCode: invalid credentials — restart the opencode server.',
 
     'send.degradedUnderLoad':
       '⚠️ Telegram is rate-limiting — some messages were delayed or dropped. Try again in a minute.',

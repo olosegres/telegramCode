@@ -3611,9 +3611,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     console.error(`[OpenCode] Session error:`, errorMsg);
     this.emit('output', key, `OpenCode error: ${errorMsg}`);
 
-    // Provider-side API error at the proxy boundary → arm the auto-retry. The
-    // session stays active after `session.error`, so the kick (S5) reuses it.
-    // Auth / non-retryable errors classify to `null` and emit nothing.
+    // Provider-side API error at the proxy boundary → emit `apiError`. transient
+    // / usageLimit arm the auto-retry (the session stays active after
+    // `session.error`, so the kick reuses it); `auth` (logged out / bad
+    // credentials) is SURFACED as a pinned notice by the bot, never retried.
+    // Unrecognised errors classify to `null` and emit nothing.
     const apiError: AgentApiErrorClass | null = classifyAgentApiError(errorMsg, Date.now());
     if (apiError) {
       this.emit('apiError', key, apiError);

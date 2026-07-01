@@ -22,7 +22,7 @@ import type {
   ThreadKey,
 } from '../types';
 import { keyToString } from '../types';
-import { classifyAgentApiError } from '../apiErrorRetry';
+import { classifyAgentApiError, authErrorPhrasesRe } from '../apiErrorRetry';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
@@ -2585,16 +2585,40 @@ const CLAUDE_AUTO_ENTER_PATTERNS = [
 const CLAUDE_BYPASS_WARNING_RE = /WARNING.*Bypass|Bypass.*Permissions/i;
 const CLAUDE_BYPASS_ACCEPT_RE = /Yes,?\s*I\s*accept/i;
 
+/** The `API Error:`-at-line-start error row shape (detector case (a)). */
+const CLAUDE_API_ERROR_START_RE = /^\s*API Error:/;
+/** The `API Error:` substring, for a `⎿` result row that carries it (case (b)). */
+const CLAUDE_API_ERROR_SUBSTR_RE = /API Error:/;
+
 /**
- * @description Matches the TUI's terminal provider-error row, rendered as a
- * single line led by `API Error:` (e.g. `API Error: Server is temporarily
- * limiting requests (not your usage limit) · Rate limited`). We anchor on this
- * exact prefix and capture only that one line, so the API-error classifier
- * (auto-retry trigger) never runs over arbitrary conversation text — a normal
- * agent sentence containing "rate limit" must not false-fire. Multiline so a
- * pane full of other rows still finds the line.
+ * @description Find the ONE line in a scraped pane that is a terminal
+ * provider / auth error, or `null` if none. `content` is `cleanOutput(raw)`,
+ * which RETAINS the `⎿` result marker. Three accepted shapes:
+ *   a) `API Error: …` at line start — the classic provider row
+ *      (`API Error: … (not your usage limit) · Rate limited`).
+ *   b) a `⎿` result row that also contains `API Error:`
+ *      (`⎿  overloaded · API Error: 429` — the render the old start-anchored gate
+ *      MISSED, which is why a `⎿`-prefixed rate-limit never auto-retried).
+ *   c) a `⎿` result row carrying an auth phrase
+ *      (`⎿  Not logged in · Please run /login` — the logged-out render).
+ * The `⎿`-marker / `API Error:`-line-start requirement is the FALSE-POSITIVE
+ * GUARD: the agent's own answer prose never starts a line with the `⎿` TUI glyph
+ * nor with `API Error:`, so quoting "not logged in" mid-sentence can't fire it.
+ * The returned line is fed VERBATIM to {@link classifyAgentApiError}. Exported for
+ * unit testing without a live tmux pane.
  */
-const CLAUDE_API_ERROR_LINE_RE = /^\s*API Error:.*$/m;
+export function getClaudeAgentErrorLine(content: string): string | null {
+  for (const line of content.split('\n')) {
+    if (CLAUDE_API_ERROR_START_RE.test(line)) return line;
+    if (
+      TOOL_RESULT_MARKER_RE.test(line) &&
+      (CLAUDE_API_ERROR_SUBSTR_RE.test(line) || authErrorPhrasesRe.test(line))
+    ) {
+      return line;
+    }
+  }
+  return null;
+}
 
 /**
  * @description Matches the TUI's live input box prompt row (`❯` led, optional
@@ -4439,10 +4463,13 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * resume-seeding path (which suppresses conversation TEXT) can still drive
    * these prompts; suppression must hide chatter, not the lifecycle.
    *
-   * Also the detection seam for a terminal provider `API Error:` line: when it
-   * first classifies as retryable, emit one `apiError` event (the auto-retry
-   * trigger). Detection lives here — at the proxy boundary on the recognized
-   * line only — never by scanning arbitrary conversation text.
+   * Also the detection seam for a terminal provider error / logged-out row
+   * ({@link getClaudeAgentErrorLine}: `API Error: …`, `⎿ … · API Error: …`, or
+   * `⎿ … Please run /login`): when it first classifies, emit one `apiError`
+   * event — the trigger for the auto-retry (transient / usageLimit) OR the
+   * surfaced logged-out notice (auth). Detection lives here — at the proxy
+   * boundary on the recognized line only — never by scanning arbitrary
+   * conversation text.
    *
    * A large new chunk (`newPart.length > 50`) means real conversation moved on,
    * so the one-shot `handled*` guards are reset to re-arm for a later prompt.
@@ -4455,12 +4482,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     if (!session.handledApiError) {
-      const apiErrorLine = CLAUDE_API_ERROR_LINE_RE.exec(content);
+      const apiErrorLine = getClaudeAgentErrorLine(content);
       if (apiErrorLine) {
-        const apiError: AgentApiErrorClass | null = classifyAgentApiError(apiErrorLine[0], Date.now());
+        const apiError: AgentApiErrorClass | null = classifyAgentApiError(apiErrorLine, Date.now());
         if (apiError) {
           session.handledApiError = true;
-          console.log(`[Claude] API error detected (${apiError.kind}): ${apiErrorLine[0].trim()}`);
+          console.log(`[Claude] API error detected (${apiError.kind}): ${apiErrorLine.trim()}`);
           this.emit('apiError', session.key, apiError);
         }
       }

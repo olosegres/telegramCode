@@ -4,8 +4,6 @@
  * row in a scraped Claude pane WITHOUT false-firing on the agent's own answer
  * prose. A live 401 / logout is not inducible on demand (documented in
  * CLAUDE.md), so these REAL scraped line samples are the load-bearing proof.
- *
- * Test case: <unknown — ask user>
  */
 
 import { test } from 'node:test';

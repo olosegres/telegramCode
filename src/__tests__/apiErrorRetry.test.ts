@@ -6,8 +6,6 @@
  *
  * A FIXED `now` is used everywhere (no `Date.now()`), so the relative/absolute
  * time math is deterministic.
- *
- * Test case: <unknown — ask user>
  */
 
 import { test } from 'node:test';

@@ -884,8 +884,10 @@ const authNoticePendingSentinel = -1;
  * `apiError('auth')` is a no-op. Deliberately SEPARATE from
  * {@link questionPinnedMessageId} — an auth notice must never clobber a real
  * pending question's pin. Cleared (and the message unpinned) on recovery (the
- * first real output after re-login) and at every {@link cancelApiRetry} site
- * (session stop / `/new` / `/quit` / leaving the folder).
+ * first real output after re-login) and at the session-END / teardown sites
+ * (session closed/stopped, `/new` release, `/quit`, leaving the folder) — but
+ * NOT at the user-takeover {@link cancelApiRetry} sites, which must not
+ * re-notify (see the NOTE in {@link cancelApiRetry}).
  */
 const authNoticePinnedMessageId = new Map<string, number>();
 const threadModelLists = new Map<string, string[]>();
@@ -1248,7 +1250,8 @@ function cancelApiRetry(key: ThreadKey): void {
  * {@link authNoticePendingSentinel} BEFORE the awaits so a burst of `apiError`
  * frames can't race two notices out. The pin is removed on recovery — the first
  * real output after re-login ({@link clearAuthNotice}, wired in
- * {@link handleAgentOutput}) — and at every {@link cancelApiRetry} site.
+ * {@link handleAgentOutput}) — and at the session-end / teardown sites (NOT the
+ * user-takeover {@link cancelApiRetry} sites; see its NOTE).
  */
 async function surfaceLoggedOutNotice(key: ThreadKey): Promise<void> {
   const k = keyToString(key);
@@ -1275,7 +1278,8 @@ async function surfaceLoggedOutNotice(key: ThreadKey): Promise<void> {
  * @description Retire a thread's pinned logged-out notice: unpin it (if a real
  * message was pinned — the sentinel means the pin hadn't landed yet) and drop the
  * one-notice guard so a LATER logout notifies again. Called on recovery (first
- * real output) and folded into {@link cancelApiRetry}. No-op when none is active.
+ * real output) and at the session-end / teardown sites (NOT folded into
+ * {@link cancelApiRetry} — see its NOTE). No-op when none is active.
  */
 function clearAuthNotice(key: ThreadKey): void {
   const k = keyToString(key);

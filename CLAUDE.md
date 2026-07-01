@@ -284,26 +284,33 @@ config/variants, not a per-message API field).
   manager; plan `agent/tasks/completed/2026-06-09-api-error-auto-retry.md`).**
   When the agent dies on a provider API error the bot doesn't leave the topic
   looking hung — it classifies the error and auto-resumes after a backoff.
-  Detection is at the **adapter boundary** via a new `apiError` event: OpenCode
-  classifies in `handleSessionError` (`session.error`, structural); Claude
-  detects the terminal `API Error:` line in `handleAutoLifecycle` behind a
-  one-shot guard. Classes (markers verified against the `claude.exe` string
-  table): *transient* (rate-limit / overloaded / 429·503·529) → retry +5/10/20
-  min, 3 tries; *usageLimit* (usage-limit reached / credit-balance too low) →
-  +60 min re-armed each repeat up to 6× (or a parsed reset time, rare); *auth*
-  (login / bad credentials) → never retried. On fire the bot posts a notice and
-  nudges the still-live session with a neutral "continue" via
-  `forwardPromptToAgent` (NEVER a wait-for-idle path — OpenCode's optimistic
-  `isBusy` is not cleared on `session.error` and would stall the 10-min cap).
-  Any user message / `/new` / `/quit` / leaving a folder cancels a
-  pending retry; pending retries survive a bot restart (`state.json` `apiRetries`,
-  re-armed after reattach). **⚠️ Known check (not yet verified live):** the
-  Claude scrape-detection regex (`^\s*API Error:`, run over `cleanOutput(raw)`
-  WITHOUT `stripTuiElements`) was never confirmed against a real raw TUI render
-  — a rate-limit isn't inducible on demand. **So if a Claude API error did NOT
-  auto-retry, first grep the bot log for `[Claude] API error detected`: absent
-  ⇒ the regex missed the line (likely a chrome prefix like `✗ ` / box char) and
-  must be widened.** OpenCode's structural path needs no such check.
+  Detection is at the **adapter boundary** via the `apiError` event: OpenCode
+  classifies in `handleSessionError` (`session.error`, structural); Claude runs
+  the scraped pane through `getClaudeAgentErrorLine` — a line STARTING with
+  `API Error:`, OR a `⎿` result row that contains `API Error:` or a logged-out
+  phrase (`not logged in` / `please run /login` / `invalid authentication
+  credentials`); the `⎿`/line-start anchor is the false-positive guard so the
+  agent's OWN prose quoting those never fires — then `classifyAgentApiError`,
+  behind a one-shot guard. Classes (markers verified against the `claude.exe`
+  string table): *transient* (rate-limit / overloaded / 429·503·529) → retry
+  +5/10/20 min, 3 tries; *usageLimit* (usage-limit reached / credit-balance too
+  low) → +60 min re-armed each repeat up to 6× (or a parsed reset time, rare);
+  *auth* (login / bad credentials) → **never retried, but SURFACED**: a deduped,
+  PINNED logged-out notice (Claude → send `/login`; OpenCode → restart the
+  server), one notification per episode, cleared on recovery (first real output
+  after re-login) and at teardown — pre-fix a logged-out Claude emitted NOTHING
+  and looked hung (live 2026-07-01, topic 434; plan
+  `agent/tasks/completed/2026-07-01-surface-logged-out-agent-notice.md`). On a
+  retryable fire the bot posts a notice and nudges the still-live session with a
+  neutral "continue" via `forwardPromptToAgent` (NEVER a wait-for-idle path —
+  OpenCode's optimistic `isBusy` is not cleared on `session.error` and would
+  stall the 10-min cap). Any user message / `/new` / `/quit` / leaving a folder
+  cancels a pending retry; pending retries survive a bot restart (`state.json`
+  `apiRetries`, re-armed after reattach). **Live-verify caveat:** a Claude
+  rate-limit / 401 isn't inducible on demand, so the `getClaudeAgentErrorLine`
+  cases are covered by unit tests against REAL scraped samples, not a live repro.
+  If a Claude API error did NOT trigger, grep the bot log for `[Claude] API
+  error detected`: absent ⇒ the detector missed the line and needs another case.
 
 ## Module map (`src/`)
 

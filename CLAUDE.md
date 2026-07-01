@@ -524,11 +524,21 @@ OpenCode events / bindings).
     shared `deliverActivePrompt` choke point (used by BOTH the text and voice
     handlers): a bare in-range digit ANSWERS that option (a button tap too), any
     other free-form text OR voice CANCELS the question (clear pending state →
-    neutralize the buttons message → `SIGINT` abort of the wedged turn →
-    `agent.question_cancelled_for_prompt` notice) and is delivered as a fresh
-    prompt. Pre-fix the voice handler had NO question handling, so a voice note
-    queued behind the blocked question-turn and the user got no reply (live
-    2026-06-25, topic «Overview app 1»). Route decision: `getQuestionReplyRoute`.
+    neutralize the buttons message → **reject the question server-side**
+    (`adapter.rejectQuestion` → `POST /question/:id/reject`) → `SIGINT` abort of
+    the wedged turn → `agent.question_cancelled_for_prompt` notice) and is
+    delivered as a fresh prompt. Pre-fix the voice handler had NO question
+    handling, so a voice note queued behind the blocked question-turn and the
+    user got no reply (live 2026-06-25, topic «Overview app 1»). Route decision:
+    `getQuestionReplyRoute`. **Abandoning a question ALSO rejects it on the
+    server** — not just on abandon-by-prompt but on session teardown while it is
+    pending (`/new`, `/quit`, leaving the folder), each rejecting BEFORE the
+    session is stopped. Without the reject the question stayed "open" in
+    OpenCode's registry and `restoreOpenQuestion` (`GET /question` on every
+    reattach) re-posted the stale question after a restart (live 2026-07-01,
+    topic 688). Claude has no server-side question concept → no reject. Pure
+    reject is the OpenCode adapter's `rejectQuestion` (mirrors `answerQuestion`,
+    empty body).
   - **`/login` OAuth code paste.** The login flow's last step shows
     `Paste code here if prompted >` (a plain `>` box, not `❯`/a selector).
     While it is up (`isLoginPastePending`, `checkIsClaudeLoginPaste` off the

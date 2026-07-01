@@ -3267,6 +3267,11 @@ async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof s
   // Session is going away → no output is coming, so stop the "working" loader
   // (covers the release half of /new before its fresh start re-arms it).
   stopTypingLoader(key);
+  // Close any still-pending OpenCode question on the server BEFORE stopping the
+  // session — a stopped session can't accept the reject, and an unrejected
+  // question re-surfaces on the next reattach (`restoreOpenQuestion`). No-op for
+  // Claude / no pending question.
+  getThreadAdapter(key).rejectQuestion?.(key);
   const result = stopAllAdaptersFor(key);
   await state.clearAgentSessionIds(key);
   return result;
@@ -3997,6 +4002,11 @@ async function unbindThread(key: ThreadKey): Promise<void> {
     // an orphan tmux/SSE stream pointing at a directory we no longer track.
     const adapter = getThreadAdapter(key);
     if (adapter.checkIsActive(key)) {
+      // Close any still-pending OpenCode question on the server BEFORE stopping
+      // the session — a stopped session can't accept the reject, and an
+      // unrejected question re-surfaces on the next reattach. No-op for Claude /
+      // no pending question.
+      adapter.rejectQuestion?.(key);
       try { adapter.stopSession(key); } catch (e) {
         console.warn(`[unbind] stopSession failed for ${kStr}:`, e);
       }
@@ -5293,6 +5303,11 @@ command(['quit', 'q'], async (_ctx, key) => {
     return;
   }
   markNeedsNewMessage(key);
+
+  // Close any still-pending OpenCode question on the server BEFORE the teardown
+  // below (a stopped session can't accept the reject; an unrejected question
+  // re-surfaces on the next reattach). No-op for Claude / no pending question.
+  adapter.rejectQuestion?.(key);
 
   if (adapterName === 'claude') {
     adapter.sendSignal(key, 'SIGINT');

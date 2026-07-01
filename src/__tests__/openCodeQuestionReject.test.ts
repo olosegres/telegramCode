@@ -14,14 +14,16 @@
  *     none" gate the plan (S4) calls for — the abandon/teardown callers just
  *     invoke it, so this method is where the fire/no-fire decision actually lives.
  *
- *  2. The bot-side WIRING (S2): `cancelPendingQuestionAndForward` (abandon-by-
- *     prompt) must call `rejectQuestion` while the session is still active, before
- *     the SIGINT. It lives in the side-effecting `bot.ts` entrypoint (Telegram +
- *     I/O deps), so — exactly like `voiceQuestionCancelWiring.test.ts` — the seam
- *     is locked with a source-scan of the isolated function body rather than by
- *     booting the whole bot. The live server round-trip is already proven (the two
- *     zombie questions were rejected → `GET /question` empty, no nudge), so this
- *     guards the wiring, not the HTTP.
+ *  2. The bot-side WIRING (S2 + S3): `cancelPendingQuestionAndForward` (abandon-
+ *     by-prompt, S2) and the three teardown initiators (`releaseThreadSession` =
+ *     /new, the `/quit` command, `unbindThread` = leaving the folder, all S3) must
+ *     call `rejectQuestion` while the session is still active, before the session
+ *     is stopped/released. These live in the side-effecting `bot.ts` entrypoint
+ *     (Telegram + I/O deps), so — exactly like `voiceQuestionCancelWiring.test.ts`
+ *     — the seam is locked with a source-scan of the isolated function bodies
+ *     rather than by booting the whole bot. The live server round-trip is already
+ *     proven (the two zombie questions were rejected → `GET /question` empty, no
+ *     nudge), so this guards the wiring, not the HTTP.
  *
  * Adapter-test harness style mirrors `openCodeQuestionReply.test.ts`: session
  * injected into the private map, `apiRequest` stubbed, private handlers driven
@@ -174,4 +176,34 @@ test('S2: cancelPendingQuestionAndForward rejects the question before the SIGINT
   const sigintIdx = body.indexOf("sendSignal(key, 'SIGINT')");
   assert.notEqual(sigintIdx, -1, 'the SIGINT must still be present');
   assert.ok(rejectIdx < sigintIdx, 'reject must run BEFORE the SIGINT');
+});
+
+test('S3: releaseThreadSession (/new) rejects before stopping the adapters', () => {
+  const body = sliceBody('async function releaseThreadSession');
+  assert.match(body, rejectCallRe, '/new must reject a pending question before release');
+  const rejectIdx = body.search(rejectCallRe);
+  const stopIdx = body.indexOf('stopAllAdaptersFor(key)');
+  assert.ok(rejectIdx !== -1 && stopIdx !== -1 && rejectIdx < stopIdx, 'reject must run BEFORE stopAllAdaptersFor');
+});
+
+test('S3: the /quit command rejects before the session teardown', () => {
+  const body = sliceBody("command(['quit', 'q']");
+  assert.match(body, rejectCallRe, '/quit must reject a pending question before teardown');
+  // Order parity with the other two teardown tests: reject must precede BOTH
+  // teardown branches (Claude double-SIGINT, OpenCode stopSession). The earlier
+  // `stopAllAdaptersFor(key, otherAdapters)` only stops OTHER adapters, so the
+  // primary adapter holding the question is still active at the reject.
+  const rejectIdx = body.search(rejectCallRe);
+  const sigintIdx = body.indexOf("sendSignal(key, 'SIGINT')");
+  const stopIdx = body.indexOf('adapter.stopSession(key)');
+  assert.ok(sigintIdx !== -1 && rejectIdx < sigintIdx, 'reject must run BEFORE the Claude SIGINT teardown');
+  assert.ok(stopIdx !== -1 && rejectIdx < stopIdx, 'reject must run BEFORE the OpenCode stopSession teardown');
+});
+
+test('S3: unbindThread (leaving the folder) rejects before stopSession', () => {
+  const body = sliceBody('async function unbindThread');
+  assert.match(body, rejectCallRe, 'leaving the folder must reject a pending question before stopSession');
+  const rejectIdx = body.search(rejectCallRe);
+  const stopIdx = body.indexOf('adapter.stopSession(key)');
+  assert.ok(rejectIdx !== -1 && stopIdx !== -1 && rejectIdx < stopIdx, 'reject must run BEFORE stopSession');
 });

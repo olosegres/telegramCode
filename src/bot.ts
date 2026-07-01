@@ -6946,6 +6946,13 @@ async function cancelPendingQuestionAndForward(
     );
   }
 
+  // Close the question on the OpenCode server too (not just the bot-local +
+  // Telegram state above): an abandoned-but-still-open question keeps getting
+  // re-found by `restoreOpenQuestion` (`GET /question` on every reattach) and
+  // re-posted after a restart. Runs while the session is still active — the
+  // SIGINT below then unblocks the wedged turn. No-op for Claude / no pending
+  // question (the adapter guards both).
+  adapter.rejectQuestion?.(key);
   adapter.sendSignal(key, 'SIGINT');
   await replyToThread(key, t('agent.question_cancelled_for_prompt'));
   await forwardPromptToAgent(key, adapter, text);

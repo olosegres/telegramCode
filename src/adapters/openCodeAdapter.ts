@@ -3769,6 +3769,30 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * @description Reject a pending question server-side WITHOUT answering it —
+   * called when the user ABANDONS the question (sends a fresh prompt instead of
+   * answering, or the session is torn down while it is pending). Mirrors
+   * {@link answerQuestion} but POSTs to `/question/:id/reject` (empty body)
+   * instead of `/reply`. Without it the question stays "open" in the server's
+   * registry and {@link restoreOpenQuestion} re-surfaces it on every reattach.
+   * No-op if no active session / no pending question.
+   */
+  rejectQuestion(key: ThreadKey): void {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive || !session.pendingQuestion) return;
+
+    const { requestId, directory } = session.pendingQuestion;
+    session.pendingQuestion = null;
+
+    // Same failure surfacing as answerQuestion: route errors through `error` so
+    // the bot's handleAgentError shows them in the thread, not just console.
+    this.apiRequest('POST', buildDirectoryScopedPath(`/question/${requestId}/reject`, directory), {}).catch((e) => {
+      console.error(`[OpenCode] Failed to reject question:`, e);
+      this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
+    });
+  }
+
+  /**
    * @description Extract human-readable message from OpenCode error objects.
    * Handles { name, data: { message } } and { message } shapes.
    */

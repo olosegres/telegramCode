@@ -754,6 +754,18 @@ export interface AgentAdapter extends EventEmitter {
   answerQuestion?(key: ThreadKey, answers: string[][]): void;
 
   /**
+   * @description Reject (close) a pending question server-side WITHOUT answering
+   * it — used when the user ABANDONS the question (sends a fresh prompt instead
+   * of answering, or tears the session down while it is pending). Without this
+   * the question stays "open" in OpenCode's registry and a later reattach
+   * re-surfaces the stale question. OpenCode-only (Claude has no server-side
+   * question concept, so it does not implement it); a no-op when no question is
+   * pending. Must run while the session is still active — a stopped session
+   * can't accept the reject POST.
+   */
+  rejectQuestion?(key: ThreadKey): void;
+
+  /**
    * @description Whether this session's turn is wedged behind an open
    * interactive question (the agent's `question` tool is blocking the turn and
    * the bot has no `pendingQuestions` entry to break out with). OpenCode-only:

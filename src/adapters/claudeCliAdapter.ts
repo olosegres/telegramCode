@@ -58,6 +58,7 @@ import {
 } from '../utils/tmuxExec';
 import { convertAnsiToMarkdown, cleanOutput } from '../utils/ansiClean';
 import { getNewPaneContent, type NewPaneContent } from '../utils/paneDiff';
+import { getPaneResizeGuardDecision, parsePaneSize } from '../utils/paneResizeGuard';
 import {
   buildTmuxSessionName as buildTmuxSessionNameWithPrefix,
   parseTmuxSessionName as parseTmuxSessionNameWithPrefix,
@@ -293,6 +294,24 @@ interface ClaudeSession {
    * resume / adopt all flow through `createSession`).
    */
   chunkContext: ClaudeChunkContext;
+  /**
+   * Last known pane size (`<width>x<height>`, e.g. `300x50`) from the per-poll
+   * `#{pane_width}x#{pane_height}` query; `null` until the first successful
+   * read. A CHANGE means tmux re-wrapped the whole scrollback (an interactive
+   * `tmux attach`/detach resizes the window — live incident 2026-07-02, topic
+   * 39933) and the poll's giant line-SET diff is repaint, not output. See
+   * {@link getPaneResizeGuardDecision}.
+   */
+  lastPaneSize: string | null;
+  /**
+   * Whether the session is swallowing a resize repaint: baseline advances
+   * every poll but NOTHING is emitted, until a poll sees the capture unchanged
+   * (or the settle cap fires). Same suppress-and-advance shape as
+   * {@link resumeSeeding}, but for pane-size changes.
+   */
+  isResizeSettling: boolean;
+  /** Consecutive suppressed polls spent in {@link isResizeSettling} — drives the cap. */
+  resizeSettlePolls: number;
   /**
    * Streaming-table stabilizer state (live incident 2026-06-11, plan
    * `2026-06-11-claude-wide-table-content-loss`). A wide markdown table re-flows
@@ -2918,6 +2937,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       | 'recentRelayWindow'
       | 'subagentTail'
       | 'chunkContext'
+      | 'lastPaneSize'
+      | 'isResizeSettling'
+      | 'resizeSettlePolls'
       | 'streamingTable'
     >,
   ): ClaudeSession {
@@ -2971,6 +2993,11 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
       // S4: fresh cross-poll classifier context per session — the all-closed
       // start, so a fresh session never inherits a prior session's open block.
       chunkContext: createInitialChunkContext(),
+      // Resize guard: the first successful size query of this session records
+      // the baseline; only a CHANGE after that suppresses (never the first read).
+      lastPaneSize: null,
+      isResizeSettling: false,
+      resizeSettlePolls: 0,
       // No table held at session start (start / resume / adopt all flow through
       // here) — this IS the "reset on session start"; stop deletes it with the
       // session. The resume-seed exit clears it again (see `pollOutput`).
@@ -4072,6 +4099,51 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
         console.log(`[Claude] Session died, cleaning up`);
         await this.stopSessionInternal(key);
         this.emit('closed', key);
+      }
+      return;
+    }
+
+    // Pane-RESIZE guard (live incident 2026-07-02, topic 39933): an
+    // interactive `tmux attach` resizes the window to the client terminal (and
+    // detach restores the `-x/-y` default); tmux re-wraps the WHOLE scrollback
+    // at the new width, so the line-SET diff below would see ~every line as
+    // "new" and relay ragged fragments of OLD conversation (the relay window
+    // can't match re-wrapped lines, and its short-line exemption lets clusters
+    // of short old lines through on every flap). Query the size AFTER the
+    // capture (same-poll order is what makes the race-free direction hold: a
+    // resize landing between the two calls is detected on THIS poll, before
+    // its giant diff ships) and, on a change, swallow the repaint — advance
+    // the baseline, emit nothing — until the capture settles. Decision logic
+    // is pure: `utils/paneResizeGuard.ts`.
+    const paneSizeRaw = await this.enqueueTmux(session, () =>
+      tmuxAsync('display-message', '-p', '-t', session.sessionName, '#{pane_width}x#{pane_height}'),
+    );
+    if (!session.isActive) return;
+    const currentPaneSize = parsePaneSize(paneSizeRaw);
+    const resizeDecision = getPaneResizeGuardDecision({
+      lastSize: session.lastPaneSize,
+      currentSize: currentPaneSize,
+      isSettling: session.isResizeSettling,
+      settlePolls: session.resizeSettlePolls,
+      isRawChanged: raw !== session.lastRawCapture,
+    });
+    if (currentPaneSize !== null && session.lastPaneSize !== null && currentPaneSize !== session.lastPaneSize) {
+      console.log(
+        `[Claude] pane resized (${session.lastPaneSize} → ${currentPaneSize}) — suppressing scrape, reseeding baseline`,
+      );
+    }
+    if (currentPaneSize !== null) session.lastPaneSize = currentPaneSize;
+    if (session.isResizeSettling && !resizeDecision.nextIsSettling) {
+      console.log(`[Claude] pane resize settled after ${session.resizeSettlePolls} suppressed polls`);
+    }
+    session.isResizeSettling = resizeDecision.nextIsSettling;
+    session.resizeSettlePolls = resizeDecision.nextSettlePolls;
+    if (resizeDecision.action === 'suppress') {
+      if (raw !== session.lastRawCapture) {
+        session.lastRawCapture = raw;
+        session.lastContent = cleanOutput(raw);
+        // The pane genuinely changed — keep the 30s pane-static liveness net honest.
+        session.lastContentChangeAt = Date.now();
       }
       return;
     }

@@ -378,7 +378,7 @@ config/variants, not a per-message API field).
 | File | Responsibility |
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
-| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat |
+| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat. **Auto-dismisses Claude's end-of-turn feedback survey** (never relayed to the topic; one Escape per appearance, signature-deduped): the detector (`extractClaudeSurvey`) is two-factor — a whole-line-anchored header + the `N: Label` option row (≥2 options) — and accepts a CLOSED alternation of the two known header wordings (`How is Claude doing this session?` and `How well is Claude following the instructions you gave earlier in this conversation?`, optional leading `●`/`⏺` bullet + trailing `(optional)`); keep it a closed list, never an open prose pattern (a quoted header once spammed bogus surveys). Wedge symptom of an UNRECOGNISED wording: the survey sits on the pane and swallows the Enter of the next forwarded prompt — the text strands unsubmitted in the TUI input box and the topic looks hung (live 2026-07-02, topic 39933); the fix is adding the new wording to the alternation |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; ONE multiplexed `/global/event` stream for the whole server, every event parsed once + routed by envelope `directory` + `sessionID`) |
 | `terminalAdapter.ts` | A raw interactive `$SHELL` in `tmux` — a third adapter sibling to claude/opencode (NO AI logic). Types the user's text in as keystrokes (`send-keys`) and streams the scraped pane back as ONE rolling message per command (generic capture → line-set-diff → `cleanOutput` → emit; no question/survey/sub-agent/tool-result/effort/MCP/resume machinery). Restart-safe: `listExistingTmuxSessions`/`adoptExistingTmuxSession` re-adopt a live `term-…` session at boot (current pane seeds the baseline, no flood). Does NOT extend `ClaudeCliAdapter` and leaves `outputsDeltas` falsy, so the Claude liveness loop never fires for it |
 
@@ -780,6 +780,10 @@ rather than typed into the agent.)
         (the prime suspect for *intermittent* loss — event-loop saturation);
       - `sendOk` but absent in `get_history` → spilled into / edited onto
         another message.
+    `editMessageText` trace records carry NO thread id — when auditing a
+    thread's sends never filter the trace by thread key alone (the edits vanish
+    from the filtered view; this produced a wrong "statuses were never sent"
+    diagnosis on 2026-07-02).
     Then diff the trace (what the bot DID) against `get_history` (what the user
     SEES). This beats reasoning from code or a homemade SSE listener — a stale
     code comment can lie (e.g. `question.asked` was once documented as carrying

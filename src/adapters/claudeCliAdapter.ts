@@ -1029,18 +1029,27 @@ export interface ClaudeSurvey {
 }
 
 /**
- * @description The EXACT survey header, matched ANCHORED start-to-end of a line
- * (after an optional leading `● ` assistant bullet), NEVER as a substring.
+ * @description The KNOWN survey header texts — a CLOSED alternation (a future
+ * rewording becomes variant #3 here), matched ANCHORED start-to-end of a line
+ * (after an optional leading `●`/`⏺` assistant bullet, before an optional
+ * trailing ` (optional)`), NEVER as a substring. The matched header text is
+ * captured (group 1) and feeds the survey's `header` + `signature`, so two
+ * variants never share a signature.
  *
  * WHY anchored, not substring: an earlier substring matcher false-fired on a
  * user message that merely QUOTED the survey text in prose — it spammed the
  * live topic with bogus surveys + duplicates. The header MUST be the WHOLE
- * line (optionally suffixed by ` (optional)`), so a header embedded mid-sentence
- * can never match.
+ * line, so a header embedded mid-sentence can never match. Do NOT loosen this
+ * to an open-ended `How .* Claude` prose pattern.
+ *
+ * WHY an alternation: Claude Code ≥2.1.19x reworded the survey ("How well is
+ * Claude following the instructions…") — the old exact-header match never
+ * fired, the undetected survey sat on the pane and SWALLOWED the Enter of the
+ * next forwarded prompt: the text stranded unsubmitted in the TUI input box
+ * and the topic looked hung for hours (live 2026-07-02, topic 39933).
  */
-const CLAUDE_SURVEY_HEADER_TEXT = 'How is Claude doing this session?';
 const CLAUDE_SURVEY_HEADER_REGEX =
-  /^\s*[●⏺]?\s*How is Claude doing this session\?(\s*\(optional\))?\s*$/;
+  /^\s*[●⏺]?\s*(How is Claude doing this session\?|How well is Claude following the instructions you gave earlier in this conversation\?)(\s*\(optional\))?\s*$/;
 /**
  * The inline option row: `N: Label  N: Label …` — every token is
  * `digit: word`, ≥2 of them, and the WHOLE line is option tokens (anchored),
@@ -1069,7 +1078,8 @@ const CLAUDE_SURVEY_MIN_OPTIONS = 2;
 export function extractClaudeSurvey(text: string): ClaudeSurvey | null {
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
-    if (!CLAUDE_SURVEY_HEADER_REGEX.test(lines[i])) continue;
+    const headerMatch = CLAUDE_SURVEY_HEADER_REGEX.exec(lines[i]);
+    if (!headerMatch) continue;
 
     // The option row is the IMMEDIATELY-following non-empty line — skip only
     // blank lines, never prose. If the next content line isn't an option row,
@@ -1085,10 +1095,11 @@ export function extractClaudeSurvey(text: string): ClaudeSurvey | null {
     }
     if (options.length < CLAUDE_SURVEY_MIN_OPTIONS) return null;
 
-    const signature = `${CLAUDE_SURVEY_HEADER_TEXT}::${options
+    const header = headerMatch[1];
+    const signature = `${header}::${options
       .map(option => `${option.digit}:${option.label}`)
       .join('|')}`;
-    return { header: CLAUDE_SURVEY_HEADER_TEXT, options, signature };
+    return { header, options, signature };
   }
   return null;
 }
@@ -4263,10 +4274,12 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
           }
 
           // S4: AUTO-DISMISS the native Claude session-feedback survey (the
-          // periodic "How is Claude doing this session?" bare-digit prompt). It
-          // lands on the pane mid-turn, occupies the input box and disrupts the
-          // scrape (it contributed to the "status never appeared" hang, live
-          // 2026-06-29). Never surface it to the topic — send a one-shot Escape
+          // periodic bare-digit prompt — either known header wording, see
+          // CLAUDE_SURVEY_HEADER_REGEX). It lands on the pane mid-turn,
+          // occupies the input box and disrupts the scrape (it contributed to
+          // the "status never appeared" hang, live 2026-06-29; an UNDETECTED
+          // wording swallowed the next prompt's Enter and hung the topic, live
+          // 2026-07-02). Never surface it to the topic — send a one-shot Escape
           // to clear it. The signature (header + option digits/labels, no
           // volatile chrome) is stable across the survey's per-poll repaints, so
           // we dismiss ONCE per appearance; cleared when it leaves the pane so a

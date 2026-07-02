@@ -7,6 +7,10 @@
  *   ● How is Claude doing this session? (optional)
  *     1: Bad    2: Fine   3: Good   0: Dismiss
  *
+ * Claude Code ≥2.1.19x reworded the header ("How well is Claude following the
+ * instructions you gave earlier in this conversation?"); the detector accepts
+ * BOTH known wordings as a closed alternation (see the new-wording section).
+ *
  * The detector must be AIRTIGHT: it matches ONLY a standalone header line
  * (anchored start-to-end, optional `● ` bullet) immediately followed by an
  * inline option row. A previous SUBSTRING matcher false-fired on a user
@@ -106,6 +110,81 @@ test('a real AskUserQuestion box is NOT detected as a survey', () => {
 test('a single-option row is not enough (needs ≥2)', () => {
   const oneOption = ['How is Claude doing this session?', '1: Bad'].join('\n');
   assert.equal(extractClaudeSurvey(oneOption), null);
+});
+
+// ── The NEW survey wording (Claude Code ≥2.1.19x) ──
+// Captured live (2026-07-02, topic 39933): same shape, reworded header. While
+// UNDETECTED the survey sat on the pane and swallowed the Enter of the next
+// forwarded prompt — the text stranded unsubmitted in the TUI input box and the
+// topic looked hung for hours. The detector accepts a CLOSED alternation of the
+// known header texts (never an open-ended prose pattern).
+const capturedNewWordingFrame = [
+  '● How well is Claude following the instructions you gave earlier in this conversation? (optional)',
+  '  1: Bad    2: Fine   3: Good   0: Dismiss',
+].join('\n');
+
+test('detects the NEW survey wording (live 2026-07-02) → dismissed', () => {
+  assert.equal(checkIsClaudeSurvey(capturedNewWordingFrame), true);
+  const survey = extractClaudeSurvey(capturedNewWordingFrame)!;
+  assert.ok(survey);
+  assert.equal(
+    survey.header,
+    'How well is Claude following the instructions you gave earlier in this conversation?',
+  );
+  assert.deepEqual(survey.options, [
+    { digit: '1', label: 'Bad' },
+    { digit: '2', label: 'Fine' },
+    { digit: '3', label: 'Good' },
+    { digit: '0', label: 'Dismiss' },
+  ]);
+  // A freshly-appeared new-wording survey must trigger the auto-dismiss.
+  assert.equal(checkShouldDismissSurvey(survey.signature, ''), true);
+});
+
+test('the OLD header is still detected alongside the new one, with a DISTINCT signature', () => {
+  const oldVariant = extractClaudeSurvey(capturedSurveyFrame)!;
+  const newVariant = extractClaudeSurvey(capturedNewWordingFrame)!;
+  assert.ok(oldVariant);
+  assert.ok(newVariant);
+  // The signature carries the matched header text, so the two wordings can
+  // never de-dup against each other.
+  assert.notEqual(oldVariant.signature, newVariant.signature);
+});
+
+test('the NEW header text quoted mid-prose (not a whole line, no option row) is NOT a survey', () => {
+  const prose = [
+    'The bot auto-dismisses "How well is Claude following the instructions you gave earlier in this conversation?" so',
+    'the user never sees it in the topic.',
+  ].join('\n');
+  assert.equal(checkIsClaudeSurvey(prose), false);
+  assert.equal(extractClaudeSurvey(prose), null);
+});
+
+// The anchor as the SOLE rejecting factor: a valid option row follows, so only
+// the whole-line anchor stands between a mid-prose quote and a bogus survey. A
+// regression to substring header matching would fail HERE even though the
+// two-factor (header + option row) check passes.
+test('the NEW header quoted mid-prose WITH a valid option row below is still NOT a survey', () => {
+  const proseWithRow = [
+    'The bot auto-dismisses "How well is Claude following the instructions you gave earlier in this conversation?" like so:',
+    '  1: Bad    2: Fine',
+  ].join('\n');
+  assert.equal(extractClaudeSurvey(proseWithRow), null);
+});
+
+test('the option row ALONE with no header line is NOT a survey', () => {
+  const rowOnly = [
+    'Some ordinary agent output.',
+    '  1: Bad    2: Fine   3: Good   0: Dismiss',
+  ].join('\n');
+  assert.equal(extractClaudeSurvey(rowOnly), null);
+});
+
+test('stripSurveyChromeLines removes the NEW wording header + option row too', () => {
+  const stripped = stripSurveyChromeLines(capturedNewWordingFrame);
+  assert.equal(stripped.includes('How well is Claude following'), false);
+  assert.equal(stripped.includes('1: Bad'), false);
+  assert.equal(stripped.trim(), '');
 });
 
 // ── De-dup: same survey across polls → ONE emit; a different survey re-emits ──

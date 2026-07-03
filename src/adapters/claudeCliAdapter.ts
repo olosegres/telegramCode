@@ -22,7 +22,7 @@ import type {
   ThreadKey,
 } from '../types';
 import { keyToString } from '../types';
-import { classifyAgentApiError, authErrorPhrasesRe } from '../apiErrorRetry';
+import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
@@ -2619,6 +2619,15 @@ const CLAUDE_BYPASS_ACCEPT_RE = /Yes,?\s*I\s*accept/i;
 const CLAUDE_API_ERROR_START_RE = /^\s*API Error:/;
 /** The `API Error:` substring, for a `⎿` result row that carries it (case (b)). */
 const CLAUDE_API_ERROR_SUBSTR_RE = /API Error:/;
+/**
+ * @description A `⎿` result row whose content LEADS with an auth phrase — Claude's
+ * canonical logged-out render (`⎿  Not logged in · Please run /login`,
+ * `⎿  Please run /login · API Error: 401 …`). The phrase is anchored right after
+ * the `⎿` marker (case (c)) — see the false-positive note on
+ * {@link getClaudeAgentErrorLine}.
+ */
+const CLAUDE_AUTH_ROW_RE =
+  /^\s*⎿\s*(?:not logged in|please run \/login|invalid authentication credentials)\b/i;
 
 /**
  * @description Find the ONE line in a scraped pane that is a terminal
@@ -2629,23 +2638,23 @@ const CLAUDE_API_ERROR_SUBSTR_RE = /API Error:/;
  *   b) a `⎿` result row that also contains `API Error:`
  *      (`⎿  overloaded · API Error: 429` — the render the old start-anchored gate
  *      MISSED, which is why a `⎿`-prefixed rate-limit never auto-retried).
- *   c) a `⎿` result row carrying an auth phrase
+ *   c) a `⎿` result row whose content LEADS with an auth phrase
  *      (`⎿  Not logged in · Please run /login` — the logged-out render).
- * The `⎿`-marker / `API Error:`-line-start requirement is the FALSE-POSITIVE
- * GUARD: the agent's own answer prose never starts a line with the `⎿` TUI glyph
- * nor with `API Error:`, so quoting "not logged in" mid-sentence can't fire it.
- * The returned line is fed VERBATIM to {@link classifyAgentApiError}. Exported for
- * unit testing without a live tmux pane.
+ * FALSE-POSITIVE GUARD: prose never starts a line with the `⎿` glyph nor with
+ * `API Error:`. But TOOL results (Bash/Read/Grep output) ARE rendered by the TUI
+ * under a `⎿` marker, so a result row that QUOTES an auth phrase deeper in the
+ * line (the agent grepping the bot's own logs/source, or a `gh`/`npm` "not
+ * logged in" line) would fire case (c) if we matched the phrase anywhere. So (c)
+ * anchors the phrase to the row START — a real logged-out row leads with it; a
+ * quote embeds it after other text (live 2026-07-03, topic 434). The returned
+ * line is fed VERBATIM to {@link classifyAgentApiError}. Exported for unit
+ * testing without a live tmux pane.
  */
 export function getClaudeAgentErrorLine(content: string): string | null {
   for (const line of content.split('\n')) {
     if (CLAUDE_API_ERROR_START_RE.test(line)) return line;
-    if (
-      TOOL_RESULT_MARKER_RE.test(line) &&
-      (CLAUDE_API_ERROR_SUBSTR_RE.test(line) || authErrorPhrasesRe.test(line))
-    ) {
-      return line;
-    }
+    if (CLAUDE_AUTH_ROW_RE.test(line)) return line;
+    if (TOOL_RESULT_MARKER_RE.test(line) && CLAUDE_API_ERROR_SUBSTR_RE.test(line)) return line;
   }
   return null;
 }
@@ -4552,9 +4561,9 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * ({@link getClaudeAgentErrorLine}: `API Error: …`, `⎿ … · API Error: …`, or
    * `⎿ … Please run /login`): when it first classifies, emit one `apiError`
    * event — the trigger for the auto-retry (transient / usageLimit) OR the
-   * surfaced logged-out notice (auth). Detection lives here — at the proxy
-   * boundary on the recognized line only — never by scanning arbitrary
-   * conversation text.
+   * surfaced logged-out notice (auth). Detection scans the NEW pane delta only
+   * (never the full pane / arbitrary conversation text), so a recognized error
+   * row fires exactly once — when it first renders.
    *
    * A large new chunk (`newPart.length > 50`) means real conversation moved on,
    * so the one-shot `handled*` guards are reset to re-arm for a later prompt.
@@ -4567,7 +4576,18 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     }
 
     if (!session.handledApiError) {
-      const apiErrorLine = getClaudeAgentErrorLine(content);
+      // Scan the NEW delta, NOT the full pane: a logged-out `⎿ … /login` (or
+      // `API Error:`) row lingers in the scrollback long after the user re-logs
+      // in, and the guard above re-arms on any >50-char redraw during the login
+      // flow — scanning `content` re-fired `apiError('auth')` on every poll, so
+      // the recovery clear (first real output) and this re-fire oscillated:
+      // re-pinning "logged out, run /login" AFTER a successful login and burying
+      // the real answer (live 2026-07-03, topic 434). The line-SET pane diff
+      // (getNewPaneContent) puts the row in `newPart` only on its FIRST
+      // appearance → one fire per genuine logout episode. The resume-seed caller
+      // passes the full pane AS newPart, so an adopted logged-out session still
+      // surfaces once.
+      const apiErrorLine = getClaudeAgentErrorLine(newPart);
       if (apiErrorLine) {
         const apiError: AgentApiErrorClass | null = classifyAgentApiError(apiErrorLine, Date.now());
         if (apiError) {

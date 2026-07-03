@@ -287,11 +287,21 @@ config/variants, not a per-message API field).
   Detection is at the **adapter boundary** via the `apiError` event: OpenCode
   classifies in `handleSessionError` (`session.error`, structural); Claude runs
   the scraped pane through `getClaudeAgentErrorLine` — a line STARTING with
-  `API Error:`, OR a `⎿` result row that contains `API Error:` or a logged-out
-  phrase (`not logged in` / `please run /login` / `invalid authentication
-  credentials`); the `⎿`/line-start anchor is the false-positive guard so the
-  agent's OWN prose quoting those never fires — then `classifyAgentApiError`,
-  behind a one-shot guard. Classes (markers verified against the `claude.exe`
+  `API Error:`, OR a `⎿` result row that contains `API Error:`, OR a `⎿` result
+  row whose content LEADS with a logged-out phrase (`not logged in` / `please run
+  /login` / `invalid authentication credentials`) — then `classifyAgentApiError`,
+  behind a one-shot guard. **Two false-positive guards (both live 2026-07-03,
+  topic 434):** (1) detection scans the NEW pane delta only, never the full pane
+  — a stale `⎿ … /login` row lingers in the scrollback long after re-login, and
+  the guard re-arms on redraws, so a full-pane scan re-fired every poll and
+  oscillated against the recovery-clear, re-pinning "logged out" AFTER a
+  successful login; the line-SET diff puts the row in the delta only on its FIRST
+  render → one fire per logout episode. (2) the auth phrase must LEAD the `⎿` row
+  (Claude's `⎿ Not logged in · …` format), because TOOL results (Bash/Read/Grep)
+  are ALSO rendered under `⎿` — a result row that merely QUOTES the phrase deeper
+  in the line (the agent grepping the bot's own logs, a `gh`/`npm` "not logged
+  in") would otherwise fire; a real logged-out row leads with it, a quote embeds
+  it after other text. Classes (markers verified against the `claude.exe`
   string table): *transient* (rate-limit / overloaded / 429·503·529) → retry
   +5/10/20 min, 3 tries; *usageLimit* (usage-limit reached / credit-balance too
   low) → +60 min re-armed each repeat up to 6× (or a parsed reset time, rare);

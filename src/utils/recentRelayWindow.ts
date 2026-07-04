@@ -28,6 +28,7 @@
  */
 
 import { DIFF_CHANGE_GUTTER_RE } from './claudeScrapeShapes';
+import { spinnerGlyphClass } from '../progressLine';
 
 /**
  * @description Minimum NORMALIZED line length for the window to record or
@@ -73,18 +74,28 @@ export const relayWindowMaxLines = 1500;
 export const relayBlockSignatureMax = 200;
 
 /**
- * @description Normalise a pane line for line-identity comparison: trim, drop
- * a leading status/tool glyph so a tool header matches regardless of which
- * `●/⏺/○/⏳/✓` state it was last rendered in (`⏺` U+23FA is the real
- * assistant-output bullet in Claude v2.1.177).
+ * @description Leading-glyph strip for line-identity comparison: the ANIMATED
+ * spinner/tick set (shared {@link spinnerGlyphClass}, so it never drifts from
+ * `PROGRESS_LINE_RE`) PLUS the bullet/tool STATE glyphs `⏺ ⏳ ✓` (`⏺` U+23FA is
+ * the real assistant-output bullet in Claude v2.1.177). The animated glyphs
+ * (`✻ ✽ ✶ ✢ · *`) rotate every frame, so without stripping them a stable line
+ * re-animated to another frame (`✻X` vs `✽X`) looks NEW to the diff and re-emits;
+ * the state glyphs let a tool header match regardless of its `⏳`/`✓` state.
+ */
+const LEADING_COMPARISON_GLYPH_RE = new RegExp(`^[${spinnerGlyphClass}⏺⏳✓]\\s*`);
+
+/**
+ * @description Normalise a pane line for line-identity comparison: trim, then
+ * drop a single leading spinner/state glyph ({@link LEADING_COMPARISON_GLYPH_RE}).
  *
  * Single source of truth for BOTH dedup layers — the per-poll set diff
  * (`getNewPaneContent`) and this relay window — which MUST share one
  * normalization domain: the window stores the same normalized forms the pane
  * diff compares, otherwise a redraw would slip past one layer or the other.
+ * Comparison-ONLY: this shapes equality/dedup keys, never the text emitted.
  */
 export function normalizeForComparison(line: string): string {
-  return line.trim().replace(/^[●○⏺⏳✓]\s*/, '');
+  return line.trim().replace(LEADING_COMPARISON_GLYPH_RE, '');
 }
 
 /**

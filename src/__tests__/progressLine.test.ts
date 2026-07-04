@@ -18,7 +18,20 @@
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { PROGRESS_LINE_RE, checkIsProgressChunk } from '../progressLine';
+import { PROGRESS_LINE_RE, checkIsProgressChunk, spinnerGlyphClass } from '../progressLine';
+
+// ─── S1 drift-lock: the shared spinner glyph class is the SAME one PROGRESS_LINE_RE uses ──
+
+test('spinnerGlyphClass is the exact glyph class PROGRESS_LINE_RE anchors on (no drift with normalizeForComparison)', () => {
+  // `normalizeForComparison` (utils/recentRelayWindow) builds its leading-glyph
+  // strip from `spinnerGlyphClass`. If someone edits PROGRESS_LINE_RE's class
+  // without updating the constant (or vice versa), the two dedup domains drift and
+  // a re-animated line leaks again — this lock fails loudly instead.
+  assert.ok(
+    PROGRESS_LINE_RE.source.includes(`[${spinnerGlyphClass}]`),
+    `PROGRESS_LINE_RE must anchor on [${spinnerGlyphClass}]; got ${PROGRESS_LINE_RE.source}`,
+  );
+});
 
 // ─── Positive: must be classified as progress ──────────────────────────
 

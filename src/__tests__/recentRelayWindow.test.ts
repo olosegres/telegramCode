@@ -69,6 +69,28 @@ test('window: lookup matches across markdown/wrapping re-renders (the 2026-06-15
   );
 });
 
+test('normalizeForComparison: a leading ANIMATED spinner glyph is stripped so re-animation dedups (S1)', () => {
+  // The live flood 2026-07-04: a stable line re-painted with a different spinner
+  // frame (`✻`→`✽`→`·`) looked NEW to the line-SET diff and re-emitted per frame.
+  // Every animation glyph must normalize to the SAME key so the diff sees it as
+  // unchanged. The full set: ✻ ✽ ✶ ✢ · * plus the ● ○ bullet states.
+  const body = 'Reticulating splines across the manifold';
+  const glyphVariants = ['✻', '✽', '✶', '✢', '·', '*', '●', '○'].map(g => `${g} ${body}`);
+  const normalized = glyphVariants.map(normalizeForComparison);
+  for (const n of normalized) assert.equal(n, body, 'every spinner glyph must strip to the same key');
+  // And the bullet/tool STATE glyphs still normalize together (⏺/⏳/✓).
+  assert.equal(normalizeForComparison('⏺ Read(x)'), normalizeForComparison('✓ Read(x)'));
+  assert.equal(normalizeForComparison('⏳ Read(x)'), normalizeForComparison('✓ Read(x)'));
+});
+
+test('normalizeForComparison: prose without a leading glyph is unchanged (comparison-only, never eats content)', () => {
+  // The nuance guard: only a LEADING glyph is stripped, and only for the equality
+  // key — real prose (even prose that merely contains a glyph mid-line) is intact.
+  assert.equal(normalizeForComparison('The quick brown fox'), 'The quick brown fox');
+  assert.equal(normalizeForComparison('a · b · c mid-line dots'), 'a · b · c mid-line dots');
+  assert.equal(normalizeForComparison('  indented prose  '), 'indented prose');
+});
+
 test('window: short lines are never recorded and never suppressed', () => {
   const relayWindow = createRecentRelayWindow();
   const shortLine = 'yes, done';

@@ -57,6 +57,17 @@
  */
 
 /**
+ * @description The animated spinner / bullet glyph set Claude's TUI rotates
+ * through at the head of a progress line (`✻ ✽ ✶ ✢ · *`) plus the `● ○` bullet
+ * states. THE single source of the class used by {@link PROGRESS_LINE_RE} below
+ * AND by `normalizeForComparison` (utils/recentRelayWindow), so the line-SET
+ * diff dedups a re-animating-but-stable line and the progress detector accept
+ * the SAME glyph set — the two must never drift. A drift-lock test asserts
+ * `PROGRESS_LINE_RE.source` still carries exactly `[${spinnerGlyphClass}]`.
+ */
+export const spinnerGlyphClass = '✻✽✶✢·*●○';
+
+/**
  * @description Single-line regex for one Claude-CLI progress tick.
  *
  * Structure (each group commented):

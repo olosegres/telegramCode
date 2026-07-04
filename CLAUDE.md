@@ -4,6 +4,9 @@
 > the **project map**: read it first to understand what the code does before
 > changing it.
 
+> **Terminology:** when the user says "чат"/"chat" they mean a **topic** (forum
+> thread), NOT the whole supergroup. Read every such request as per-topic.
+
 ## What this project is
 
 A Telegram **forum-supergroup bot that proxies user commands and messages to

@@ -42,6 +42,7 @@ import {
   DIFF_CHANGE_GUTTER_RE,
   TRANSIENT_TICK_RE,
   checkIsClaudeChromeLine,
+  checkIsBareSpinnerActivityLine,
   type ToolResultKind,
 } from '../utils/claudeScrapeShapes';
 import { checkIsProgressChunk } from '../progressLine';
@@ -1899,6 +1900,12 @@ export function stripTuiElementsWithContext(
     // poll diff (msg 1853, 1855, 1863 in the debug session).
     if (SPINNER_TICK_RE.test(line)) continue;
     if (POST_THINKING_TRAILER_RE.test(line.trim())) continue;
+    // S2 (render-flood 2026-07-04): a leading star-burst activity title with NO
+    // stats anchor (`✻ Herding cats`) is transient spinner chrome the
+    // stats-requiring SPINNER_TICK_RE above misses — drop it so it never ships
+    // as answer content. Both relay paths (fast + verbosity-routed) funnel
+    // through here, so this one drop covers them.
+    if (checkIsBareSpinnerActivityLine(line)) continue;
 
     const trimmedLine = line.trim();
     const isToolCall = /^[●○⏺]?\s*(Bash|Read|Write|Edit|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch)\s*\(/i.test(trimmedLine);

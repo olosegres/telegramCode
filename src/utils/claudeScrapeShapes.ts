@@ -118,6 +118,30 @@ export const THINKING_HEADER_RE =
   /^\s*[●○⏺✻✽✶✢·*]?\s*Thinking for\s+\*?(?:\d+h\s+)?(?:\d+m\s+)?\d+s\*?…/;
 
 /**
+ * @description A leading star-burst spinner-glyph line (`✻ ✽ ✶ ✢`) carrying an
+ * activity TITLE that ends in the `…` ellipsis but has NO `(elapsed · tokens)`
+ * stats anchor — e.g. `✻ Herding cats…` right after a turn starts, before the
+ * timer shows. {@link SPINNER_TICK_RE} requires the trailing `(…)` stats, so
+ * these bare-title frames slip past it and, being neither chrome nor a tool
+ * line, classify as PROSE and ship as answer content (live flood 2026-07-04,
+ * alongside the table). They are transient TUI activity, never content → drop.
+ *
+ * Two deliberate narrowings keep this from eating real text:
+ *  - the trailing `…` is REQUIRED — Claude's spinner activity always ends in the
+ *    ellipsis, so a `✻ <word> for 4 people` / `✻ Ready for input` prose look-alike
+ *    (no ellipsis) is preserved (see cleanOutput.test.ts), and a
+ *    {@link POST_THINKING_TRAILER_RE} `✻ Cooked for 27s` trailer is left to its
+ *    own filter;
+ *  - only the FOUR star-burst glyphs — exclusively TUI animation frames that
+ *    never lead prose. `·`/`*` are excluded (they lead `· item` / `* item`
+ *    markdown bullets), as is a {@link THINKING_HEADER_RE} `Thinking for Ns…`
+ *    header (kept verbatim under `/thinking full`).
+ */
+export function checkIsBareSpinnerActivityLine(line: string): boolean {
+  return /^\s*[✻✽✶✢]\s+\S.*…\s*$/.test(line) && !THINKING_HEADER_RE.test(line);
+}
+
+/**
  * @description Code-producing tool headers whose `⎿` result is code / diff /
  * command output and should render as a monospaced Telegram code block. Two
  * classes, differing in what the `⎿` line itself holds:

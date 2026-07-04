@@ -38,6 +38,39 @@ function checkIsInsideFence(text: string, line: string): boolean {
   return false;
 }
 
+// ─── S2 — bare spinner-activity title (no stats anchor) is dropped ──────
+
+test('stripTuiElements: a leading star-burst activity title (…) with NO stats anchor is dropped (S2)', () => {
+  // `✻ Herding cats…` (no `(Ns · tokens)` tail) slipped past SPINNER_TICK_RE and
+  // shipped as content in the 2026-07-04 flood. It must be dropped, while the
+  // real answer prose around it survives.
+  const input = ['Here is the plan:', '✻ Herding cats…', 'Step one is to look.'].join('\n');
+  assert.equal(stripTuiElements(input), ['Here is the plan:', 'Step one is to look.'].join('\n'));
+  for (const glyph of ['✻', '✽', '✶', '✢']) {
+    assert.equal(stripTuiElements(`${glyph} Reticulating…`), '', `${glyph}-led bare title must drop`);
+  }
+});
+
+test('stripTuiElements: a star-burst prose look-alike with NO ellipsis is KEPT (S2 requires the …)', () => {
+  // The narrowing that preserves cleanOutput.test.ts's look-alikes: a `✻`-led
+  // line WITHOUT the trailing … is not a spinner activity title, so it survives.
+  assert.equal(stripTuiElements('✻ Ready for input'), '✻ Ready for input');
+  assert.equal(stripTuiElements('✻ Cooking for 4 people'), '✻ Cooking for 4 people');
+});
+
+test('stripTuiElements: a `Thinking for Ns…` header is NOT dropped by the S2 spinner filter', () => {
+  // The one structured line that also leads with a star-burst glyph must survive
+  // (it is kept verbatim under `/thinking full`); S2 explicitly excludes it.
+  assert.equal(stripTuiElements('✻ Thinking for *5s*…'), '✻ Thinking for *5s*…');
+});
+
+test('stripTuiElements: a `· item…` / `* item…` markdown bullet is NEVER treated as a spinner title (S2)', () => {
+  // `·`/`*` legitimately lead markdown bullets — S2 must leave them alone even
+  // when they end in an ellipsis.
+  assert.equal(stripTuiElements('* first bullet point…'), '* first bullet point…');
+  assert.equal(stripTuiElements('· a middle-dot list item…'), '· a middle-dot list item…');
+});
+
 // ─── B3 — (ctrl+o …) strip ─────────────────────────────────────────────
 
 test('stripTuiElements: drops "(ctrl+o to expand)", keeps the prefix', () => {

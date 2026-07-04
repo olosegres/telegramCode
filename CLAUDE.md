@@ -138,10 +138,14 @@ config/variants, not a per-message API field).
   The sole "agent is working" cue is the native typing indicator (`startTypingLoader`
   re-fires `sendChatAction('typing')` every `typingLoaderRefreshMs`; it REPLACED
   the old `⏳` placeholder message). It runs at every wait point — a self-greeting
-  agent's boot AND every prompt forward — and is cleared ONLY by a real event
-  (first output via `handleAgentOutput`, a status/question frame, or session
-  teardown / start-fail via `stopTypingLoader`); there is NO timeout, so a
-  long-thinking agent keeps showing it. An adapter that prints its own greeting
+  agent's boot AND every prompt forward. It is a PERSISTENT working state (S3):
+  each tick keeps firing while `checkShouldKeepTyping` holds — output mid-flight
+  (`checkIsOutputStreaming`) OR the adapter is busy (`checkIsBusy`) — and
+  SELF-STOPS only when the topic is truly drained + idle (pure rule in
+  `utils/typingActive.ts`). It is NOT cleared on the first output or a status
+  frame any more (that made the topic look idle mid-answer); hard teardown paths
+  (session end / question UI / unbind / start-fail) still call `stopTypingLoader`.
+  There is NO timeout, so a long-thinking agent keeps showing it. An adapter that prints its own greeting
   declares `selfGreetsOnStart` (Claude's TUI banner) — then `startAgentSession`
   suppresses the bot's `agent.ready` notice (returns `''` via `getStartReadyMessage`)
   and keeps the loader up until that banner lands. OpenCode/terminal don't
@@ -158,28 +162,29 @@ config/variants, not a per-message API field).
   message — the old edit-in-place for fresh outputs silently replaced interim
   texts (live bug 2026-06-05). Claude's adapter never marks continuations, so
   its flushes stay one-message-each.
-- **Relay resilience under sustained 429 — never SILENTLY drop, always land the
-  final answer** (plan `agent/tasks/actual/2026-06-23-relay-429-resilience-no-drop-final-flush.md`).
-  The rate limiter never drops (delays, or throws `RateLimitedError` on a
-  double-429) — the keep/drop decision is in `replyToThread`. (S1) A recoverable
-  send (interactive reply, OR the agent's FINAL answer marked `isImportant`)
-  that double-429s is redelivered on a BOUNDED schedule (`decideRedelivery` in
-  `redeliverDecision.ts`: up to `maxRedeliveryAttempts`=4 passes, each waiting
-  the LIVE `getRateLimitRemainingMs`+slack, clamped), and on exhaustion posts ONE
-  deduped degraded notice (`send.degradedUnderLoad`) instead of the old silent
-  `console.error`. Intermediate output / status stay disposable (the
-  `pendingIsFinal` sticky flag threads final-answer eligibility through the output
-  queue → `sendOutputImmediate` → `replyChunkWithFallback` → `replyToThread`).
-  (S2) The group transport's `finalizeInFlight` is now a REAL reconcile
-  (`finalizeGroupOutput` + pure `utils/groupFinalizePlan.ts`): on every
-  settle/teardown it drains the coalesced-but-unsent buffer to a permanent
-  message via the S1 path (mark important) BEFORE `clearThreadOutputQueues`
-  discards it — idempotent, exactly-once (a fully-delivered turn is a no-op),
-  per-key in `both` so DM finalizes its draft and group its buffer (no
-  double-finalize). (S3) While in a 429 cooldown the output debounce
-  (`utils/outputFlushTiming.ts`) scales to the LIVE remaining cooldown
-  (`max(normal, 5s floor, remainingCooldownMs)`) so a long cooldown coalesces into
-  one larger edit instead of a backlog of tiny ones; `isFinal` still flushes now.
+- **Send pacing & ordering — global 1/2s FCFS gate, 3s debounce, backlog glue**
+  (plan `agent/tasks/actual/2026-07-04-send-limits-ordering-global-pacer.md`).
+  With two topics streaming at once the bot used to overrun Telegram's per-chat
+  budget → a sustained 429 storm. Now ONE process-wide `GlobalSendPacer`
+  (`rateLimiter.ts`) releases at most one send every `globalSendIntervalMs`=2s
+  across ALL chats (supergroup + owner DM), FCFS — CLOCK-BASED and non-blocking,
+  so a slow/stuck send never head-of-line-blocks others (it replaced the per-chat
+  priority `TokenBucket`; `enqueueSend` no longer takes a priority — pure FCFS
+  temporal order, no class jumps the line). Each topic coalesces its own stream
+  at a 3s output debounce (`OUTPUT_DEBOUNCE_MS`, up from 1s; `isFinal` still
+  flushes now). When a topic BACKS UP (≥3 messages queued) the flush GLUES the
+  backlog into the fewest `\n\n`-joined messages (pure `utils/outputBacklogGlue.ts`,
+  wired at `sendOutputImmediate` fresh-path + `sendAgentChunks`) so a burst drains
+  in one send. The old bounded post-cooldown REDELIVERY + `send.degradedUnderLoad`
+  notice are RETIRED — at 1/2s a 429 is essentially impossible, and the late
+  re-send was the OUT-OF-ORDER cause the user reported; `withRateLimitRetry`'s
+  single retry-after wait stays the floor, a rare double-429 just logs. The group
+  transport's `finalizeInFlight` still drains the coalesced-but-unsent buffer to a
+  permanent message on settle/teardown (`finalizeGroupOutput` + pure
+  `utils/groupFinalizePlan.ts`, idempotent, per-key in `both`) so the final
+  answer is never discarded. While in a 429 cooldown the output debounce
+  (`utils/outputFlushTiming.ts`) still scales to the LIVE remaining cooldown
+  (`max(normal, 5s floor, remainingCooldownMs)`) as a harmless safety net.
 - **Output transport seam (CHAT_MODE-selected).** HOW agent output reaches a topic
   is chosen ONCE at boot by `CHAT_MODE` via `createOutputTransport` (`src/output/`),
   mirroring the `AgentAdapter` factory — no per-call surface branch. **Group** =

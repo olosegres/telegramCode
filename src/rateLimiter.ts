@@ -41,15 +41,6 @@ import { formatRateLimit429Line, formatRateSummaryLine } from './utils/rateLimit
  */
 
 /**
- * @name SendPriority
- * @description Legacy priority class arg on {@link enqueueSend}. The global
- * pacer is pure FCFS now, so the value is INERT — kept only so the existing
- * call sites keep compiling until the end-to-end cleanup drops it. Do not add
- * new behaviour keyed on it.
- */
-export type SendPriority = 'interactive' | 'output' | 'status';
-
-/**
  * @description The global frequency gate: at most one send is released every
  * {@link globalSendIntervalMs} across ALL chats. Steady state ≈ 1 send / 2 s,
  * so Telegram's per-chat budget is never overrun under multi-topic streaming.
@@ -311,9 +302,7 @@ function logRateLimit429(chatId: number, err: TelegramErrorLike, isAfterRetry: b
       retryAfterSec: getRawRetryAfterSec(err),
       sentPerMin: sendRateTracker.getSendsPerMin(chatId),
       peak10s: sendRateTracker.getPeakInSubWindow(chatId),
-      // FCFS pacer has no priority classes — report the total parked count
-      // under `output` so the existing log shape keeps rendering the depth.
-      waitersByPriority: { interactive: 0, output: globalPacer.getPendingCount(), status: 0 },
+      queuedSends: globalPacer.getPendingCount(),
       isAfterRetry,
     });
     if (isAfterRetry) console.error(line);
@@ -391,9 +380,6 @@ export async function withRateLimitRetry<T>(
  * them — only the queue tail is swallowed so a single failure doesn't poison
  * every subsequent send on that thread).
  *
- * `priority` is INERT (the pacer is pure FCFS) — kept only so existing call
- * sites keep compiling until the end-to-end cleanup drops it.
- *
  * @example
  *   await enqueueSend(key, () =>
  *     bot.telegram.sendMessage(key.chatId, text, { message_thread_id: key.threadId }));
@@ -401,9 +387,6 @@ export async function withRateLimitRetry<T>(
 export async function enqueueSend<T>(
   key: ThreadKey,
   fn: () => Promise<T>,
-  // Inert — kept only so existing call sites compile until the S5 cleanup drops
-  // it. Underscore-prefixed so `noUnusedParameters` accepts the unused arg.
-  _priority: SendPriority = 'interactive',
 ): Promise<T> {
   const queueKey = keyToString(key);
   const prev = queues.get(queueKey);

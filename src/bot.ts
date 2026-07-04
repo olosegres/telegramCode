@@ -55,7 +55,6 @@ import {
   getRateLimitRemainingMs,
   getActiveChatRateSummaries,
   formatRateSummaryLine,
-  type SendPriority,
 } from './rateLimiter';
 import {
   stopOpenCodeServer,
@@ -1492,7 +1491,7 @@ function clearThinkingMessage(key: ThreadKey): void {
   if (s.thinkingMessageId === null) return;
   const id = s.thinkingMessageId;
   setThinkingFrameId(key, null);
-  deleteThreadMessage(key, id, 'status').catch(() => {});
+  deleteThreadMessage(key, id).catch(() => {});
 }
 
 /**
@@ -1846,7 +1845,6 @@ async function pinMessageQuiet(key: ThreadKey, messageId: number, options: { dis
   try {
     await enqueueSend(key, () =>
       bot.telegram.pinChatMessage(key.chatId, messageId, { disable_notification: options.disableNotification }),
-      'status',
     );
     return true;
   } catch (e) {
@@ -1864,7 +1862,6 @@ async function unpinMessageQuiet(key: ThreadKey, messageId: number): Promise<voi
   try {
     await enqueueSend(key, () =>
       bot.telegram.unpinChatMessage(key.chatId, messageId),
-      'status',
     );
   } catch (e) {
     console.warn(`[question-pin] unpin ${keyToString(key)} msg ${messageId} failed: ${describeSendError(e)}`);
@@ -1968,7 +1965,6 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
       try {
         await enqueueSend(key, () =>
           bot.telegram.editMessageText(key.chatId, existingId, undefined, text),
-          'status',
         );
         pinnedStatusTextCache.set(k, text);
         persistPinnedStatusText(key, text);
@@ -2005,7 +2001,6 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
           message_thread_id: key.threadId,
           disable_notification: true,
         }),
-        'status',
       );
       messageId = (sent as { message_id: number }).message_id;
     } catch (e) {
@@ -2018,7 +2013,6 @@ async function updatePinnedStatus(key: ThreadKey): Promise<void> {
         bot.telegram.pinChatMessage(key.chatId, messageId, {
           disable_notification: true,
         }),
-        'status',
       );
     } catch (e) {
       // Most common reason: bot is not admin or lacks `can_pin_messages`.
@@ -2071,7 +2065,6 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
     try {
       await enqueueSend(key, () =>
         bot.telegram.unpinChatMessage(key.chatId, existingId),
-        'status',
       );
     } catch (e) {
       console.warn(`[pinned] unpin ${k} failed: ${describeSendError(e)}`);
@@ -2079,7 +2072,6 @@ async function clearPinnedStatus(key: ThreadKey): Promise<void> {
     try {
       await enqueueSend(key, () =>
         bot.telegram.deleteMessage(key.chatId, existingId),
-        'status',
       );
     } catch {
       // Older than 48h or already deleted — silently ignored.
@@ -2200,7 +2192,6 @@ async function replyToThread(
   key: ThreadKey,
   text: string,
   extra: SendExtra = {},
-  priority: SendPriority = 'interactive',
 ): Promise<number | null> {
   const sendOnce = (sendExtra: Record<string, unknown>) =>
     enqueueSend(key, () =>
@@ -2209,7 +2200,6 @@ async function replyToThread(
         text,
         sendExtra as Parameters<typeof bot.telegram.sendMessage>[2],
       ),
-      priority,
     );
 
   try {
@@ -2268,7 +2258,6 @@ async function editThreadMessage(
   messageId: number,
   text: string,
   extra: SendExtra = {},
-  priority: SendPriority = 'interactive',
 ): Promise<boolean> {
   const editOnce = (editExtra: Record<string, unknown>) =>
     enqueueSend(key, () =>
@@ -2276,7 +2265,6 @@ async function editThreadMessage(
         key.chatId, messageId, undefined, text,
         editExtra as Parameters<typeof bot.telegram.editMessageText>[4],
       ),
-      priority,
     );
 
   try {
@@ -2320,10 +2308,9 @@ async function editThreadMessage(
 async function deleteThreadMessage(
   key: ThreadKey,
   messageId: number,
-  priority: SendPriority = 'interactive',
 ): Promise<void> {
   try {
-    await enqueueSend(key, () => bot.telegram.deleteMessage(key.chatId, messageId), priority);
+    await enqueueSend(key, () => bot.telegram.deleteMessage(key.chatId, messageId));
   } catch {
     /* messages older than 48h or already deleted — silently ignore */
   }
@@ -2671,7 +2658,7 @@ async function sendOutputImmediate(
   if (shouldEditFirstChunk) {
     const editedOk =
       chunks[0] === msgState.lastMessageText ||
-      (await editThreadMessage(key, msgState.lastMessageId!, renderAgentHtml(chunks[0]), { parse_mode: 'HTML' }, 'output'));
+      (await editThreadMessage(key, msgState.lastMessageId!, renderAgentHtml(chunks[0]), { parse_mode: 'HTML' }));
     if (editedOk) {
       msgState.lastMessageText = chunks[0];
       startIndex = 1;
@@ -2689,7 +2676,7 @@ async function sendOutputImmediate(
   // caller re-enqueues it for the next flush.
   let sentCount = startIndex;
   for (let i = startIndex; i < chunks.length; i++) {
-    const id = await replyChunkWithFallback(key, renderAgentHtml(chunks[i]), chunks[i], 'output');
+    const id = await replyChunkWithFallback(key, renderAgentHtml(chunks[i]), chunks[i]);
     if (!id) break;
     msgState.lastMessageId = id;
     msgState.lastMessageText = chunks[i];
@@ -2712,11 +2699,10 @@ async function replyChunkWithFallback(
   key: ThreadKey,
   renderedHtml: string,
   plainFallback: string,
-  priority: SendPriority = 'interactive',
 ): Promise<number | null> {
-  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' }, priority);
+  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' });
   if (id) return id;
-  return replyToThread(key, plainFallback, {}, priority);
+  return replyToThread(key, plainFallback, {});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2759,7 +2745,7 @@ async function sendAgentChunks(key: ThreadKey, chunks: string[]): Promise<void> 
   // burst (DM finalize / overflow-spill) lands in one send, not a trickle.
   const toSend = glueBacklogFrames(chunks, MAX_MESSAGE_LEN, (chunk) => renderAgentHtml(chunk).length);
   for (const chunk of toSend) {
-    const id = await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk, 'output');
+    const id = await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk);
     if (id) {
       msgState.lastMessageId = id;
       msgState.lastMessageText = chunk;
@@ -5847,7 +5833,7 @@ async function processVoiceJob(key: ThreadKey, fileId: string): Promise<void> {
     }
     const transcript = result.text;
     console.log(`[Bot] voice transcribed: "${transcript}"`);
-    void replyToThread(key, t('voice.transcribed', { text: transcript }), {}, 'status').catch(() => {});
+    void replyToThread(key, t('voice.transcribed', { text: transcript }), {}).catch(() => {});
 
     // Session is mid-startup → buffer the transcript and replay it once ready.
     if (startupPromptBuffer.checkIsStarting(keyToString(key))) {
@@ -6551,7 +6537,6 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
           () => bot.telegram.editMessageReplyMarkup(
             key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
           ),
-          'interactive',
         );
       } catch (e) {
         const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
@@ -6633,7 +6618,6 @@ async function handleDisplayModeCallback(
         () => bot.telegram.editMessageReplyMarkup(
           key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
         ),
-        'interactive',
       );
     } catch (e) {
       const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
@@ -6697,7 +6681,6 @@ bot.action(/^agent_(.+)$/, async (ctx) => {
           () => bot.telegram.editMessageReplyMarkup(
             key.chatId, cbMsg.message_id, undefined, keyboard.reply_markup,
           ),
-          'interactive',
         );
       } catch (e) {
         const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
@@ -6981,7 +6964,7 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
       // Land any in-flight content (DM draft / coalesced group output) ABOVE the
       // question first, mirroring the OpenCode question path's finalize.
       await getOutputTransport().finalizeInFlight(key);
-      const id = await replyChunkWithFallback(key, renderAgentHtml(output), output, 'interactive');
+      const id = await replyChunkWithFallback(key, renderAgentHtml(output), output);
       if (id !== null) void pinThreadQuestion(key, id);
     })();
     markNeedsNewMessage(key);
@@ -7232,7 +7215,7 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
   const storeOrDiscardCreatedFrame = async (createdId: number | null): Promise<boolean> => {
     if (createdId === null) return false;
     if (getStatusFrameStoreDecision(generationAtStart, msgState.statusFrameGeneration) === 'discard') {
-      await deleteThreadMessage(key, createdId, 'status');
+      await deleteThreadMessage(key, createdId);
       return false;
     }
     setStatusFrameId(key, createdId);
@@ -7245,7 +7228,7 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
       const editId = msgState.statusMessageId;
       const ok = await editThreadMessage(key, editId, firstRendered, {
         parse_mode: 'HTML',
-      }, 'status');
+      });
       // A delete that landed during the edit already nulled (or replaced) the id;
       // don't claim the frame as live — let the create path below re-evaluate.
       if (ok && msgState.statusMessageId === editId) {
@@ -7255,16 +7238,16 @@ async function sendStatusFrame(key: ThreadKey, status: string): Promise<boolean>
         // still points at the message we tried to edit — a concurrent delete may
         // already have moved it. Then create a replacement under the gen guard.
         if (msgState.statusMessageId === editId) setStatusFrameId(key, null);
-        const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
+        const id = await replyChunkWithFallback(key, firstRendered, chunks[0]);
         landed = await storeOrDiscardCreatedFrame(id);
       }
     } else {
-      const id = await replyChunkWithFallback(key, firstRendered, chunks[0], 'status');
+      const id = await replyChunkWithFallback(key, firstRendered, chunks[0]);
       landed = await storeOrDiscardCreatedFrame(id);
     }
     for (let i = 1; i < chunks.length; i++) {
       const rendered = renderAgentHtml(chunks[i]);
-      const id = await replyChunkWithFallback(key, rendered, chunks[i], 'status');
+      const id = await replyChunkWithFallback(key, rendered, chunks[i]);
       await storeOrDiscardCreatedFrame(id);
     }
   } catch (err) {
@@ -7418,7 +7401,7 @@ async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<
   try {
     if (msgState.thinkingMessageId !== null) {
       const editId = msgState.thinkingMessageId;
-      const ok = await editThreadMessage(key, editId, renderedHtml, { parse_mode: 'HTML' }, 'status');
+      const ok = await editThreadMessage(key, editId, renderedHtml, { parse_mode: 'HTML' });
       // A clear (session end / takeover) may have nulled the id mid-edit — only
       // treat the edit as live if the id still points at the message we edited.
       if (ok && msgState.thinkingMessageId === editId) return true;
@@ -7430,10 +7413,10 @@ async function sendThinkingFrame(key: ThreadKey, renderedHtml: string): Promise<
     // just-created message instead of resurrecting it as an orphan under a
     // "session ended" / question UI (the leftover-frame guard).
     const generationAtStart = msgState.thinkingFrameGeneration;
-    const id = await replyChunkWithFallback(key, renderedHtml, renderedHtml, 'status');
+    const id = await replyChunkWithFallback(key, renderedHtml, renderedHtml);
     if (id === null) return false;
     if (msgState.thinkingFrameGeneration !== generationAtStart) {
-      await deleteThreadMessage(key, id, 'status');
+      await deleteThreadMessage(key, id);
       return false;
     }
     setThinkingFrameId(key, id);
@@ -7489,7 +7472,7 @@ function handleAgentToolResult(key: ThreadKey, payload: ToolResultEvent): void {
 async function sendStandaloneAgentMessage(key: ThreadKey, text: string): Promise<void> {
   const chunks = splitMessage(text, undefined, chunk => renderAgentHtml(chunk).length);
   for (const chunk of chunks) {
-    await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk, 'output');
+    await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk);
   }
   // A standalone message is "other output" that landed below any pending
   // question — bring the question back to the bottom (debounced; no-op when
@@ -7743,7 +7726,6 @@ async function refreshSubagentStatus(key: ThreadKey): Promise<void> {
     state.subagentStatusMessageId,
     renderAgentHtml(text),
     { parse_mode: 'HTML' },
-    'status',
   );
 }
 
@@ -7786,7 +7768,7 @@ function clearSubagentStatus(key: ThreadKey): void {
   setSubagentFrameId(key, null);
   state.subagentStartedAt = null;
   state.subagentTitle = null;
-  if (id !== null) deleteThreadMessage(key, id, 'status').catch(() => {});
+  if (id !== null) deleteThreadMessage(key, id).catch(() => {});
 }
 
 /**
@@ -7824,12 +7806,12 @@ function handleSubagentStatus(key: ThreadKey, payload: SubagentStatusEvent): voi
         state.subagentStartedAt = Date.now();
         state.subagentTitle = payload.title;
         const text = buildSubagentElapsedText(state.subagentTitle, 0);
-        const id = await replyToThread(key, renderAgentHtml(text), { parse_mode: 'HTML' }, 'status');
+        const id = await replyToThread(key, renderAgentHtml(text), { parse_mode: 'HTML' });
         if (id === null) return;
         // A close (teardown) may have landed during the create — don't leave the
         // just-created message orphaned and untracked; remove it.
         if (state.subagentStartedAt === null) {
-          deleteThreadMessage(key, id, 'status').catch(() => {});
+          deleteThreadMessage(key, id).catch(() => {});
           return;
         }
         setSubagentFrameId(key, id);
@@ -8680,7 +8662,6 @@ function wireScheduler(): SchedulerMcpHandle {
           bot.telegram.pinChatMessage(key.chatId, messageId, {
             disable_notification: isSilent,
           }),
-        'interactive',
       );
     },
     checkBusy: (threadKeyStr) => {

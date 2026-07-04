@@ -9,15 +9,10 @@
  *   - `[RateLimit] rate` — the periodic per-chat outbound-rate summary.
  */
 
-import type { SendPriority } from '../rateLimiter';
-
-/** Order the priority breakdown is rendered in (highest-first, stable). */
-const priorityRenderOrder: readonly SendPriority[] = ['interactive', 'output', 'status'];
-
 /**
  * @description Snapshot of the outbound channel at the instant a 429 was
- * received, gathered from the send-rate tracker (rate) and the chat's token
- * bucket (queue depth + priority mix of waiters).
+ * received, gathered from the send-rate tracker (rate) and the global send
+ * pacer (how many sends were parked behind the gate).
  */
 export interface RateLimit429Context {
   chatId: number;
@@ -27,40 +22,28 @@ export interface RateLimit429Context {
   sentPerMin: number;
   /** Busiest short-burst count (sends in any 10s sub-window) in that minute. */
   peak10s: number;
-  /** Sends currently parked on the bucket, by priority class. */
-  waitersByPriority: Record<SendPriority, number>;
+  /** Sends currently parked on the global send pacer (FCFS, no priority). */
+  queuedSends: number;
   /** Whether this was the SECOND consecutive 429 (after the single retry). */
   isAfterRetry: boolean;
-}
-
-/** Total waiters across all priority classes. */
-function getTotalWaiters(waiters: Record<SendPriority, number>): number {
-  return priorityRenderOrder.reduce((sum, p) => sum + (waiters[p] ?? 0), 0);
-}
-
-/** Render the priority breakdown as `interactive=N,output=M,status=K`. */
-function formatPriorityBreakdown(waiters: Record<SendPriority, number>): string {
-  return priorityRenderOrder.map((p) => `${p}=${waiters[p] ?? 0}`).join(',');
 }
 
 /**
  * @description Build the rich, greppable 429 log line. Example:
  *
- *   [RateLimit] 429 chat=-100123 retryAfter=5s sent/min=38 peak10s=12 queue=7 (interactive=1,output=5,status=1) after_retry=yes
+ *   [RateLimit] 429 chat=-100123 retryAfter=5s sent/min=38 peak10s=12 queue=7 after_retry=yes
  *
- * Every field is load-bearing for tuning the per-chat budget later: the
- * measured send-rate (how hard we were pushing), the peak burst (spikes the
- * average hides), and the queue depth + priority mix (how much was backed up,
- * and of what).
+ * Every field is load-bearing for tuning the send pacing later: the measured
+ * send-rate (how hard we were pushing), the peak burst (spikes the average
+ * hides), and the global queue depth (how much was backed up behind the gate).
  */
 export function formatRateLimit429Line(context: RateLimit429Context): string {
-  const queueDepth = getTotalWaiters(context.waitersByPriority);
   return (
     `[RateLimit] 429 chat=${context.chatId} ` +
     `retryAfter=${context.retryAfterSec}s ` +
     `sent/min=${context.sentPerMin} ` +
     `peak10s=${context.peak10s} ` +
-    `queue=${queueDepth} (${formatPriorityBreakdown(context.waitersByPriority)}) ` +
+    `queue=${context.queuedSends} ` +
     `after_retry=${context.isAfterRetry ? 'yes' : 'no'}`
   );
 }

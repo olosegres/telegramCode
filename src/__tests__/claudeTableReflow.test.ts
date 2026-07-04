@@ -448,6 +448,48 @@ test('table reflow: table-only answer emits at IDLE, not on byte-stability', () 
   assert.ok(stripTuiElementsWithContext(idle.block!).text.includes('row 5 content'));
 });
 
+test('table reflow: WIDTH re-flow with trailing prose ALREADY present emits only the settled width once (S4)', () => {
+  // The topic-434 shape: prose sits BELOW the table the whole time, and Claude
+  // re-flows the table WIDER as cells stream in. RULE 2 (prose-after → emit) used
+  // to fire on every width → a flood of widening copies. It now holds until the
+  // width is byte-stable, so only the settled width ships, once.
+  const proseAfter = ['', 'Рекомендация: начать с пункта 3.'];
+  const narrow = withFooter(
+    [
+      'Вот план:',
+      '',
+      `${outputBullet} ┌──┬────┬────┐`,
+      '│# │План│Суть│',
+      '├──┼────┼────┤',
+      '│3 │r3  │d3  │',
+      '└──┴────┴────┘',
+      ...proseAfter,
+    ],
+    busyFooter,
+  );
+  const wide = withFooter(
+    [
+      'Вот план:',
+      '',
+      `${outputBullet} ┌──┬────────────────────┬──────────────┐`,
+      '│# │ План               │ Суть         │',
+      '├──┼────────────────────┼──────────────┤',
+      '│3 │ row 3 content      │ detail 3     │',
+      '└──┴────────────────────┴──────────────┘',
+      ...proseAfter,
+    ],
+    busyFooter,
+  );
+  // narrow (appears) → wide (re-flows) → wide (settles): only the settled wide emits.
+  const { tableEmits } = replayPoll([narrow, wide, wide]);
+  assert.equal(tableEmits.length, 1, `only the settled width may ship, got ${tableEmits.length}`);
+  assert.ok(tableEmits[0].includes('detail 3'), 'the one emit is the settled wide table');
+  assert.ok(
+    !tableEmits.join('\n---\n').includes('│r3  │'),
+    'the intermediate narrow width must never ship',
+  );
+});
+
 test('table reflow: a table that leaves the pane flushes the held table once (case C)', () => {
   // The pane moves on to prose with the table scrolled out of the capture window
   // before any done-signal fired while it was visible → the no-table rule flushes
@@ -479,6 +521,26 @@ test('checkHasContentAfterLastSharpTable: the input box and its rule are NOT con
 
 test('checkHasContentAfterLastSharpTable: a real prose line after the table IS content', () => {
   assert.equal(checkHasContentAfterLastSharpTable(captureFullThenProse), true);
+});
+
+test('checkHasContentAfterLastSharpTable: TUI corner hints BELOW the input box are NOT content (S4, the /rc leak)', () => {
+  // Live root cause 2026-07-04, topic 9085: Claude v2.1.201 draws right-aligned
+  // corner hints (`/rc`, `You've used N% of your weekly limit …`, token counts)
+  // BELOW the `❯` input box. None match a chrome predicate, so the after-table
+  // scan ran past the input box and counted `/rc` as "content after the table" →
+  // RULE 2 fired on every byte-stable growth stage → the wide table flooded.
+  // The scan must STOP at the input box: nothing below it is transcript content.
+  const tableThenFooterWithHints = [
+    ...fullTableBody,
+    '',
+    '────────────────────────────────────────',
+    '❯ ',
+    '────────────────────────────────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents         88770 tokens',
+    "                                    You've used 77% of your weekly limit · resets 1am (Asia/Tbilisi)",
+    '                                                                                                  /rc',
+  ].join('\n');
+  assert.equal(checkHasContentAfterLastSharpTable(tableThenFooterWithHints), false);
 });
 
 test('checkHasContentAfterLastSharpTable: no table → false', () => {
@@ -604,10 +666,10 @@ test('getTableStabilizationDecision: a byte-stable but still-busy table does NOT
   assert.deepEqual(decision.nextStreamingTable, { block: 'T', heldPolls: 2 });
 });
 
-test('getTableStabilizationDecision: emits when real content follows the table', () => {
+test('getTableStabilizationDecision: emits when real content follows a SETTLED table', () => {
   const held = { block: 'T', heldPolls: 1 };
   const decision = getTableStabilizationDecision({
-    currentTable: 'T',
+    currentTable: 'T', // byte-stable since the held poll → width settled
     streamingTable: held,
     hasContentAfterTable: true,
     isTurnIdle: false,
@@ -615,6 +677,25 @@ test('getTableStabilizationDecision: emits when real content follows the table',
   assert.equal(decision.kind, 'emit');
   assert.equal(decision.block, 'T');
   assert.equal(decision.nextStreamingTable, null);
+});
+
+test('getTableStabilizationDecision: a WIDTH re-flow with trailing prose HOLDS until the width settles (S4)', () => {
+  // Live flood 2026-07-04, topic 434: a table re-flowing wider WHILE trailing
+  // prose is already on the pane fired RULE 2 on EVERY width → one message per
+  // width. RULE 2 now also requires the block to be byte-stable since last poll.
+  const proseAfterBusy = { hasContentAfterTable: true, isTurnIdle: false } as const;
+  // Poll 1: narrow width A just appeared (nothing held) with prose after → HOLD.
+  const p1 = getTableStabilizationDecision({ currentTable: 'A', streamingTable: null, ...proseAfterBusy });
+  assert.equal(p1.kind, 'hold', 'a just-appeared width must not emit even with prose after');
+  assert.deepEqual(p1.nextStreamingTable, { block: 'A', heldPolls: 1 });
+  // Poll 2: width grew to B (still re-flowing), prose after → still HOLD (changed).
+  const p2 = getTableStabilizationDecision({ currentTable: 'B', streamingTable: p1.nextStreamingTable, ...proseAfterBusy });
+  assert.equal(p2.kind, 'hold', 'a changed (wider) width must not emit even with prose after');
+  assert.deepEqual(p2.nextStreamingTable, { block: 'B', heldPolls: 1 });
+  // Poll 3: width B byte-stable since last poll + prose after → NOW emit settled B.
+  const p3 = getTableStabilizationDecision({ currentTable: 'B', streamingTable: p2.nextStreamingTable, ...proseAfterBusy });
+  assert.equal(p3.kind, 'emit');
+  assert.equal(p3.block, 'B', 'only the settled width is emitted');
 });
 
 test('getTableStabilizationDecision: emits when the turn goes idle', () => {

@@ -1460,6 +1460,17 @@ export function checkHasContentAfterLastSharpTable(content: string): boolean {
     const line = lines[i];
     if (line.trim() === '') continue;
     if (checkIsSharpTableLine(line)) continue;
+    // The `❯` input box ends the transcript region: everything BELOW it (the
+    // bypass-permissions footer, right-aligned token/usage counters, and corner
+    // shortcut hints like `/rc` in Claude v2.1.201) is TUI footer chrome, never
+    // transcript content. A real prose line after the table appears ABOVE the
+    // input box, so once the scan reaches it, stop — nothing below is content.
+    // WHY this is the real fix (live 2026-07-04, topic 9085): the `/rc` corner
+    // hint is not matched by any chrome predicate, so the scan ran PAST the input
+    // box and counted it as "content after the table" → `hasContentAfterTable`
+    // stayed true through the whole render → RULE 2 emitted every byte-stable
+    // growth stage → the wide table flooded as ~7 messages.
+    if (/^\s*❯/.test(line)) return false;
     if (checkIsClaudeChromeLine(line)) continue;
     if (checkIsProgressChunk(line)) continue;
     if (SPINNER_TICK_RE.test(line)) continue;
@@ -1497,9 +1508,12 @@ export function maskSharpTableLines(deltaText: string): string {
  *
  *  1. no table in the pane: flush whatever was held, once (table scrolled away /
  *     message moved on); else no-op.
- *  2. real PROSE now follows the table (`hasContentAfterTable`) → the table is
- *     done; emit it BEFORE that trailing prose (the poll loop withholds the prose
- *     this tick), so ordering is table-then-prose.
+ *  2. real PROSE now follows the table (`hasContentAfterTable`) AND the table's
+ *     width has settled (`sameBlock` — byte-stable since the previous poll) → the
+ *     table is done; emit it BEFORE that trailing prose (the poll loop withholds
+ *     the prose this tick), so ordering is table-then-prose. A table still
+ *     re-flowing wider while prose is already on the pane HOLDS instead — only the
+ *     settled width ships (live flood 2026-07-04).
  *  3. the turn is IDLE (`isTurnIdle`) → emit promptly (covers a table-only
  *     answer, which never gets trailing prose).
  *  4. otherwise HOLD — update the held block and advance `heldPolls` only while
@@ -1524,9 +1538,18 @@ export function getTableStabilizationDecision(input: {
     return { kind: 'none', block: null, nextStreamingTable: null };
   }
 
+  // Whether the table block is byte-stable since the previous poll (its WIDTH has
+  // settled, not still re-flowing). Load-bearing for RULE 2 and the RULE 4 guard.
+  const sameBlock = streamingTable !== null && currentTable === streamingTable.block;
+
   // RULE 2: real content follows the table → it is done; emit it BEFORE that
-  // prose (the caller masks the prose out of this tick to keep ordering).
-  if (hasContentAfterTable) {
+  // prose (the caller masks the prose out of this tick to keep ordering). BUT
+  // only once the WIDTH has settled (`sameBlock`): a table still re-flowing wider
+  // WHILE trailing prose is already on the pane must NOT ship an intermediate
+  // width (live flood 2026-07-04, topic 434 — each width shipped as its own
+  // message). A changed (wider) block falls through to HOLD and re-checks next
+  // poll; idle (RULE 3) and the safety cap still emit a final width.
+  if (hasContentAfterTable && sameBlock) {
     return { kind: 'emit', block: currentTable, nextStreamingTable: null };
   }
 
@@ -1538,8 +1561,9 @@ export function getTableStabilizationDecision(input: {
 
   // RULE 4: still mid-turn (incl. a byte-stable mid-stream pause) → HOLD. Advance
   // the runaway guard only while the block is unchanged; a changed block restarts
-  // the count (it is actively re-flowing, give it the full budget).
-  const sameBlock = streamingTable !== null && currentTable === streamingTable.block;
+  // the count (it is actively re-flowing, give it the full budget) — so a
+  // continuously-widening table never hits the cap and can never force-emit a
+  // partial width; only a FROZEN busy pane does.
   const heldPolls = (sameBlock ? streamingTable.heldPolls : 0) + 1;
   if (heldPolls > maxTableHoldPolls) {
     // SAFETY: a pane stuck mid-paint must never swallow the table — ship the

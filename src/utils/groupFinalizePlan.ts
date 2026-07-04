@@ -23,22 +23,15 @@ export interface GroupFinalizeInput {
   pendingOutput: string | null;
   /** Whether the FIRST batch in `pendingOutput` continues the last sent message. */
   pendingIsContinuation: boolean;
-  /** Whether the buffer holds the turn's FINAL answer (drives redelivery eligibility). */
-  pendingIsFinal: boolean;
 }
 
 /**
  * @description The finalize plan: either nothing to do (fully delivered), or the
  * exact remainder to send and how.
- *
- * `isImportant` carries the buffer's `pendingIsFinal`, so a buffer that genuinely
- * holds the final answer becomes redelivery-eligible (S1), while a mid-turn
- * drain (e.g. a status-ordering finalize on a still-streaming turn) stays
- * disposable.
  */
 export type GroupFinalizePlan =
   | { action: 'noop' }
-  | { action: 'send'; text: string; isContinuation: boolean; isImportant: boolean };
+  | { action: 'send'; text: string; isContinuation: boolean };
 
 export function getGroupFinalizePlan(input: GroupFinalizeInput): GroupFinalizePlan {
   // A fully-delivered turn (no pending remainder) — and a buffer holding only
@@ -51,6 +44,5 @@ export function getGroupFinalizePlan(input: GroupFinalizeInput): GroupFinalizePl
     action: 'send',
     text: input.pendingOutput,
     isContinuation: input.pendingIsContinuation,
-    isImportant: input.pendingIsFinal,
   };
 }

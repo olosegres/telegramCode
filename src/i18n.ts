@@ -448,13 +448,6 @@ const dict: Record<Lang, Record<string, string>> = {
       '⚠️ Claude разлогинен — отправь /login, чтобы продолжить.',
     'apiRetry.loggedOutOpenCode':
       '⚠️ OpenCode: неверные учётные данные — перезапусти opencode-сервер.',
-
-    // ── delivery degraded under sustained Telegram 429 (S1/D2). Posted ONCE
-    //    per congestion window when a recoverable send's bounded redelivery is
-    //    exhausted — replaces the old silent console.error so the user knows
-    //    output was delayed/dropped, not that the bot hung ──
-    'send.degradedUnderLoad':
-      '⚠️ Telegram ограничивает скорость — часть сообщений задержалась или не доставлена. Попробуй ещё раз через минуту.',
   },
   en: {
     'access.denied': 'Access denied.',
@@ -855,9 +848,6 @@ const dict: Record<Lang, Record<string, string>> = {
       '⚠️ Claude is logged out — run /login to continue.',
     'apiRetry.loggedOutOpenCode':
       '⚠️ OpenCode: invalid credentials — restart the opencode server.',
-
-    'send.degradedUnderLoad':
-      '⚠️ Telegram is rate-limiting — some messages were delayed or dropped. Try again in a minute.',
   },
 };
 

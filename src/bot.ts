@@ -53,12 +53,10 @@ import {
   enqueueSend,
   checkIsRateLimited,
   getRateLimitRemainingMs,
-  checkIsRateLimitedError,
   getActiveChatRateSummaries,
   formatRateSummaryLine,
   type SendPriority,
 } from './rateLimiter';
-import { scheduleRedelivery, decideRedelivery, maxRedeliveryAttempts } from './redeliverDecision';
 import {
   stopOpenCodeServer,
   ensureOpenCodeServer,
@@ -780,14 +778,6 @@ interface OutputQueueState {
   pendingOutput: string | null;
   /** Whether the FIRST batch in `pendingOutput` continues the last sent message. */
   pendingIsContinuation: boolean;
-  /**
-   * Whether the buffer currently holds the turn's FINAL answer frame (an
-   * `isFinal`/`isComplete` output coalesced in). Sticky once set for the
-   * pending buffer: it makes the flush mark those chunks `isImportant` so a
-   * double-429 on the final answer triggers bounded redelivery instead of a
-   * silent drop (S1). Reset when the buffer drains empty.
-   */
-  pendingIsFinal: boolean;
   isProcessing: boolean;
   debounceTimer: NodeJS.Timeout | null;
 }
@@ -1436,7 +1426,7 @@ function getOutputQueueState(key: ThreadKey): OutputQueueState {
   const k = keyToString(key);
   let s = outputQueues.get(k);
   if (!s) {
-    s = { pendingOutput: null, pendingIsContinuation: false, pendingIsFinal: false, isProcessing: false, debounceTimer: null };
+    s = { pendingOutput: null, pendingIsContinuation: false, isProcessing: false, debounceTimer: null };
     outputQueues.set(k, s);
   }
   return s;
@@ -1776,7 +1766,6 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   awaitingFolderName.delete(k);
   pinnedStatusTextCache.delete(k);
   statusCoalescers.delete(k);
-  degradedNoticeArmed.delete(k);
   // `clearThreadQueues` → `finalizeInFlight` above already finalized any accumulated
   // draft text (synchronously capturing it + clearing the timers); drop the now-
   // reset per-transport state so it doesn't leak across a rebind (DM: the draft map
@@ -2212,26 +2201,7 @@ async function replyToThread(
   text: string,
   extra: SendExtra = {},
   priority: SendPriority = 'interactive',
-  /**
-   * 0-based count of post-cooldown redeliveries ALREADY made for this content
-   * (the original send is attempt 0). The B14 redelivery (see below) re-enters
-   * `replyToThread` with this bumped, and `decideRedelivery` stops re-arming
-   * once {@link maxRedeliveryAttempts} is reached — so a sustained 429 storm
-   * can never reopen an infinite requeue loop. Callers never pass this.
-   */
-  redeliveryAttempt = 0,
-  /**
-   * True only for the agent's FINAL answer frame: it rides `output` priority
-   * (disposable by default) but must still land, so this marker makes it
-   * redelivery-eligible. Intermediate output / status stay disposable.
-   */
-  isImportant = false,
 ): Promise<number | null> {
-  // Snapshot binding presence now so the eventual redelivery can tell a
-  // fresh (still-unbound) folder-picker thread apart from one the user
-  // unbound / deleted between this send and the cooldown (B14).
-  const hadBindingAtSend = state.getBinding(key) !== null;
-
   const sendOnce = (sendExtra: Record<string, unknown>) =>
     enqueueSend(key, () =>
       bot.telegram.sendMessage(
@@ -2276,110 +2246,14 @@ async function replyToThread(
       }
     }
 
-    // B14 (now bounded + extended): a double-429 (rate-limited even after the
-    // single retry) would otherwise drop a recoverable reply permanently
-    // (live: the `/bind` folder list that never arrived). For an eligible
-    // class (interactive, or the agent's FINAL answer via `isImportant`),
-    // schedule a BOUNDED chain of redeliveries after the cooldown instead of
-    // dropping — up to `maxRedeliveryAttempts` passes, each waiting the LIVE
-    // remaining cooldown + slack. The requeue goes back through
-    // `replyToThread` → `enqueueSend` with the attempt bumped, so FIFO /
-    // bucket / blockedUntil are all respected and the loop is strictly
-    // bounded. On exhaustion the user gets ONE degraded notice (D2) instead
-    // of a silent drop. Disposable classes (non-final output / status) fall
-    // through to `handleSendError`. Edits/deletes don't reach here.
-    if (checkIsRateLimitedError(e)) {
-      const decision = decideRedelivery({
-        priority,
-        isImportant,
-        attempt: redeliveryAttempt,
-        remainingCooldownMs: getRateLimitRemainingMs(key.chatId),
-        slackMs: COOLDOWN_RETRY_SLACK_MS,
-      });
-      if (decision.action === 'schedule') {
-        scheduleBoundedRedelivery(
-          key, text, extra, priority, isImportant, redeliveryAttempt, hadBindingAtSend, decision.delayMs,
-        );
-        return null;
-      }
-      if (decision.action === 'exhausted') {
-        notifyDeliveryDegraded(key);
-        return null;
-      }
-      // `ineligible` (disposable class) → fall through to handleSendError below.
-    }
-
+    // A double-429 (rate-limited even after withRateLimitRetry's single
+    // retry-after wait) surfaces as a RateLimitedError. The global 1/2s send
+    // pacer (S1) makes a sustained 429 essentially impossible, so we no longer
+    // re-arm a bounded redelivery (its late re-send was the OUT-OF-ORDER cause
+    // the user reported) — the rare 429 is just logged via handleSendError.
     await handleSendError(key, e);
     return null;
   }
-}
-
-/**
- * @description Schedule the next BOUNDED redelivery of a rate-limited
- * recoverable reply, fired once the chat's 429 cooldown has lifted. The
- * redelivery re-enters `replyToThread` with the attempt counter bumped, so a
- * persistent 429 walks the schedule to exhaustion (then the degraded notice)
- * rather than looping forever — `decideRedelivery` is the only place that
- * re-arms, and it stops at {@link maxRedeliveryAttempts}.
- */
-function scheduleBoundedRedelivery(
-  key: ThreadKey,
-  text: string,
-  extra: SendExtra,
-  priority: SendPriority,
-  isImportant: boolean,
-  attempt: number,
-  hadBindingAtSend: boolean,
-  delayMs: number,
-): void {
-  console.warn(
-    `[send] ${keyToString(key)} ${isImportant ? 'final answer' : priority} hit double-429; redelivery ${attempt + 1}/${maxRedeliveryAttempts} scheduled after cooldown`,
-  );
-  scheduleRedelivery(priority, isImportant, hadBindingAtSend, {
-    delayMs,
-    scheduleAfter: (fn, ms) => { setTimeout(fn, ms); },
-    getBindingNow: () => state.getBinding(key),
-    redeliver: () => { void replyToThread(key, text, extra, priority, attempt + 1, isImportant); },
-    onSkip: reason => console.log(`[send] ${keyToString(key)} skipping redelivery — ${reason}`),
-  });
-}
-
-/**
- * @description Per-thread guard so the D2 "delivery degraded under load"
- * notice posts AT MOST ONCE per active congestion window, not once per
- * exhausted send. The flag is set when the notice is posted and cleared when
- * the chat's 429 cooldown has fully lifted (the next exhaustion in a NEW storm
- * notifies again). Keyed by serialised {@link ThreadKey}.
- */
-const degradedNoticeArmed = new Set<string>();
-
-/**
- * @description Post the single user-visible "delivery degraded under load"
- * notice (D2) when a recoverable send's bounded redelivery is exhausted —
- * replacing the old silent `console.error` for the 429 class. Deduped per
- * thread per congestion window: while the chat is still in a 429 cooldown a
- * second exhaustion is swallowed, and the guard is re-armed once the cooldown
- * lifts so a later storm notifies again. The notice itself sends at
- * `interactive` priority but with NO redelivery (it must not recurse into the
- * very path that exhausted), so a doomed chat doesn't multiply notices.
- */
-function notifyDeliveryDegraded(key: ThreadKey): void {
-  const k = keyToString(key);
-  if (degradedNoticeArmed.has(k)) {
-    console.error(`[send] ${k} redelivery exhausted under sustained 429 (notice already shown this window)`);
-    return;
-  }
-  degradedNoticeArmed.add(k);
-  console.error(`[send] ${k} redelivery exhausted under sustained 429 — posting degraded notice`);
-  // Disarm once the cooldown is over (or now, if already clear) so the NEXT
-  // congestion window can notify again. Bounded by the cooldown remainder, so
-  // this is not an unbounded timer.
-  setTimeout(() => { degradedNoticeArmed.delete(k); }, getRateLimitRemainingMs(key.chatId) + COOLDOWN_RETRY_SLACK_MS);
-  // The notice is interactive (the user is staring at a hung-looking topic) but
-  // pass it through `replyToThread` already at the attempt cap so it can NEVER
-  // re-arm a redelivery and recurse — `decideRedelivery` returns `exhausted`,
-  // which on the notice's own failure just logs (no further notice this window).
-  void replyToThread(key, t('send.degradedUnderLoad'), {}, 'interactive', maxRedeliveryAttempts, false);
 }
 
 /**
@@ -2637,12 +2511,9 @@ function queueOutput(
   // the whole flush extends the last sent message; later batches only append.
   if (q.pendingOutput === null) q.pendingIsContinuation = isContinuation;
   q.pendingOutput = appendPendingOutput(q.pendingOutput, output, isContinuation, startsNewParagraph);
-  // Sticky importance: once the turn's final answer (isFinal / a complete
-  // one-shot) is coalesced into the buffer, the buffer carries it, so the flush
-  // marks those chunks redelivery-eligible (S1) — a double-429 on the final
-  // answer must not silently drop. OR-in so an earlier non-final batch can't
-  // clear it. Reset to false only when the buffer drains empty (below).
-  if (isFinal || isComplete) q.pendingIsFinal = true;
+  // `isFinal` / `isComplete` still drive the immediate-flush timing below (a
+  // finished turn must not wait out the debounce) — they no longer mark the
+  // buffer for redelivery (retired with the global send pacer, S4).
   if (q.debounceTimer) clearTimeout(q.debounceTimer);
 
   const timing = getOutputFlushTiming({
@@ -2674,25 +2545,21 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
   try {
     const out = q.pendingOutput;
     const isContinuation = q.pendingIsContinuation;
-    const isImportant = q.pendingIsFinal;
     q.pendingOutput = null;
-    q.pendingIsFinal = false;
-    const { unsentRemainder } = await sendOutputImmediate(key, out, isContinuation, isImportant);
-    // S2 (no silent drop): a chunk dropped on a 429 after the rate-limit queue
-    // gave up comes back as `unsentRemainder`. Put it BACK at the FRONT of the
-    // buffer (it is older than anything that arrived during the await) so the
-    // re-trigger flush below retries it — never lost. Landed chunks are excluded
-    // by `getUnsentRemainder`, so this never re-sends what already reached
-    // Telegram. The remainder restarts a fresh message (its predecessors landed
-    // / edited in place already), so it is NOT a continuation. A final-answer
-    // remainder stays important so its re-flush keeps redelivery eligibility.
+    const { unsentRemainder } = await sendOutputImmediate(key, out, isContinuation);
+    // No silent drop: a chunk dropped on a 429 after the retry-after wait comes
+    // back as `unsentRemainder`. Put it BACK at the FRONT of the buffer (it is
+    // older than anything that arrived during the await) so the re-trigger flush
+    // below retries it — never lost. Landed chunks are excluded by
+    // `getUnsentRemainder`, so this never re-sends what already reached Telegram.
+    // The remainder restarts a fresh message (its predecessors landed / edited in
+    // place already), so it is NOT a continuation.
     if (unsentRemainder) {
       q.pendingOutput =
         q.pendingOutput === null
           ? unsentRemainder
           : appendPendingOutput(unsentRemainder, q.pendingOutput, false);
       q.pendingIsContinuation = false;
-      if (isImportant) q.pendingIsFinal = true;
     }
   } finally {
     q.isProcessing = false;
@@ -2729,10 +2596,8 @@ async function processOutputQueue(key: ThreadKey): Promise<void> {
  * the drain is never double-sent (mirrors `processOutputQueue`'s snapshot
  * discipline + the DM `finalizeDraft` reset-before-await). Idempotent + runs
  * exactly once per turn: an empty buffer (a fully-delivered turn) is a no-op,
- * so no duplicate post. The remainder rides the S1 bounded-redelivery path with
- * `isImportant = pendingIsFinal` — a buffer that genuinely holds the final
- * answer becomes redelivery-eligible, while a mid-turn drain (e.g. the
- * status-ordering finalize) stays disposable.
+ * so no duplicate post. The drain just sends the remainder once; the global 1/2s
+ * send pacer (S1) makes a 429 at this point essentially impossible.
  */
 async function finalizeGroupOutput(key: ThreadKey): Promise<void> {
   const q = outputQueues.get(keyToString(key));
@@ -2742,19 +2607,17 @@ async function finalizeGroupOutput(key: ThreadKey): Promise<void> {
   // Snapshot is captured by the plan; null the buffer SYNCHRONOUSLY before the
   // await so the immediately-following clear / a concurrent flush can't re-send it.
   q.pendingOutput = null;
-  q.pendingIsFinal = false;
   if (q.debounceTimer) {
     clearTimeout(q.debounceTimer);
     q.debounceTimer = null;
   }
-  const { unsentRemainder } = await sendOutputImmediate(key, plan.text, plan.isContinuation, plan.isImportant);
-  // A final-answer remainder that still 429'd already armed its per-chunk S1
-  // redelivery inside sendOutputImmediate, so it is not lost. A non-important
-  // remainder at teardown is dropped (the buffer is being torn down anyway —
-  // unchanged from the pre-S2 discard). Either way, do NOT re-queue here: the
-  // queue is about to be cleared, and re-queuing would race that clear.
-  if (unsentRemainder && plan.isImportant) {
-    console.warn(`[send] ${keyToString(key)} final-answer remainder 429'd at finalize — S1 redelivery armed`);
+  const { unsentRemainder } = await sendOutputImmediate(key, plan.text, plan.isContinuation);
+  // A remainder that still 429'd at teardown is dropped (the buffer is being
+  // torn down anyway — unchanged from the pre-S2 discard). Do NOT re-queue: the
+  // queue is about to be cleared, and re-queuing would race that clear. At 1/2s
+  // global pacing a 429 here is essentially impossible.
+  if (unsentRemainder) {
+    console.warn(`[send] ${keyToString(key)} finalize remainder 429'd and was dropped at teardown`);
   }
 }
 
@@ -2781,9 +2644,6 @@ async function sendOutputImmediate(
   key: ThreadKey,
   output: string,
   isContinuation = false,
-  /** True when this flush carries the turn's FINAL answer — mark each fresh
-   * chunk redelivery-eligible so a double-429 doesn't silently drop it (S1). */
-  isImportant = false,
 ): Promise<{ unsentRemainder: string | null }> {
   // The typing loader is stopped upstream in `handleAgentOutput` (the shared
   // onOutput entry for BOTH transports), so it's not repeated here.
@@ -2820,16 +2680,16 @@ async function sendOutputImmediate(
     // chunk fresh — the full combined text still reaches the user.
   }
 
-  // S2 (no silent drop): track how many chunks actually landed, counting from
-  // the FRONT. `startIndex` already covers a successful in-place edit of
-  // chunks[0]; when that edit failed it is 0 and every chunk re-sends fresh
-  // below. A `replyChunkWithFallback` that returns null means the chunk was
-  // dropped on a 429 after the rate-limit queue gave up — STOP the run (the
-  // cooldown would drop the rest of this synchronous flush too) and report the
-  // un-sent remainder so the caller re-enqueues it for the next flush.
+  // No silent drop: track how many chunks actually landed, counting from the
+  // FRONT. `startIndex` already covers a successful in-place edit of chunks[0];
+  // when that edit failed it is 0 and every chunk re-sends fresh below. A
+  // `replyChunkWithFallback` that returns null means the chunk was dropped on a
+  // 429 after the retry-after wait — STOP the run (the cooldown would drop the
+  // rest of this synchronous flush too) and report the un-sent remainder so the
+  // caller re-enqueues it for the next flush.
   let sentCount = startIndex;
   for (let i = startIndex; i < chunks.length; i++) {
-    const id = await replyChunkWithFallback(key, renderAgentHtml(chunks[i]), chunks[i], 'output', isImportant);
+    const id = await replyChunkWithFallback(key, renderAgentHtml(chunks[i]), chunks[i], 'output');
     if (!id) break;
     msgState.lastMessageId = id;
     msgState.lastMessageText = chunks[i];
@@ -2853,13 +2713,10 @@ async function replyChunkWithFallback(
   renderedHtml: string,
   plainFallback: string,
   priority: SendPriority = 'interactive',
-  /** Mark the send redelivery-eligible (the turn's final answer) — threaded
-   * into `replyToThread` so a double-429 triggers bounded redelivery (S1). */
-  isImportant = false,
 ): Promise<number | null> {
-  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' }, priority, 0, isImportant);
+  const id = await replyToThread(key, renderedHtml, { parse_mode: 'HTML' }, priority);
   if (id) return id;
-  return replyToThread(key, plainFallback, {}, priority, 0, isImportant);
+  return replyToThread(key, plainFallback, {}, priority);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

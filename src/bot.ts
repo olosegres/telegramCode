@@ -29,7 +29,8 @@ import {
   registerSeenWatermarkWriter,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
-  checkIsExperimentalJsonStreamThread,
+  checkIsClaudeBackend,
+  resolveClaudeBackendName,
 } from './adapters/createAdapter';
 import { claudeJsonStreamAdapterName } from './adapters/claudeJsonStreamAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
@@ -3206,7 +3207,10 @@ async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<voi
   // surviving fields.
   const next: { name: string; model?: string; claudeSessionId?: string; opencodeSessionId?: string } = { name: newName };
   if (agent.model !== undefined) next.model = agent.model;
-  if (newName === 'claude' && agent.claudeSessionId) next.claudeSessionId = agent.claudeSessionId;
+  // Both Claude backends share the on-disk transcript, so keep the session id
+  // when switching between tmux-scrape and json-stream — the new backend resumes
+  // the SAME conversation (`/claude_mode` live switch).
+  if (checkIsClaudeBackend(newName) && agent.claudeSessionId) next.claudeSessionId = agent.claudeSessionId;
   if (newName === 'opencode' && agent.opencodeSessionId) next.opencodeSessionId = agent.opencodeSessionId;
   // Overwrite by removing the row first; setAgent then writes only the
   // fields we kept.
@@ -4565,6 +4569,9 @@ async function handleAgentStart(
     await replyToThread(key, t('thread.no_binding'), extra);
     return;
   }
+  // "Claude Code" is one user-facing choice with two backends (tmux-scrape vs
+  // json-stream); open the thread's picked backend, default json-stream.
+  if (adapterName === 'claude') adapterName = resolveClaudeBackendName(key);
   await switchThreadAdapter(key, adapterName);
   const adapter = getThreadAdapter(key);
   if (adapter.checkIsActive(key)) {
@@ -4592,6 +4599,77 @@ function handleStartCommand(
 command('claude', (ctx, key) => handleStartCommand(ctx, key, 'claude'));
 command(['opencode', 'oc'], (ctx, key) => handleStartCommand(ctx, key, 'opencode'));
 command('terminal', (ctx, key) => handleStartCommand(ctx, key, 'terminal'));
+
+/** Human label for a Claude backend name (the two adapters share `label`
+ *  "Claude Code", so the picker/notices need a distinguishing name). */
+function getClaudeBackendLabel(name: string): string {
+  return name === claudeJsonStreamAdapterName ? '⚡ JSON-stream' : '🖥 Terminal-scrape';
+}
+
+/** Build the `/claude_mode` picker: one button per Claude backend, `✓` on the
+ *  current one. Callback data `ccmode_<adapterName>`. */
+function buildClaudeModeKeyboard(current: string) {
+  const buttons = [claudeJsonStreamAdapterName, 'claude'].map((name) =>
+    Markup.button.callback(
+      name === current ? `${getClaudeBackendLabel(name)} ✓` : getClaudeBackendLabel(name),
+      `ccmode_${name}`,
+    ),
+  );
+  return Markup.inlineKeyboard(buttons, { columns: 1 });
+}
+
+/**
+ * @description Switch a thread's Claude Code backend (tmux-scrape ↔ json-stream)
+ * live. Both drive the same CLI against the same on-disk transcript, so an
+ * ACTIVE session is RESUMED seamlessly on the new backend (same conversation);
+ * an idle thread just records the pick for its next start. Returns the localized
+ * notice to show. Assumes the thread is already on a Claude backend (callers gate).
+ */
+async function applyClaudeBackendSwitch(key: ThreadKey, target: string): Promise<string> {
+  const label = getClaudeBackendLabel(target);
+  const wasActive = getThreadAdapter(key).checkIsActive(key);
+  const sessionId = state.getAgent(key)?.claudeSessionId;
+
+  // Stops the previous backend, records the pick, keeps `claudeSessionId`.
+  await switchThreadAdapter(key, target);
+
+  if (!wasActive) return t('claudeMode.set_idle', { label });
+
+  const decision = getWorkDirStartDecision(key);
+  if (!decision.ok) return decision.message;
+  const targetAdapter = getThreadAdapter(key);
+  sendThreadTypingIndicator(key).catch(() => {});
+  if (sessionId && targetAdapter.resumeSession) {
+    markNeedsNewMessage(key);
+    clearThreadContextMarker(key);
+    try {
+      await targetAdapter.resumeSession(key, decision.workDir, sessionId, { isWithRecentContext: true });
+      await persistAdapterSessionIds(key, targetAdapter, state);
+      return t('claudeMode.switched_resumed', { label });
+    } catch (e) {
+      console.error('[claude_mode] resume failed, starting fresh:', e instanceof Error ? e.message : e);
+    }
+  }
+  const msg = await startAgentSession(key);
+  return msg || t('claudeMode.switched_fresh', { label });
+}
+
+command('claude_mode', async (ctx, key) => {
+  if (checkIsGeneral(key)) { await replyToThread(key, t('error.start_in_general')); return; }
+  const current = getThreadAdapterName(key);
+  if (!checkIsClaudeBackend(current)) { await replyToThread(key, t('claudeMode.not_claude')); return; }
+
+  const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+  const direct =
+    ['json', 'jsonstream', 'json-stream', 'stream'].includes(arg) ? claudeJsonStreamAdapterName :
+    ['tmux', 'scrape', 'terminal', 'classic'].includes(arg) ? 'claude' : null;
+  if (direct) {
+    if (direct === current) { await replyToThread(key, t('claudeMode.already', { label: getClaudeBackendLabel(direct) })); return; }
+    await replyToThread(key, await applyClaudeBackendSwitch(key, direct));
+    return;
+  }
+  await replyToThread(key, t('claudeMode.pick', { label: getClaudeBackendLabel(current) }), buildClaudeModeKeyboard(current));
+});
 
 command('model', async (ctx, key) => {
   const adapter = getThreadAdapter(key);
@@ -5504,7 +5582,7 @@ const botCommands = new Set([
   'stop', 'stopall', 'stop-all', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
-  'subagent',
+  'subagent', 'claude_mode',
 ]);
 
 /**
@@ -6546,6 +6624,30 @@ bot.action(/^effort_(.+)$/, async (ctx) => {
           console.warn('[effort_cb] keyboard re-render failed:', desc || e);
         }
       }
+    }
+  }
+});
+
+bot.action(/^ccmode_(.+)$/, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  const target = ctx.match[1];
+  if (!checkIsClaudeBackend(target)) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  const current = getThreadAdapterName(key);
+  if (target === current) { await ctx.answerCbQuery(t('cb.claudeMode_already')); return; }
+  await ctx.answerCbQuery(t('cb.claudeMode_switching'));
+  await replyToThread(key, await applyClaudeBackendSwitch(key, target));
+  // Re-render the picker so the `✓` follows the new backend (mirrors effort_cb).
+  const cbMsg = ctx.callbackQuery?.message as Message | undefined;
+  if (cbMsg) {
+    try {
+      await enqueueSend(key, () => bot.telegram.editMessageReplyMarkup(
+        key.chatId, cbMsg.message_id, undefined,
+        buildClaudeModeKeyboard(getThreadAdapterName(key)).reply_markup,
+      ));
+    } catch (e) {
+      const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
+      if (!/message is not modified/i.test(desc)) console.warn('[ccmode_cb] re-render:', desc || e);
     }
   }
 });
@@ -8254,10 +8356,10 @@ async function reattachExistingSessions(
           killed += 1;
           continue;
         }
-        // S8: a thread pinned to the experimental claude-json-stream backend must
-        // never re-adopt a stale tmux-claude session — kill it and let the
-        // json-stream reattach (2b) own this thread instead.
-        if (checkIsExperimentalJsonStreamThread(key)) {
+        // A thread whose resolved backend is json-stream must never re-adopt a
+        // stale tmux-claude session — kill it and let the json-stream reattach
+        // (2b) own this thread instead.
+        if (getThreadAdapterName(key) === claudeJsonStreamAdapterName) {
           await claudeAdapter.killOrphanTmuxSession(sessionName);
           killed += 1;
           continue;

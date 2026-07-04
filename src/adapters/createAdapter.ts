@@ -216,35 +216,31 @@ export function getAvailableAdapters(): Array<{ name: string; label: string }> {
 export function getDefaultAdapterName(): string {
   const env = process.env.DEFAULT_AGENT;
   if (env && adapterFactories[env]) return env;
-  return 'claude';
+  return claudeJsonStreamAdapterName;
 }
 
 /**
- * @description S8 code-only per-thread switch to the experimental
- * `claude-json-stream` backend. `CLAUDE_JSON_STREAM_THREADS` is a
- * comma-separated list of `ThreadKey` strings (`"<chatId>:<threadId>"`); each
- * listed thread is FORCED onto `claude-json-stream`, overriding its
- * persisted/default pick — the intended way to trial the experimental backend
- * on specific topics without a command/button and without changing the default
- * for anyone else. Read once at module load; unset/empty → inert (no thread is
- * routed, every thread keeps its normal resolution).
+ * @description The two Claude Code backends. Both drive the SAME `claude` CLI
+ * against the SAME on-disk transcript, so a thread is cross-resumable between
+ * them live:
+ *  - `'claude'` — the tmux TUI, scraped screen (classic).
+ *  - {@link claudeJsonStreamAdapterName} — an owned child process reading
+ *    structured stream-json events (the DEFAULT; see {@link getDefaultAdapterName}).
+ * `/claude_mode` flips a thread between them.
  */
-const experimentalJsonStreamThreads: Set<string> = new Set(
-  (process.env.CLAUDE_JSON_STREAM_THREADS ?? '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean),
-);
-
-/** The forced experimental adapter name for `key` (S8 opt-in), or `undefined`. */
-function getExperimentalThreadOverride(key: ThreadKey): string | undefined {
-  return experimentalJsonStreamThreads.has(keyToString(key)) ? claudeJsonStreamAdapterName : undefined;
+export function checkIsClaudeBackend(name: string): boolean {
+  return name === 'claude' || name === claudeJsonStreamAdapterName;
 }
 
-/** Whether `key` is pinned to the experimental backend via the S8 opt-in list.
- *  Exposed so reattach can route such a thread's boot recovery correctly. */
-export function checkIsExperimentalJsonStreamThread(key: ThreadKey): boolean {
-  return getExperimentalThreadOverride(key) !== undefined;
+/**
+ * @description Which Claude backend a fresh "start Claude Code" should open for
+ * `key`: the thread's explicit backend pick if it has one, else the default
+ * (json-stream). Lets the ▶️ Claude button / `/claude` open json-stream by
+ * default while honouring an explicit `/claude_mode` tmux pick.
+ */
+export function resolveClaudeBackendName(key: ThreadKey): string {
+  const raw = getThreadAdapterNameRaw(key);
+  return raw && checkIsClaudeBackend(raw) ? raw : claudeJsonStreamAdapterName;
 }
 
 /**
@@ -259,10 +255,10 @@ export function getThreadAdapter(key: ThreadKey): AgentAdapter {
   return getAdapter(getThreadAdapterName(key));
 }
 
-/** Returns the adapter NAME for a thread (without instantiating it). The S8
- *  experimental opt-in (if any) wins over the in-memory pick and the default. */
+/** Returns the adapter NAME for a thread (without instantiating it): the
+ *  in-memory pick, else the default ({@link getDefaultAdapterName}). */
 export function getThreadAdapterName(key: ThreadKey): string {
-  return getExperimentalThreadOverride(key) ?? threadAdapterNames.get(keyToString(key)) ?? getDefaultAdapterName();
+  return threadAdapterNames.get(keyToString(key)) ?? getDefaultAdapterName();
 }
 
 /**
@@ -273,7 +269,7 @@ export function getThreadAdapterName(key: ThreadKey): string {
  * "no pick yet" apart from "picked the default".
  */
 export function getThreadAdapterNameRaw(key: ThreadKey): string | undefined {
-  return getExperimentalThreadOverride(key) ?? threadAdapterNames.get(keyToString(key));
+  return threadAdapterNames.get(keyToString(key));
 }
 
 /** Record that a given thread is now using a specific adapter. */

@@ -93,14 +93,18 @@ event (identical shape to OpenCode's), so the pin + one-at-a-time + inline-butto
 flow is reused verbatim; `answerQuestion` / `rejectQuestion` emit the matching
 `control_response`.
 
-## Switching it on (code-only)
+## Selecting it (default + `/claude_mode`)
 
-No command, no button. `getThreadAdapter` honours env
-`CLAUDE_JSON_STREAM_THREADS` — a comma-separated list of `ThreadKey`s
-(`"<chatId>:<threadId>"`) forced onto this backend, overriding the
-persisted/default pick. A reattach guard stops such a thread from re-adopting a
-stale tmux-`claude` session at boot. `hiddenAdapterNames` (in `createAdapter.ts`)
-keeps it out of `/start` and the agent-selection keyboard.
+This is the **DEFAULT** Claude backend (`getDefaultAdapterName` /
+`resolveClaudeBackendName`): ▶️ Claude / `/claude` open it unless the thread
+explicitly picked tmux. `/claude_mode` switches a topic between the two backends
+on the fly — the pick persists as the thread's adapter name and the switch
+RESUMES the same conversation (see "Shared session store";
+`switchThreadAdapter` keeps `claudeSessionId` for both backends). A reattach
+guard stops a json-stream thread from re-adopting a stale tmux-`claude` session
+at boot. `hiddenAdapterNames` (in `createAdapter.ts`) keeps it out of the generic
+`/start` agent list — it is reached via the default + `/claude_mode`, not a start
+entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.)
 
 ## Shared session store
 

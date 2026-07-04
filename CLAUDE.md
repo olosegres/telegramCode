@@ -399,7 +399,7 @@ config/variants, not a per-message API field).
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
 | `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat. **Auto-dismisses Claude's end-of-turn feedback survey** (never relayed to the topic; one Escape per appearance, signature-deduped): the detector (`extractClaudeSurvey`) is two-factor — a whole-line-anchored header + the `N: Label` option row (≥2 options) — and accepts a CLOSED alternation of the two known header wordings (`How is Claude doing this session?` and `How well is Claude following the instructions you gave earlier in this conversation?`, optional leading `●`/`⏺` bullet + trailing `(optional)`); keep it a closed list, never an open prose pattern (a quoted header once spammed bogus surveys). Wedge symptom of an UNRECOGNISED wording: the survey sits on the pane and swallows the Enter of the next forwarded prompt — the text strands unsubmitted in the TUI input box and the topic looks hung (live 2026-07-02, topic 39933); the fix is adding the new wording to the alternation |
-| `claudeJsonStreamAdapter.ts` | **Experimental** 2nd Claude backend — drives `claude -p --input-format stream-json --output-format stream-json` as an OWNED child process (structured events, NO tmux scrape). Code-only switch (env `CLAUDE_JSON_STREAM_THREADS`, comma-separated `ThreadKey`s); hidden from the UI (`hiddenAdapterNames`), tmux `claude` stays default. Subscription-billed (non-`--bare`, no `ANTHROPIC_API_KEY`; proof: `system/init` `apiKeySource:"none"` + a `seven_day` `rate_limit_event`). Interactive questions ride a REVERSE-ENGINEERED stdio control protocol (`--permission-prompt-tool stdio` + `initialize` handshake + `can_use_tool`/`control_response`) — full wire format in `src/adapters/README.md`. Sessions cross-resumable with the tmux backend (shared transcript readers) |
+| `claudeJsonStreamAdapter.ts` | **Experimental** 2nd Claude backend — drives `claude -p --input-format stream-json --output-format stream-json` as an OWNED child process (structured events, NO tmux scrape). The **DEFAULT** Claude backend now (`getDefaultAdapterName` / `resolveClaudeBackendName`), switchable per-topic on the fly via `/claude_mode` (the pick persists as the thread's adapter name; the switch is a SEAMLESS resume — both backends share the on-disk transcript). Hidden from the generic `/start` agent list (`hiddenAdapterNames`) — reached via the default + `/claude_mode`, not a start entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.) Subscription-billed (non-`--bare`, no `ANTHROPIC_API_KEY`; proof: `system/init` `apiKeySource:"none"` + a `seven_day` `rate_limit_event`). Interactive questions ride a REVERSE-ENGINEERED stdio control protocol (`--permission-prompt-tool stdio` + `initialize` handshake + `can_use_tool`/`control_response`) — full wire format in `src/adapters/README.md`. Sessions cross-resumable with the tmux backend (shared transcript readers) |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; ONE multiplexed `/global/event` stream for the whole server, every event parsed once + routed by envelope `directory` + `sessionID`) |
 | `terminalAdapter.ts` | A raw interactive `$SHELL` in `tmux` — a third adapter sibling to claude/opencode (NO AI logic). Types the user's text in as keystrokes (`send-keys`) and streams the scraped pane back as ONE rolling message per command (generic capture → line-set-diff → `cleanOutput` → emit; no question/survey/sub-agent/tool-result/effort/MCP/resume machinery). Restart-safe: `listExistingTmuxSessions`/`adoptExistingTmuxSession` re-adopt a live `term-…` session at boot (current pane seeds the baseline, no flood). Does NOT extend `ClaudeCliAdapter` and leaves `outputsDeltas` falsy, so the Claude liveness loop never fires for it |
 
@@ -515,8 +515,18 @@ OpenCode events / bindings).
     normal welcome stack. Invalid name → error, mode stays armed for retry.
     Any command exits the mode. `/bind <subdir>` direct form is unchanged.
 - **Agent control (proxied):** `/model`, `/effort`, `/verbosity`, `/thinking`,
-  `/tool_results`, `/subagent`, `/output`, `/schedule`, and raw TUI
+  `/tool_results`, `/subagent`, `/output`, `/schedule`, `/claude_mode`, and raw TUI
   keys `/c`, `/y`, `/n`, `/enter`, `/up`, `/down`, `/tab`, `/esc` (`/escape`)
+  - `/claude_mode [json|tmux]` switches THIS topic's Claude Code backend between
+    the tmux-scrape adapter (`'claude'`) and the structured stream-json adapter
+    (`claudeJsonStreamAdapterName`) — the two share the on-disk transcript, so a
+    live switch STOPS the old backend and RESUMES the same conversation on the new
+    one (`applyClaudeBackendSwitch` → `switchThreadAdapter` keeps `claudeSessionId`
+    for both backends). Bare `/claude_mode` shows a picker (✓ on current); persists
+    as the thread's adapter name, so ▶️ Claude / `/claude` reopen the picked backend
+    (default **json-stream**, `resolveClaudeBackendName`). Only for Claude topics
+    (OpenCode/terminal → a hint). Replaces the retired `CLAUDE_JSON_STREAM_THREADS`
+    env gate.
   - `/esc` (alias `/escape`) sends a raw Escape keystroke to the live agent
     (Claude: interrupt the current turn / dismiss a selector via
     `sendEscape` → `tmux send-keys Escape`, a fire-and-forget one-shot, NOT a

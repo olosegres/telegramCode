@@ -402,7 +402,7 @@ const sessionTitleMaxLength = 60;
  */
 const effortPrefsFile = path.join(resolveDataDir(), '.claude-effort-prefs.json');
 
-function loadEffortPrefs(): Record<string, string> {
+export function loadEffortPrefs(): Record<string, string> {
   try {
     if (!fs.existsSync(effortPrefsFile)) return {};
     const raw = fs.readFileSync(effortPrefsFile, 'utf-8');
@@ -421,7 +421,7 @@ function loadEffortPrefs(): Record<string, string> {
   }
 }
 
-function saveEffortPref(key: ThreadKey, level: string): void {
+export function saveEffortPref(key: ThreadKey, level: string): void {
   try {
     const data = loadEffortPrefs();
     data[keyToString(key)] = level;
@@ -470,7 +470,7 @@ function parseTmuxSessionName(name: string): ThreadKey | null {
  * (corrupted state.json, future user-facing `/resume <id>`), it would land
  * in that shell. Rejecting up front keeps the surface tight.
  */
-function checkIsValidUuid(s: string): boolean {
+export function checkIsValidUuid(s: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 }
 
@@ -1999,7 +1999,7 @@ export function stripTuiElements(
  * correctness gate is the `recordedCwd === workDir` filter in
  * {@link listClaudeSessionsForWorkDir}.
  */
-function getClaudeProjectSlug(workDir: string): string {
+export function getClaudeProjectSlug(workDir: string): string {
   return workDir.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
@@ -2008,7 +2008,7 @@ function getClaudeProjectSlug(workDir: string): string {
  * (`~/.claude/projects`). Single source for every path built from it —
  * session listing, resume-context reads, and the sub-agent transcript scan.
  */
-function getClaudeProjectsRoot(): string {
+export function getClaudeProjectsRoot(): string {
   return path.join(os.homedir(), '.claude', 'projects');
 }
 

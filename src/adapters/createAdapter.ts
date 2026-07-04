@@ -4,6 +4,7 @@ import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
 import type { OpenCodePendingQuestion } from './openCodeAdapter';
 import { TerminalAdapter } from './terminalAdapter';
+import { ClaudeJsonStreamAdapter, claudeJsonStreamAdapterName } from './claudeJsonStreamAdapter';
 
 type AdapterFactory = () => AgentAdapter;
 
@@ -11,7 +12,23 @@ const adapterFactories: Record<string, AdapterFactory> = {
   claude: () => new ClaudeCliAdapter(),
   opencode: () => new OpenCodeAdapter(),
   terminal: () => new TerminalAdapter(),
+  [claudeJsonStreamAdapterName]: () => new ClaudeJsonStreamAdapter(),
 };
+
+/**
+ * @description Adapters that consume the injected per-thread display-prefs
+ * reader + seen-watermark writer (the two DI seams wired at boot). Structural
+ * check via method presence rather than N `instanceof` branches, so a new
+ * adapter that exposes the setters is picked up without editing every wiring
+ * site.
+ */
+function checkAdapterTakesDisplayPrefs(adapter: AgentAdapter): adapter is AgentAdapter & { setDisplayPrefsReader(reader: DisplayPrefsReader): void } {
+  return typeof (adapter as { setDisplayPrefsReader?: unknown }).setDisplayPrefsReader === 'function';
+}
+
+function checkAdapterTakesWatermarkWriter(adapter: AgentAdapter): adapter is AgentAdapter & { setSeenWatermarkWriter(writer: SeenWatermarkWriter): void } {
+  return typeof (adapter as { setSeenWatermarkWriter?: unknown }).setSeenWatermarkWriter === 'function';
+}
 
 /** Singleton adapter instances — one per adapter name */
 const adapterInstances = new Map<string, AgentAdapter>();
@@ -64,10 +81,9 @@ let displayPrefsReader: DisplayPrefsReader | null = null;
  */
 export function registerDisplayPrefsReader(reader: DisplayPrefsReader): void {
   displayPrefsReader = reader;
-  const existingOpenCode = adapterInstances.get('opencode');
-  if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setDisplayPrefsReader(reader);
-  const existingClaude = adapterInstances.get('claude');
-  if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setDisplayPrefsReader(reader);
+  for (const adapter of adapterInstances.values()) {
+    if (checkAdapterTakesDisplayPrefs(adapter)) adapter.setDisplayPrefsReader(reader);
+  }
 }
 
 /** Per-thread seen-watermark writer for BOTH adapters — same late-wiring idiom
@@ -84,10 +100,9 @@ let seenWatermarkWriter: SeenWatermarkWriter | null = null;
  */
 export function registerSeenWatermarkWriter(writer: SeenWatermarkWriter): void {
   seenWatermarkWriter = writer;
-  const existingOpenCode = adapterInstances.get('opencode');
-  if (existingOpenCode instanceof OpenCodeAdapter) existingOpenCode.setSeenWatermarkWriter(writer);
-  const existingClaude = adapterInstances.get('claude');
-  if (existingClaude instanceof ClaudeCliAdapter) existingClaude.setSeenWatermarkWriter(writer);
+  for (const adapter of adapterInstances.values()) {
+    if (checkAdapterTakesWatermarkWriter(adapter)) adapter.setSeenWatermarkWriter(writer);
+  }
 }
 
 function wireAdapterEvents(adapter: AgentAdapter): void {
@@ -159,37 +174,77 @@ export function getAdapter(name: string): AgentAdapter {
     adapter = factory();
     adapterInstances.set(name, adapter);
     wireAdapterEvents(adapter);
-    if (displayPrefsReader && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
+    if (displayPrefsReader && checkAdapterTakesDisplayPrefs(adapter)) {
       adapter.setDisplayPrefsReader(displayPrefsReader);
     }
-    if (seenWatermarkWriter && (adapter instanceof OpenCodeAdapter || adapter instanceof ClaudeCliAdapter)) {
+    if (seenWatermarkWriter && checkAdapterTakesWatermarkWriter(adapter)) {
       adapter.setSeenWatermarkWriter(seenWatermarkWriter);
     }
   }
   return adapter;
 }
 
+/**
+ * @description Adapters registered in the factory (so `getAdapter`, sweeps, and
+ * reattach see them) but HIDDEN from every user-facing surface — the `/start`
+ * agent list and the agent-selection keyboard. `claude-json-stream` is an
+ * experimental, CODE-ONLY backend (selected via `DEFAULT_AGENT` or
+ * `setThreadAdapter`, never a command/button), so it must not leak a start
+ * entry.
+ */
+const hiddenAdapterNames = new Set<string>([claudeJsonStreamAdapterName]);
+
 export function getAvailableAdapters(): Array<{ name: string; label: string }> {
-  return Object.keys(adapterFactories).map(name => {
-    // Get label from factory by creating a temp instance only if not already created
-    const adapter = adapterInstances.get(name);
-    if (adapter) {
-      return { name, label: adapter.label };
-    }
-    // Use known labels to avoid creating unnecessary instances
-    const labels: Record<string, string> = {
-      claude: 'Claude Code',
-      opencode: 'OpenCode',
-      terminal: 'Terminal',
-    };
-    return { name, label: labels[name] || name };
-  });
+  return Object.keys(adapterFactories)
+    .filter(name => !hiddenAdapterNames.has(name))
+    .map(name => {
+      // Get label from factory by creating a temp instance only if not already created
+      const adapter = adapterInstances.get(name);
+      if (adapter) {
+        return { name, label: adapter.label };
+      }
+      // Use known labels to avoid creating unnecessary instances
+      const labels: Record<string, string> = {
+        claude: 'Claude Code',
+        opencode: 'OpenCode',
+        terminal: 'Terminal',
+      };
+      return { name, label: labels[name] || name };
+    });
 }
 
 export function getDefaultAdapterName(): string {
   const env = process.env.DEFAULT_AGENT;
   if (env && adapterFactories[env]) return env;
   return 'claude';
+}
+
+/**
+ * @description S8 code-only per-thread switch to the experimental
+ * `claude-json-stream` backend. `CLAUDE_JSON_STREAM_THREADS` is a
+ * comma-separated list of `ThreadKey` strings (`"<chatId>:<threadId>"`); each
+ * listed thread is FORCED onto `claude-json-stream`, overriding its
+ * persisted/default pick — the intended way to trial the experimental backend
+ * on specific topics without a command/button and without changing the default
+ * for anyone else. Read once at module load; unset/empty → inert (no thread is
+ * routed, every thread keeps its normal resolution).
+ */
+const experimentalJsonStreamThreads: Set<string> = new Set(
+  (process.env.CLAUDE_JSON_STREAM_THREADS ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
+);
+
+/** The forced experimental adapter name for `key` (S8 opt-in), or `undefined`. */
+function getExperimentalThreadOverride(key: ThreadKey): string | undefined {
+  return experimentalJsonStreamThreads.has(keyToString(key)) ? claudeJsonStreamAdapterName : undefined;
+}
+
+/** Whether `key` is pinned to the experimental backend via the S8 opt-in list.
+ *  Exposed so reattach can route such a thread's boot recovery correctly. */
+export function checkIsExperimentalJsonStreamThread(key: ThreadKey): boolean {
+  return getExperimentalThreadOverride(key) !== undefined;
 }
 
 /**
@@ -201,13 +256,13 @@ export function getDefaultAdapterName(): string {
  * to `DEFAULT_AGENT`.
  */
 export function getThreadAdapter(key: ThreadKey): AgentAdapter {
-  const adapterName = threadAdapterNames.get(keyToString(key)) || getDefaultAdapterName();
-  return getAdapter(adapterName);
+  return getAdapter(getThreadAdapterName(key));
 }
 
-/** Returns the adapter NAME for a thread (without instantiating it). */
+/** Returns the adapter NAME for a thread (without instantiating it). The S8
+ *  experimental opt-in (if any) wins over the in-memory pick and the default. */
 export function getThreadAdapterName(key: ThreadKey): string {
-  return threadAdapterNames.get(keyToString(key)) || getDefaultAdapterName();
+  return getExperimentalThreadOverride(key) ?? threadAdapterNames.get(keyToString(key)) ?? getDefaultAdapterName();
 }
 
 /**
@@ -218,7 +273,7 @@ export function getThreadAdapterName(key: ThreadKey): string {
  * "no pick yet" apart from "picked the default".
  */
 export function getThreadAdapterNameRaw(key: ThreadKey): string | undefined {
-  return threadAdapterNames.get(keyToString(key));
+  return getExperimentalThreadOverride(key) ?? threadAdapterNames.get(keyToString(key));
 }
 
 /** Record that a given thread is now using a specific adapter. */

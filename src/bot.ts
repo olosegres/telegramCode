@@ -29,7 +29,9 @@ import {
   registerSeenWatermarkWriter,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
+  checkIsExperimentalJsonStreamThread,
 } from './adapters/createAdapter';
+import { claudeJsonStreamAdapterName } from './adapters/claudeJsonStreamAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
 import type { ThreadKey, AgentAdapter, AgentSession, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { createOutputTransport } from './output/createOutputTransport';
@@ -6920,7 +6922,7 @@ async function applyQuestionAnswerInner(key: ThreadKey, answerForCurrent: string
  */
 function checkAdapterSupportsDraftStreaming(key: ThreadKey): boolean {
   const name = getThreadAdapterName(key);
-  return name === 'opencode' || name === 'claude';
+  return name === 'opencode' || name === 'claude' || name === claudeJsonStreamAdapterName;
 }
 
 /**
@@ -8252,6 +8254,14 @@ async function reattachExistingSessions(
           killed += 1;
           continue;
         }
+        // S8: a thread pinned to the experimental claude-json-stream backend must
+        // never re-adopt a stale tmux-claude session — kill it and let the
+        // json-stream reattach (2b) own this thread instead.
+        if (checkIsExperimentalJsonStreamThread(key)) {
+          await claudeAdapter.killOrphanTmuxSession(sessionName);
+          killed += 1;
+          continue;
+        }
         let agent = state.getAgent(key);
         // If state and reality disagree (agent missing, or names another
         // adapter, or claudeSessionId is gone), try to reconstruct state
@@ -8367,6 +8377,36 @@ async function reattachExistingSessions(
     }
   }
   console.log(`[reattach] opencode: reopened ${reopened} sessions (quiet=${opts.quietReattach})`);
+
+  // 2b. Claude JSON-stream — an OWNED child process (unlike tmux, it dies with
+  //     the bot), so reattach = re-spawn `claude -p --resume <id>` from the
+  //     persisted claude session id (same on-disk store, so `claudeSessionId` is
+  //     reused). Mirrors the OpenCode resume block above.
+  const claudeJsonAdapter = getAdapter(claudeJsonStreamAdapterName);
+  let jsonReopened = 0;
+  for (const { key } of state.listBindings()) {
+    const agent = state.getAgent(key);
+    if (!agent || agent.name !== claudeJsonStreamAdapterName || !agent.claudeSessionId) continue;
+    if (claudeJsonAdapter.checkIsActive(key)) continue;
+    try {
+      const workDirDecision = getWorkDirStartDecision(key);
+      if (!workDirDecision.ok) {
+        console.warn(`[reattach] claude-json-stream ${keyToString(key)} refused: ${workDirDecision.message}`);
+        if (!opts.quietReattach) replyToThread(key, workDirDecision.message).catch(() => {});
+        continue;
+      }
+      const workDir = workDirDecision.workDir;
+      const preAdoptWatermark = state.getAgent(key)?.seenWatermark ?? null;
+      await claudeJsonAdapter.resumeSession(key, workDir, agent.claudeSessionId);
+      jsonReopened += 1;
+      void postReattachRecap(
+        key, claudeJsonAdapter, workDir, agent.claudeSessionId, preAdoptWatermark, !opts.quietReattach,
+      ).catch(() => {});
+    } catch (e) {
+      console.warn(`[reattach] claude-json-stream ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+  console.log(`[reattach] claude-json-stream: reopened ${jsonReopened} sessions (quiet=${opts.quietReattach})`);
 
   // 3. Terminal — tmux shells (`term-…`). Like the Claude scan but simpler:
   //    a terminal has no session-id to recover, so adoption keys purely on a

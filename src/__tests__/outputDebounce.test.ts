@@ -6,17 +6,17 @@
  * GROUP mode ONLY (DM streams via the native-draft cursor and finalizes at
  * boundaries), so there is a single window left — the original group cadence.
  * This proves the value against the same constant `bot.ts` uses (no Telegraf
- * boot needed): group mode keeps its 1000ms window byte-for-byte. A regression
- * that changed the group cadence — or re-introduced a DM-specific window into
- * this path — would flip this.
+ * boot needed): S2 raised the group window to 3000ms. A regression that changed
+ * the group cadence — or re-introduced a DM-specific window into this path —
+ * would flip this.
  */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { getOutputDebounceMs, OUTPUT_DEBOUNCE_MS } from '../utils/outputDebounce';
 
-test('the output debounce is the group cadence (1000ms)', () => {
-  assert.equal(getOutputDebounceMs(), 1000, 'debounce must stay 1000ms');
+test('the output debounce is the group cadence (3000ms, S2)', () => {
+  assert.equal(getOutputDebounceMs(), 3000, 'debounce must be 3000ms (S2)');
   assert.equal(
     getOutputDebounceMs(),
     OUTPUT_DEBOUNCE_MS,
@@ -25,5 +25,5 @@ test('the output debounce is the group cadence (1000ms)', () => {
 });
 
 test('the constant is the locked group value', () => {
-  assert.equal(OUTPUT_DEBOUNCE_MS, 1000);
+  assert.equal(OUTPUT_DEBOUNCE_MS, 3000);
 });

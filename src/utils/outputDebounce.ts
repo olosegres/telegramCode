@@ -10,8 +10,12 @@
  * source `bot.ts` uses — no drift.
  */
 
-/** Group-mode debounce. Telegram tolerates ~1 msg/sec/chat. */
-export const OUTPUT_DEBOUNCE_MS = 1000;
+/**
+ * Group-mode debounce (S2). Raised 1s → 3s so each topic coalesces its own
+ * stream to at most ~1 update / 3s: fewer, larger edits that compose with the
+ * global 1/2s send pacer instead of a trickle of tiny sends.
+ */
+export const OUTPUT_DEBOUNCE_MS = 3000;
 
 /**
  * @description The output debounce window. Group-only now (DM finalizes the

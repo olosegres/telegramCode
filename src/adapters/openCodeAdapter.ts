@@ -268,9 +268,11 @@ interface OpenCodeSession {
   /**
    * Id of the LAST completed parent assistant message of the turn, captured from
    * the message events (no extra HTTP). Advanced to the persisted
-   * {@link SeenWatermark} on `session.idle` so a bot restart can count the
-   * assistant messages produced after it (the reattach recap). `undefined` until
-   * the first assistant turn finishes.
+   * {@link SeenWatermark} on each parent-message `finish` (S7 — so a mid-turn
+   * restart re-counts nothing already relayed) and again on `session.idle` (the
+   * safety net), so a bot restart can count only the assistant messages produced
+   * after it (the reattach recap). `undefined` until the first assistant message
+   * finishes.
    */
   lastMessageId?: string;
   /**
@@ -3471,10 +3473,18 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       const isParentMessage = !info.sessionID || info.sessionID === session.sessionId;
       if (isParentMessage) {
         // Anchor the seen-watermark on the PARENT turn's final assistant message
-        // id (a child's id must never become the watermark). Advanced to state on
-        // the following `session.idle`.
+        // id (a child's id must never become the watermark).
         if (info.id) session.lastMessageId = info.id;
         this.closeSubagentStatusOnParentTurnEnd(key);
+        // S7: advance the persisted watermark on EACH parent-message `finish`,
+        // not only at turn-end idle. The bot relays every completed assistant
+        // message live (`flushOutput` below), so tracking each finished parent id
+        // keeps `missedCount` at what was genuinely unseen — a mid-turn restart
+        // after these messages already landed re-shows nothing (the false
+        // "missed N" fix, live 2026-07-04). The `session.idle` advance stays as
+        // the final safety net (a dropped `finish`); child messages never reach
+        // here (the `isParentMessage` guard).
+        this.advanceSeenWatermark(key, { sessionId: session.sessionId, opencodeMessageId: session.lastMessageId });
       }
       this.flushOutput(key);
     }
@@ -3527,6 +3537,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // child idle (routed here via lineage) leaves the parent turn in flight.
     // Anchored on the last completed parent assistant message id (captured in
     // handleMessageUpdate); a missing anchor is skipped (recap falls back).
+    // S7: this is now the SAFETY NET — the primary advance runs per parent
+    // `finish` in handleMessageUpdate, so a mid-turn restart already sees the
+    // relayed tail; idle still fires in case a `finish` was dropped.
     if (!sessionId || sessionId === session.sessionId) {
       this.advanceSeenWatermark(key, { sessionId: session.sessionId, opencodeMessageId: session.lastMessageId });
     }

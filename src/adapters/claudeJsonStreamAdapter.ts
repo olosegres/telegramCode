@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import type {
   AgentAdapter,
@@ -112,6 +113,10 @@ interface StreamSession {
   pendingQuestion: PendingStreamQuestion | null;
   // — api error one-shot guard (re-armed on recovery) —
   apiErrorFired: boolean;
+  /** Last transcript byte offset persisted as the seen-watermark (S7 monotonic
+   *  guard). `-1` until the first advance so a never-advanced session writes on
+   *  its first relayed message. */
+  lastWatermarkOffset: number;
 }
 
 /**
@@ -258,6 +263,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       subagentActive: false, childResponseText: '', childEmittedLength: 0, childOutputTimer: null,
       pendingInitResolve: null, initRequestId: null,
       pendingQuestion: null, apiErrorFired: false,
+      lastWatermarkOffset: -1,
     };
     this.sessions.set(keyToString(key), session);
 
@@ -407,6 +413,18 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       if (msg.type === 'control_response') { this.handleControlResponse(session, msg); continue; }
       for (const action of classifyClaudeStreamMessage(msg)) {
         this.applyAction(session, action);
+      }
+      // S7: advance the seen-watermark as each PARENT assistant message settles
+      // (is relayed), not only at turn end. This backend's child dies with the
+      // bot, so a mid-turn restart ABORTS the turn before `handleTurnEnd` — the
+      // idle/turn-end advance never runs, and the aborted turn's already-relayed
+      // assistant messages would re-count as a false "missed N" on reattach (the
+      // same shared recap reader as the tmux backend, so the same 2026-07-04
+      // bug). A settled `assistant` message is on disk here, so the transcript
+      // EOF includes it. A CHILD (sub-agent) message (`parent_tool_use_id` set)
+      // must never advance the watermark.
+      if (msg.type === 'assistant' && msg.parent_tool_use_id == null) {
+        this.advanceWatermarkFromTranscript(session);
       }
     }
   }
@@ -577,19 +595,30 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     this.flushAnswer(session, true);
 
     // Advance the seen watermark to the transcript's current byte size so a bot
-    // restart can count assistant messages produced while it was down.
+    // restart can count assistant messages produced while it was down. Also runs
+    // per settled parent message (see `onStdout`); this turn-end call is the
+    // safety-net catch-up for the final assistant line.
     this.advanceWatermarkFromTranscript(session);
   }
 
+  /**
+   * @description Advance the persisted seen-watermark to the transcript's current
+   * byte size when it grew past the last write (S7). A cheap `fs.statSync().size`
+   * (NOT a whole-file read — this runs per settled parent assistant message, not
+   * only at turn end) plus a monotonic guard, mirroring the tmux backend's
+   * {@link import('./claudeCliAdapter').ClaudeCliAdapter} advance so both Claude
+   * paths track "relayed up to here". Best-effort — a transcript not yet on disk
+   * leaves the watermark where it was; the next relayed message re-tries.
+   */
   private advanceWatermarkFromTranscript(session: StreamSession): void {
     try {
       const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(session.workDir), `${session.sessionId}.jsonl`);
-      const { headOffset } = readClaudeReattachTranscript(filePath, 0, 1);
-      if (headOffset !== undefined) {
-        this.advanceSeenWatermark(session.key, { sessionId: session.sessionId, claudeTranscriptOffset: headOffset });
-      }
-    } catch (e) {
-      console.warn(`[ClaudeJson] watermark advance failed:`, e instanceof Error ? e.message : e);
+      const eof = fs.statSync(filePath).size;
+      if (eof <= session.lastWatermarkOffset) return; // monotonic: only real growth writes
+      session.lastWatermarkOffset = eof;
+      this.advanceSeenWatermark(session.key, { sessionId: session.sessionId, claudeTranscriptOffset: eof });
+    } catch {
+      // Transcript not yet on disk (UUID just born) / stat failed — retry next relay.
     }
   }
 

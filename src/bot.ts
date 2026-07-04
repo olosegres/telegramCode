@@ -99,6 +99,7 @@ import { StartupPromptBuffer } from './startupPromptBuffer';
 import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput, getUnsentRemainder } from './utils/outputFlushPlan';
+import { glueBacklogFrames } from './utils/outputBacklogGlue';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { getOutputDebounceMs as resolveOutputDebounceMs } from './utils/outputDebounce';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
@@ -2762,13 +2763,22 @@ async function sendOutputImmediate(
   await deleteStatusMessage(key);
 
   const msgState = getThreadMessageState(key);
-  const { chunks, shouldEditFirstChunk } = getOutputFlushPlan({
+  const { chunks: planChunks, shouldEditFirstChunk } = getOutputFlushPlan({
     output,
     isContinuation,
     needsNewMessage: msgState.needsNewMessage,
     lastMessageId: msgState.lastMessageId,
     lastMessageText: msgState.lastMessageText,
   });
+  // S2b: when this flush starts FRESH (no in-place edit) and its backlog is ≥3
+  // messages, glue them into the fewest \n\n-joined messages so a burst drains in
+  // one send, not a per-2s trickle behind the global pacer. The edit-in-place
+  // (continuation) path is left untouched — chunks[0] must still match the
+  // message being edited. Glue uses the same rendered-length measure the plan
+  // split with, so a glued block never exceeds Telegram's cap.
+  const chunks = shouldEditFirstChunk
+    ? planChunks
+    : glueBacklogFrames(planChunks, MAX_MESSAGE_LEN, (chunk) => renderAgentHtml(chunk).length);
 
   let startIndex = 0;
   if (shouldEditFirstChunk) {
@@ -2861,7 +2871,10 @@ const callSendMessageDraft = bot.telegram.callApi.bind(
  */
 async function sendAgentChunks(key: ThreadKey, chunks: string[]): Promise<void> {
   const msgState = getThreadMessageState(key);
-  for (const chunk of chunks) {
+  // S2b: collapse a ≥3-message backlog into the fewest \n\n-joined messages so a
+  // burst (DM finalize / overflow-spill) lands in one send, not a trickle.
+  const toSend = glueBacklogFrames(chunks, MAX_MESSAGE_LEN, (chunk) => renderAgentHtml(chunk).length);
+  for (const chunk of toSend) {
     const id = await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk, 'output');
     if (id) {
       msgState.lastMessageId = id;

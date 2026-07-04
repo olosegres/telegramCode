@@ -1,6 +1,7 @@
 import type { ChatMode } from '../threadRouting';
 import type { OutputTransport, ThreadKey } from '../types';
 import { createDmOutputTransport, type DmOutputTransportDeps } from './dmOutputTransport';
+import { getGroupDeltaContinuation } from '../utils/outputFlushPlan';
 
 /**
  * @description Bot primitives the output transport routes through. The group
@@ -31,13 +32,25 @@ export type OutputTransportDeps = DmOutputTransportDeps & {
 function createGroupOutputTransport(deps: OutputTransportDeps): OutputTransport {
   return {
     deliverOutput(key, output, meta) {
+      const startsNewParagraph = meta?.startsNewParagraph === true;
+      // S3 (edit-in-place): the Claude scrape adapter marks no continuations, so a
+      // growing block used to send one NEW message per poll flush (the table
+      // flood). Synthesise the flag so a poll delta EDITS the growing message in
+      // place, breaking to a new message only at a paragraph/block boundary
+      // (`startsNewParagraph`) or a fresh turn (`needsNewMessage`, honoured by
+      // `getOutputFlushPlan`). OpenCode (outputsDeltas false) passes through.
+      const isContinuation = getGroupDeltaContinuation(
+        meta?.isContinuation === true,
+        deps.checkOutputsDeltas(key),
+        startsNewParagraph,
+      );
       deps.queueOutput(
         key,
         output,
-        meta?.isContinuation === true,
+        isContinuation,
         meta?.isFinal === true,
         meta?.isComplete === true,
-        meta?.startsNewParagraph === true,
+        startsNewParagraph,
       );
     },
     // S2: drain the coalesced-but-unsent output to a permanent message so the

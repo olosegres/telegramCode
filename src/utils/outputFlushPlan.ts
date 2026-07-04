@@ -67,6 +67,40 @@ export function getOutputFlushPlan(input: OutputFlushInput): OutputFlushPlan {
 }
 
 /**
+ * @description The effective continuation flag the GROUP output path should use
+ * for an incoming `output`, accounting for adapters that stream WITHOUT marking
+ * continuations (the Claude scrape adapter).
+ *
+ * OpenCode marks every tail except a response's first with `meta.isContinuation`,
+ * so the group edit-in-place path already knows which outputs extend the last
+ * message; for it (`outputsDeltas === false`) the meta flag passes through
+ * unchanged. The Claude scrape adapter emits each poll's prose delta with NO
+ * meta even though every delta CONTINUES the same block — treating those as
+ * non-continuations made `getOutputFlushPlan` start a new message per poll flush
+ * (the one-message-per-scrape flood, and every re-flowed table width its own
+ * message).
+ *
+ * For a delta-emitting adapter a poll delta is therefore a CONTINUATION (it
+ * edits the growing message in place) UNLESS the pane had a real block boundary
+ * before it — a blank-line paragraph break or a distinct block (a settled
+ * table), both surfaced out-of-band as `startsNewParagraph`. At such a boundary
+ * the delta starts a NEW message (the locked boundary rule: a new message begins
+ * only at a paragraph/section, a distinct block, or a fresh turn — the last via
+ * `needsNewMessage`, which `getOutputFlushPlan` already honours). Unlike the DM
+ * cursor (one accumulating draft → everything is a continuation,
+ * {@link getDmDraftContinuation}), group renders discrete messages, so a
+ * paragraph/block boundary must break the message, not glue onto it.
+ */
+export function getGroupDeltaContinuation(
+  metaIsContinuation: boolean,
+  outputsDeltas: boolean,
+  startsNewParagraph: boolean,
+): boolean {
+  if (!outputsDeltas) return metaIsContinuation;
+  return !startsNewParagraph;
+}
+
+/**
  * @description Coalesce a new output batch into the pending (not yet flushed)
  * buffer. Continuation tails concatenate as-is — they may be cut mid-word, a
  * `\n` would split the word across lines. DISTINCT standalone outputs join with

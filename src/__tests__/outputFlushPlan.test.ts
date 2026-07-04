@@ -23,6 +23,7 @@ import {
   getOutputFlushPlan,
   appendPendingOutput,
   getUnsentRemainder,
+  getGroupDeltaContinuation,
 } from '../utils/outputFlushPlan';
 import { MAX_MESSAGE_LEN, splitMessage } from '../messageSplit';
 
@@ -204,5 +205,27 @@ describe('getUnsentRemainder (S2 — no silent drop on send failure)', () => {
 
     // The full original content survived exactly once each across both flushes.
     assert.deepEqual(landed, ['chunk A', 'chunk B', 'chunk C']);
+  });
+});
+
+describe('getGroupDeltaContinuation (S3 — Claude edit-in-place in group mode)', () => {
+  it('a continuation-marking adapter (OpenCode, outputsDeltas false) passes the meta flag through', () => {
+    // OpenCode is authoritative; startsNewParagraph is irrelevant (it never sets it).
+    assert.equal(getGroupDeltaContinuation(true, false, false), true);
+    assert.equal(getGroupDeltaContinuation(false, false, false), false);
+    assert.equal(getGroupDeltaContinuation(true, false, true), true);
+  });
+
+  it('a delta adapter (Claude) treats a poll delta as a CONTINUATION → edits in place', () => {
+    // The core fix: a mid-block prose delta (no paragraph break, no meta) must
+    // continue the growing message instead of spawning a new one per flush.
+    assert.equal(getGroupDeltaContinuation(false, true, false), true);
+  });
+
+  it('a delta adapter starts a NEW message at a paragraph/block boundary (startsNewParagraph)', () => {
+    // The boundary rule: a blank-line paragraph break or a distinct block (a
+    // settled table emits with startsNewParagraph) is NOT a continuation → new
+    // message, so blocks never glue and a re-flowed table stays its own message.
+    assert.equal(getGroupDeltaContinuation(false, true, true), false);
   });
 });

@@ -106,6 +106,28 @@ test('group: deliverOutput routes to queueOutput with the meta flags', () => {
   assert.equal(calls.feedDraft.length, 0, 'group must never touch the draft path');
 });
 
+test('group: a Claude delta (no continuation meta, outputsDeltas) is SYNTHESISED as a continuation (S3)', () => {
+  // The scrape adapter marks no continuations; without S3 every poll flush was a
+  // fresh queueOutput → a new message (the table flood). A mid-block delta (no
+  // paragraph break) must reach queueOutput as isContinuation=true so it edits
+  // the growing message in place.
+  const { deps, calls } = createStubDeps(/* supportsDraft */ false, /* outputsDeltas */ true);
+  const transport = createOutputTransport('group', deps);
+  transport.deliverOutput(KEY, 'claude prose delta', { isContinuation: false });
+  assert.equal(calls.queueOutput.length, 1);
+  assert.equal(calls.queueOutput[0].isContinuation, true, 'a Claude delta edits in place');
+});
+
+test('group: a Claude delta AT a paragraph/block boundary is NOT a continuation → new message (S3)', () => {
+  // startsNewParagraph (a blank-line paragraph break or a settled table block)
+  // must break to a new message, not glue onto the growing one.
+  const { deps, calls } = createStubDeps(/* supportsDraft */ false, /* outputsDeltas */ true);
+  const transport = createOutputTransport('group', deps);
+  transport.deliverOutput(KEY, 'new paragraph', { startsNewParagraph: true });
+  assert.equal(calls.queueOutput.length, 1);
+  assert.equal(calls.queueOutput[0].isContinuation, false, 'a block boundary starts a new message');
+});
+
 test('group: finalizeInFlight delegates to finalizeGroupOutput (S2 reconcile, not a noop)', async () => {
   const { deps, calls } = createStubDeps(true);
   const transport = createOutputTransport('group', deps);

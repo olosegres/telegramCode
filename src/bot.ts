@@ -100,6 +100,7 @@ import { renderAgentHtml } from './renderAgentHtml';
 import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput, getUnsentRemainder } from './utils/outputFlushPlan';
 import { glueBacklogFrames } from './utils/outputBacklogGlue';
+import { checkShouldKeepTyping as checkShouldKeepTypingDecision } from './utils/typingActive';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { getOutputDebounceMs as resolveOutputDebounceMs } from './utils/outputDebounce';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
@@ -2474,20 +2475,46 @@ async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
   }
 }
 
+/** Whether the thread's adapter is still working (its optional `checkIsBusy`). */
+function checkIsAdapterBusy(key: ThreadKey): boolean {
+  return getThreadAdapter(key).checkIsBusy?.(key) === true;
+}
+
+/**
+ * @description S3 — should the native typing state keep showing for `key`? True
+ * while output is mid-flight OR the agent is still working. The pure rule lives
+ * in `utils/typingActive`; this wraps it with the two live readings.
+ */
+function checkShouldKeepTyping(key: ThreadKey): boolean {
+  return checkShouldKeepTypingDecision({
+    isOutputStreaming: checkIsOutputStreaming(key),
+    isAdapterBusy: checkIsAdapterBusy(key),
+  });
+}
+
 /**
  * @description Start the sustained "agent is working" loader for `key`: fire the
  * native typing indicator NOW, then keep re-firing it every
  * {@link typingLoaderRefreshMs} (Telegram's `typing` action self-expires). This
  * is the ONLY loader — it replaced the old `⏳` placeholder message. Idempotent:
  * an already-running loader is cleared first so a second start can't leave two
- * timers. There is deliberately NO self-cap/timeout — a long-thinking agent must
- * keep the loader; it is cleared only by a real event via {@link stopTypingLoader}.
+ * timers.
+ *
+ * S3: the loader is a PERSISTENT state — each tick keeps firing `typing` while
+ * {@link checkShouldKeepTyping} holds (output streaming OR agent busy) and
+ * self-stops once the topic is truly drained + idle. It is NOT cleared on the
+ * first output any more; hard teardown paths (session end / question UI / unbind)
+ * still call {@link stopTypingLoader} directly.
  */
 function startTypingLoader(key: ThreadKey): void {
   const s = getThreadMessageState(key);
   if (s.typingLoaderTimer) clearInterval(s.typingLoaderTimer);
   sendThreadTypingIndicator(key).catch(() => {});
   s.typingLoaderTimer = setInterval(() => {
+    if (!checkShouldKeepTyping(key)) {
+      stopTypingLoader(key);
+      return;
+    }
     sendThreadTypingIndicator(key).catch(() => {});
   }, typingLoaderRefreshMs);
   // Don't keep the event loop alive just for a loader (mirrors the liveness timer).
@@ -3567,8 +3594,9 @@ async function forwardPromptToAgent(
   msgState.statusIdleSuppressed = false;
   msgState.workingSince = Date.now();
   // The native typing indicator is the loader: it shows immediately, can't be
-  // delayed behind a chat-wide 429 cooldown (unlike a sent message), and clears
-  // on the agent's first output via `handleAgentOutput`'s `stopTypingLoader`.
+  // delayed behind a chat-wide 429 cooldown (unlike a sent message), and (S3)
+  // persists while output is streaming OR the agent is busy — self-stopping only
+  // when the topic drains + idles.
   startTypingLoader(key);
   if (adapter.interruptAndWaitIdle) {
     await adapter.interruptAndWaitIdle(key);
@@ -7156,10 +7184,10 @@ function handleAgentOutput(key: ThreadKey, output: string, meta?: OutputEventMet
     const adapter = getThreadAdapter(key);
     if (adapter.outputsDeltas) msgState.needsNewMessage = true;
   }
-  // The agent produced output → the "working" loader has done its job. Stop it
-  // HERE (the shared onOutput entry for BOTH group and DM transports) so the DM
-  // path is covered too, not only the group's `sendOutputImmediate`.
-  stopTypingLoader(key);
+  // S3: do NOT stop the typing loader on the first output. It is a persistent
+  // "working" state now — the loader self-sustains while output is streaming OR
+  // the agent is busy and self-stops only when the topic is drained + idle
+  // (teardown paths clear it). Stopping here made the topic look idle mid-answer.
   // Delete UNCONDITIONALLY — not only when a frame is currently visible. A
   // liveness/scrape `sendStatusFrame` create may be mid-`await` with its id not
   // yet stored; calling `deleteStatusMessage` here bumps the frame generation so
@@ -7230,8 +7258,9 @@ async function handleAgentStatus(key: ThreadKey, status: string): Promise<void> 
   console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
   traceAgentEmit('status', key, status);
 
-  // A status / thinking frame already signals "working" — drop the typing loader.
-  stopTypingLoader(key);
+  // S3: a status/thinking frame does NOT stop the typing state — both are
+  // "working" cues and typing persists while the agent is busy. The loader
+  // self-stops when the topic drains + idles; teardown paths clear it explicitly.
 
   // DM streaming v2 — status is ALWAYS the bottom-most message. If a content
   // cursor draft is still active, finalize it to a permanent message FIRST so the

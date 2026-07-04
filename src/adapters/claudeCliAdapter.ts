@@ -27,6 +27,7 @@ import { checkIsInstalled, installTool } from '../installManager';
 import { prepareMcpFlags, cleanupMcpTempFiles } from '../mcpConfig';
 import { resolveDataDir } from '../state';
 import { threadContextPreambleHeader } from '../threadContextPreamble';
+import { getSessionTitleCandidate } from '../utils/claudeSessionTitle';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
 import {
   SPINNER_TICK_RE,
@@ -2048,10 +2049,14 @@ interface ParsedTranscript {
   recordedCwd: string | null;
   /** Model-written conversation title (from the matching `summary` entry). */
   summaryTitle: string | null;
-  /** First user prompt — final fallback title. */
-  firstUser: string | null;
-  /** Last user prompt — preferred over `firstUser` when no summary matches. */
-  lastPrompt: string | null;
+  /**
+   * First user prompt that reads as a real TOPIC — preamble/marker stripped,
+   * tooling noise skipped (see {@link getSessionTitleCandidate}). The primary
+   * title source now that Claude no longer writes `summary` lines. `null` when
+   * the session has no meaningful prompt (all turns were command echoes / noise)
+   * → the caller falls back to the bare session id.
+   */
+  firstMeaningfulPrompt: string | null;
   firstTimestamp: string | null;
 }
 
@@ -2079,8 +2084,7 @@ function parseClaudeTranscript(filePath: string): ParsedTranscript {
   const result: ParsedTranscript = {
     recordedCwd: null,
     summaryTitle: null,
-    firstUser: null,
-    lastPrompt: null,
+    firstMeaningfulPrompt: null,
     firstTimestamp: null,
   };
   let raw: string;
@@ -2116,11 +2120,11 @@ function parseClaudeTranscript(filePath: string): ParsedTranscript {
     if (result.firstTimestamp === null && typeof entry.timestamp === 'string') {
       result.firstTimestamp = entry.timestamp;
     }
-    if (entry.type === 'user') {
+    if (entry.type === 'user' && result.firstMeaningfulPrompt === null) {
       const userText = extractUserText(entry.message);
       if (userText) {
-        if (result.firstUser === null) result.firstUser = userText;
-        result.lastPrompt = userText; // keep the LAST user prompt
+        const candidate = getSessionTitleCandidate(userText);
+        if (candidate) result.firstMeaningfulPrompt = candidate;
       }
     }
   }
@@ -2307,8 +2311,13 @@ export function readClaudeReattachTranscript(
  *   3. Parse each; KEEP only files whose recorded cwd === `workDir`
  *      (the load-bearing correctness gate — slug collisions / version drift).
  *   4. id = filename stem, MUST pass {@link checkIsValidUuid} (else skip).
- *   5. title = summaryTitle ?? lastPrompt ?? firstUser ?? id (trimmed, capped).
- *      updatedAt = file mtime; createdAt = first timestamp ?? mtime.
+ *   5. title = summaryTitle ?? firstMeaningfulPrompt ?? id (trimmed, capped).
+ *      `summaryTitle` is legacy (current Claude no longer writes it); the
+ *      primary source is the first REAL prompt topic
+ *      ({@link getSessionTitleCandidate}) — preamble/marker stripped, tooling
+ *      noise skipped — NOT the last (often noise) prompt. A session with no
+ *      meaningful prompt (all turns were command echoes / noise) falls back to
+ *      the bare id. updatedAt = file mtime; createdAt = first timestamp ?? mtime.
  *
  * Result is newest-first by mtime.
  */
@@ -2342,7 +2351,7 @@ export function listClaudeSessionsForWorkDir(projectsRoot: string, workDir: stri
     if (!checkIsValidUuid(id)) continue;
     const parsed = parseClaudeTranscript(candidate.fullPath);
     if (parsed.recordedCwd !== workDir) continue;
-    const rawTitle = parsed.summaryTitle ?? parsed.lastPrompt ?? parsed.firstUser ?? id;
+    const rawTitle = parsed.summaryTitle ?? parsed.firstMeaningfulPrompt ?? id;
     const title = rawTitle.trim().slice(0, sessionTitleMaxLength) || id;
     const updatedAt = new Date(candidate.mtimeMs);
     const createdAt = parsed.firstTimestamp ? new Date(parsed.firstTimestamp) : updatedAt;

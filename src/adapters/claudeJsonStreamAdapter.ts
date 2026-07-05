@@ -41,6 +41,8 @@ import {
   ClaudeStreamLineReader,
   parseStreamJsonLine,
   classifyClaudeStreamMessage,
+  buildCanUseToolAllow,
+  buildCanUseToolDeny,
   type ClaudeStreamAction,
 } from '../utils/claudeStreamJson';
 
@@ -229,7 +231,17 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       '--include-partial-messages',
       '--verbose',
       '--replay-user-messages',
-      '--permission-mode', 'acceptEdits',
+      // Bypass ALL permission checks (tmux-backend parity) so the operator's own
+      // agent never stalls on a permission prompt. `--dangerously-skip-permissions`
+      // + `bypassPermissions` means regular tools (Bash/Read/…) never route through
+      // the stdio prompt tool at all. `--permission-prompt-tool stdio` STAYS: it is
+      // what keeps `AskUserQuestion` in the tool list AND still routes it through the
+      // control channel even under bypass (verified live on v2.1.201 — bypass does
+      // NOT suppress AskUserQuestion, and `apiKeySource` stays `none`). The residual
+      // circuit-breakers claude never bypasses (`rm -rf /`, `rm -rf ~`) still arrive
+      // as `can_use_tool` and are answered by the generic auto-allow below.
+      '--dangerously-skip-permissions',
+      '--permission-mode', 'bypassPermissions',
       '--permission-prompt-tool', 'stdio',
     ];
     if (opts.resume) args.push('--resume', sessionId);
@@ -646,8 +658,10 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
         return;
       }
       // Any other tool → auto-allow (operator trusts their own agent; parity with
-      // the tmux backend's bypassPermissions). Never wedge the turn.
-      this.writeControlResponse(session, action.requestId, { behavior: 'allow', toolUseID: action.toolUseId });
+      // the tmux backend's bypassPermissions). Under bypass this fires only for the
+      // residual circuit-breakers claude never bypasses (`rm -rf /`, `rm -rf ~`).
+      // `buildCanUseToolAllow` guarantees the schema-required `updatedInput`.
+      this.writeControlResponse(session, action.requestId, buildCanUseToolAllow(action.input, action.toolUseId));
       return;
     }
     if (action.subtype === 'request_user_dialog') {
@@ -663,7 +677,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     const questions = this.parseQuestions(rawInput);
     if (questions.length === 0) {
       // Nothing to ask — allow with the raw input so the turn continues.
-      this.writeControlResponse(session, requestId, { behavior: 'allow', updatedInput: rawInput, toolUseID: toolUseId });
+      this.writeControlResponse(session, requestId, buildCanUseToolAllow(rawInput, toolUseId));
       return;
     }
     session.pendingQuestion = { requestId, toolUseId, rawInput, questions };
@@ -712,11 +726,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       const selected = answers[i] ?? [];
       answersMap[q.question] = selected.join(',');
     });
-    this.writeControlResponse(session, pending.requestId, {
-      behavior: 'allow',
-      updatedInput: { ...pending.rawInput, answers: answersMap },
-      toolUseID: pending.toolUseId,
-    });
+    this.writeControlResponse(session, pending.requestId, buildCanUseToolAllow({ ...pending.rawInput, answers: answersMap }, pending.toolUseId));
   }
 
   rejectQuestion(key: ThreadKey): void {
@@ -724,11 +734,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (!session?.pendingQuestion) return;
     const pending = session.pendingQuestion;
     session.pendingQuestion = null;
-    this.writeControlResponse(session, pending.requestId, {
-      behavior: 'deny',
-      message: 'User declined to answer the question.',
-      toolUseID: pending.toolUseId,
-    });
+    this.writeControlResponse(session, pending.requestId, buildCanUseToolDeny('User declined to answer the question.', pending.toolUseId));
   }
 
   private writeControlResponse(session: StreamSession, requestId: string, response: Record<string, unknown>): void {

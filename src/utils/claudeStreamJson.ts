@@ -227,3 +227,32 @@ export function classifyClaudeStreamMessage(msg: Record<string, unknown>): Claud
 
   return [];
 }
+
+/** The `response` payload of a `can_use_tool` control_response (allow / deny). */
+export type CanUseToolResponse =
+  | { behavior: 'allow'; updatedInput: Record<string, unknown>; toolUseID?: string }
+  | { behavior: 'deny'; message: string; toolUseID?: string };
+
+/**
+ * @description Build the `allow` body of a `can_use_tool` control_response.
+ *
+ * The CLI's control-response schema REQUIRES `updatedInput` to be a record on an
+ * allow — omit it and the CLI rejects the whole response ("Tool permission
+ * request failed: ZodError"), which silently blocks the tool it was meant to
+ * permit. This builder makes that field impossible to forget: `input` is echoed
+ * unchanged (`{}` when the request carried none). Used for the generic auto-allow
+ * of ordinary tools and for the empty-question fast-path.
+ */
+export function buildCanUseToolAllow(input: Record<string, unknown> | undefined, toolUseId: string | undefined): CanUseToolResponse {
+  const response: CanUseToolResponse = { behavior: 'allow', updatedInput: input ?? {} };
+  if (toolUseId) response.toolUseID = toolUseId;
+  return response;
+}
+
+/** Build the `deny` body of a `can_use_tool` control_response (schema requires
+ *  `message`). Used when the user declines / abandons an AskUserQuestion. */
+export function buildCanUseToolDeny(message: string, toolUseId: string | undefined): CanUseToolResponse {
+  const response: CanUseToolResponse = { behavior: 'deny', message };
+  if (toolUseId) response.toolUseID = toolUseId;
+  return response;
+}

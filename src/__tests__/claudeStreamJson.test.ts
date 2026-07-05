@@ -20,6 +20,8 @@ import {
   ClaudeStreamLineReader,
   parseStreamJsonLine,
   classifyClaudeStreamMessage,
+  buildCanUseToolAllow,
+  buildCanUseToolDeny,
   type ClaudeStreamAction,
 } from '../utils/claudeStreamJson';
 
@@ -204,5 +206,39 @@ describe('classifyClaudeStreamMessage — AskUserQuestion control_request (rever
   it('malformed control_request (no request_id / subtype) → no action', () => {
     assert.deepEqual(classify({ type: 'control_request', request: { subtype: 'can_use_tool' } }), []);
     assert.deepEqual(classify({ type: 'control_request', request_id: 'r' }), []);
+  });
+});
+
+describe('buildCanUseToolAllow / buildCanUseToolDeny — control_response bodies', () => {
+  // Regression: the CLI rejects an allow WITHOUT `updatedInput`
+  // ("Tool permission request failed: ZodError"), silently blocking the tool.
+  // The generic auto-allow once sent `{behavior:'allow',toolUseID}` with no
+  // `updatedInput` → EVERY non-edit tool failed. `updatedInput` must ALWAYS be a
+  // record on an allow.
+  it('allow ALWAYS carries updatedInput (echoes the tool input unchanged)', () => {
+    const res = buildCanUseToolAllow({ command: 'echo hi' }, 'toolu_x');
+    assert.equal(res.behavior, 'allow');
+    assert.deepEqual((res as { updatedInput: unknown }).updatedInput, { command: 'echo hi' });
+    assert.equal((res as { toolUseID?: string }).toolUseID, 'toolu_x');
+  });
+
+  it('allow with NO input still emits updatedInput as an empty record, not undefined', () => {
+    const res = buildCanUseToolAllow(undefined, 'toolu_y');
+    assert.equal(res.behavior, 'allow');
+    assert.ok('updatedInput' in res, 'updatedInput key must be present');
+    assert.deepEqual((res as { updatedInput: unknown }).updatedInput, {});
+  });
+
+  it('allow omits toolUseID when the request carried none (no key with undefined value)', () => {
+    const res = buildCanUseToolAllow({ a: 1 }, undefined);
+    assert.equal(res.behavior, 'allow');
+    assert.ok(!('toolUseID' in res), 'toolUseID must be absent, not undefined');
+  });
+
+  it('deny carries the schema-required message', () => {
+    const res = buildCanUseToolDeny('User declined to answer the question.', 'toolu_z');
+    assert.equal(res.behavior, 'deny');
+    assert.equal((res as { message: string }).message, 'User declined to answer the question.');
+    assert.equal((res as { toolUseID?: string }).toolUseID, 'toolu_z');
   });
 });

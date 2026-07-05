@@ -17,8 +17,9 @@ and exchanges structured JSON over the child's stdio. Min version: `claude`
 
 ```
 claude -p --input-format stream-json --output-format stream-json \
-  --include-partial-messages --verbose \
-  --permission-prompt-tool stdio --permission-mode acceptEdits \
+  --include-partial-messages --verbose --replay-user-messages \
+  --dangerously-skip-permissions --permission-mode bypassPermissions \
+  --permission-prompt-tool stdio \
   --session-id <uuid> [--resume <id>] --model … --effort … --mcp-config <file> -C <workDir>
 ```
 
@@ -27,10 +28,17 @@ claude -p --input-format stream-json --output-format stream-json \
 - `--permission-prompt-tool stdio` — **the lynchpin for interactive questions**:
   without it `AskUserQuestion` is not even in the tool list, and there is no
   channel to answer a permission over. Easy to miss; nothing else surfaces the
-  need for it.
-- `--permission-mode acceptEdits` — ordinary tool use is auto-approved
-  (tmux-parity: the operator trusts their own agent), so only `AskUserQuestion`
-  actually reaches the user.
+  need for it. It STAYS even under `bypassPermissions` — verified live on
+  v2.1.201 that bypass does NOT drop `AskUserQuestion` from the tool list and
+  still routes it through the control channel (and `apiKeySource` stays `none`).
+- `--dangerously-skip-permissions --permission-mode bypassPermissions` — bypass
+  ALL permission checks (tmux-backend parity: the operator trusts their own
+  agent). Regular tool use (Bash/Read/…) never routes through the stdio prompt
+  tool at all, so the agent never stalls waiting for an allow. WITHOUT these
+  (the old `acceptEdits`) every non-edit tool DID route through the prompt tool
+  — and any hiccup in the auto-allow reply silently blocked it. The residual
+  circuit-breakers claude never bypasses (`rm -rf /`, `rm -rf ~`) still arrive
+  as a `can_use_tool` and get a generic auto-allow.
 - **Billing**: NEVER `--bare`, NEVER set `ANTHROPIC_API_KEY` — either one forces
   metered pay-per-token API billing. Non-`--bare` + the existing OAuth login runs
   on the **subscription**. Proof in the stream: `system/init` carries

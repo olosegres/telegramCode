@@ -365,3 +365,40 @@ export function decodeStdoutTailChunk(state: StdoutTailState, chunk: Buffer): st
 export function getStdoutLineBoundaryOffset(state: StdoutTailState, pendingLineText: string): number {
   return state.consumedBytes - state.decoderRetainedBytes - Buffer.byteLength(pendingLineText, 'utf8');
 }
+
+/**
+ * @description Janitor: remove `jsonstream/` host dirs whose thread no longer
+ * owns a json-stream session (crash leftovers — the normal stop/release paths
+ * delete the dir themselves, and reattach handles live tmux sessions).
+ * `checkIsThreadOwned` is injected by the bot (persisted json-stream agent row
+ * with a session id, or a currently-active adapter session). Unparseable dir
+ * names are skipped, never swept. Returns the number of dirs removed. Runs at
+ * boot + the daily file sweep.
+ */
+export async function sweepOrphanJsonStreamDirs(
+  jsonStreamRoot: string,
+  checkIsThreadOwned: (key: ThreadKey) => boolean,
+): Promise<number> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(jsonStreamRoot, { withFileTypes: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn(`[jsonStreamSweep] cannot read ${jsonStreamRoot}:`, e);
+    }
+    return 0;
+  }
+  let removedCount = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const key = parseJsonStreamDirName(entry.name);
+    if (!key || checkIsThreadOwned(key)) continue;
+    try {
+      await fs.promises.rm(path.join(jsonStreamRoot, entry.name), { recursive: true, force: true });
+      removedCount += 1;
+    } catch (e) {
+      console.warn(`[jsonStreamSweep] cannot remove orphan dir ${entry.name}:`, e);
+    }
+  }
+  return removedCount;
+}

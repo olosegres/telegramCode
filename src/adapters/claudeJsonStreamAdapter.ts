@@ -6,6 +6,7 @@ import type {
   AgentAdapter,
   AgentSession,
   DisplayPrefsReader,
+  JsonStreamTailOffset,
   JsonStreamTailWriter,
   OpenCodeQuestion,
   OutputEventMeta,
@@ -39,6 +40,7 @@ import {
 } from './claudeCliAdapter';
 import {
   ClaudeStreamLineReader,
+  checkIsStreamRecord,
   parseStreamJsonLine,
   classifyClaudeStreamMessage,
   buildCanUseToolAllow,
@@ -58,8 +60,10 @@ import {
   getStdoutLineBoundaryOffset,
   getStdoutTailDecision,
   openFifoWriterNonBlocking,
+  parseJsonStreamTmuxSessionName,
   readExitCodeFile,
   readFileByteRange,
+  readPidFile,
   readStderrTail,
   resolveJsonStreamSessionDir,
   stdoutOversizeWarnBytes,
@@ -188,8 +192,9 @@ interface StreamSession {
  * tool permissions are auto-allowed (operator trusts their own agent — parity
  * with the tmux backend's `bypassPermissions`), so only questions block.
  *
- * Experimental: selected only by code (`DEFAULT_AGENT=claude-json-stream` or a
- * `setThreadAdapter` call). The tmux `claude` adapter stays the default.
+ * The DEFAULT Claude backend (`getDefaultAdapterName`); a topic flips between
+ * it and the tmux-scrape backend via `/claude_mode` (they share the on-disk
+ * transcript, so the switch resumes the same conversation).
  */
 export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapter {
   readonly name = claudeJsonStreamAdapterName;
@@ -447,7 +452,15 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (chunk.length === 0) return false;
     const text = decodeStdoutTailChunk(session.tail, chunk);
     if (text) this.onStdout(session, text);
-    this.persistTailOffset(session);
+    // Persist the consumption boundary ONLY when nothing sits in the answer /
+    // child batchers: the offset means "everything before here has LEFT the
+    // adapter", so text still waiting in a 350ms batch must hold it back —
+    // otherwise a reload in that window skips the batched text on replay
+    // (live seam-loss 2026-07-05 on topic 9085: lines 216–221 were consumed
+    // into the batch, the offset moved past them, and the kill dropped them).
+    // A deferred persist happens in `flushAnswer` / the child flush, right
+    // after the batched text is emitted.
+    if (checkIsEmitCaughtUp(session)) this.persistTailOffset(session);
     return true;
   }
 
@@ -496,6 +509,141 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     session.stdinWriteChain = session.stdinWriteChain
       .catch(() => { /* write failures were already logged */ })
       .then(() => { try { fs.closeSync(fd); } catch { /* already closed */ } });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  Reattach at boot (S3) — adopt the external process, resume the tail
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Scan tmux for `cjson-…` sessions that outlived the bot (mirror of the
+   *  scrape backend's scan). The bot decides adopt-vs-orphan per key — this
+   *  method only lists. */
+  async listExistingTmuxSessions(): Promise<Array<{ key: ThreadKey; sessionName: string }>> {
+    const raw = await tmuxAsync('list-sessions', '-F', '#{session_name}');
+    if (!raw) return [];
+    const result: Array<{ key: ThreadKey; sessionName: string }> = [];
+    for (const name of raw.split('\n').map((s) => s.trim()).filter(Boolean)) {
+      const key = parseJsonStreamTmuxSessionName(name);
+      if (key) result.push({ key, sessionName: name });
+    }
+    return result;
+  }
+
+  /** Kill an orphan `cjson-…` tmux session AND its host dir (the dir is
+   *  per-thread, derived from the parsed name; an unparseable name only
+   *  kills the tmux session). */
+  async killOrphanTmuxSession(sessionName: string): Promise<void> {
+    console.log(`[ClaudeJson] kill orphan tmux session: ${sessionName}`);
+    await tmuxAsync('kill-session', '-t', sessionName);
+    const key = parseJsonStreamTmuxSessionName(sessionName);
+    if (!key) return;
+    try {
+      fs.rmSync(resolveJsonStreamSessionDir(resolveDataDir(), key), { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  }
+
+  /**
+   * @description Adopt an external json-stream process that survived a bot
+   * restart: reopen the stdin FIFO writer and resume the stdout tail from the
+   * persisted line-boundary offset — everything claude produced during the
+   * downtime replays through the normal pipeline, so the in-flight turn is
+   * delivered end-to-end (which is why the bot posts NO reattach recap for an
+   * adopt). An unknown / foreign-session offset seeds to the CURRENT EOF (no
+   * backlog flood — the first-migration case). No initialize handshake — the
+   * surviving process completed it at spawn; a pending question is restored
+   * from the sidecar so its buttons stay answerable. Returns `false` — after
+   * killing the leftovers — when the process is dead (exitcode present / pid
+   * gone / FIFO unheld): the caller falls back to the dead-process `--resume`
+   * reopen.
+   */
+  async adoptExistingTmuxSession(
+    key: ThreadKey,
+    sessionName: string,
+    workDir: string,
+    claudeSessionId: string,
+    persistedTail: JsonStreamTailOffset | null,
+  ): Promise<boolean> {
+    const names = await tmuxAsync('list-sessions', '-F', '#{session_name}');
+    if (!names.split('\n').includes(sessionName)) {
+      console.log(`[ClaudeJson] adopt: tmux session ${sessionName} no longer exists`);
+      return false;
+    }
+    const k = keyToString(key);
+    if (this.sessions.has(k)) {
+      console.log(`[ClaudeJson] adopt: already tracking ${k}, skipping`);
+      return true;
+    }
+    const sessionDir = resolveJsonStreamSessionDir(resolveDataDir(), key);
+    const paths = getJsonStreamSessionPaths(sessionDir);
+    const pid = readPidFile(paths.pidFile);
+    const exitCode = readExitCodeFile(paths.exitCodeFile);
+    if (pid === null || exitCode !== null || !checkIsPidAlive(pid)) {
+      console.log(`[ClaudeJson] adopt: ${sessionName} process is dead (pid=${pid} exit=${exitCode}), cleaning up`);
+      await this.killOrphanTmuxSession(sessionName);
+      return false;
+    }
+    const fifoFd = await openFifoWriterNonBlocking(paths.stdinFifo);
+    if (fifoFd === null) {
+      console.log(`[ClaudeJson] adopt: ${sessionName} is not holding its stdin FIFO, cleaning up`);
+      await this.killOrphanTmuxSession(sessionName);
+      return false;
+    }
+    const size = getFileSize(paths.stdoutFile) ?? 0;
+    const isTailTrusted = persistedTail !== null && persistedTail.sessionId === claudeSessionId;
+    const startOffset = isTailTrusted ? Math.min(persistedTail.offsetBytes, size) : size;
+
+    console.log(`[ClaudeJson] adopt: re-attaching to ${sessionName} in ${workDir} (pid=${pid}, tail=${startOffset}/${size})`);
+    const session: StreamSession = {
+      key, workDir, sessionId: claudeSessionId,
+      pid, paths, fifoFd,
+      stdinWriteChain: Promise.resolve(),
+      tail: createStdoutTailState(startOffset),
+      pollTimer: null, pollDelayMs: basePollIntervalMs, unchangedStreak: 0,
+      isOversizeWarned: false, lastPersistedTailOffset: startOffset,
+      reader: new ClaudeStreamLineReader(),
+      // isBusy=false: the replayed/live events reconstruct it (deltas/toolUse
+      // set it, `result` clears it) — see `applyAction`.
+      isActive: true, isStopping: false, isRespawning: false, isBusy: false,
+      model: null, effort: null,
+      currentResponseText: '', emittedLength: 0, outputTimer: null,
+      reasoningText: '', reasoningStartedAt: null, reasoningTimer: null, reasoningActive: false,
+      toolNamesById: new Map(), questionToolUseIds: new Set(),
+      subagentActive: false, childResponseText: '', childEmittedLength: 0, childOutputTimer: null,
+      pendingInitResolve: null, initRequestId: null,
+      pendingQuestion: this.readQuestionSidecar(paths),
+      apiErrorFired: false,
+      lastWatermarkOffset: -1,
+    };
+    if (session.pendingQuestion) {
+      // The external process is still blocked on this question — busy, and the
+      // question's internal tool_result echo must stay suppressed after answer.
+      session.isBusy = true;
+      session.questionToolUseIds.add(session.pendingQuestion.toolUseId);
+    }
+    this.sessions.set(k, session);
+    this.schedulePoll(session, basePollIntervalMs);
+    this.emit('started', key);
+    return true;
+  }
+
+  /** Restore a pending question persisted by a previous bot life (see
+   *  {@link writeQuestionSidecar}). Parse-boundary narrowing; the questions
+   *  array re-runs the same validator as a live control_request, so a corrupt
+   *  sidecar yields `null`, never a malformed pending question. */
+  private readQuestionSidecar(paths: JsonStreamSessionPaths): PendingStreamQuestion | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(paths.questionFile, 'utf8'));
+    } catch {
+      return null; // absent (the common case) or corrupt
+    }
+    if (!checkIsStreamRecord(parsed)) return null;
+    const { requestId, toolUseId, rawInput, questions } = parsed;
+    if (typeof requestId !== 'string' || typeof toolUseId !== 'string') return null;
+    if (!checkIsStreamRecord(rawInput) || !Array.isArray(questions)) return null;
+    const revalidated = this.parseQuestions({ questions });
+    if (revalidated.length === 0) return null;
+    return { requestId, toolUseId, rawInput, questions: revalidated };
   }
 
   private performInitialize(session: StreamSession): Promise<void> {
@@ -624,14 +772,15 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
         this.applyAction(session, action);
       }
       // S7: advance the seen-watermark as each PARENT assistant message settles
-      // (is relayed), not only at turn end. This backend's child dies with the
-      // bot, so a mid-turn restart ABORTS the turn before `handleTurnEnd` — the
-      // idle/turn-end advance never runs, and the aborted turn's already-relayed
-      // assistant messages would re-count as a false "missed N" on reattach (the
-      // same shared recap reader as the tmux backend, so the same 2026-07-04
-      // bug). A settled `assistant` message is on disk here, so the transcript
-      // EOF includes it. A CHILD (sub-agent) message (`parent_tool_use_id` set)
-      // must never advance the watermark.
+      // (is relayed), not only at turn end. The external process normally
+      // SURVIVES a bot restart now (adopt replays the stdout tail — no recap),
+      // but when the process itself DIES mid-turn the dead-process `--resume`
+      // fallback recaps from this watermark: without the per-message advance
+      // the aborted turn's already-relayed assistant messages would re-count
+      // as a false "missed N" (same shared recap reader as the tmux backend,
+      // the 2026-07-04 bug). A settled `assistant` message is on disk here, so
+      // the transcript EOF includes it. A CHILD (sub-agent) message
+      // (`parent_tool_use_id` set) must never advance the watermark.
       if (msg.type === 'assistant' && msg.parent_tool_use_id == null) {
         this.advanceWatermarkFromTranscript(session);
       }
@@ -706,11 +855,15 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
   private flushAnswer(session: StreamSession, isFinal: boolean): void {
     if (session.outputTimer) { clearTimeout(session.outputTimer); session.outputTimer = null; }
     const tail = session.currentResponseText.slice(session.emittedLength);
-    if (!tail) return;
-    session.emittedLength = session.currentResponseText.length;
-    const meta: OutputEventMeta = isFinal ? { isFinal: true } : {};
-    // NO isContinuation: `outputsDeltas` adapters let the transports synthesise it.
-    this.emit('output', session.key, tail, meta);
+    if (tail) {
+      session.emittedLength = session.currentResponseText.length;
+      const meta: OutputEventMeta = isFinal ? { isFinal: true } : {};
+      // NO isContinuation: `outputsDeltas` adapters let the transports synthesise it.
+      this.emit('output', session.key, tail, meta);
+    }
+    // The answer batcher is drained — the held-back consumption boundary is now
+    // safe to persist (see `drainStdoutTail`).
+    if (checkIsEmitCaughtUp(session)) this.persistTailOffset(session);
   }
 
   // — reasoning / thinking —
@@ -772,6 +925,9 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
         if (!tail.trim()) return;
         session.childEmittedLength = session.childResponseText.length;
         this.emit('output', session.key, tail, { isSubagent: true } satisfies OutputEventMeta);
+        // Child batcher drained — release the held-back tail offset (see
+        // `drainStdoutTail`).
+        if (checkIsEmitCaughtUp(session)) this.persistTailOffset(session);
       }, streamOutputBatchMs);
     } else {
       this.markSubagentActive(session);
@@ -1058,6 +1214,19 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (session.reasoningTimer) { clearTimeout(session.reasoningTimer); session.reasoningTimer = null; }
     if (session.childOutputTimer) { clearTimeout(session.childOutputTimer); session.childOutputTimer = null; }
   }
+}
+
+/**
+ * @description Whether every consumed event has LEFT the adapter — nothing is
+ * waiting in the answer / sub-agent 350ms batchers. Gates the tail-offset
+ * persist: batched-but-unemitted text must keep the persisted offset BEHIND
+ * it, so a restart replays (never skips) it. Live thinking text is
+ * deliberately ignored — it renders as a transient frame, so a lost batch of
+ * it at a reload seam costs nothing permanent.
+ */
+function checkIsEmitCaughtUp(session: StreamSession): boolean {
+  return session.currentResponseText.length === session.emittedLength
+    && session.childResponseText.length === session.childEmittedLength;
 }
 
 /** Spawn-fail diagnostics: the wrapper's exit code + a stderr excerpt (the

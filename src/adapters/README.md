@@ -70,6 +70,44 @@ The process stays alive between turns and exits ONLY when stdin closes (a single
 message + EOF makes it answer once and exit — that is not multi-turn).
 `--replay-user-messages` echoes each input back as an ack.
 
+### Process hosting — external tmux + FIFO + file tail (restart isolation)
+
+The process is NOT a bot child (plan 2026-07-05-jsonstream-restart-isolation):
+a generated `#!/bin/sh` wrapper (`utils/jsonStreamHost.buildWrapperScript`)
+hosts it in a detached tmux session `cjson-<chatId>-<threadId>`, so bot
+restarts — every hot reload — never touch it. Per-thread host dir
+`DATA_DIR/jsonstream/<chatId>_<threadId>/`:
+
+- `stdin.fifo` — the bot writes turns/control frames here. Claude holds the
+  fifo **`0<>` (read-write on fd 0)**, so a writer (bot) dying never EOFs its
+  stdin. The bot's write-open is `O_WRONLY|O_NONBLOCK` with an `ENXIO` retry
+  loop — a plain blocking open on a reader-less fifo hangs forever (probe-
+  proven); persistent `ENXIO` = the process is dead.
+- `stdout.jsonl` — append-only event log replacing the stdout pipe. The
+  adapter TAILS it (adaptive 300ms→1.5s cadence) and feeds the same line
+  reader/classifier; deltas keep landing while the bot is down. The consumed
+  line-boundary byte offset persists in `state.json` (`agents[key].jsonStreamTail`)
+  but only once batched answer text has actually been EMITTED — an offset past
+  un-emitted text would skip it on replay (live seam-loss 2026-07-05).
+- `stderr.log` — passive; read only for spawn-fail / unexpected-exit
+  diagnostics. `pid` / `exitcode` — written by the wrapper; the poll tick's
+  exit detection (pid-alive + exitcode file) routes into the normal
+  stopped/closed handling with the real code.
+- `question.json` — the pending `AskUserQuestion` control_request, persisted
+  when surfaced and removed when resolved: the blocked question's
+  control_request line lies BEFORE the persisted tail offset, so an adopting
+  bot restores it from this sidecar and can still answer over the fifo.
+
+On boot, reattach ADOPTS a live `cjson-*` session (reopen fifo + resume the
+tail from the persisted offset → the downtime gap replays through the normal
+pipeline, in-flight turn delivered end-to-end, no recap posted); a released
+session (`/quit`/`/new` cleared the persisted id) is killed as an orphan, and
+a thread whose process died falls back to the old dead-process `--resume`
+reopen (the only path that posts a recap). Explicit stop = SIGTERM + tmux
+kill + host-dir removal. The wrapper runs `env -u ANTHROPIC_API_KEY`, keeping
+subscription billing under tmux. tmux is therefore REQUIRED for BOTH Claude
+backends.
+
 ## The control protocol (reverse-engineered — not public)
 
 `canUseTool` / `AskUserQuestion` are documented only as an SDK-library concept;

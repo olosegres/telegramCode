@@ -1,13 +1,13 @@
 /**
  * @description S7 — the claude-json-stream adapter advances the persisted
  * seen-watermark as each PARENT assistant message settles (in `onStdout`), not
- * only at turn end. This backend runs the `claude` CLI as an OWNED child that
- * dies with the bot, so a mid-turn restart ABORTS the turn before `handleTurnEnd`
- * — the turn-end advance never runs. Without the per-message advance the aborted
- * turn's already-relayed assistant messages would re-count as a false "⚠️ missed
- * N" on reattach (it shares the tmux backend's recap reader, so the identical
- * 2026-07-04 bug). A CHILD (sub-agent) message (`parent_tool_use_id` set) must
- * NEVER advance the watermark.
+ * only at turn end. The claude process is EXTERNAL (tmux-hosted) and normally
+ * survives bot restarts, but when the process itself dies mid-turn the
+ * dead-process `--resume` fallback recaps from this watermark: without the
+ * per-message advance the aborted turn's already-relayed assistant messages
+ * would re-count as a false "⚠️ missed N" on reattach (it shares the tmux
+ * backend's recap reader, so the identical 2026-07-04 bug). A CHILD (sub-agent)
+ * message (`parent_tool_use_id` set) must NEVER advance the watermark.
  *
  * The advance reads the REAL on-disk transcript size (`fs.statSync`), so the test
  * points Claude's projects root at a temp `$HOME` and drives the adapter's

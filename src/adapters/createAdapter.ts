@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, DisplayPrefsReader, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, DisplayPrefsReader, JsonStreamTailWriter, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -28,6 +28,10 @@ function checkAdapterTakesDisplayPrefs(adapter: AgentAdapter): adapter is AgentA
 
 function checkAdapterTakesWatermarkWriter(adapter: AgentAdapter): adapter is AgentAdapter & { setSeenWatermarkWriter(writer: SeenWatermarkWriter): void } {
   return typeof (adapter as { setSeenWatermarkWriter?: unknown }).setSeenWatermarkWriter === 'function';
+}
+
+function checkAdapterTakesJsonStreamTailWriter(adapter: AgentAdapter): adapter is AgentAdapter & { setJsonStreamTailWriter(writer: JsonStreamTailWriter): void } {
+  return typeof (adapter as { setJsonStreamTailWriter?: unknown }).setJsonStreamTailWriter === 'function';
 }
 
 /** Singleton adapter instances — one per adapter name */
@@ -102,6 +106,22 @@ export function registerSeenWatermarkWriter(writer: SeenWatermarkWriter): void {
   seenWatermarkWriter = writer;
   for (const adapter of adapterInstances.values()) {
     if (checkAdapterTakesWatermarkWriter(adapter)) adapter.setSeenWatermarkWriter(writer);
+  }
+}
+
+/** Per-thread json-stream tail-offset writer — same late-wiring idiom. */
+let jsonStreamTailWriter: JsonStreamTailWriter | null = null;
+
+/**
+ * @description Register the callback the json-stream adapter invokes as its
+ * stdout tail consumes lines, persisting the line-boundary offset a restarted
+ * bot resumes from (plan 2026-07-05-jsonstream-restart-isolation). Wired in
+ * `bot.ts` to `state.setJsonStreamTail`; inert (no-op) until registered.
+ */
+export function registerJsonStreamTailWriter(writer: JsonStreamTailWriter): void {
+  jsonStreamTailWriter = writer;
+  for (const adapter of adapterInstances.values()) {
+    if (checkAdapterTakesJsonStreamTailWriter(adapter)) adapter.setJsonStreamTailWriter(writer);
   }
 }
 
@@ -180,6 +200,9 @@ export function getAdapter(name: string): AgentAdapter {
     if (seenWatermarkWriter && checkAdapterTakesWatermarkWriter(adapter)) {
       adapter.setSeenWatermarkWriter(seenWatermarkWriter);
     }
+    if (jsonStreamTailWriter && checkAdapterTakesJsonStreamTailWriter(adapter)) {
+      adapter.setJsonStreamTailWriter(jsonStreamTailWriter);
+    }
   }
   return adapter;
 }
@@ -187,10 +210,10 @@ export function getAdapter(name: string): AgentAdapter {
 /**
  * @description Adapters registered in the factory (so `getAdapter`, sweeps, and
  * reattach see them) but HIDDEN from every user-facing surface — the `/start`
- * agent list and the agent-selection keyboard. `claude-json-stream` is an
- * experimental, CODE-ONLY backend (selected via `DEFAULT_AGENT` or
- * `setThreadAdapter`, never a command/button), so it must not leak a start
- * entry.
+ * agent list and the agent-selection keyboard. `claude-json-stream` is reached
+ * through the Claude DEFAULT + the `/claude_mode` backend switch, never a
+ * start-list entry of its own — listing it next to "Claude Code" would read as
+ * two different agents.
  */
 const hiddenAdapterNames = new Set<string>([claudeJsonStreamAdapterName]);
 
@@ -224,8 +247,9 @@ export function getDefaultAdapterName(): string {
  * against the SAME on-disk transcript, so a thread is cross-resumable between
  * them live:
  *  - `'claude'` — the tmux TUI, scraped screen (classic).
- *  - {@link claudeJsonStreamAdapterName} — an owned child process reading
- *    structured stream-json events (the DEFAULT; see {@link getDefaultAdapterName}).
+ *  - {@link claudeJsonStreamAdapterName} — an EXTERNAL tmux-hosted process
+ *    streaming structured stream-json events over a FIFO + stdout file, so it
+ *    survives bot restarts (the DEFAULT; see {@link getDefaultAdapterName}).
  * `/claude_mode` flips a thread between them.
  */
 export function checkIsClaudeBackend(name: string): boolean {

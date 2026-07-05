@@ -7,6 +7,7 @@ import {
   keyToString,
   type ApiRetryState,
   type DisplayVerbosityMode,
+  type JsonStreamTailOffset,
   type PendingQuestionState,
   type ResolvedThreadDisplayPrefs,
   type SeenWatermark,
@@ -116,6 +117,16 @@ export interface AgentData {
    * (no-count) path. Backend-specific representation; only one sub-field is set.
    */
   seenWatermark?: SeenWatermark;
+  /**
+   * json-stream stdout tail position (line-boundary byte offset into the
+   * external session's `stdout.jsonl`), advanced as the tail consumes lines.
+   * Lets a restarted bot resume the surviving process's output exactly where
+   * processing stopped and replay only the downtime gap (plan
+   * 2026-07-05-jsonstream-restart-isolation). Optional so older state files
+   * stay valid — a missing value seeds the adopt tail to the current EOF.
+   * Cleared together with the session ids on explicit release.
+   */
+  jsonStreamTail?: JsonStreamTailOffset;
 }
 
 export interface StateV1 {
@@ -812,7 +823,25 @@ export class StateStore {
   }
 
   /**
-   * @description Release both persisted session ids for `key` while keeping
+   * @description Persist the json-stream stdout tail offset (advanced by the
+   * adapter's tail poller through the injected writer, sealed by the shutdown
+   * `flush()`). Merge-only like {@link setSeenWatermark}: never flips
+   * `agent.name` and never creates a row — an offset is meaningless without
+   * the agent row its session recorded first.
+   */
+  async setJsonStreamTail(key: ThreadKey, tail: JsonStreamTailOffset): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.agents[k];
+      if (!existing) return;
+      this.state.agents[k] = { ...existing, jsonStreamTail: tail };
+      this.scheduleSave();
+    });
+  }
+
+  /**
+   * @description Release both persisted session ids (and the json-stream tail
+   * offset, which is meaningless without its session) for `key` while keeping
    * `name` / `model`. Called on explicit user stop (`/quit`, `/quit-all`,
    * `/new`, `/unbind`) so a later bot restart won't auto-reattach a session
    * the user deliberately ended. No-op when the thread has no agent record.
@@ -822,7 +851,7 @@ export class StateStore {
     await this.withLock(key, async () => {
       const existing = this.state.agents[k];
       if (!existing) return;
-      const { claudeSessionId, opencodeSessionId, ...rest } = existing;
+      const { claudeSessionId, opencodeSessionId, jsonStreamTail, ...rest } = existing;
       this.state.agents[k] = rest;
       this.scheduleSave();
     });

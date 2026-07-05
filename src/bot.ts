@@ -27,12 +27,13 @@ import {
   registerAdapterEventHandlers,
   registerDisplayPrefsReader,
   registerSeenWatermarkWriter,
+  registerJsonStreamTailWriter,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
   checkIsClaudeBackend,
   resolveClaudeBackendName,
 } from './adapters/createAdapter';
-import { claudeJsonStreamAdapterName } from './adapters/claudeJsonStreamAdapter';
+import { ClaudeJsonStreamAdapter, claudeJsonStreamAdapterName } from './adapters/claudeJsonStreamAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
 import type { ThreadKey, AgentAdapter, AgentSession, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { createOutputTransport } from './output/createOutputTransport';
@@ -191,6 +192,7 @@ import {
   fileRetentionMs,
   fileSweepIntervalMs,
 } from './botFileStorage';
+import { resolveJsonStreamRoot, sweepOrphanJsonStreamDirs } from './utils/jsonStreamHost';
 import { RunLedger } from './scheduler/runLedger';
 import { createScheduleDelivery, unboundDeliveryError } from './scheduler/delivery';
 import { createSchedulerEngine, maxTimeoutMs, type SchedulerEngine } from './scheduler/engine';
@@ -8599,16 +8601,59 @@ async function reattachExistingSessions(
   }
   console.log(`[reattach] opencode: reopened ${reopened} sessions (quiet=${opts.quietReattach})`);
 
-  // 2b. Claude JSON-stream — an OWNED child process (unlike tmux, it dies with
-  //     the bot), so reattach = re-spawn `claude -p --resume <id>` from the
-  //     persisted claude session id (same on-disk store, so `claudeSessionId` is
-  //     reused). Mirrors the OpenCode resume block above.
+  // 2b. Claude JSON-stream — EXTERNAL tmux-hosted processes (plan
+  //     2026-07-05-jsonstream-restart-isolation): like the scrape backend, the
+  //     sessions outlive the bot. First ADOPT every live `cjson-*` session —
+  //     reopen the FIFO writer and resume the stdout tail from the persisted
+  //     line-boundary offset, so everything produced during the downtime
+  //     replays through the normal pipeline (which is why an adopt posts NO
+  //     recap — the replay IS the delivery). A session whose thread released
+  //     its persisted id (`/quit`, `/new`) or isn't a json-stream thread is an
+  //     orphan and is killed, never adopted (locked decision). Then RESUME
+  //     (dead-process fallback, the pre-plan behavior) any bound json-stream
+  //     thread that still has a persisted id but no live process — the only
+  //     path that still re-spawns `--resume`, and the only one that recaps.
   const claudeJsonAdapter = getAdapter(claudeJsonStreamAdapterName);
+  let jsonAdopted = 0;
+  let jsonKilled = 0;
   let jsonReopened = 0;
+  if (claudeJsonAdapter instanceof ClaudeJsonStreamAdapter) {
+    try {
+      const found = await claudeJsonAdapter.listExistingTmuxSessions();
+      for (const { key, sessionName } of found) {
+        const binding = state.getBinding(key);
+        const agent = state.getAgent(key);
+        if (!binding || agent?.name !== claudeJsonStreamAdapterName || !agent.claudeSessionId) {
+          await claudeJsonAdapter.killOrphanTmuxSession(sessionName);
+          jsonKilled += 1;
+          continue;
+        }
+        const workDirDecision = getWorkDirStartDecision(key);
+        if (!workDirDecision.ok) {
+          console.warn(`[reattach] claude-json-stream ${keyToString(key)} refused: ${workDirDecision.message}`);
+          await claudeJsonAdapter.killOrphanTmuxSession(sessionName);
+          jsonKilled += 1;
+          if (!opts.quietReattach) replyToThread(key, workDirDecision.message).catch(() => {});
+          continue;
+        }
+        if (await claudeJsonAdapter.adoptExistingTmuxSession(
+          key, sessionName, workDirDecision.workDir, agent.claudeSessionId, agent.jsonStreamTail ?? null,
+        )) {
+          jsonAdopted += 1;
+        } else {
+          // Dead/zombie — adopt cleaned it up itself; the resume loop below
+          // still reopens this thread from the persisted session id.
+          jsonKilled += 1;
+        }
+      }
+    } catch (e) {
+      console.error('[reattach] claude-json-stream scan failed:', e);
+    }
+  }
   for (const { key } of state.listBindings()) {
     const agent = state.getAgent(key);
     if (!agent || agent.name !== claudeJsonStreamAdapterName || !agent.claudeSessionId) continue;
-    if (claudeJsonAdapter.checkIsActive(key)) continue;
+    if (claudeJsonAdapter.checkIsActive(key)) continue; // adopted above
     try {
       const workDirDecision = getWorkDirStartDecision(key);
       if (!workDirDecision.ok) {
@@ -8627,7 +8672,7 @@ async function reattachExistingSessions(
       console.warn(`[reattach] claude-json-stream ${keyToString(key)} failed:`, e instanceof Error ? e.message : e);
     }
   }
-  console.log(`[reattach] claude-json-stream: reopened ${jsonReopened} sessions (quiet=${opts.quietReattach})`);
+  console.log(`[reattach] claude-json-stream: adopted ${jsonAdopted}, reopened ${jsonReopened}, killed ${jsonKilled} orphans (quiet=${opts.quietReattach})`);
 
   // 3. Terminal — tmux shells (`term-…`). Like the Claude scan but simpler:
   //    a terminal has no session-id to recover, so adoption keys purely on a
@@ -9082,6 +9127,12 @@ export async function startBot(): Promise<void> {
   registerSeenWatermarkWriter((key, watermark) => {
     void state.setSeenWatermark(key, watermark);
   });
+  // The json-stream tail poller persists its line-boundary stdout offset through
+  // this writer (debounced save; the shutdown flush seals it) so the next boot
+  // adopts the surviving external process and replays exactly the downtime gap.
+  registerJsonStreamTailWriter((key, tail) => {
+    void state.setJsonStreamTail(key, tail);
+  });
   // The output path is selected ONCE here from CHAT_MODE (mirrors the adapter /
   // display-prefs wiring above) instead of a per-call surface branch at each
   // output site. Group is thin (queueOutput); DM owns the draft-cursor manager;
@@ -9279,6 +9330,19 @@ export async function startBot(): Promise<void> {
         }
       })
       .catch((e) => console.warn('[fileSweep] sweep failed:', e));
+    // Orphan json-stream host dirs: a crash can leave a host dir behind for a
+    // thread that no longer owns a json-stream session (the normal stop /
+    // release paths delete the dir themselves; reattach's adopt/orphan-kill
+    // covers live tmux sessions — this covers their dirs).
+    void sweepOrphanJsonStreamDirs(resolveJsonStreamRoot(getDataDir()), (key) => {
+      if (getAdapter(claudeJsonStreamAdapterName).checkIsActive(key)) return true;
+      const agent = state.getAgent(key);
+      return agent?.name === claudeJsonStreamAdapterName && !!agent.claudeSessionId;
+    })
+      .then((removedCount) => {
+        if (removedCount > 0) console.log(`[fileSweep] removed ${removedCount} orphan jsonstream dirs`);
+      })
+      .catch((e) => console.warn('[fileSweep] jsonstream sweep failed:', e));
     // Best-effort already (pruneExpiredBuckets never throws) — the .catch is
     // belt-and-braces against an unexpected rejection from the shared helper.
     void pruneTraceBuckets(nowMs).catch((e) => console.warn('[fileSweep] trace prune failed:', e));

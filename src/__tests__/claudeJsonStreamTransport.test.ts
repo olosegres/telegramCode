@@ -149,6 +149,30 @@ describe('json-stream external transport — exit detection', () => {
     assert.equal(fs.existsSync(dir), false, 'the host dir is removed on stop');
   });
 
+  it('holds the tail offset back while answer text sits in the batch, releases it on flush', () => {
+    // Live seam-loss repro (2026-07-05, topic 9085): lines consumed into the
+    // 350ms answer batch died with the killed bot while the persisted offset
+    // had already moved past them — the adopting bot skipped them on replay
+    // ("216–221 missing"). The offset must persist only once the batched text
+    // has actually been emitted.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-defer-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    fs.writeFileSync(session.paths.stdoutFile, textDeltaLine);
+    const tailWrites: JsonStreamTailOffset[] = [];
+    adapter.setJsonStreamTailWriter((_k, tail) => tailWrites.push(tail));
+
+    assert.equal(adapter['drainStdoutTail'](session), true, 'the delta line is consumed');
+    assert.deepEqual(tailWrites, [], 'un-emitted batched text must hold the offset back');
+
+    adapter['flushAnswer'](session, false);
+    assert.deepEqual(
+      tailWrites,
+      [{ sessionId: 'sess-transport', offsetBytes: Buffer.byteLength(textDeltaLine) }],
+      'the flush releases the boundary at the consumed line',
+    );
+  });
+
   it('reconstructs isBusy from replayed events (adopt has no sendInput)', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-busy-'));
     const adapter = new ClaudeJsonStreamAdapter();

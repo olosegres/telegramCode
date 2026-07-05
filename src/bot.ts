@@ -2192,19 +2192,35 @@ function buildSendExtra(key: ThreadKey, extra: SendExtra): Record<string, unknow
   return { ...base, message_thread_id: key.threadId };
 }
 
+/**
+ * @description Options for {@link replyToThread}.
+ */
+interface ReplyToThreadOptions {
+  /**
+   * Route the send OUTSIDE the global message pacer (via {@link sendUnpaced})
+   * instead of the paced {@link enqueueSend}. Default `false`. Reserved for
+   * user-input acknowledgements — e.g. the voice-transcript echo — that must
+   * surface immediately and not queue behind the thread's streaming agent
+   * output. Still 429-safe and traced; do NOT use it for ordinary agent output.
+   */
+  unpaced?: boolean;
+}
+
 async function replyToThread(
   key: ThreadKey,
   text: string,
   extra: SendExtra = {},
+  options: ReplyToThreadOptions = {},
 ): Promise<number | null> {
-  const sendOnce = (sendExtra: Record<string, unknown>) =>
-    enqueueSend(key, () =>
+  const sendOnce = (sendExtra: Record<string, unknown>) => {
+    const send = () =>
       bot.telegram.sendMessage(
         key.chatId,
         text,
         sendExtra as Parameters<typeof bot.telegram.sendMessage>[2],
-      ),
-    );
+      );
+    return options.unpaced ? sendUnpaced(key, send) : enqueueSend(key, send);
+  };
 
   try {
     const sent = await sendOnce(buildSendExtra(key, extra));
@@ -5921,7 +5937,10 @@ async function processVoiceJob(key: ThreadKey, fileId: string): Promise<void> {
     }
     const transcript = result.text;
     console.log(`[Bot] voice transcribed: "${transcript}"`);
-    void replyToThread(key, t('voice.transcribed', { text: transcript }), {}).catch(() => {});
+    // Acknowledge the user's own input on the UNPACED path so the "🎤 …" echo
+    // surfaces immediately instead of queuing behind the thread's streaming
+    // agent output (which is what made it arrive minutes late under load).
+    void replyToThread(key, t('voice.transcribed', { text: transcript }), {}, { unpaced: true }).catch(() => {});
 
     // Session is mid-startup → buffer the transcript and replay it once ready.
     if (startupPromptBuffer.checkIsStarting(keyToString(key))) {

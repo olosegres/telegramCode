@@ -54,6 +54,30 @@ export interface SeenWatermark {
 export type SeenWatermarkWriter = (key: ThreadKey, watermark: SeenWatermark) => void;
 
 /**
+ * @description Per-thread json-stream stdout tail position — how far the bot
+ * has consumed the EXTERNAL claude process's `stdout.jsonl` (plan
+ * 2026-07-05-jsonstream-restart-isolation). Persisted in `state.json` on the
+ * agent row so a restarted bot resumes tailing exactly where it left off and
+ * replays only what was produced during the downtime. `offsetBytes` always
+ * lands on a LINE BOUNDARY (see `getStdoutLineBoundaryOffset`), so the resumed
+ * tail never starts on a torn JSON line. `sessionId` scopes the offset to the
+ * session's own stdout file — a mismatch on adopt means the file belongs to a
+ * different run and the tail seeds to the current EOF instead.
+ */
+export interface JsonStreamTailOffset {
+  sessionId: string;
+  offsetBytes: number;
+}
+
+/**
+ * @description Adapter-side callback that persists the {@link JsonStreamTailOffset}
+ * as the json-stream tail consumes stdout lines. Same DI seam and inert-until-
+ * registered semantics as {@link SeenWatermarkWriter}; wired in `bot.ts` to
+ * `state.setJsonStreamTail`.
+ */
+export type JsonStreamTailWriter = (key: ThreadKey, tail: JsonStreamTailOffset) => void;
+
+/**
  * @description Result of {@link AgentAdapter.getReattachRecap} — the data the
  * bot needs to assemble the post-restart recap for one thread.
  *

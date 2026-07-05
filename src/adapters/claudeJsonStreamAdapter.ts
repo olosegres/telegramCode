@@ -1,12 +1,12 @@
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import type {
   AgentAdapter,
   AgentSession,
   DisplayPrefsReader,
+  JsonStreamTailWriter,
   OpenCodeQuestion,
   OutputEventMeta,
   RecentTurn,
@@ -45,6 +45,29 @@ import {
   buildCanUseToolDeny,
   type ClaudeStreamAction,
 } from '../utils/claudeStreamJson';
+import { execFilePromise, tmuxAsync, tmuxOrThrowAsync } from '../utils/tmuxExec';
+import { basePollIntervalMs, getNextPollDelay } from '../utils/pollBackoff';
+import {
+  buildJsonStreamTmuxSessionName,
+  buildWrapperScript,
+  checkIsPidAlive,
+  createStdoutTailState,
+  decodeStdoutTailChunk,
+  getFileSize,
+  getJsonStreamSessionPaths,
+  getStdoutLineBoundaryOffset,
+  getStdoutTailDecision,
+  openFifoWriterNonBlocking,
+  readExitCodeFile,
+  readFileByteRange,
+  readStderrTail,
+  resolveJsonStreamSessionDir,
+  stdoutOversizeWarnBytes,
+  waitForPidFile,
+  writeFifoText,
+  type JsonStreamSessionPaths,
+  type StdoutTailState,
+} from '../utils/jsonStreamHost';
 
 /** Adapter name (the `state.agents[key].name` value + factory key). */
 export const claudeJsonStreamAdapterName = 'claude-json-stream';
@@ -78,7 +101,25 @@ interface StreamSession {
   /** The `--session-id` UUID (== Claude on-disk transcript id, shared with the
    *  tmux backend's `claudeSessionId`). */
   sessionId: string;
-  child: ChildProcessWithoutNullStreams;
+  // — external process transport (plan 2026-07-05-jsonstream-restart-isolation:
+  //   claude is tmux-hosted, NOT a bot child, so bot restarts never touch it) —
+  /** pid of the external claude process (from the wrapper's `pid` file). */
+  pid: number;
+  /** Host-file layout (stdin fifo / stdout log / pid / exitcode / …). */
+  paths: JsonStreamSessionPaths;
+  /** Non-blocking write fd on the stdin FIFO. */
+  fifoFd: number;
+  /** Serialises FIFO writes so control frames and user turns keep wire order. */
+  stdinWriteChain: Promise<void>;
+  /** `stdout.jsonl` tail bookkeeping (byte offsets + stateful utf8 decode). */
+  tail: StdoutTailState;
+  pollTimer: NodeJS.Timeout | null;
+  pollDelayMs: number;
+  unchangedStreak: number;
+  /** One-shot oversize warning (no stdout rotation in v1 — locked decision). */
+  isOversizeWarned: boolean;
+  /** Last line-boundary offset handed to the tail writer (monotonic guard). */
+  lastPersistedTailOffset: number;
   reader: ClaudeStreamLineReader;
   isActive: boolean;
   /** True between an explicit stop and process exit → emit `stopped` not `closed`. */
@@ -124,10 +165,15 @@ interface StreamSession {
 /**
  * @description SECOND Claude backend: drives the `claude` CLI over its
  * documented `--input-format stream-json --output-format stream-json` protocol
- * (typed events, no TUI scrape) as an OWNED child process per {@link ThreadKey}
- * — the structured-event analogue of the tmux backend, on the SAME subscription
- * billing (proven `apiKeySource:"none"` + `seven_day` rate-limit event; never
- * sets `ANTHROPIC_API_KEY`, never uses `--bare`).
+ * (typed events, no TUI scrape) as an EXTERNAL tmux-hosted process per
+ * {@link ThreadKey} (plan 2026-07-05-jsonstream-restart-isolation): a `#!/bin/sh`
+ * wrapper backgrounds claude with stdin on a FIFO the process itself holds
+ * `0<>` and stdout appended to a `stdout.jsonl` the adapter TAILS — so a bot
+ * restart (every hot reload) neither EOFs claude's stdin nor loses its output;
+ * the restarted bot re-adopts the tmux session and replays the missed tail.
+ * Same structured events, on the SAME subscription billing (proven
+ * `apiKeySource:"none"` + `seven_day` rate-limit event; the wrapper runs
+ * `env -u ANTHROPIC_API_KEY`, never `--bare`).
  *
  * Structural template is {@link import('./openCodeAdapter').OpenCodeAdapter}
  * (event-driven, own process, per-key session map); the Claude on-disk
@@ -159,6 +205,12 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
 
   private displayPrefsReader: DisplayPrefsReader | null = null;
   private seenWatermarkWriter: SeenWatermarkWriter | null = null;
+  private jsonStreamTailWriter: JsonStreamTailWriter | null = null;
+  /** In-flight explicit stops, per key — a second stop (or a start's implicit
+   *  stop) AWAITS the first instead of racing it: the delayed first
+   *  `tmux kill-session` could otherwise land AFTER a fresh same-name spawn
+   *  and kill the new session. */
+  private readonly stopsInFlight = new Map<string, Promise<void>>();
 
   setDisplayPrefsReader(reader: DisplayPrefsReader): void {
     this.displayPrefsReader = reader;
@@ -166,6 +218,10 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
 
   setSeenWatermarkWriter(writer: SeenWatermarkWriter): void {
     this.seenWatermarkWriter = writer;
+  }
+
+  setJsonStreamTailWriter(writer: JsonStreamTailWriter): void {
+    this.jsonStreamTailWriter = writer;
   }
 
   private getDisplayPrefs(key: ThreadKey): ResolvedThreadDisplayPrefs {
@@ -207,10 +263,13 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
   }
 
   /**
-   * @description Spawn (or re-spawn) the CLI child for a thread, wire its stdio,
-   * and complete the `initialize` control handshake (which enables the
-   * `AskUserQuestion` control channel). Rejects if the binary can't be resolved
-   * or the process fails to start. Reused by start / resume / effort-respawn.
+   * @description Spawn (or re-spawn) the CLI process for a thread as an
+   * EXTERNAL tmux-hosted process (wrapper + FIFO stdin + stdout file — the
+   * probe-proven layout in `utils/jsonStreamHost.ts`), start the stdout tail
+   * poller, and complete the `initialize` control handshake (which enables the
+   * `AskUserQuestion` control channel). Rejects — with the wrapper's exit code
+   * and a stderr excerpt — if the process fails to come up. Reused by start /
+   * resume / effort-respawn.
    */
   private async spawnSession(
     key: ThreadKey,
@@ -250,22 +309,46 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (opts.effort) args.push('--effort', opts.effort);
     args.push(...mcpFlags);
 
-    // Subscription billing: NEVER pass ANTHROPIC_API_KEY (that would meter the
-    // API). The CLI reads the OAuth login from ~/.claude — `apiKeySource:"none"`.
-    const env = { ...process.env };
-    delete env.ANTHROPIC_API_KEY;
+    // Subscription billing: the wrapper runs `env -u ANTHROPIC_API_KEY` (a set
+    // key would meter the API). The CLI reads the OAuth login from ~/.claude —
+    // `apiKeySource:"none"` (probe-verified under the wrapper).
+    const sessionDir = resolveJsonStreamSessionDir(resolveDataDir(), key);
+    const paths = getJsonStreamSessionPaths(sessionDir);
+    const tmuxName = buildJsonStreamTmuxSessionName(key);
+    console.log(`[ClaudeJson] spawn ${keyToString(key)} session=${sessionId} resume=${opts.resume} effort=${opts.effort} model=${opts.model ?? 'default'} (tmux ${tmuxName})`);
 
-    console.log(`[ClaudeJson] spawn ${keyToString(key)} session=${sessionId} resume=${opts.resume} effort=${opts.effort} model=${opts.model ?? 'default'}`);
-    let child: ChildProcessWithoutNullStreams;
+    let pid: number;
+    let fifoFd: number;
     try {
-      child = spawn(this.claudePath, args, { cwd: workDir, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      // Fresh host layout — a stale dir/fifo from a crashed run must not be reused.
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+      await execFilePromise('mkfifo', [paths.stdinFifo]);
+      fs.writeFileSync(paths.wrapperFile, buildWrapperScript(this.claudePath, args, workDir, paths), { mode: 0o755 });
+      // A stale same-name tmux session (crashed bot / pre-adopt build) would make
+      // `new-session` fail — and must not keep running unowned next to ours.
+      await tmuxAsync('kill-session', '-t', tmuxName);
+      await tmuxOrThrowAsync('new-session', '-d', '-s', tmuxName, paths.wrapperFile);
+      const pidRead = await waitForPidFile(paths.pidFile);
+      if (pidRead === null) throw new Error(`claude never wrote its pid file${describeSpawnFailure(paths)}`);
+      pid = pidRead;
+      const fdRead = await openFifoWriterNonBlocking(paths.stdinFifo);
+      if (fdRead === null) throw new Error(`claude is not holding its stdin FIFO${describeSpawnFailure(paths)}`);
+      fifoFd = fdRead;
     } catch (e) {
       cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
+      await tmuxAsync('kill-session', '-t', tmuxName);
+      try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch { /* best-effort */ }
       throw new Error(`Failed to start Claude stream session: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     const session: StreamSession = {
-      key, workDir, sessionId, child,
+      key, workDir, sessionId,
+      pid, paths, fifoFd,
+      stdinWriteChain: Promise.resolve(),
+      tail: createStdoutTailState(0),
+      pollTimer: null, pollDelayMs: basePollIntervalMs, unchangedStreak: 0,
+      isOversizeWarned: false, lastPersistedTailOffset: 0,
       reader: new ClaudeStreamLineReader(),
       isActive: true, isStopping: false, isRespawning: false, isBusy: false,
       model: opts.model, effort: opts.effort,
@@ -278,26 +361,141 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       lastWatermarkOffset: -1,
     };
     this.sessions.set(keyToString(key), session);
-
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => this.onStdout(session, chunk));
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => console.warn(`[ClaudeJson stderr ${keyToString(key)}] ${chunk.trimEnd()}`));
-    child.on('error', (err) => {
-      console.error(`[ClaudeJson] child error ${keyToString(key)}:`, err.message);
-      if (session.isActive && !session.isStopping && !session.isRespawning) {
-        this.emit('error', key, err instanceof Error ? err : new Error(String(err)));
-      }
-    });
-    child.on('exit', (code, signal) => this.onChildExit(session, code, signal));
+    // A fresh spawn starts a fresh stdout file — reset the persisted tail offset
+    // so a later adopt never resumes from a previous run's position.
+    this.jsonStreamTailWriter?.(key, { sessionId, offsetBytes: 0 });
+    this.schedulePoll(session, basePollIntervalMs);
 
     // Initialize handshake: declares the interactive control channel (permission
     // prompts + AskUserQuestion route to stdio). Without it AskUserQuestion is not
     // even in the tool list (verified). Best-effort — proceed on timeout so a
-    // handshake hiccup never blocks a plain-output session.
+    // handshake hiccup never blocks a plain-output session. The response arrives
+    // through the tail poller started above.
     await this.performInitialize(session);
 
     this.emit('started', key);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  External-process transport: stdout tail poll + exit detection
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Arm the next tail poll (single-flight `setTimeout` chain, mirroring the
+   *  scrape backend's `schedulePoll` — never overlapping ticks). */
+  private schedulePoll(session: StreamSession, delayMs: number): void {
+    if (!session.isActive) return;
+    if (session.pollTimer) clearTimeout(session.pollTimer);
+    session.pollDelayMs = delayMs;
+    session.pollTimer = setTimeout(() => {
+      session.pollTimer = null;
+      this.pollTailTick(session);
+    }, delayMs);
+  }
+
+  /** Snap the tail cadence back to base — called on every stdin write, when
+   *  fresh output is expected shortly (mirrors the scrape backend's write snap). */
+  private snapPollToBase(session: StreamSession): void {
+    if (!session.isActive) return;
+    session.unchangedStreak = 0;
+    this.schedulePoll(session, basePollIntervalMs);
+  }
+
+  private pollTailTick(session: StreamSession): void {
+    if (!session.isActive || this.sessions.get(keyToString(session.key)) !== session) return;
+    let isChanged = false;
+    try {
+      isChanged = this.drainStdoutTail(session);
+    } catch (e) {
+      console.warn(`[ClaudeJson] stdout tail read failed for ${keyToString(session.key)}:`, e instanceof Error ? e.message : e);
+    }
+    // Exit detection (locked decision): the wrapper writes `exitcode` when
+    // claude exits; pid-alive covers a hard-killed wrapper that never wrote it.
+    const exitCode = readExitCodeFile(session.paths.exitCodeFile);
+    if (exitCode !== null || !checkIsPidAlive(session.pid)) {
+      // Final drain — bytes flushed at process exit may postdate the read above.
+      try { this.drainStdoutTail(session); } catch { /* already reported above */ }
+      this.finalizeExternalExit(session, exitCode ?? readExitCodeFile(session.paths.exitCodeFile));
+      return;
+    }
+    const next = getNextPollDelay({ isChanged, currentDelayMs: session.pollDelayMs, unchangedStreak: session.unchangedStreak });
+    session.unchangedStreak = next.unchangedStreak;
+    this.schedulePoll(session, next.delayMs);
+  }
+
+  /**
+   * @description Read whatever `stdout.jsonl` grew since the last poll and feed
+   * it through the SAME decode → line-reader → classifier pipeline the stdio
+   * pipe used to feed. Returns whether anything new was consumed (drives the
+   * adaptive poll backoff). After consuming, persists the line-boundary tail
+   * offset so a bot restart resumes exactly where processing stopped.
+   */
+  private drainStdoutTail(session: StreamSession): boolean {
+    const size = getFileSize(session.paths.stdoutFile);
+    if (size === null) return false; // not created yet (claude still booting)
+    if (size > stdoutOversizeWarnBytes && !session.isOversizeWarned) {
+      session.isOversizeWarned = true;
+      console.warn(`[ClaudeJson] stdout log for ${keyToString(session.key)} exceeds ${stdoutOversizeWarnBytes} bytes (no rotation in v1)`);
+    }
+    const decision = getStdoutTailDecision(session.tail, size);
+    if (decision.kind === 'reseed') {
+      // External truncation — the retained partial line died with the old file.
+      session.reader = new ClaudeStreamLineReader();
+      return false;
+    }
+    if (decision.kind === 'none') return false;
+    const chunk = readFileByteRange(session.paths.stdoutFile, decision.startOffset, decision.endOffset);
+    if (chunk.length === 0) return false;
+    const text = decodeStdoutTailChunk(session.tail, chunk);
+    if (text) this.onStdout(session, text);
+    this.persistTailOffset(session);
+    return true;
+  }
+
+  /** Persist the tail's line-boundary offset (monotonic; inert until the
+   *  writer is registered — same idiom as the seen-watermark writer). */
+  private persistTailOffset(session: StreamSession): void {
+    const boundary = getStdoutLineBoundaryOffset(session.tail, session.reader.pending);
+    if (boundary <= session.lastPersistedTailOffset) return;
+    session.lastPersistedTailOffset = boundary;
+    this.jsonStreamTailWriter?.(session.key, { sessionId: session.sessionId, offsetBytes: boundary });
+  }
+
+  /**
+   * @description Single teardown convergence point for the external process —
+   * both the explicit stop (`isStopping` → `stopped`) and the poll tick's exit
+   * detection (→ `closed`, with the wrapper-reported exit code and a stderr
+   * excerpt). Kills any tmux leftovers, removes the host dir, and cleans the
+   * MCP temp files. A respawn owns its own transition (`isRespawning`).
+   */
+  private finalizeExternalExit(session: StreamSession, exitCode: number | null): void {
+    if (session.isRespawning) return; // an effort/model re-spawn owns the transition
+    const key = session.key;
+    // Only act if this session is still the current one for the key.
+    if (this.sessions.get(keyToString(key)) !== session) return;
+    this.clearTimers(session);
+    session.isActive = false;
+    this.sessions.delete(keyToString(key));
+    this.closeFifo(session);
+    const stderrTail = session.isStopping ? '' : readStderrTail(session.paths.stderrFile);
+    void tmuxAsync('kill-session', '-t', buildJsonStreamTmuxSessionName(key));
+    try { fs.rmSync(session.paths.dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
+    if (session.isStopping) {
+      console.log(`[ClaudeJson] session ${keyToString(key)} stopped (code=${exitCode})`);
+      this.emit('stopped', key);
+    } else {
+      console.warn(`[ClaudeJson] session ${keyToString(key)} exited unexpectedly (code=${exitCode})${stderrTail ? ` stderr: ${stderrTail}` : ''}`);
+      this.emit('closed', key);
+    }
+  }
+
+  /** Close the FIFO fd AFTER any queued writes settle, so an in-flight write
+   *  never hits a closed fd (EBADF noise on every stop). */
+  private closeFifo(session: StreamSession): void {
+    const fd = session.fifoFd;
+    session.stdinWriteChain = session.stdinWriteChain
+      .catch(() => { /* write failures were already logged */ })
+      .then(() => { try { fs.closeSync(fd); } catch { /* already closed */ } });
   }
 
   private performInitialize(session: StreamSession): Promise<void> {
@@ -320,39 +518,34 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     });
   }
 
-  private onChildExit(session: StreamSession, code: number | null, signal: NodeJS.Signals | null): void {
-    if (session.isRespawning) return; // an effort/model re-spawn owns the transition
-    const key = session.key;
-    // Only act if this session is still the current one for the key.
-    if (this.sessions.get(keyToString(key)) !== session) return;
-    this.clearTimers(session);
-    session.isActive = false;
-    this.sessions.delete(keyToString(key));
-    cleanupMcpTempFiles({ key, dataDir: resolveDataDir() });
-    if (session.isStopping) {
-      console.log(`[ClaudeJson] session ${keyToString(key)} stopped (code=${code} sig=${signal})`);
-      this.emit('stopped', key);
-    } else {
-      console.warn(`[ClaudeJson] session ${keyToString(key)} exited unexpectedly (code=${code} sig=${signal})`);
-      this.emit('closed', key);
-    }
-  }
-
   stopSession(key: ThreadKey): void {
     void this.stopSessionInternal(key);
   }
 
   private async stopSessionInternal(key: ThreadKey): Promise<void> {
-    const session = this.sessions.get(keyToString(key));
+    const k = keyToString(key);
+    const inFlight = this.stopsInFlight.get(k);
+    if (inFlight) return inFlight; // join the running stop instead of racing it
+    const session = this.sessions.get(k);
     if (!session) return;
+    const stopPromise = this.performStop(session).finally(() => { this.stopsInFlight.delete(k); });
+    this.stopsInFlight.set(k, stopPromise);
+    return stopPromise;
+  }
+
+  /** Explicit stop = hard-kill the EXTERNAL process (released sessions are
+   *  never adopted — locked decision): SIGTERM the pid, kill the tmux session,
+   *  then converge through {@link finalizeExternalExit} (dir removal + `stopped`). */
+  private async performStop(session: StreamSession): Promise<void> {
     // Reject a pending question server-side before teardown so the model's
     // AskUserQuestion turn is unblocked (deny), mirroring OpenCode's reject.
-    this.rejectQuestion(key);
+    this.rejectQuestion(session.key);
     session.isStopping = true;
-    session.isActive = false;
-    this.clearTimers(session);
-    try { session.child.stdin.end(); } catch { /* pipe already closed */ }
-    try { session.child.kill('SIGTERM'); } catch { /* already gone */ }
+    // Let the reject (and any queued frame) reach the FIFO before the kill.
+    await session.stdinWriteChain.catch(() => { /* already logged */ });
+    try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
+    await tmuxAsync('kill-session', '-t', buildJsonStreamTmuxSessionName(session.key));
+    this.finalizeExternalExit(session, null);
   }
 
   checkIsActive(key: ThreadKey): boolean {
@@ -405,12 +598,16 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     });
   }
 
+  /** Enqueue one stream-json frame onto the stdin FIFO. Fire-and-forget for
+   *  callers (sync signature preserved); the per-session chain keeps wire
+   *  order and absorbs transient `EAGAIN` (see `writeFifoText`). */
   private writeStdin(session: StreamSession, obj: unknown): void {
-    try {
-      session.child.stdin.write(JSON.stringify(obj) + '\n');
-    } catch (e) {
-      console.error(`[ClaudeJson] stdin write failed for ${keyToString(session.key)}:`, e instanceof Error ? e.message : e);
-    }
+    const line = JSON.stringify(obj) + '\n';
+    session.stdinWriteChain = session.stdinWriteChain
+      .then(() => writeFifoText(session.fifoFd, line))
+      .catch((e) => console.error(`[ClaudeJson] stdin write failed for ${keyToString(session.key)}:`, e instanceof Error ? e.message : e));
+    // New input → output expected shortly; snap the tail poll back to base.
+    this.snapPollToBase(session);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -456,14 +653,20 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
         // to do besides confirm liveness.
         return;
       case 'textDelta':
+        // Mid-turn activity marks the session busy: `sendInput` normally set it,
+        // but an ADOPTED session (bot restart mid-turn) reconstructs the busy
+        // state purely from the replayed/live events; `turnEnd` clears it.
+        session.isBusy = true;
         if (action.isSubagent) this.handleSubagentText(session, action.text);
         else this.appendAnswerDelta(session, action.text);
         return;
       case 'thinkingDelta':
+        session.isBusy = true;
         if (action.isSubagent) return; // child reasoning never rendered (parity)
         this.appendThinkingDelta(session, action.text);
         return;
       case 'toolUse':
+        session.isBusy = true;
         this.handleToolUse(session, action);
         return;
       case 'toolResult':
@@ -682,8 +885,31 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     }
     session.pendingQuestion = { requestId, toolUseId, rawInput, questions };
     session.isBusy = true;
+    this.writeQuestionSidecar(session);
     const payload: OpenCodePendingQuestion = { requestId, questions };
     this.emit('question', session.key, payload);
+  }
+
+  /**
+   * @description Persist the pending question to the host dir. The external
+   * claude process stays BLOCKED on its `can_use_tool` across a bot restart,
+   * but the control_request line lies BEFORE the persisted tail offset (it was
+   * consumed pre-restart), so tail replay alone would never resurface it — the
+   * sidecar is what lets an adopting bot still answer over the FIFO. Removed
+   * the moment the question resolves (answer / reject); dies with the dir on
+   * stop.
+   */
+  private writeQuestionSidecar(session: StreamSession): void {
+    if (!session.pendingQuestion) return;
+    try {
+      fs.writeFileSync(session.paths.questionFile, JSON.stringify(session.pendingQuestion));
+    } catch (e) {
+      console.warn(`[ClaudeJson] cannot persist pending question for ${keyToString(session.key)}:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  private clearQuestionSidecar(session: StreamSession): void {
+    try { fs.unlinkSync(session.paths.questionFile); } catch { /* absent */ }
   }
 
   /** Map the AskUserQuestion `input.questions` to the shared question shape
@@ -718,6 +944,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (!session?.isActive || !session.pendingQuestion) return;
     const pending = session.pendingQuestion;
     session.pendingQuestion = null;
+    this.clearQuestionSidecar(session);
 
     // Build the answers map: question text → selected label(s) (comma-joined for
     // multi-select), the exact shape AskUserQuestion expects.
@@ -734,6 +961,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (!session?.pendingQuestion) return;
     const pending = session.pendingQuestion;
     session.pendingQuestion = null;
+    this.clearQuestionSidecar(session);
     this.writeControlResponse(session, pending.requestId, buildCanUseToolDeny('User declined to answer the question.', pending.toolUseId));
   }
 
@@ -814,16 +1042,32 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     const { key, workDir, sessionId } = session;
     session.isRespawning = true;
     this.rejectQuestion(key);
+    await session.stdinWriteChain.catch(() => { /* already logged */ });
     this.clearTimers(session);
     session.isActive = false;
-    try { session.child.stdin.end(); } catch { /* closed */ }
-    try { session.child.kill('SIGTERM'); } catch { /* gone */ }
+    this.closeFifo(session);
+    try { process.kill(session.pid, 'SIGTERM'); } catch { /* gone */ }
+    await tmuxAsync('kill-session', '-t', buildJsonStreamTmuxSessionName(key));
+    // spawnSession lays the host dir out fresh and replaces the map entry.
     await this.spawnSession(key, workDir, sessionId, { effort: change.effort, model: change.model, resume: true });
   }
 
   private clearTimers(session: StreamSession): void {
+    if (session.pollTimer) { clearTimeout(session.pollTimer); session.pollTimer = null; }
     if (session.outputTimer) { clearTimeout(session.outputTimer); session.outputTimer = null; }
     if (session.reasoningTimer) { clearTimeout(session.reasoningTimer); session.reasoningTimer = null; }
     if (session.childOutputTimer) { clearTimeout(session.childOutputTimer); session.childOutputTimer = null; }
   }
+}
+
+/** Spawn-fail diagnostics: the wrapper's exit code + a stderr excerpt (the
+ *  passive `stderr.log` is read ONLY here and at unexpected exit — locked
+ *  decision, no live stderr consumer). */
+function describeSpawnFailure(paths: JsonStreamSessionPaths): string {
+  const exitCode = readExitCodeFile(paths.exitCodeFile);
+  const stderrTail = readStderrTail(paths.stderrFile);
+  const parts: string[] = [];
+  if (exitCode !== null) parts.push(`exit=${exitCode}`);
+  if (stderrTail) parts.push(`stderr: ${stderrTail}`);
+  return parts.length > 0 ? ` (${parts.join(', ')})` : '';
 }

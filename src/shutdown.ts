@@ -29,7 +29,16 @@
  * agents alive" property the surrounding plan rests on.
  */
 
-const DEFAULT_WATCHDOG_MS = 3000;
+/**
+ * @description Upper bound (ms) on the whole graceful-shutdown sequence — the
+ * watchdog forces `releaseLock(); exit(0)` when it elapses first. Raised from
+ * 3s when the sequence gained the bounded (≤~7s) output flush. Exported because
+ * the lock module's same-token handoff wait must OUT-WAIT this window (the
+ * incoming nodemon respawn polls the lock while the predecessor finishes
+ * shutting down); an undersized wait aborts the new process and leaves the bot
+ * down until the next file change.
+ */
+export const DEFAULT_WATCHDOG_MS = 10000;
 
 export interface ShutdownDeps {
   /** Name of the triggering signal (`SIGINT` / `SIGTERM` / etc.), for logs. */
@@ -48,6 +57,17 @@ export interface ShutdownDeps {
    * budget; the outer watchdog is the backstop.
    */
   drainPendingUpdates?: () => Promise<void>;
+  /**
+   * Optional: flush every thread's not-yet-delivered agent output (the
+   * coalesce buffers / DM drafts, then the paced send FIFOs) so a hot-reload
+   * restart can't swallow answer chunks that were already emitted but not yet
+   * sent. Runs AFTER {@link cleanupTimers} and BEFORE {@link clearTransientFrames}
+   * (content lands first, then the transient frames are deleted) — both before
+   * `bot.stop()`, while the Telegram client is fully alive. MUST self-bound
+   * (the bot-side flush races its own timeout) so a hung Telegram API can't
+   * eat the whole watchdog budget; the outer watchdog is the backstop.
+   */
+  finalizePendingOutput?: () => Promise<void>;
   /** Release the single-instance lockfile (idempotent — owner-checked inside). */
   releaseLock: () => void;
   /** Terminate the process. Real prod value: `(code) => process.exit(code)`. */
@@ -76,6 +96,9 @@ export interface ShutdownDeps {
  *
  *   1. `cleanupTimers()` — drop any background `setInterval`s so they
  *      don't fire mid-shutdown and re-dirty state.
+ *   1a. `await finalizePendingOutput()` — flush the not-yet-delivered agent
+ *      output (coalesce buffers / DM drafts → send FIFOs) while the Telegram
+ *      client is still up, so a restart can't swallow it. Self-bounded.
  *   1b. `await clearTransientFrames()` — best-effort delete of the
  *      "✽ working…" / thinking / sub-agent status frames still on screen,
  *      while the Telegram client is still up. Self-bounded so it can't
@@ -130,6 +153,13 @@ export async function gracefulShutdown(deps: ShutdownDeps): Promise<void> {
         deps.cleanupTimers();
       } catch (e) {
         console.error('[shutdown] cleanupTimers failed:', e);
+      }
+    }
+    if (deps.finalizePendingOutput) {
+      try {
+        await deps.finalizePendingOutput();
+      } catch (e) {
+        console.error('[shutdown] finalizePendingOutput failed:', e);
       }
     }
     if (deps.clearTransientFrames) {

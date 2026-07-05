@@ -61,6 +61,9 @@ function createGroupOutputTransport(deps: OutputTransportDeps): OutputTransport 
     finalizeInFlight: (key) => deps.finalizeGroupOutput(key),
     disposeThread: () => {},
     checkIsStreaming: () => false,
+    // The group path's coalesced-but-unsent state lives in the bot's output
+    // queues (which the shutdown flush enumerates directly), not here.
+    getInFlightThreadKeys: () => [],
   };
 }
 
@@ -96,6 +99,14 @@ export function createOutputTransport(
     },
     checkIsStreaming(key) {
       return pickTransport(key).checkIsStreaming(key);
+    },
+    getInFlightThreadKeys() {
+      // Not per-key routed: the union of both surfaces' in-flight threads
+      // (group's is always empty; see the group impl).
+      return [
+        ...dmTransport.getInFlightThreadKeys(),
+        ...groupTransport.getInFlightThreadKeys(),
+      ];
     },
   };
 }

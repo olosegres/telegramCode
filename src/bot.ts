@@ -59,6 +59,10 @@ import {
   getRateLimitRemainingMs,
   getActiveChatRateSummaries,
   formatRateSummaryLine,
+  enterShutdownDrain,
+  drainPendingSends,
+  shutdownDrainMaxMs,
+  type ShutdownDrainVerdict,
 } from './rateLimiter';
 import {
   stopOpenCodeServer,
@@ -419,7 +423,7 @@ const updateDispatcher = createUpdateDispatcher({
     console.error(`[dispatch] unhandled error for update ${update.update_id}:`, error),
 });
 installUpdateDispatcher(bot, updateDispatcher);
-/** Bound (< the 3s shutdown watchdog) for draining queued updates on shutdown. */
+/** Bound (well under the 10s shutdown watchdog) for draining queued updates on shutdown. */
 const updateDrainTimeoutMs = 2000;
 
 // Output-trace mode (toggled at runtime via `/trace`): record every outgoing
@@ -2802,7 +2806,7 @@ async function deleteStatusMessage(key: ThreadKey): Promise<void> {
 
 /**
  * Internal bound (ms) on the graceful-shutdown transient-frame sweep. Well under
- * the 3s shutdown watchdog so a slow Telegram API can't eat into the budget
+ * the 10s shutdown watchdog so a slow Telegram API can't eat into the budget
  * `state.flush()` needs to land the last state to disk.
  */
 const shutdownFrameSweepMs = 1500;
@@ -2854,6 +2858,94 @@ async function sweepTransientFramesOnShutdown(): Promise<void> {
       timer.unref?.();
     }),
   ]);
+}
+
+/**
+ * Hard bound (ms) on the whole shutdown output flush (finalize + FIFO drain):
+ * the drain budget plus headroom for the finalize sends themselves. Under the
+ * 10s shutdown watchdog so the later steps (frame sweep, update drain,
+ * `state.flush()`) keep their budgets.
+ */
+const shutdownOutputFlushMaxMs = shutdownDrainMaxMs + 1000;
+
+/**
+ * @description Flush every thread's not-yet-delivered agent output at graceful
+ * shutdown, so a hot-reload restart can't swallow it (live 2026-07-05, topic
+ * 434: already-emitted answer chunks died in the send pipeline with the
+ * process and were never re-sent). Two buffers drain, in order:
+ *
+ *  [A] per-thread COALESCE state — the group/baseline `q.pendingOutput`
+ *      buffers (enumerated here from {@link outputQueues}) and the DM
+ *      transport's active drafts (enumerated via `getInFlightThreadKeys`) —
+ *      each finalized to a permanent message via the transport's
+ *      `finalizeInFlight`;
+ *  [B] the per-thread send FIFOs already parked on the global pacer — drained
+ *      by `drainPendingSends` after `enterShutdownDrain()` flips the pacer to
+ *      immediate release (at 1 send/2s a 5-message backlog alone outlives any
+ *      sane shutdown window; every drained send keeps `withRateLimitRetry`).
+ *
+ * `enterShutdownDrain()` is flipped BEFORE the finalizes: their awaits resolve
+ * only when their sends land, and with the pacer still spacing each queued
+ * send would wait out its 2s slot and bust the bound. Still strictly inside
+ * the shutdown sequence — live operation never runs unpaced.
+ *
+ * Wired into {@link gracefulShutdown} as `finalizePendingOutput`: runs AFTER
+ * `cleanupTimers()` and BEFORE `clearTransientFrames` / `bot.stop()` (content
+ * lands first, then transient frames are deleted, all while the Telegram
+ * client is alive). Self-bounded by {@link shutdownOutputFlushMaxMs} — the
+ * outer watchdog stays the backstop.
+ */
+async function finalizePendingOutputOnShutdown(): Promise<void> {
+  const drainDeadlineMs = Date.now() + shutdownDrainMaxMs;
+  let flushedCount = 0;
+  const flushWork = (async (): Promise<ShutdownDrainVerdict> => {
+    enterShutdownDrain();
+    const transport = getOutputTransport();
+    // [A] union of threads with pending coalesced output: the bot-owned output
+    // queues + the transport-owned DM drafts (deduped by serialised key).
+    const pendingKeys = new Map<string, ThreadKey>();
+    for (const [keyStr, q] of outputQueues) {
+      if (q.pendingOutput === null) continue;
+      try {
+        pendingKeys.set(keyStr, keyFromString(keyStr));
+      } catch {
+        /* malformed key — nothing to flush for it */
+      }
+    }
+    for (const key of transport.getInFlightThreadKeys()) {
+      pendingKeys.set(keyToString(key), key);
+    }
+    flushedCount = pendingKeys.size;
+    await Promise.allSettled(
+      [...pendingKeys.values()].map((key) => transport.finalizeInFlight(key)),
+    );
+    // A DM-surface thread on a non-draft adapter (e.g. terminal) coalesces via
+    // the group `queueOutput` path, but its transport finalize handled only the
+    // draft — drain any such leftover buffer directly. Group keys were already
+    // drained above (their finalize nulls `pendingOutput` synchronously), so
+    // this is a no-op for them.
+    const leftoverDrains: Promise<void>[] = [];
+    for (const [keyStr, q] of outputQueues) {
+      if (q.pendingOutput === null) continue;
+      try {
+        leftoverDrains.push(finalizeGroupOutput(keyFromString(keyStr)));
+      } catch {
+        /* malformed key */
+      }
+    }
+    await Promise.allSettled(leftoverDrains);
+    // [B] wait for the released FIFOs to empty, bounded by what is left of the
+    // shared drain budget.
+    return drainPendingSends(Math.max(drainDeadlineMs - Date.now(), 0));
+  })();
+  const verdict = await Promise.race([
+    flushWork,
+    new Promise<ShutdownDrainVerdict>((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), shutdownOutputFlushMaxMs);
+      timer.unref?.();
+    }),
+  ]);
+  console.log(`[shutdown] flushed ${flushedCount} threads, ${verdict}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -9244,6 +9336,7 @@ export async function startBot(): Promise<void> {
       releaseLock,
       exit: (code) => process.exit(code),
       drainPendingUpdates: () => updateDispatcher.drainIdle(updateDrainTimeoutMs),
+      finalizePendingOutput: () => finalizePendingOutputOnShutdown(),
       clearTransientFrames: () => sweepTransientFramesOnShutdown(),
       cleanupTimers: () => {
         clearInterval(inMemoryGcInterval);

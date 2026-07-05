@@ -248,6 +248,95 @@ test('a slow clearTransientFrames still hits the watchdog and forces exit', asyn
   await drained();
 });
 
+test('finalizePendingOutput runs after cleanupTimers, before clearTransientFrames / bot.stop / state.flush', async () => {
+  // The output flush must land content while the Telegram client is fully up
+  // (before bot.stop) and BEFORE the transient frames are deleted (content
+  // first, then frame cleanup), but after the timers are stopped.
+  const { deps, events, drained } = makeDeps({
+    flushDelayMs: 10,
+    finalizePendingOutput: async () => {
+      events.push('finalizePendingOutput');
+    },
+    clearTransientFrames: async () => {
+      events.push('clearTransientFrames');
+    },
+  });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  const cleanupIdx = events.indexOf('cleanupTimers');
+  const finalizeIdx = events.indexOf('finalizePendingOutput');
+  const sweepIdx = events.indexOf('clearTransientFrames');
+  const stopIdx = events.indexOf('bot.stop(SIGTERM)');
+  const flushStartIdx = events.indexOf('state.flush:start');
+  assert.notEqual(finalizeIdx, -1, 'finalizePendingOutput must run');
+  assert.ok(cleanupIdx !== -1 && cleanupIdx < finalizeIdx, 'must run AFTER cleanupTimers');
+  assert.ok(sweepIdx !== -1 && finalizeIdx < sweepIdx, 'must run BEFORE clearTransientFrames');
+  assert.ok(stopIdx !== -1 && finalizeIdx < stopIdx, 'must run BEFORE bot.stop');
+  assert.ok(finalizeIdx < flushStartIdx, 'must run BEFORE state.flush');
+});
+
+test('a hanging finalizePendingOutput still hits the watchdog and forces exit', async () => {
+  // The bot-side flush self-bounds; but even a wedged one (e.g. a hung Telegram
+  // socket past its own race) must NOT strand the shutdown — the outer watchdog
+  // wins and we still releaseLock + exit(0).
+  const { deps, events, exitCode, drained } = makeDeps({
+    watchdogMs: 50,
+    finalizePendingOutput: () => new Promise<void>((resolve) => setTimeout(resolve, 200)),
+  });
+
+  const start = Date.now();
+  await gracefulShutdown(deps);
+  const elapsed = Date.now() - start;
+
+  assert.ok(elapsed < 180, `watchdog should return promptly; got ${elapsed}ms`);
+  assert.equal(exitCode(), 0, 'watchdog must still exit(0) so nodemon respawns');
+  assert.ok(events.includes('releaseLock'), `releaseLock must fire; events=${JSON.stringify(events)}`);
+  assert.ok(
+    !events.includes('state.flush:start'),
+    'flush is blocked behind the hung finalize when the watchdog fires',
+  );
+
+  // Let the orphan finalize + its trailing flush settle so node:test doesn't
+  // flag a pending promise.
+  await drained();
+});
+
+test('a thrown finalizePendingOutput does NOT skip clearTransientFrames / state.flush / releaseLock', async () => {
+  const { deps, events, exitCode, drained } = makeDeps({
+    flushDelayMs: 5,
+    finalizePendingOutput: async () => {
+      events.push('finalizePendingOutput:threw');
+      throw new Error('flush failure');
+    },
+    clearTransientFrames: async () => {
+      events.push('clearTransientFrames');
+    },
+  });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  assert.ok(events.includes('clearTransientFrames'), 'frame sweep must still run');
+  assert.ok(events.includes('state.flush:start'), 'flush must still run');
+  assert.ok(events.includes('state.flush:resolved'), 'flush must still resolve');
+  assert.ok(events.includes('releaseLock'), 'lock must still be released');
+  assert.equal(exitCode(), 0);
+});
+
+test('finalizePendingOutput is optional — orchestrator copes when it is absent', async () => {
+  const { deps, events, exitCode, drained } = makeDeps({ flushDelayMs: 5 });
+
+  await gracefulShutdown(deps);
+  await drained();
+
+  assert.ok(!events.includes('finalizePendingOutput'));
+  assert.ok(events.includes('bot.stop(SIGTERM)'));
+  assert.ok(events.includes('state.flush:resolved'));
+  assert.equal(exitCode(), 0);
+});
+
 test('drainPendingUpdates runs AFTER bot.stop and BEFORE state.flush', async () => {
   // The off-loop update queues must drain while polling is already halted
   // (after bot.stop → no new enqueue) but before the flush (so the drained

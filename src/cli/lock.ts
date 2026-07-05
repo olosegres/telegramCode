@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { DEFAULT_WATCHDOG_MS } from '../shutdown';
 
 /**
  * @description Number of acquisition attempts before giving up.
@@ -192,6 +193,17 @@ export function tryAcquireLock(): AcquireResult {
 }
 
 /**
+ * @description Default same-token handoff wait: the predecessor's graceful
+ * shutdown is bounded by its watchdog ({@link DEFAULT_WATCHDOG_MS} — which now
+ * covers the bounded output flush), so the incoming process must out-wait that
+ * WHOLE window plus margin. Undersizing this re-creates the live 2026-07-05
+ * outage: nodemon spawns the replacement while the old process is still
+ * flushing, the lock wait expires, the replacement exits "already running",
+ * and nodemon then idles until the next file change — bot down.
+ */
+export const lockHandoffMaxWaitMs = DEFAULT_WATCHDOG_MS + 2000;
+
+/**
  * @description Same as {@link tryAcquireLock} but waits up to `maxWaitMs`
  * for a same-token holder to release before giving up.
  *
@@ -201,10 +213,11 @@ export function tryAcquireLock(): AcquireResult {
  * polite waiting would mask the misconfiguration. A matching token, on the
  * other hand, almost always means "my own predecessor is in the middle of
  * its graceful-shutdown sequence" — typical during a `nodemon`-driven hot
- * reload where the old PID has been signalled but is still flushing state.
- * That window is short (sub-second) and well worth waiting out so the new
- * process picks the lock back up without spamming the operator with a
- * "live-holder" abort.
+ * reload where the old PID has been signalled but is still flushing. That
+ * shutdown is bounded by the predecessor's watchdog, so the default wait
+ * ({@link lockHandoffMaxWaitMs}) out-waits it with margin and the new process
+ * picks the lock back up without spamming the operator with a "live-holder"
+ * abort.
  *
  * The sleep function is injected so unit tests can drive the retry loop
  * deterministically without spending real wall-clock time.
@@ -214,7 +227,7 @@ export async function tryAcquireLockWithRetry(opts: {
   intervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
 } = {}): Promise<AcquireResult> {
-  const maxWaitMs = opts.maxWaitMs ?? 3000;
+  const maxWaitMs = opts.maxWaitMs ?? lockHandoffMaxWaitMs;
   const intervalMs = opts.intervalMs ?? 100;
   const sleep = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const ourTokenHash = hashToken(process.env.TELEGRAM_BOT_TOKEN);

@@ -48,6 +48,14 @@ import { formatRateLimit429Line, formatRateSummaryLine } from './utils/rateLimit
 export const globalSendIntervalMs = 2000;
 
 /**
+ * @description Default bound (ms) for {@link drainPendingSends}: how long the
+ * graceful-shutdown flush waits for the per-thread send FIFOs to empty before
+ * giving up. Sized well under the 10s shutdown watchdog so the later steps
+ * (transient-frame sweep, update drain, `state.flush()`) keep their budgets.
+ */
+export const shutdownDrainMaxMs = 6000;
+
+/**
  * @description Injectable clock + timer so timing tests can drive the pacer
  * deterministically with a fake clock instead of real-time sleeps.
  */
@@ -78,6 +86,8 @@ export class GlobalSendPacer {
   private nextAllowedAt = 0;
   /** A drain timer is already armed for the current waiter set. */
   private timerArmed = false;
+  /** Shutdown-drain mode: permits are granted immediately, no spacing. */
+  private isShutdownDraining = false;
 
   constructor(
     private intervalMs: number,
@@ -90,12 +100,28 @@ export class GlobalSendPacer {
   }
 
   /**
+   * Flip the pacer into shutdown-drain mode: every parked waiter is released
+   * NOW (in FIFO order) and every subsequent `acquire()` resolves immediately.
+   * ONLY for the graceful-shutdown flush — during live operation the spacing is
+   * what keeps Telegram from 429ing; `withRateLimitRetry` stays on every send
+   * either way, so the small shutdown burst remains 429-safe. One-way: the
+   * process is exiting, so there is no leave-drain path.
+   */
+  enterShutdownDrain(): void {
+    this.isShutdownDraining = true;
+    const parked = this.waiters;
+    this.waiters = [];
+    for (const waiter of parked) waiter();
+  }
+
+  /**
    * Resolve when a send permit is granted. Fast path: when nobody is waiting
    * and the window is already open, grant immediately (so a send after a ≥
    * interval-long idle never eats a needless delay). Otherwise queue FIFO and
    * let the clock-driven drain grant it in turn.
    */
   acquire(): Promise<void> {
+    if (this.isShutdownDraining) return Promise.resolve();
     const now = this.clock.now();
     if (this.waiters.length === 0 && now >= this.nextAllowedAt) {
       this.nextAllowedAt = now + this.intervalMs;
@@ -197,6 +223,52 @@ export { formatRateSummaryLine };
  * others.
  */
 const queues = new Map<string, Promise<unknown>>();
+
+/**
+ * @description Flip the process pacer into shutdown-drain mode (immediate
+ * release, no 2s spacing). ONLY called from the graceful-shutdown output flush
+ * — never during live operation, where the spacing is the 429 protection.
+ * Sends drained in this mode still run through {@link withRateLimitRetry}.
+ */
+export function enterShutdownDrain(): void {
+  globalPacer.enterShutdownDrain();
+}
+
+/** Verdict of {@link drainPendingSends}: did the FIFOs empty within the bound? */
+export type ShutdownDrainVerdict = 'drained' | 'timeout';
+
+/**
+ * @description Resolve once every per-thread send FIFO is empty, or after
+ * `maxWaitMs` — whichever comes first — reporting which. Pure bookkeeping over
+ * the existing {@link queues} map: it awaits the current queue tails (which
+ * never reject — `enqueueSend` tracks them settled-only) and loops, because a
+ * send finishing may have chained a successor onto the same thread's queue.
+ * Used by the graceful-shutdown flush after {@link enterShutdownDrain} so
+ * already-enqueued output lands before the process exits.
+ */
+export async function drainPendingSends(
+  maxWaitMs: number = shutdownDrainMaxMs,
+): Promise<ShutdownDrainVerdict> {
+  const deadline = Date.now() + maxWaitMs;
+  while (queues.size > 0) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return 'timeout';
+    const tails = [...queues.values()];
+    const isTimedOut = await Promise.race([
+      Promise.all(tails).then(() => false),
+      new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(true), remainingMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (isTimedOut) return 'timeout';
+    // The settled tails delete their map entries in `enqueueSend`'s `finally`,
+    // which runs a microtask after the tracked promise resolves — yield one
+    // macrotask so those deletes land before the emptiness re-check.
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return 'drained';
+}
 
 interface RateLimitState {
   /** Timestamp (ms) when rate limit cooldown expires */

@@ -431,6 +431,14 @@ export interface OutputTransport {
    * (its streaming is already tracked via the output queue).
    */
   checkIsStreaming(key: ThreadKey): boolean;
+  /**
+   * Thread keys whose TRANSPORT-OWNED in-flight state holds content to finalize
+   * (DM: threads with an active draft turn). The graceful-shutdown flush
+   * enumerates these so every live draft lands as a permanent message before the
+   * process exits. Group: always empty — its coalesced-but-unsent state lives in
+   * the bot's output queues, which the shutdown flush enumerates directly.
+   */
+  getInFlightThreadKeys(): ThreadKey[];
 }
 
 /**

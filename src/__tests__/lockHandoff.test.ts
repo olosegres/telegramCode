@@ -31,7 +31,9 @@ import {
   tryAcquireLockWithRetry,
   releaseLock,
   lockPath,
+  lockHandoffMaxWaitMs,
 } from '../cli/lock';
+import { DEFAULT_WATCHDOG_MS } from '../shutdown';
 
 let tmpRoot: string;
 let savedDataDir: string | undefined;
@@ -67,6 +69,19 @@ function tokenHashFor(token: string): string {
     .digest('hex')
     .slice(0, 12);
 }
+
+test('default handoff wait out-waits the shutdown watchdog (live 2026-07-05 outage guard)', () => {
+  // The predecessor's graceful shutdown is bounded by DEFAULT_WATCHDOG_MS; the
+  // incoming nodemon respawn polls the lock for lockHandoffMaxWaitMs. If the
+  // wait doesn't exceed the watchdog (plus real margin), a slow shutdown makes
+  // the replacement abort "already running" and the bot stays down until the
+  // next file change.
+  assert.ok(
+    lockHandoffMaxWaitMs >= DEFAULT_WATCHDOG_MS + 1000,
+    `lockHandoffMaxWaitMs (${lockHandoffMaxWaitMs}) must exceed the shutdown watchdog ` +
+      `(${DEFAULT_WATCHDOG_MS}) with margin`,
+  );
+});
 
 test('happy path: no holder → first try succeeds, sleep never called', async () => {
   let sleepCalls = 0;

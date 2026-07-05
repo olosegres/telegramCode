@@ -28,6 +28,8 @@ import {
   GlobalSendPacer,
   __setGlobalPacerForTest,
   globalSendIntervalMs,
+  enterShutdownDrain,
+  drainPendingSends,
   type PacerClock,
 } from '../rateLimiter';
 import type { ThreadKey } from '../types';
@@ -352,4 +354,110 @@ test('sendUnpaced still retries once on a 429 (429 safety preserved)', async () 
   assert.equal(calls, 2, 'sendUnpaced must retry exactly once on 429 (withRateLimitRetry still wraps it)');
   assert.equal(result, 'ok');
   assert.equal(checkIsRateLimited(key.chatId), false, 'not blocked after a successful retry');
+});
+
+// ── shutdown drain: immediate-release mode + FIFO drain at graceful exit ─────
+
+test('shutdown drain: enterShutdownDrain releases parked waiters at once (FCFS) and un-gates future acquires', async () => {
+  const clock = createFakeClock();
+  const pacer = new GlobalSendPacer(globalSendIntervalMs, clock);
+  const order: number[] = [];
+
+  await pacer.acquire(); // close the window
+  void pacer.acquire().then(() => order.push(1));
+  void pacer.acquire().then(() => order.push(2));
+  await Promise.resolve();
+  assert.deepEqual(order, [], 'both waiters are parked behind the closed window');
+
+  pacer.enterShutdownDrain();
+  await Promise.resolve();
+  assert.deepEqual(order, [1, 2], 'released immediately, in arrival order, without any clock advance');
+  assert.equal(pacer.getPendingCount(), 0, 'nothing stays parked in drain mode');
+
+  let grantedImmediately = false;
+  await pacer.acquire().then(() => { grantedImmediately = true; });
+  assert.equal(grantedImmediately, true, 'a later acquire is granted immediately in drain mode');
+});
+
+test('shutdown drain: saturated queued sends all run without waiting out the 2s spacing; drainPendingSends reports drained', async () => {
+  // Fake-clock pacer: without the drain nothing would run until the clock
+  // advances — proving the drain (not elapsed time) released the sends.
+  const clock = createFakeClock();
+  const pacer = new GlobalSendPacer(globalSendIntervalMs, clock);
+  __setGlobalPacerForTest(pacer);
+  try {
+    const key = k(7201, 1);
+    const ran: number[] = [];
+
+    await pacer.acquire(); // close the window so every send below is gated
+    const sends = [1, 2, 3].map((i) => enqueueSend(key, async () => { ran.push(i); }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(ran, [], 'gated by the saturated pacer before the drain');
+
+    enterShutdownDrain();
+    const verdict = await drainPendingSends(1000);
+    assert.equal(verdict, 'drained', 'the FIFOs emptied within the bound');
+    assert.deepEqual(ran, [1, 2, 3], 'every queued send ran, in order, with zero clock advances');
+    await Promise.all(sends);
+  } finally {
+    __setGlobalPacerForTest(new GlobalSendPacer(1));
+  }
+});
+
+test('shutdown drain: a 429 during the drain still retries once (withRateLimitRetry preserved)', async () => {
+  const clock = createFakeClock();
+  const pacer = new GlobalSendPacer(globalSendIntervalMs, clock);
+  __setGlobalPacerForTest(pacer);
+  try {
+    const key = k(7202, 1);
+    let calls = 0;
+    const fakeError = {
+      response: { error_code: 429, parameters: { retry_after: 0 } },
+    };
+
+    await pacer.acquire(); // close the window so the send is genuinely parked
+    const send = enqueueSend(key, async () => {
+      calls += 1;
+      if (calls === 1) throw fakeError;
+      return 'ok';
+    });
+
+    enterShutdownDrain();
+    const verdict = await drainPendingSends(2000);
+    assert.equal(verdict, 'drained');
+    assert.equal(await send, 'ok');
+    assert.equal(calls, 2, 'the drained send retried exactly once on the 429');
+    assert.equal(checkIsRateLimited(key.chatId), false, 'not blocked after a successful retry');
+  } finally {
+    __setGlobalPacerForTest(new GlobalSendPacer(1));
+  }
+});
+
+test('shutdown drain: drainPendingSends reports timeout when a send outlives the bound, then drains once it settles', async () => {
+  __setGlobalPacerForTest(new GlobalSendPacer(1));
+  const key = k(7203, 1);
+
+  // drainPendingSends unref's its bound timer (correct at shutdown — the drain
+  // must never keep the exiting process alive), so with only a hung promise
+  // pending the test's event loop would empty and node:test would cancel the
+  // await. Keep a ref'd interval alive for the duration of the test.
+  const keepEventLoopAlive = setInterval(() => {}, 20);
+  try {
+    let releaseHungSend: () => void = () => {};
+    const hungSend = enqueueSend(
+      key,
+      () => new Promise<void>((resolve) => { releaseHungSend = resolve; }),
+    );
+
+    const verdict = await drainPendingSends(50);
+    assert.equal(verdict, 'timeout', 'the bound elapsed with the send still in flight');
+
+    // Let the hung send settle and clean its queue entry, so the verdict flips.
+    releaseHungSend();
+    await hungSend;
+    assert.equal(await drainPendingSends(1000), 'drained', 'an emptied FIFO reports drained');
+  } finally {
+    clearInterval(keepEventLoopAlive);
+  }
 });

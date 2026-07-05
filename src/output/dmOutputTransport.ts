@@ -1,5 +1,5 @@
 import type { OutputTransport, OutputEventMeta, ThreadKey } from '../types';
-import { keyToString } from '../types';
+import { keyToString, keyFromString } from '../types';
 import { nextDraftId } from '../utils/draftId';
 import { appendPendingOutput } from '../utils/outputFlushPlan';
 import {
@@ -514,6 +514,15 @@ export function createDmOutputTransport(deps: DmOutputTransportDeps): OutputTran
     // trip `needsNewMessage` and finalize the draft mid-answer).
     checkIsStreaming(key) {
       return draftStreams.get(keyToString(key))?.active === true;
+    },
+    // Threads with an active draft turn — the shutdown flush finalizes each so
+    // the live draft's accumulated text lands as a permanent message before exit.
+    getInFlightThreadKeys() {
+      const keys: ThreadKey[] = [];
+      for (const [keyStr, draft] of draftStreams) {
+        if (draft.active) keys.push(keyFromString(keyStr));
+      }
+      return keys;
     },
   };
 }

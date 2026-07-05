@@ -365,6 +365,44 @@ export async function withRateLimitRetry<T>(
 }
 
 /**
+ * @description The shared send tail both the paced and unpaced paths end in:
+ * record the outbound send for the per-chat rate summary (best-effort — never
+ * throws into the send path), then run `fn` through the reactive 429 retry.
+ * Keeping it in one place stops {@link enqueueSend} and {@link sendUnpaced} from
+ * drifting on 429-safety or instrumentation.
+ */
+function recordAndRetry<T>(key: ThreadKey, fn: () => Promise<T>): Promise<T> {
+  // Record exactly one outbound send per logical send (best-effort
+  // instrumentation — never let it break a send).
+  try { sendRateTracker.recordSend(key.chatId); } catch { /* never throw into the send path */ }
+  return withRateLimitRetry(key.chatId, fn);
+}
+
+/**
+ * @description Send a Telegram operation OUTSIDE the global message pacer and
+ * the per-thread FIFO — still 429-safe ({@link withRateLimitRetry}) and still
+ * counted by {@link sendRateTracker}, but WITHOUT taking a
+ * {@link globalSendIntervalMs} permit and WITHOUT chaining behind the thread's
+ * other sends. Runs immediately.
+ *
+ * Reserved for the rare, non-output sends that must not consume the paced
+ * message budget nor queue behind streaming agent output:
+ *  - the typing indicator (`sendChatAction` — not a Telegram message, not
+ *    subject to the flood limit, so pacing it just wastes ~60% of the budget);
+ *  - the voice-transcript echo (the user's own input being acknowledged, which
+ *    should surface ahead of queued agent output).
+ *
+ * Do NOT route ordinary agent-output `sendMessage`s through this — that would
+ * break the FCFS ordering the pacer guarantees.
+ */
+export async function sendUnpaced<T>(
+  key: ThreadKey,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return recordAndRetry(key, fn);
+}
+
+/**
  * @description Send a Telegram operation through the per-thread FIFO queue, the
  * global send pacer, and per-chat 429 retry.
  *
@@ -393,10 +431,7 @@ export async function enqueueSend<T>(
 
   const exec = async (): Promise<T> => {
     await globalPacer.acquire();
-    // Record exactly one outbound send per logical send at the single
-    // chokepoint (best-effort instrumentation — never let it break a send).
-    try { sendRateTracker.recordSend(key.chatId); } catch { /* never throw into the send path */ }
-    return withRateLimitRetry(key.chatId, fn);
+    return recordAndRetry(key, fn);
   };
 
   // Chain: wait for prev (ignore its errors), then run our exec.

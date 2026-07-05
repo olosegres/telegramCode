@@ -19,6 +19,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   enqueueSend,
+  sendUnpaced,
   withRateLimitRetry,
   checkIsRateLimited,
   getRateLimitRemainingMs,
@@ -290,4 +291,65 @@ test('non-429 errors propagate without retry', async () => {
 
   assert.equal(calls, 1, 'non-429 errors must not retry');
   assert.equal(checkIsRateLimited(chatId), false);
+});
+
+// ── sendUnpaced: skips the pacer, keeps 429 safety, paced path untouched ─────
+
+test('sendUnpaced runs immediately while the global pacer is saturated; the paced enqueueSend stays gated', async () => {
+  // Install a fake-clock pacer so we can hold it "saturated" (window closed +
+  // a waiter parked) deterministically. Restore the fast process pacer after,
+  // so the following enqueueSend tests (module-level 1 ms pacer) are unaffected.
+  const clock = createFakeClock();
+  const pacer = new GlobalSendPacer(globalSendIntervalMs, clock);
+  __setGlobalPacerForTest(pacer);
+  try {
+    const key = k(7101, 5);
+
+    // Saturate: drain the open window, then park a waiter → the next permit
+    // now needs a full interval that only the clock can advance.
+    await pacer.acquire();
+    void pacer.acquire();
+
+    // A PACED send cannot run yet — it is gated behind the saturated pacer.
+    let pacedRan = false;
+    const paced = enqueueSend(key, async () => { pacedRan = true; return 'paced'; });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(pacedRan, false, 'enqueueSend is gated by the saturated pacer (paced path unchanged)');
+
+    // The UNPACED send runs at once — it never asks the pacer for a permit.
+    let unpacedRan = false;
+    const unpaced = await sendUnpaced(key, async () => { unpacedRan = true; return 'unpaced'; });
+    assert.equal(unpacedRan, true, 'sendUnpaced ran without waiting for a pacer permit');
+    assert.equal(unpaced, 'unpaced');
+    assert.equal(pacedRan, false, 'the paced send is STILL gated — proving the pacer really was saturated');
+
+    // Drain the clock so the parked sends settle and nothing leaks.
+    for (let i = 0; i < 3; i++) {
+      clock.advance(globalSendIntervalMs);
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+    assert.equal(await paced, 'paced', 'the paced send completes once the pacer window reopens');
+  } finally {
+    __setGlobalPacerForTest(new GlobalSendPacer(1));
+  }
+});
+
+test('sendUnpaced still retries once on a 429 (429 safety preserved)', async () => {
+  const key = k(7102, 9);
+  let calls = 0;
+  const fakeError = {
+    response: { error_code: 429, parameters: { retry_after: 0 } },
+  };
+
+  const result = await sendUnpaced(key, async () => {
+    calls += 1;
+    if (calls === 1) throw fakeError;
+    return 'ok';
+  });
+
+  assert.equal(calls, 2, 'sendUnpaced must retry exactly once on 429 (withRateLimitRetry still wraps it)');
+  assert.equal(result, 'ok');
+  assert.equal(checkIsRateLimited(key.chatId), false, 'not blocked after a successful retry');
 });

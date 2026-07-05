@@ -54,6 +54,7 @@ import {
 import { checkShouldRepostPendingQuestion } from './pendingQuestionRepost';
 import {
   enqueueSend,
+  sendUnpaced,
   checkIsRateLimited,
   getRateLimitRemainingMs,
   getActiveChatRateSummaries,
@@ -2323,10 +2324,17 @@ async function deleteThreadMessage(
  * @description `sendChatAction('typing')` in a thread. Best-effort; we
  * don't fail the caller if the API rejects it (e.g. action briefly not
  * supported for forum threads on older clients).
+ *
+ * Sent via {@link sendUnpaced}, NOT the paced {@link enqueueSend}: the typing
+ * action is not a Telegram message and is not subject to the flood limit, yet
+ * at one tick / thread / few seconds it used to eat ~60% of the global send
+ * budget and push real message sends (voice echoes, acks) minutes behind. It
+ * stays 429-safe and traced (both live at the `callApi` chokepoint), it just no
+ * longer takes a pacer permit or queues behind the thread's other sends.
  */
 async function sendThreadTypingIndicator(key: ThreadKey): Promise<void> {
   try {
-    await enqueueSend(key, () =>
+    await sendUnpaced(key, () =>
       bot.telegram.sendChatAction(
         key.chatId,
         'typing',

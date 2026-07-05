@@ -185,6 +185,16 @@ config/variants, not a per-message API field).
   answer is never discarded. While in a 429 cooldown the output debounce
   (`utils/outputFlushTiming.ts`) still scales to the LIVE remaining cooldown
   (`max(normal, 5s floor, remainingCooldownMs)`) as a harmless safety net.
+  **Two deliberate UNPACED exceptions** ride `sendUnpaced` (`rateLimiter.ts`:
+  429-retry + rate-summary kept, but NO pacer permit and NO per-thread FIFO):
+  the typing indicator (`sendChatAction` is not a message → not subject to the
+  message flood limit, yet it was eating ~60% of the paced budget) and the
+  voice-transcript 🎤 echo (`replyToThread` opt-in `unpaced` flag, sole caller —
+  the user's own input ack must not queue behind agent output; was up to 182s
+  late under load, now sub-second). Agent output NEVER goes unpaced — this is
+  not a priority class inside the pacer, it is a small closed set of rare
+  non-output sends moved out of it (plan
+  `agent/tasks/completed/2026-07-05-unpace-typing-and-priority-acks.md`).
 - **Output transport seam (CHAT_MODE-selected).** HOW agent output reaches a topic
   is chosen ONCE at boot by `CHAT_MODE` via `createOutputTransport` (`src/output/`),
   mirroring the `AgentAdapter` factory — no per-call surface branch. **Group** =

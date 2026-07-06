@@ -609,3 +609,48 @@ test('checkIsForwardedEcho: case/whitespace drift in the echo still matches', ()
   const echo = 'summarise   the relay module\n  and list its exports';
   assert.equal(checkIsForwardedEcho(echo, forwarded), true);
 });
+
+// ─── S1 widen — echo row GLUED to a transient spinner tick (live 2026-07-06) ──
+//
+// Topic 9085, msg 48092: the poll caught the just-submitted echo's wrapped
+// continuation row TOGETHER with the new turn's first spinner tick in ONE frame:
+//   "<wrapped echo row>\n\n* Twisting…"
+// The glued chrome is not part of the forwarded text, so whole-frame containment
+// failed and the echo row leaked into the topic as a permanent message. The
+// widened gate drops transient-shaped lines first, then re-tests the remainder.
+
+const forwardedLongWrapped =
+  'Echo test two with a deliberately long single line that should wrap inside the Claude terminal ' +
+  'input box several times because it just keeps going and going with more and more words about ' +
+  'absolutely nothing in particular, padding padding padding, still padding to make sure the visual ' +
+  'wrap happens across at least two or three rows of the three-hundred-column pane so the ' +
+  'continuation rows carry no prompt glyph at all. Reply with exactly the word DONE and nothing else, no tools.';
+
+test('checkIsForwardedEcho: echo row glued to a spinner tick is an echo (live 2026-07-06 fixture)', () => {
+  const frame = [
+    'across at least two or three rows of the three-hundred-column pane so the continuation rows ' +
+      'carry no prompt glyph at all. Reply with exactly the word DONE and nothing else, no tools.',
+    '',
+    '* Twisting…',
+  ].join('\n');
+  assert.equal(checkIsForwardedEcho(frame, forwardedLongWrapped), true);
+});
+
+test('checkIsForwardedEcho: echo row glued to a glyph-led stats spinner is an echo', () => {
+  const frame = [
+    'across at least two or three rows of the three-hundred-column pane so the continuation rows carry no prompt glyph at all.',
+    '✻ Simmering… (3s · ↓ 1.2k tokens)',
+  ].join('\n');
+  assert.equal(checkIsForwardedEcho(frame, forwardedLongWrapped), true);
+});
+
+test('checkIsForwardedEcho: a REAL answer glued to a spinner tick is NOT an echo', () => {
+  // The residual after dropping the transient line is genuine prose that is not
+  // a slice of the prompt — must be kept (the answer is never swallowed).
+  const frame = '● The wrap happens at the pane width, not the box width.\n* Twisting…';
+  assert.equal(checkIsForwardedEcho(frame, forwardedLongWrapped), false);
+});
+
+test('checkIsForwardedEcho: a frame of ONLY spinner lines is NOT an echo (status flow owns it)', () => {
+  assert.equal(checkIsForwardedEcho('* Twisting…\n✻ Simmering… (3s)', forwardedLongWrapped), false);
+});

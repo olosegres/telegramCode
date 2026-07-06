@@ -2569,6 +2569,15 @@ function normalizeEchoText(text: string): string {
  * prompt and then adds an answer is NOT a substring of the prompt and is kept.
  * The caller additionally gates this on a short post-forward time window.
  *
+ * WIDENED (live 2026-07-06, topic 9085): the poll can catch the just-submitted
+ * echo's wrapped row GLUED to the new turn's first spinner tick in ONE frame
+ * (`<echo row>\n\n* Twisting…`). The glued chrome is not part of the forwarded
+ * text, so whole-frame containment failed and the row leaked as a permanent
+ * message. When the whole frame misses, transient-shaped lines (per-line
+ * {@link checkIsStatusOutput}) are dropped and the remaining content is
+ * re-tested — only a frame whose real content is nothing but a slice of the
+ * forwarded text is suppressed, so an answer glued to a spinner is still kept.
+ *
  * Pure + exported so every observed echo variant is unit-testable. MAINTENANCE:
  * like {@link checkIsInputEchoFrame}, WIDEN (never swap) when a new echo shape
  * leaks — keep the old variants.
@@ -2578,8 +2587,19 @@ export function checkIsForwardedEcho(frameText: string, forwardedText: string): 
   if (!frame) return false;
   if (frame.includes(normalizeEchoText(threadContextPreambleHeader))) return true;
   const forwarded = normalizeEchoText(forwardedText);
-  if (!forwarded || frame.length < claudeEchoMinMatchChars) return false;
-  return forwarded.includes(frame);
+  if (!forwarded) return false;
+  if (frame.length >= claudeEchoMinMatchChars && forwarded.includes(frame)) return true;
+
+  // Glued-chrome widen: drop transient/spinner-shaped lines, keep real content
+  // lines, and re-run the SAME containment on the remainder. A frame with no
+  // content lines left is pure status — the status flow owns it, not the gate.
+  const contentLines = frameText
+    .split('\n')
+    .filter((line) => line.trim() && !checkIsStatusOutput(line));
+  if (contentLines.length === 0) return false;
+  const residual = normalizeEchoText(contentLines.join('\n'));
+  if (residual === frame) return false; // nothing was dropped — already tested above
+  return residual.length >= claudeEchoMinMatchChars && forwarded.includes(residual);
 }
 
 /**

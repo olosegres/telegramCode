@@ -28,6 +28,7 @@ import {
   convertAnsiToMarkdown,
   stripTuiElements,
 } from '../adapters/claudeCliAdapter';
+import { checkIsClaudeChromeLine } from '../utils/claudeScrapeShapes';
 
 // ─── C1 — paragraph gluing through whitespace-only line drop ───────────
 
@@ -690,4 +691,33 @@ test('checkIsForwardedEcho: an answer that mentions a DIFFERENT timestamp is NOT
     checkIsForwardedEcho('The build finished at 2026-06-27T20:00:00+04:00 successfully.', forwardedWithTimestamp),
     false,
   );
+});
+
+// ─── v2.1.201 corner shortcut hint `/rc` — footer chrome, never content ──────
+//
+// Claude Code v2.1.201 paints a `/rc` shortcut hint in the pane's bottom-right
+// corner. Right-aligned, it scrapes as a line whose only content is `/rc`
+// (heavy leading whitespace); the diff relayed it as a 3-char status frame
+// (`sendMessage "/rc"`, then `✽ /rc · 0:01` via lastActivityText — live
+// 2026-07-06, topic 9085, msg 48085). Whole-line-anchored: prose that merely
+// mentions `/rc` inline is untouched.
+
+test('checkIsClaudeChromeLine: a standalone /rc corner hint is chrome (bare + right-aligned)', () => {
+  assert.equal(checkIsClaudeChromeLine('/rc'), true);
+  assert.equal(checkIsClaudeChromeLine(`${' '.repeat(280)}/rc`), true);
+});
+
+test('checkIsClaudeChromeLine: prose mentioning /rc inline is NOT chrome', () => {
+  assert.equal(checkIsClaudeChromeLine('Run /rc to see rate limits.'), false);
+  assert.equal(checkIsClaudeChromeLine('/rc shows the rate-limit summary'), false);
+});
+
+test('stripTuiElements: drops the standalone /rc corner-hint line, keeps surrounding prose', () => {
+  const input = 'Real answer paragraph.\n                    /rc';
+  assert.equal(stripTuiElements(input), 'Real answer paragraph.');
+});
+
+test('stripTuiElements: keeps prose that mentions /rc inline', () => {
+  const input = 'Use /rc to check limits.';
+  assert.equal(stripTuiElements(input), 'Use /rc to check limits.');
 });

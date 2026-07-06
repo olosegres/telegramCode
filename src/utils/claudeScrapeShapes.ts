@@ -248,6 +248,19 @@ export const COMPLETION_SUMMARY_RE = /^\s*Done\s*\([^)]*tokens[^)]*\)\s*$/;
 export const DIFF_CHANGE_GUTTER_RE = /^\s*\d+\s+\+/;
 
 /**
+ * @description The bottom-right corner shortcut hint Claude Code v2.1.201
+ * paints on the footer row (`/rc`). Right-aligned at the pane edge, it can
+ * scrape as a line whose ONLY content is the hint token (heavy leading
+ * whitespace) — the line-set diff then relayed it as a 3-char status frame
+ * (`sendMessage "/rc"`, `✽ /rc · 0:01`; live 2026-07-06, topic 9085). Anchored
+ * to the WHOLE line being nothing but the literal hint, so prose that merely
+ * mentions `/rc` inline is never matched. Closed shape — if a future version
+ * paints a different corner hint, WIDEN the alternation (keep `/rc`), don't
+ * loosen the whole-line anchor.
+ */
+export const CORNER_HINT_RE = /^\s*\/rc\s*$/;
+
+/**
  * @description Which tool a `⎿` result body belongs to, deciding how it is
  * fenced: `output` (Bash/Grep/Glob — the `⎿` line is stdout, fenced with the
  * body) vs `file` (Read/Edit/Update/Write — the `⎿` line is a prose summary,
@@ -285,6 +298,8 @@ export function checkIsClaudeChromeLine(line: string): boolean {
     /Enter to select/i.test(line) ||
     /\(shift\+tab to cycle\)/i.test(line) ||
     /⏵⏵\s*(?:bypass permissions|accept edits)\s*(?:on|off)/i.test(line) ||
+    // Bottom-right corner shortcut hint (v2.1.201 `/rc`), scraped standalone.
+    CORNER_HINT_RE.test(line) ||
     // Input-box cursor row / cursor-led nav.
     /^❯/.test(trimmed) ||
     // Ephemeral "Tip:" affordance under a turn.

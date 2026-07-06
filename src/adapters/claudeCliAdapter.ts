@@ -42,6 +42,7 @@ import {
   COMPLETION_SUMMARY_RE,
   DIFF_CHANGE_GUTTER_RE,
   TRANSIENT_TICK_RE,
+  CORNER_HINT_RE,
   checkIsClaudeChromeLine,
   checkIsBareSpinnerActivityLine,
   type ToolResultKind,
@@ -1916,6 +1917,11 @@ export function stripTuiElementsWithContext(
     // prose merely mentioning the word "Interrupted" is NOT stripped.
     if (/^\s*(?:⎿\s*)?Interrupted · What should Claude do instead\?\s*$/.test(line)) continue;
     if (/\(shift\+tab to cycle\)/i.test(line)) continue;
+    // Bottom-right corner shortcut hint (v2.1.201 `/rc`): right-aligned, it
+    // scrapes as a lone whitespace-padded token line. Same shape the chrome
+    // classifier drops (`CORNER_HINT_RE` in claudeScrapeShapes — the deliberate
+    // strip/classifier parallel, keep in sync).
+    if (CORNER_HINT_RE.test(line)) continue;
     if (/^[\s·✽✢✶✻⏵❯─━↵]+$/.test(line)) continue;
 
     // S3 (N1.a) / S4 (N1.b): per-line strip of mid-chunk spinner ticks

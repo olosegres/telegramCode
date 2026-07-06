@@ -32,6 +32,8 @@ import {
   getKnownAdapterNames,
   checkIsClaudeBackend,
   resolveClaudeBackendName,
+  parseClaudeBackendArg,
+  getClaudeModeAction,
 } from './adapters/createAdapter';
 import { ClaudeJsonStreamAdapter, claudeJsonStreamAdapterName } from './adapters/claudeJsonStreamAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
@@ -4787,19 +4789,32 @@ async function applyClaudeBackendSwitch(key: ThreadKey, target: string): Promise
 
 command('claude_mode', async (ctx, key) => {
   if (checkIsGeneral(key)) { await replyToThread(key, t('error.start_in_general')); return; }
-  const current = getThreadAdapterName(key);
-  if (!checkIsClaudeBackend(current)) { await replyToThread(key, t('claudeMode.not_claude')); return; }
 
+  // Gate on the thread adapter name (a `DEFAULT_AGENT` fallback included) but
+  // compare/✓ against the EFFECTIVE Claude backend — the same resolution the
+  // start path uses. See `getClaudeModeAction` for the live bug this split
+  // resolution fixes (a fresh thread under DEFAULT_AGENT=claude no-oped the
+  // first `/claude_mode tmux`).
   const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
-  const direct =
-    ['json', 'jsonstream', 'json-stream', 'stream'].includes(arg) ? claudeJsonStreamAdapterName :
-    ['tmux', 'scrape', 'terminal', 'classic'].includes(arg) ? 'claude' : null;
-  if (direct) {
-    if (direct === current) { await replyToThread(key, t('claudeMode.already', { label: getClaudeBackendLabel(direct) })); return; }
-    await replyToThread(key, await applyClaudeBackendSwitch(key, direct));
+  const action = getClaudeModeAction({
+    threadAdapterName: getThreadAdapterName(key),
+    effectiveBackendName: resolveClaudeBackendName(key),
+    requestedBackendName: parseClaudeBackendArg(arg),
+  });
+  if (action.kind === 'notClaude') { await replyToThread(key, t('claudeMode.not_claude')); return; }
+  if (action.kind === 'already') {
+    await replyToThread(key, t('claudeMode.already', { label: getClaudeBackendLabel(action.backendName) }));
     return;
   }
-  await replyToThread(key, t('claudeMode.pick', { label: getClaudeBackendLabel(current) }), buildClaudeModeKeyboard(current));
+  if (action.kind === 'switch') {
+    await replyToThread(key, await applyClaudeBackendSwitch(key, action.backendName));
+    return;
+  }
+  await replyToThread(
+    key,
+    t('claudeMode.pick', { label: getClaudeBackendLabel(action.currentBackendName) }),
+    buildClaudeModeKeyboard(action.currentBackendName),
+  );
 });
 
 command('model', async (ctx, key) => {
@@ -6807,7 +6822,10 @@ bot.action(/^ccmode_(.+)$/, async (ctx) => {
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   const target = ctx.match[1];
   if (!checkIsClaudeBackend(target)) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  const current = getThreadAdapterName(key);
+  // Compare against the EFFECTIVE backend (what /claude would start), same as
+  // the command handler — the raw thread name may be a legacy DEFAULT_AGENT
+  // fallback that never matches what a start would actually open.
+  const current = resolveClaudeBackendName(key);
   if (target === current) { await ctx.answerCbQuery(t('cb.claudeMode_already')); return; }
   await ctx.answerCbQuery(t('cb.claudeMode_switching'));
   await replyToThread(key, await applyClaudeBackendSwitch(key, target));
@@ -6817,7 +6835,7 @@ bot.action(/^ccmode_(.+)$/, async (ctx) => {
     try {
       await enqueueSend(key, () => bot.telegram.editMessageReplyMarkup(
         key.chatId, cbMsg.message_id, undefined,
-        buildClaudeModeKeyboard(getThreadAdapterName(key)).reply_markup,
+        buildClaudeModeKeyboard(resolveClaudeBackendName(key)).reply_markup,
       ));
     } catch (e) {
       const desc = checkIsApiError(e) ? getErrorDescription(e) : '';

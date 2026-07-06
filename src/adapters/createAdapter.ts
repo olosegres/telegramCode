@@ -268,6 +268,61 @@ export function resolveClaudeBackendName(key: ThreadKey): string {
 }
 
 /**
+ * @description Parse a `/claude_mode <arg>` backend argument into an adapter
+ * name: the json-stream aliases, the tmux-scrape aliases, or `null` for
+ * anything else (incl. the bare command → picker). One place for the alias
+ * vocabulary so the command handler stays declarative.
+ */
+export function parseClaudeBackendArg(arg: string): string | null {
+  if (['json', 'jsonstream', 'json-stream', 'stream'].includes(arg)) return claudeJsonStreamAdapterName;
+  if (['tmux', 'scrape', 'terminal', 'classic'].includes(arg)) return 'claude';
+  return null;
+}
+
+/** What the `/claude_mode` command (or a `ccmode_` button) should do. */
+export type ClaudeModeAction =
+  | { kind: 'notClaude' }
+  | { kind: 'already'; backendName: string }
+  | { kind: 'switch'; backendName: string }
+  | { kind: 'picker'; currentBackendName: string };
+
+/**
+ * @description Pure decision for `/claude_mode`: gate, compare, or open the
+ * picker. The load-bearing subtlety is that the GATE and the COMPARE use two
+ * DIFFERENT resolutions:
+ *
+ *  - `threadAdapterName` (in-memory pick ?? `DEFAULT_AGENT` fallback) answers
+ *    "is this a Claude topic at all?" — an opencode/terminal topic gets the
+ *    not-Claude hint.
+ *  - `effectiveBackendName` ({@link resolveClaudeBackendName}: raw pick if a
+ *    Claude backend, else the json-stream default) answers "which backend
+ *    would a Claude start actually open?" — the same resolution the start
+ *    path uses, so the "already" answer and the picker's ✓ can never disagree
+ *    with what `/claude` would really do.
+ *
+ * The live bug this fixes (2026-07-06, topic 9085): with `DEFAULT_AGENT=claude`
+ * in the operator env, a NO-pick thread had `threadAdapterName === 'claude'`,
+ * so `/claude_mode tmux` compared against that legacy fallback and replied
+ * "already tmux-scrape" WITHOUT persisting — while `/claude` then resolved the
+ * effective default and started json-stream. Comparing against the EFFECTIVE
+ * backend makes the first `tmux` switch on a fresh thread persist + switch.
+ */
+export function getClaudeModeAction(input: {
+  threadAdapterName: string;
+  effectiveBackendName: string;
+  requestedBackendName: string | null;
+}): ClaudeModeAction {
+  if (!checkIsClaudeBackend(input.threadAdapterName)) return { kind: 'notClaude' };
+  if (input.requestedBackendName === null) {
+    return { kind: 'picker', currentBackendName: input.effectiveBackendName };
+  }
+  if (input.requestedBackendName === input.effectiveBackendName) {
+    return { kind: 'already', backendName: input.requestedBackendName };
+  }
+  return { kind: 'switch', backendName: input.requestedBackendName };
+}
+
+/**
  * @description Resolve the adapter instance currently bound to `key`.
  *
  * Replaces the old `getUserAdapter(userId)` — see plan §10.4. The bot picks

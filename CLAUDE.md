@@ -723,7 +723,20 @@ OpenCode events / bindings).
     `utils/toolResultRender.ts`, `utils/subagentRender.ts`,
     `utils/subagentStatusRender.ts`, `utils/claudeSubagentTail.ts`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
-  `/doctor`, `/mcp`, `/trace`
+  `/doctor`, `/mcp`, `/trace`, `/timestamps`
+  - `/timestamps on|off` (bare → status) toggles the per-thread prompt
+    timestamp: when ON, every prompt forwarded to the agent gets its send time
+    prepended as the very top line (`2026-06-27T19:42:10+04:00` — local-offset
+    ISO from `formatIsoLocalOffset` in `utils/isoTimestamp.ts`, never `Z`),
+    above the on-change thread-context preamble. **Agent-facing only** — never
+    posted to the topic, and the Claude echo gates strip it with the rest of
+    the echo. The time is the Telegram message's real `date` (plumbed from the
+    text/voice handlers as `sentAtMs`); prompts with no live message (scheduled
+    runs, buffered replay, api-retry nudge, file intake) fall back to now.
+    Slash commands are never timestamped (same skip rule as the preamble).
+    Default OFF; persisted in `state.json` (`timestampThreads`, mirrors
+    `/trace`'s shape), lifecycle-independent. Use case: long multi-day sessions
+    where the agent needs absolute time for "yesterday" / "2-3 days ago".
   - `/trace on|off` toggles the output-trace recorder for THIS topic; `/trace
     on all` / `/trace off all` flips the every-thread flag (and `off all`
     clears the per-thread set too); bare `/trace` reports status. Persisted in

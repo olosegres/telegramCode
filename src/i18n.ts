@@ -417,6 +417,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'trace.statusOffLabel': 'выкл',
     'trace.usageHint': 'Использование: /trace on | off | on all | off all | (без аргумента — статус)',
 
+    // ── prompt-timestamp toggle (/timestamps) ──
+    'timestamps.onReply':
+      '🕐 Метки времени включены: каждый промпт агенту получает время отправки первой строкой (в топик не постится).',
+    'timestamps.offReply': '🕐 Метки времени выключены для этого треда.',
+    'timestamps.statusOnReply': '🕐 Метки времени: вкл для этого треда.',
+    'timestamps.statusOffReply': '🕐 Метки времени: выкл для этого треда.',
+    'timestamps.usageHint': 'Использование: /timestamps on | off | (без аргумента — статус)',
+
     // ── scheduler fire announcement ({name}=имя задачи, {schedule}=расписание
     //    словами, {prompt}=текст промпта, {missedNote}=пометка о пропуске или
     //    пусто для запуска вовремя) ──
@@ -824,6 +832,14 @@ const dict: Record<Lang, Record<string, string>> = {
     'trace.statusOnLabel': 'on',
     'trace.statusOffLabel': 'off',
     'trace.usageHint': 'Usage: /trace on | off | on all | off all | (no arg — status)',
+
+    // ── prompt-timestamp toggle (/timestamps) ──
+    'timestamps.onReply':
+      '🕐 Timestamps enabled: every prompt forwarded to the agent gets the send time as its top line (never posted to the topic).',
+    'timestamps.offReply': '🕐 Timestamps disabled for this thread.',
+    'timestamps.statusOnReply': '🕐 Timestamps: on for this thread.',
+    'timestamps.statusOffReply': '🕐 Timestamps: off for this thread.',
+    'timestamps.usageHint': 'Usage: /timestamps on | off | (no arg — status)',
 
     // ── scheduler fire announcement ({name}=job name, {schedule}=human
     //    schedule text, {prompt}=prompt text, {missedNote}=catch-up note or

@@ -476,6 +476,39 @@ test('traceConfig: dedups + sorts thread keys and drops an empty thread list on 
   assert.equal('tracedThreads' in rawOff, false, 'empty thread list must be absent on disk');
 });
 
+// ── prompt-timestamp toggle (/timestamps) ──
+
+test('timestamps: default OFF on a fresh state file', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  assert.equal(store.checkIsTimestampsEnabled(key1), false);
+});
+
+test('timestamps: on → persists, survives a reload, and is per-thread', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setTimestampsEnabled(key1, true);
+  assert.equal(first.checkIsTimestampsEnabled(key1), true);
+  assert.equal(first.checkIsTimestampsEnabled(key2), false, 'toggle is per-thread');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.checkIsTimestampsEnabled(key1), true, 'on survives reload');
+  assert.equal(second.checkIsTimestampsEnabled(key2), false);
+});
+
+test('timestamps: off removes the thread and drops an empty list on disk', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setTimestampsEnabled(key1, true);
+  await store.setTimestampsEnabled(key1, false);
+  assert.equal(store.checkIsTimestampsEnabled(key1), false);
+  await store.flush();
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal('timestampThreads' in raw, false, 'empty list must be absent on disk');
+});
+
 // ── setTransientFrames (transient status-frame ids — restart cleanup, S2) ──
 
 test('setTransientFrames: set → get round-trips the id list for a thread', async () => {

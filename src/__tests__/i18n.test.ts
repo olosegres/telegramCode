@@ -168,6 +168,18 @@ test('trace toggle keys exist in every locale', () => {
   }
 });
 
+test('timestamps toggle keys exist in every locale', () => {
+  for (const code of [
+    'timestamps.onReply',
+    'timestamps.offReply',
+    'timestamps.statusOnReply',
+    'timestamps.statusOffReply',
+    'timestamps.usageHint',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
 test('trace.statusReply substitutes thisThread/allThreads/count placeholders', () => {
   const out = t('trace.statusReply', { thisThread: 'on', allThreads: 'off', count: 3 });
   assert.ok(out.includes('3'), `expected count in "${out}"`);

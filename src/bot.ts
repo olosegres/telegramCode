@@ -164,6 +164,7 @@ import {
   getStatusFrameStoreDecision,
 } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
+import { formatIsoLocalOffset } from './utils/isoTimestamp';
 import {
   buildThreadContextPreamble,
   prependThreadContextPreamble,
@@ -3543,6 +3544,7 @@ async function forwardPromptToAgent(
   key: ThreadKey,
   adapter: AgentAdapter,
   text: string,
+  sentAtMs?: number,
 ): Promise<void> {
   // Glue the thread-context preamble (topic / group / thread / folder) ahead
   // of the prompt so the agent knows WHERE it works. Slash commands forwarded
@@ -3550,7 +3552,18 @@ async function forwardPromptToAgent(
   // corrupt them into plain text. The preamble rides only when it differs
   // from the last one we injected this session (fresh session, rename, or
   // post-`/clear` marker reset). See `threadContextPreamble.ts`.
-  const promptText = getPromptWithThreadContext(key, text);
+  //
+  // `/timestamps` injection (S2): when the thread toggle is ON, the send-time
+  // rides EVERY prompt as the very top line (local-offset ISO + blank line,
+  // above the on-change preamble) — agent-facing only, never posted to the
+  // topic. `sentAtMs` is the originating Telegram message's real send time
+  // (plumbed from the text/voice handlers); prompts with no live message
+  // (scheduled runs, buffered replay, api-retry nudge, file intake) fall back
+  // to now. Slash commands skip it for the same reason they skip the preamble.
+  let promptText = getPromptWithThreadContext(key, text);
+  if (state.checkIsTimestampsEnabled(key) && !checkShouldSkipPreambleForText(text)) {
+    promptText = `${formatIsoLocalOffset(sentAtMs ?? Date.now())}\n\n${promptText}`;
+  }
   markNeedsNewMessage(key);
   // A new prompt is a new turn: lift the S2 idle-suppress latch and re-base the
   // working-status elapsed so the next busy period shows a fresh 0:00 counter
@@ -5576,6 +5589,42 @@ command('trace', async (ctx, key) => {
 });
 
 /**
+ * @description `/timestamps` — toggle the per-thread prompt-timestamp injection.
+ *
+ *   /timestamps on   → prepend the send-time (local-offset ISO top line) to
+ *                      every prompt forwarded to THIS topic's agent
+ *   /timestamps off  → stop injecting
+ *   /timestamps      → status: this thread on/off
+ *
+ * Agent-facing only: the line rides the forwarded prompt like the thread-context
+ * preamble and is never posted to the topic. Persisted in `state.json`
+ * (mirrors `/trace`'s shape), lifecycle-independent — nothing in the session
+ * lifecycle touches it. Default OFF. Use case: long multi-day sessions where
+ * the agent needs absolute time to interpret "yesterday" / "2-3 days ago".
+ */
+command('timestamps', async (ctx, key) => {
+  const args = ctx.message.text.split(' ').slice(1).map(a => a.toLowerCase()).filter(Boolean);
+
+  // Bare `/timestamps` — status only.
+  if (args.length === 0) {
+    await replyToThread(
+      key,
+      t(state.checkIsTimestampsEnabled(key) ? 'timestamps.statusOnReply' : 'timestamps.statusOffReply'),
+    );
+    return;
+  }
+
+  const [action] = args;
+  if ((action !== 'on' && action !== 'off') || args.length > 1) {
+    await replyToThread(key, t('timestamps.usageHint'));
+    return;
+  }
+
+  await state.setTimestampsEnabled(key, action === 'on');
+  await replyToThread(key, t(action === 'on' ? 'timestamps.onReply' : 'timestamps.offReply'));
+});
+
+/**
  * @description `/schedule` (S7) — a thin prompt wrapper. The bot owns NO
  * scheduling logic: it wraps the user's request in an agent-facing instruction
  * (forward template with args, interview template without) and delivers it
@@ -5699,7 +5748,7 @@ const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'terminal', 'agent', 'sessions', 'resume', 'cancel', 'model',
   'stop', 'stopall', 'stop-all', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
-  'doctor', 'mcp', 'rename_session', 'trace', 'schedule', 'thinking', 'tool_results',
+  'doctor', 'mcp', 'rename_session', 'trace', 'timestamps', 'schedule', 'thinking', 'tool_results',
   'subagent', 'claude_mode',
 ]);
 
@@ -5926,9 +5975,10 @@ bot.on(message('text'), async (ctx) => {
   // owns the pending-question route (digit answers / free-form cancels), the G2
   // wedge backstop, and the actual forward. The Claude-selector + terminal
   // branches above already returned for their own cases, so this is reached only
-  // for a generic active prompt.
+  // for a generic active prompt. The message's real send time (Telegram `date`,
+  // unix seconds) rides along for the `/timestamps` injection.
   if (adapter.checkIsActive(key)) {
-    await deliverActivePrompt(key, adapter, text);
+    await deliverActivePrompt(key, adapter, text, ctx.message.date * 1000);
     return;
   }
 
@@ -5977,8 +6027,9 @@ bot.on(message('voice'), async (ctx) => {
   // rejected job is guarded so it can never become an unhandledRejection
   // (processVoiceJob already reports its own errors via replyToThread).
   const fileId = ctx.message.voice.file_id;
+  const sentAtMs = ctx.message.date * 1000;
   void getVoiceTranscriptionQueue(key)
-    .run(() => processVoiceJob(key, fileId))
+    .run(() => processVoiceJob(key, fileId, sentAtMs))
     .catch((err) => {
       console.error('[Bot] Voice job error (already handled):', err);
     });
@@ -5990,9 +6041,11 @@ bot.on(message('voice'), async (ctx) => {
  * Byte-for-byte the old voice handler's post-gate body — moved verbatim out of
  * the handler so it runs OFF the telegraf update loop (per-thread serialized).
  * Uses only `key`/`bot`, never the request `ctx`, so it survives past the
- * handler's return.
+ * handler's return. `sentAtMs` is the voice note's real Telegram send time,
+ * captured by the handler for the `/timestamps` injection (transcription can
+ * take ~20s, so "now" at forward time would drift).
  */
-async function processVoiceJob(key: ThreadKey, fileId: string): Promise<void> {
+async function processVoiceJob(key: ThreadKey, fileId: string, sentAtMs?: number): Promise<void> {
   try {
     // Audit S14 / #33: `getFileLink` builds the bot-token URL in one
     // place inside Telegraf instead of us materialising the token in a
@@ -6087,7 +6140,7 @@ async function processVoiceJob(key: ThreadKey, fileId: string): Promise<void> {
     // CANCELS it (a transcript is free-form prose, never a bare digit) and is
     // delivered as a fresh prompt — closing the gap where voice queued behind a
     // blocked question-turn and the user got no reply.
-    await deliverActivePrompt(key, adapter, transcript);
+    await deliverActivePrompt(key, adapter, transcript, sentAtMs);
   } catch (err) {
     console.error('[Bot] Voice handling error:', err);
     await replyToThread(key, 'Error processing voice message');
@@ -6996,6 +7049,7 @@ async function deliverActivePrompt(
   key: ThreadKey,
   adapter: AgentAdapter,
   text: string,
+  sentAtMs?: number,
 ): Promise<void> {
   const pending = pendingQuestions.get(keyToString(key));
   if (pending && adapter.answerQuestion) {
@@ -7005,7 +7059,7 @@ async function deliverActivePrompt(
       await applyQuestionAnswer(key, route.labels);
       return;
     }
-    await cancelPendingQuestionAndForward(key, adapter, text);
+    await cancelPendingQuestionAndForward(key, adapter, text, sentAtMs);
     return;
   }
 
@@ -7033,7 +7087,7 @@ async function deliverActivePrompt(
     adapter.sendSignal(key, 'SIGINT');
     await replyToThread(key, t('agent.question_cancelled_for_prompt'));
   }
-  await forwardPromptToAgent(key, adapter, text);
+  await forwardPromptToAgent(key, adapter, text, sentAtMs);
 }
 
 /**
@@ -7053,6 +7107,7 @@ async function cancelPendingQuestionAndForward(
   key: ThreadKey,
   adapter: AgentAdapter,
   text: string,
+  sentAtMs?: number,
 ): Promise<void> {
   const pending = pendingQuestions.get(keyToString(key));
   const cancelledMessageId = pending?.messageId ?? null;
@@ -7076,7 +7131,7 @@ async function cancelPendingQuestionAndForward(
   adapter.rejectQuestion?.(key);
   adapter.sendSignal(key, 'SIGINT');
   await replyToThread(key, t('agent.question_cancelled_for_prompt'));
-  await forwardPromptToAgent(key, adapter, text);
+  await forwardPromptToAgent(key, adapter, text, sentAtMs);
 }
 
 /**

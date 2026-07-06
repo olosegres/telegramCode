@@ -43,9 +43,12 @@ function getProcessVoiceJobBody(): string {
 
 test('S4: processVoiceJob delivers the transcript via the shared deliverActivePrompt choke point', () => {
   const body = getProcessVoiceJobBody();
+  // The trailing `sentAtMs` is the `/timestamps` plumbing (the voice note's
+  // real Telegram send time) — optional in the pattern so the guard keys on
+  // the ROUTE, not the extra argument.
   assert.match(
     body,
-    /await\s+deliverActivePrompt\(\s*key\s*,\s*adapter\s*,\s*transcript\s*\)/,
+    /await\s+deliverActivePrompt\(\s*key\s*,\s*adapter\s*,\s*transcript\s*(?:,\s*sentAtMs\s*)?\)/,
     'voice must route the transcript through deliverActivePrompt (the text+voice choke point)',
   );
 });
@@ -62,9 +65,11 @@ test('S4: processVoiceJob no longer forwards the transcript with the bare forwar
 test('S2: the text handler routes a generic active prompt through the same deliverActivePrompt choke point', () => {
   // The text handler's generic active branch must delegate to deliverActivePrompt
   // too, so text + voice share one cancel/answer/forward implementation.
+  // The trailing message-date expression is the `/timestamps` plumbing —
+  // optional in the pattern so the guard keys on the ROUTE.
   assert.match(
     botSource,
-    /await\s+deliverActivePrompt\(\s*key\s*,\s*adapter\s*,\s*text\s*\)/,
+    /await\s+deliverActivePrompt\(\s*key\s*,\s*adapter\s*,\s*text\s*(?:,[^)]*)?\)/,
     'the text handler must delegate its active branch to deliverActivePrompt',
   );
 });

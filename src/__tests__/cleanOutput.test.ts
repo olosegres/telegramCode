@@ -654,3 +654,40 @@ test('checkIsForwardedEcho: a REAL answer glued to a spinner tick is NOT an echo
 test('checkIsForwardedEcho: a frame of ONLY spinner lines is NOT an echo (status flow owns it)', () => {
   assert.equal(checkIsForwardedEcho('* Twisting…\n✻ Simmering… (3s)', forwardedLongWrapped), false);
 });
+
+// ─── S2 — `/timestamps` echo-strip: the injected ISO top line is part of the ──
+// forwarded text (sendInput records the FINAL typed string), so its echo must
+// be suppressed by the same content gate — alone, with the message, and glued.
+
+const forwardedWithTimestamp = [
+  '2026-06-27T19:42:10+04:00',
+  '',
+  'please summarise the relay module and list its exports',
+].join('\n');
+
+test('checkIsForwardedEcho: the injected timestamp line alone is an echo slice', () => {
+  assert.equal(checkIsForwardedEcho('2026-06-27T19:42:10+04:00', forwardedWithTimestamp), true);
+});
+
+test('checkIsForwardedEcho: timestamp line + message echo is an echo', () => {
+  assert.equal(checkIsForwardedEcho(forwardedWithTimestamp, forwardedWithTimestamp), true);
+});
+
+test('checkIsForwardedEcho: timestamp-topped echo glued to a spinner tick is an echo', () => {
+  const frame = `${forwardedWithTimestamp}\n\n* Twisting…`;
+  assert.equal(checkIsForwardedEcho(frame, forwardedWithTimestamp), true);
+});
+
+test('checkIsInputEchoFrame: a ❯ draft row carrying the timestamp top line is an echo', () => {
+  assert.equal(
+    checkIsInputEchoFrame('❯ 2026-06-27T19:42:10+04:00\n  please summarise the relay module'),
+    true,
+  );
+});
+
+test('checkIsForwardedEcho: an answer that mentions a DIFFERENT timestamp is NOT an echo', () => {
+  assert.equal(
+    checkIsForwardedEcho('The build finished at 2026-06-27T20:00:00+04:00 successfully.', forwardedWithTimestamp),
+    false,
+  );
+});

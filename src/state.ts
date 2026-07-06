@@ -169,6 +169,16 @@ export interface StateV1 {
   tracedThreads?: string[];
   traceAllThreads?: boolean;
   /**
+   * Threads with the `/timestamps` prompt-injection toggle ON (default OFF —
+   * absent list means no thread injects). When ON, every forwarded prompt gets
+   * the send-time prepended as a local-offset ISO top line (agent-facing only,
+   * never posted to the topic). Same persistence shape as `tracedThreads`
+   * (deduped/sorted {@link ThreadKey} strings, dropped when empty) and equally
+   * lifecycle-independent: only `/timestamps` mutates it, never session
+   * teardown. Optional so older state files stay valid.
+   */
+  timestampThreads?: string[];
+  /**
    * Persisted scheduled jobs, keyed by {@link ScheduleRecord.id}. Optional so
    * older state files (created before the scheduler feature) stay valid —
    * `loadStateFile`'s shape check doesn't require it and a missing value is an
@@ -976,6 +986,35 @@ export class StateStore {
     if (uniqueKeys.length > 0) this.state.tracedThreads = uniqueKeys;
     else delete this.state.tracedThreads;
     this.state.traceAllThreads = config.allThreads;
+    this.scheduleSave();
+  }
+
+  // ── per-thread prompt-timestamp toggle (`/timestamps`) ──
+
+  /**
+   * @description Whether `/timestamps` is ON for `key` (default OFF). When ON,
+   * `forwardPromptToAgent` prepends the send-time as a local-offset ISO top
+   * line to every forwarded prompt.
+   */
+  checkIsTimestampsEnabled(key: ThreadKey): boolean {
+    return this.state.timestampThreads?.includes(keyToString(key)) ?? false;
+  }
+
+  /**
+   * @description Persist the per-thread `/timestamps` toggle. Mirrors
+   * {@link setTraceConfig}'s shape discipline: the list is deduped + sorted so
+   * the on-disk form is stable, and an empty list is dropped (an all-defaults
+   * install leaves no trace in `state.json`). Not crash-critical, so it rides
+   * the debounced save loop.
+   */
+  async setTimestampsEnabled(key: ThreadKey, isEnabled: boolean): Promise<void> {
+    const keyStr = keyToString(key);
+    const current = new Set(this.state.timestampThreads ?? []);
+    if (isEnabled) current.add(keyStr);
+    else current.delete(keyStr);
+    const uniqueKeys = [...current].sort();
+    if (uniqueKeys.length > 0) this.state.timestampThreads = uniqueKeys;
+    else delete this.state.timestampThreads;
     this.scheduleSave();
   }
 

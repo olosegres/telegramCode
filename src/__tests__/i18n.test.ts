@@ -274,6 +274,15 @@ test('thinking (/thinking) keys exist in every locale (S2)', () => {
   }
 });
 
+test('thinking.live is the static ••• indicator in every locale (locked decision, S3)', () => {
+  // Plan 2026-06-27: the live working cue is the STATIC three-bullet glyph —
+  // no animation, no "thinking"/"думаю" word, identical across locales. The
+  // native Telegram typing action stays the animated cue.
+  for (const lang of ['ru', 'en']) {
+    assert.equal(getKeyInLang(lang, 'thinking.live'), '•••', `thinking.live must be ••• in ${lang}`);
+  }
+});
+
 test('unified display-mode label keys exist in every locale (S1)', () => {
   // One label per unified mode per command group — the pickers of /thinking,
   // /tool_results, /subagent and the /verbosity umbrella all render

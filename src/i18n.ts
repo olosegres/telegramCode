@@ -241,7 +241,9 @@ const dict: Record<Lang, Record<string, string>> = {
     // ── /thinking (chain-of-thought verbosity, both backends) ──
     // Live indicator + collapsed line shown in the topic. Mode names are also
     // used on the picker buttons. {seconds}=reasoning duration, {mode}=mode name.
-    'thinking.live': '☁️ думаю …',
+    // Static ••• (three bullets, no animation) — the minimal "agent is working"
+    // cue; it also stands in for the suppressed input echo pre-first-output.
+    'thinking.live': '•••',
     'thinking.thoughtForSeconds': '💭 думал {seconds} с',
     'thinking.choose': '☁️ Текущий режим размышлений: {current}\nВыбери режим:',
     'thinking.set_success': '✅ Режим размышлений: {mode}',
@@ -664,7 +666,9 @@ const dict: Record<Lang, Record<string, string>> = {
     // ── /thinking (chain-of-thought verbosity, both backends) ──
     // Live indicator + collapsed line shown in the topic. Mode names are also
     // used on the picker buttons. {seconds}=reasoning duration, {mode}=mode name.
-    'thinking.live': '☁️ thinking …',
+    // Static ••• (three bullets, no animation) — the minimal "agent is working"
+    // cue; it also stands in for the suppressed input echo pre-first-output.
+    'thinking.live': '•••',
     'thinking.thoughtForSeconds': '💭 thought for {seconds}s',
     'thinking.choose': '☁️ Current thinking mode: {current}\nPick a mode:',
     'thinking.set_success': '✅ Thinking mode: {mode}',

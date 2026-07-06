@@ -668,7 +668,9 @@ OpenCode events / bindings).
     `utils/displayVerbosity.ts` — pickers and replies show only the new
     names). All offer inline mode buttons (✓ on current) and work with no
     session running. **`/thinking`** (default `minimal`) controls what REMAINS
-    of the chain-of-thought — the live "☁️ thinking …" indicator shows in ALL
+    of the chain-of-thought — the live `•••` indicator (`thinking.live`, a
+    STATIC three-bullet glyph in both locales — the minimal "agent is working"
+    cue; the animated cue stays the native typing action) shows in ALL
     modes: `full` keeps the full reasoning, `short` collapses it to "💭 thought
     for {N}s" (OpenCode times it from ms; Claude scrapes the duration from the
     "Thinking for…" header / "✻ … for Ns" trailer via

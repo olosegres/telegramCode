@@ -129,13 +129,13 @@ relevant but interesting for the "ship as a SaaS" path:
 │  └────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────┘
                        ↕ Telegram (Bot API 9.5+)
-┌─ In Telegram ────────────────────────────────────────┐
-│  Private chat with @yourTgcodeBot                    │
-│   ├─ 📁 projectAlpha      ← cwd=/Users/user/src/projectAlpha │
-│   ├─ 📁 projectB         ← cwd=/Users/user/src/projectB    │
-│   ├─ 📁 telegramCode     ← cwd=/Users/user/src/telegramCode│
-│   └─ ⚙️  System          ← /list /add /remove /help        │
-└──────────────────────────────────────────────────────┘
+┌─ In Telegram ───────────────────────────────────────────┐
+│  Private chat with @yourTgcodeBot                       │
+│   ├─ 📁 projectAlpha ← cwd=/Users/user/src/projectAlpha │
+│   ├─ 📁 projectB     ← cwd=/Users/user/src/projectB     │
+│   ├─ 📁 telegramCode ← cwd=/Users/user/src/telegramCode │
+│   └─ ⚙️  System       ← /list /add /remove /help        │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### Components

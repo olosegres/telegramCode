@@ -133,11 +133,11 @@ and vice versa.
 
 ```
 $PWD=/home/user/src                     ← launch `telegramCode` here
-├── projectAlpha/      ← Topic "projectAlpha"        (claude)
-├── projectB/         ← Topic "projB-frontend"       (claude)
-│                     ← Topic "projB-backend"        (opencode)   ← one folder, two topics
-│                     ← Topic "projB-refactor"       (claude)
-└── telegramCode/     ← Topic "telegramCode"       (claude)
+├── projectAlpha/     ← Topic "projectAlpha"    (claude)
+├── projectB/         ← Topic "projB-frontend"  (claude)
+│                     ← Topic "projB-backend"   (opencode)   ← one folder, two topics
+│                     ← Topic "projB-refactor"  (claude)
+└── telegramCode/     ← Topic "telegramCode"    (claude)
 
 Telegram forum supergroup
 ├── Bot is admin with can_manage_topics + can_delete_messages + can_pin_messages

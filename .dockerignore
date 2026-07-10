@@ -1,0 +1,21 @@
+# Never bake secrets or per-instance state into an image.
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.log
+
+# Build inputs come from the repo, not from local artifacts.
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# VCS and agent-local files have no place in a build context.
+.git/
+.idea/
+.DS_Store
+agent/tmp/
+agent/NOTES.md
+CLAUDE.local.md

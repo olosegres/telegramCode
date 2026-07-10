@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # Audit S16 / #23: base pinned by digest to keep `claude-node-git` builds
-# reproducible. Bump deliberately, not via `docker pull node:22-slim`.
-FROM node:22-slim
+# reproducible. Bump deliberately (re-resolve with
+# `docker buildx imagetools inspect node:22-slim`), not via `docker pull`.
+FROM node:22-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
 
 # `--no-install-recommends` shrinks the image and avoids pulling random
 # language packs / docs into a container that only needs git + curl for

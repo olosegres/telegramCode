@@ -2,6 +2,8 @@
   "name": "telegram-code",
   "version": "2.0.0",
   "private": true,
+  "license": "MIT",
+  "author": "Sergei Solo",
   "description": "Telegram forum-supergroup bot for Claude Code / OpenCode — one topic per task, isolated sessions, per-thread MCP",
   "main": "dist/cli.js",
   "bin": {

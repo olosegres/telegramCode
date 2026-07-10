@@ -231,6 +231,13 @@ effect immediately (the 1h TTL is only the fallback). The bot must be a group
 admin itself (it already needs that to create topics and pin). Anonymous admins
 can't be matched from their messages, so post non-anonymously.
 
+> **Security model — group admin ⇒ shell on the host.** The agents run with
+> permission checks disabled (`--dangerously-skip-permissions` for Claude,
+> auto-approve for OpenCode) and `/terminal` opens a raw `$SHELL` in the bound
+> folder, so anyone who can talk to the bot can execute arbitrary commands as
+> the bot's OS user. Only promote people you would trust with SSH access to
+> that machine, and keep the served group itself private.
+
 ### External Optional
 
 | Variable | Default | Description |

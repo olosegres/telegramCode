@@ -34,9 +34,17 @@ export interface TappableStream {
 /** How the tap appends a chunk — injectable so tests assert without real IO. */
 export type AppendChunkFn = (chunk: WriteChunk) => void;
 
-function appendToBucket(dir: string, chunk: WriteChunk): void {
+/**
+ * @description Append one chunk to the current hour's console bucket. The
+ * bucket is created owner-only (`0600`) — console logs may quote prompts and
+ * agent output, so they must not be world-readable on a shared host. Exported
+ * for the mode-bits unit test.
+ */
+export function appendConsoleBucketChunk(dir: string, chunk: WriteChunk): void {
   try {
-    appendFileSync(getHourBucketPath(dir, consoleFileBase, consoleFileExt, Date.now()), chunk);
+    appendFileSync(getHourBucketPath(dir, consoleFileBase, consoleFileExt, Date.now()), chunk, {
+      mode: 0o600,
+    });
   } catch {
     // Best-effort: a tap write failure must never break the original write.
   }
@@ -71,12 +79,15 @@ export function installConsoleFileTap(dir: string): void {
   // later by the state store's load() — but the tap is installed before that, so
   // without this the very boot logs we want to capture would `ENOENT` and be
   // swallowed (the run that matters most). Mirrors outputTrace.ts / diagLog.ts.
+  // Owner-only mode: this mkdir WINS on a fresh install (the state store's own
+  // 0700 mkdir is a no-op on an existing dir), so it must not leave DATA_DIR
+  // with the umask default. The state store additionally chmod-heals at init.
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   } catch {
     // Best-effort: if the dir can't be created the per-append swallow still holds.
   }
   for (const stream of [process.stdout, process.stderr]) {
-    tapStreamWrite(stream, (chunk) => appendToBucket(dir, chunk));
+    tapStreamWrite(stream, (chunk) => appendConsoleBucketChunk(dir, chunk));
   }
 }

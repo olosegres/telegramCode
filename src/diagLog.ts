@@ -41,11 +41,12 @@ function rotateIfOversized(): void {
 export function appendDiagLog(message: string): void {
   try {
     if (!isLogDirEnsured) {
-      mkdirSync(path.dirname(logFilePath), { recursive: true });
+      mkdirSync(path.dirname(logFilePath), { recursive: true, mode: 0o700 });
       isLogDirEnsured = true;
     }
     rotateIfOversized();
-    appendFileSync(logFilePath, `${new Date().toISOString()} ${message}\n`);
+    // Owner-only file (mode applies at creation) — diag lines may quote agent errors.
+    appendFileSync(logFilePath, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
   } catch {
     // Diagnostics are best-effort; a logging failure must never break the bot.
   }

@@ -525,6 +525,19 @@ export class StateStore {
    */
   async init(): Promise<void> {
     await fsp.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
+    // `mkdir`'s mode applies only when the dir is CREATED — an existing deploy
+    // (or a dir created earlier in this boot by the console tap / trace writer)
+    // keeps its old bits. Heal to owner-only: DATA_DIR holds state.json, traces
+    // and console logs that quote prompts/session ids. Best-effort — an exotic
+    // filesystem may refuse chmod, which must not block boot.
+    try {
+      await fsp.chmod(this.dataDir, 0o700);
+    } catch (e) {
+      console.warn(
+        `[state] could not chmod DATA_DIR to owner-only:`,
+        e instanceof Error ? e.message : e,
+      );
+    }
     this.legacyMigrationPath = await migrateLegacyMessageIdsFile();
 
     const loaded = await loadStateFile(this.statePath);

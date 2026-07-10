@@ -83,11 +83,12 @@ export class RunLedger {
   append(record: ScheduleRunRecord): void {
     try {
       if (!this.isDirEnsured) {
-        mkdirSync(path.dirname(this.ledgerPath), { recursive: true });
+        mkdirSync(path.dirname(this.ledgerPath), { recursive: true, mode: 0o700 });
         this.isDirEnsured = true;
       }
       this.rotateIfOversized();
-      appendFileSync(this.ledgerPath, `${JSON.stringify(record)}\n`);
+      // Owner-only file (mode applies at creation) — records carry prompt text.
+      appendFileSync(this.ledgerPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     } catch {
       // Ledger is best-effort; a write failure must never break a fire.
     }

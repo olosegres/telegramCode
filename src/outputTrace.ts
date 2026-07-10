@@ -169,10 +169,12 @@ export interface TraceWriterDeps {
 }
 
 const defaultWriterDeps: TraceWriterDeps = {
-  appendFile: (filePath, data) => fsp.appendFile(filePath, data),
-  appendFileSync: (filePath, data) => appendFileSync(filePath, data),
+  // Trace lines quote message previews / agent output → files are owner-only
+  // (0600; mode applies at creation), and DATA_DIR is created owner-only too.
+  appendFile: (filePath, data) => fsp.appendFile(filePath, data, { mode: 0o600 }),
+  appendFileSync: (filePath, data) => appendFileSync(filePath, data, { mode: 0o600 }),
   mkdir: async (dirPath) => {
-    await fsp.mkdir(dirPath, { recursive: true });
+    await fsp.mkdir(dirPath, { recursive: true, mode: 0o700 });
   },
   getFileSize: async (filePath) => {
     try {
@@ -276,7 +278,7 @@ export function flushTraceBufferSyncOnExit(): void {
   if (traceBuffer.length === 0) return;
   try {
     const filePath = getTraceFilePath();
-    mkdirSync(path.dirname(filePath), { recursive: true });
+    mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
     if (existsSync(filePath) && statSync(filePath).size > maxTraceBytes) {
       renameSync(filePath, `${filePath}.1`);
     }

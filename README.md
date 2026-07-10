@@ -122,12 +122,12 @@ and vice versa.
 
 1. Open the group in Telegram.
 2. In the General topic, send `/ls` — bot lists subfolders under `WORK_ROOT`.
-3. Create a topic (`+` button, or `/new <name> [subdir]` in General).
+3. Create a topic (`+` button).
 4. In the new topic: `/bind <subdir>` (auto-bound if the topic name
    matches a subdir).
 5. `/claude` or `/opencode` → talk to the agent.
-6. `/stop` to kill the session; `/where` to inspect; `/clear_messages` to
-   delete the topic's bot messages.
+6. `/quit` to end the session; bare `/bind` to inspect the binding;
+   `/clear_messages` to delete the topic's bot messages.
 
 ## Architecture
 
@@ -177,16 +177,15 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/effort` | Set reasoning effort (per-thread) via inline buttons. Claude: native `/effort` levels (`low…ultracode`). OpenCode: the current model's variants, applied per-prompt. No env configuration |
 | `/verbosity` | Output-verbosity macro (`minimal\|short\|full`): sets the thinking, tool-results and sub-agent display prefs at once; `/thinking`, `/tool_results`, `/subagent` point-override afterwards. Mixed prefs show as "custom" in the picker |
 | `/sessions` | List & resume previous sessions in this folder |
-| `/stop` | Kill current agent (tmux/server, brute) |
-| `/quit`, `/q` | Graceful exit — Claude: double Ctrl+C, OpenCode: `stopSession` |
+| `/quit`, `/q` | End the session — Claude: graceful double Ctrl+C; OpenCode/terminal: `stopSession` |
+| `/new`, `/clear_session` | End the current session and start a fresh one (same adapter) |
 | `/status` | This thread's status |
 | `/output` | Last 500 lines of agent output |
 | `/c`, `/y`, `/n` | Ctrl+C / "y" / "n" |
 | `/enter`, `/up`, `/down`, `/tab` | tmux key passthrough |
 | `/clear_messages` | Delete bot messages in this topic (up to 48h, Telegram limit) |
 | `/clear` | Forwarded to the agent (Claude wipes context; OpenCode plain text) — not a bot command anymore |
-| `/where` | Show bound folder, branch, agent, status |
-| `/unbind` | Stop agent, drop binding |
+| `/bind` | Bare: current binding + folder picker, with «leave current dir» (the old `/unbind`) and «create new folder» buttons |
 | `/mcp` | List MCP servers active for this thread |
 
 ### In the General topic
@@ -196,7 +195,7 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/help` | Context-aware help |
 | `/ls` | List subdirs under `WORK_ROOT` |
 | `/list` | List existing topics and their bindings |
-| `/new <name> [subdir]` | Create a topic (auto-bound if subdir given) |
+| `/quit-all`, `/quitall` | End every active agent in every bound topic |
 | `/status` | Global view of all topics + active agents |
 | `/doctor` | Self-diagnose: admin rights, privacy mode, paths, CLIs |
 | `/version` | Versions: bot, claude, opencode, node, tmux |
@@ -383,7 +382,7 @@ asking the user to reopen.
 If you run the bot under `systemd`/`systemd-run`, set `KillMode=process`.
 The default `control-group` mode kills tmux and `opencode serve` children,
 which defeats restart/reattach. Process restarts intentionally leave agent
-sessions alive; use `/stop` or `/stop-all` when you want to terminate them.
+sessions alive; use `/quit` or `/quit-all` when you want to terminate them.
 
 ## Troubleshooting
 

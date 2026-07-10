@@ -92,7 +92,8 @@ import {
   DM_GENERAL_THREAD_ID,
   type ChatMode,
 } from './threadRouting';
-import { AdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
+import { AdminCache, checkShouldInvalidateAdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
+import type { UpdateType } from 'telegraf/typings/telegram-types';
 import { downloadFile } from './utils/download';
 import { stripCommandBotMention } from './utils';
 import { checkIsConnectCommandText, getRecvTracePreview } from './utils/recvPreviewRedaction';
@@ -445,9 +446,10 @@ process.on('exit', flushTraceBufferSyncOnExit);
 //
 //  Authority is fully runtime: the creator + administrators of the served forum
 //  group. The set is read live via `getChatAdministrators` and cached for an
-//  hour (lazy refresh on the first access after expiry); a demoted/left user
-//  drops out on the next refresh and is silently ignored thereafter. There is
-//  no static allow-list env and no /grant command.
+//  hour (lazy refresh on the first access after expiry); an admin-status change
+//  in the group (`chat_member` update) invalidates the cache immediately, so a
+//  demoted/left admin drops out on their next message — the TTL is only the
+//  fallback. There is no static allow-list env and no /grant command.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const adminCache = new AdminCache({
@@ -541,6 +543,24 @@ bot.use(async (ctx, next) => {
  * (the pure routing module owns it so unit tests can reach it without
  * booting Telegraf). Plan §4.3 point 3 / R2.
  */
+
+/**
+ * @description Update types the bot subscribes to (`allowed_updates` at
+ * launch). `chat_member` is NOT in Telegram's default set and must be
+ * requested explicitly — it drives the immediate admin-cache invalidation on
+ * promotion/demotion in the served group. The rest reproduces exactly the
+ * default-set types the registered handlers use (`message` covers text, voice,
+ * media and the forum service messages; `callback_query` the inline buttons).
+ * Telegram REMEMBERS `allowed_updates` between polls, so the full list must
+ * ride every launch — a partial list would silently unsubscribe the rest.
+ */
+const botAllowedUpdates: UpdateType[] = [
+  'message',
+  'edited_message',
+  'callback_query',
+  'my_chat_member',
+  'chat_member',
+];
 
 /**
  * @description The output debounce window in effect for this process. The
@@ -6632,6 +6652,26 @@ bot.on('my_chat_member', async (ctx) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  chat_member — admin promotion/demotion invalidates the admin cache
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @description React to member-status changes in the served group: a
+ * promotion/demotion changes the admin set that gates access, so the cached
+ * set is invalidated and the next authorisation re-fetches it live — a demoted
+ * admin loses access immediately instead of at the 1h TTL. Regular-member
+ * joins/leaves can't change the admin set and are ignored
+ * (`checkShouldInvalidateAdminCache`). Requires `chat_member` in
+ * `allowed_updates` (NOT in Telegram's default set — see `botAllowedUpdates`).
+ */
+bot.on('chat_member', (ctx) => {
+  if (ctx.chat?.id !== getAllowedGroupId()) return;
+  const { old_chat_member, new_chat_member } = ctx.update.chat_member;
+  if (!checkShouldInvalidateAdminCache(old_chat_member.status, new_chat_member.status)) return;
+  adminCache.invalidate();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Forum service events — created / deleted / closed / reopened
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -9620,7 +9660,10 @@ export async function startBot(): Promise<void> {
   //    down (otherwise the user gets a flood of replies to old messages).
   console.log(`Launching Telegraf bot (long polling, dropPendingUpdates=${bootMode.dropPendingUpdates})...`);
   try {
-    await bot.launch({ dropPendingUpdates: bootMode.dropPendingUpdates });
+    await bot.launch({
+      dropPendingUpdates: bootMode.dropPendingUpdates,
+      allowedUpdates: botAllowedUpdates,
+    });
     console.log('');
     console.log('Bot is running! Waiting for messages...');
     console.log('Press Ctrl+C to stop');

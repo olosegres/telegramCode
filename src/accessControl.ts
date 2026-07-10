@@ -37,6 +37,25 @@ export function extractAdminIds(members: ChatMember[]): number[] {
   return ids;
 }
 
+/**
+ * @description Should a `chat_member` status transition invalidate the cached
+ * admin set? Only transitions that TOUCH admin status matter — someone was or
+ * becomes creator/administrator (promotion, demotion, an admin leaving).
+ * Joins/leaves of regular members can't change the admin set, so they must not
+ * trigger a `getChatAdministrators` refetch.
+ */
+export function checkShouldInvalidateAdminCache(
+  oldStatus: ChatMember['status'],
+  newStatus: ChatMember['status'],
+): boolean {
+  return (
+    oldStatus === 'creator' ||
+    oldStatus === 'administrator' ||
+    newStatus === 'creator' ||
+    newStatus === 'administrator'
+  );
+}
+
 export interface AdminCacheDeps {
   /** Fetches the current admin list (e.g. `bot.telegram.getChatAdministrators(groupId)`). */
   fetchAdmins: () => Promise<ChatMember[]>;

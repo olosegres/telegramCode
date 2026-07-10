@@ -225,10 +225,11 @@ That `$PWD` is the work root; do not set `WORK_ROOT` for normal use.
 **Access control.** There is no user allow-list. Whoever is a **creator or
 administrator of the served forum group** may talk to the agent — read live from
 Telegram (`getChatAdministrators`) and cached for 1h. Promote someone in the
-group to grant access; demote/remove them to revoke it (takes effect on the next
-refresh). The bot must be a group admin itself (it already needs that to create
-topics and pin). Anonymous admins can't be matched from their messages, so post
-non-anonymously.
+group to grant access; demote/remove them to revoke it — the bot subscribes to
+`chat_member` updates, so an admin change invalidates the cache and takes
+effect immediately (the 1h TTL is only the fallback). The bot must be a group
+admin itself (it already needs that to create topics and pin). Anonymous admins
+can't be matched from their messages, so post non-anonymously.
 
 ### External Optional
 

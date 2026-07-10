@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import type { ChatMember, User } from 'telegraf/typings/core/types/typegram';
-import { extractAdminIds, AdminCache } from '../accessControl';
+import { extractAdminIds, AdminCache, checkShouldInvalidateAdminCache } from '../accessControl';
 
 function makeUser(id: number, isBot = false): User {
   return { id, is_bot: isBot, first_name: `u${id}` };
@@ -169,4 +169,23 @@ test('AdminCache: invalidate() forces the next read to re-fetch', async () => {
   cache.invalidate();
   await cache.getAdminIds();
   assert.equal(calls, 2); // forced refresh
+});
+
+// ─── checkShouldInvalidateAdminCache (chat_member → cache invalidation) ──
+
+test('chat_member transitions touching admin status invalidate the cache', () => {
+  // Promotion: a member becomes an admin → the admin set grew.
+  assert.equal(checkShouldInvalidateAdminCache('member', 'administrator'), true);
+  // Demotion: an admin becomes a regular member → must lose access NOW, not at TTL.
+  assert.equal(checkShouldInvalidateAdminCache('administrator', 'member'), true);
+  // An admin leaves / is kicked → the admin set shrank.
+  assert.equal(checkShouldInvalidateAdminCache('administrator', 'left'), true);
+  assert.equal(checkShouldInvalidateAdminCache('creator', 'member'), true);
+});
+
+test('chat_member transitions of regular members do not invalidate the cache', () => {
+  // Join / leave / restriction of a non-admin can't change the admin set.
+  assert.equal(checkShouldInvalidateAdminCache('left', 'member'), false);
+  assert.equal(checkShouldInvalidateAdminCache('member', 'left'), false);
+  assert.equal(checkShouldInvalidateAdminCache('member', 'restricted'), false);
 });

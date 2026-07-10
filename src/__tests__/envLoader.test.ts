@@ -35,6 +35,11 @@ const TOUCHED = [
 ];
 let savedEnv: Record<string, string | undefined>;
 
+function getExpectedLocalEnvPath(): string {
+  // macOS may canonicalize /var to /private/var after chdir; match runtime cwd.
+  return path.join(process.cwd(), '.env');
+}
+
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcode-env-'));
   projectDir = path.join(tmpRoot, 'project');
@@ -93,7 +98,7 @@ test('loads local .env when only local exists', () => {
   const { loaded } = loadEnvFiles();
 
   assert.equal(loaded.length, 1);
-  assert.equal(loaded[0], path.join(projectDir, '.env'));
+  assert.equal(loaded[0], getExpectedLocalEnvPath());
   assert.equal(process.env.ENV_LOADER_TEST_LOCAL_ONLY, 'from-local');
 });
 
@@ -114,7 +119,7 @@ test('local .env overrides global on per-key basis, leaves global-only keys inta
   assert.equal(loaded.length, 2);
   // Order matters for documentation / banner output: global first, local last.
   assert.match(loaded[0], /\.config\/telegram-code\/\.env$/);
-  assert.equal(loaded[1], path.join(projectDir, '.env'));
+  assert.equal(loaded[1], getExpectedLocalEnvPath());
 
   assert.equal(process.env.ENV_LOADER_TEST_GLOBAL_ONLY, 'g-only');
   assert.equal(process.env.ENV_LOADER_TEST_OVERRIDE, 'from-local');

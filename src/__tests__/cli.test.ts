@@ -85,6 +85,11 @@ function runCli(
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
+function getRegexEscapedCanonicalPath(filePath: string): string {
+  // Child cwd can canonicalize symlinked temp roots (/var -> /private/var) on macOS.
+  return fs.realpathSync(filePath).replace(/\//g, '\\/');
+}
+
 test('cli claude injects --dangerously-skip-permissions and forwards extra args', () => {
   const { status } = runCli(['cli', 'claude', '--print', 'hello world']);
   assert.equal(status, 0);
@@ -96,7 +101,7 @@ test('cli claude injects --dangerously-skip-permissions and forwards extra args'
     recorded,
     /argv=--dangerously-skip-permissions --print hello world/,
   );
-  assert.match(recorded, new RegExp(`cwd=${tmpRoot}`));
+  assert.match(recorded, new RegExp(`cwd=${getRegexEscapedCanonicalPath(tmpRoot)}`));
 });
 
 test('cli claude forwards non-zero exit code from the child', () => {
@@ -225,7 +230,7 @@ test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () 
   assert.match(
     r.stderr,
     new RegExp(
-      `Using \\$PWD as WORK_ROOT: ${projectDir.replace(/\//g, '\\/')}`,
+      `Using \\$PWD as WORK_ROOT: ${getRegexEscapedCanonicalPath(projectDir)}`,
     ),
   );
 });

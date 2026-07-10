@@ -95,6 +95,7 @@ import {
 import { AdminCache, extractAdminIds, ADMIN_CACHE_TTL_MS } from './accessControl';
 import { downloadFile } from './utils/download';
 import { stripCommandBotMention } from './utils';
+import { checkIsConnectCommandText, getRecvTracePreview } from './utils/recvPreviewRedaction';
 import {
   classifySendError,
   checkIsApiError,
@@ -495,18 +496,28 @@ async function checkIsForumAdmin(chatId: number, userId: number): Promise<boolea
 
 // Output-trace `recv` hook — must be the FIRST middleware so every update is
 // recorded before any gating (access control, group routing) can drop it.
+// Security: while the thread awaits a `/connect` key paste (same
+// `pendingProviderConnects` state the text handler consumes later in this
+// update), the message text is a provider API key — the preview is redacted
+// at record time so the secret never lands in the on-disk trace.
 bot.use(async (ctx, next) => {
   const message = ctx.message;
   const messageText = message && 'text' in message ? message.text : undefined;
   const callbackData =
     ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
+  const threadKey = messageText === undefined ? null : getThreadKey(ctx);
+  const isThreadPendingProviderConnect =
+    threadKey !== null && pendingProviderConnects.has(keyToString(threadKey));
   traceRecvUpdate({
     updateType: ctx.updateType,
     updateId: ctx.update.update_id,
     fromId: ctx.from?.id,
     chatId: ctx.chat?.id,
     threadId: message?.message_thread_id,
-    preview: messageText ?? callbackData,
+    preview:
+      messageText === undefined
+        ? callbackData
+        : getRecvTracePreview(messageText, isThreadPendingProviderConnect),
     tgDateSec: message?.date,
   });
   return next();
@@ -3720,11 +3731,6 @@ async function applyModelSelection(
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Commands
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function checkIsConnectCommandText(rawText: string): boolean {
-  const [commandName = ''] = stripCommandBotMention(rawText.trim()).split(/\s+/, 1);
-  return commandName === '/connect';
-}
 
 /**
  * @description Wrap a command handler with the gating check.

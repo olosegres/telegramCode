@@ -330,6 +330,35 @@ both as different Linux users with separate Docker networks, the port
 isolation is already handled by the network — but keeping ports explicit
 is the safer default.
 
+## Updating a deployment (self-update, no root)
+
+`scripts/self-update.sh` refreshes a checkout in place, running as the
+checkout's owning user — no root, no cross-user copying. It is safe to run
+blindly (e.g. from cron):
+
+- fast-forward only: it skips silently when the tree has tracked changes, a
+  merge/rebase is in progress, or local history diverged from the upstream —
+  a dev clone that is ahead of origin is never touched;
+- `yarn install --immutable` runs only when `yarn.lock` / `package.json`
+  changed;
+- a hot-mode instance (`telegramCode hot`) rebuilds and restarts the worker
+  by itself (after a dependency install the script touches `tsconfig.json`
+  so `tsc -w` recompiles with the new modules); a non-hot instance gets
+  `yarn build` plus a restart notice — the script never kills processes;
+- changes to the hot supervisor itself (`src/cli.ts`, `src/cli/hot.ts`,
+  `nodemon.json`) are flagged with a warning: those need a manual
+  `telegramCode hot` restart (nodemon reloads only the worker).
+
+For unattended updates give the deploying user read access to the repo (e.g.
+a read-only GitLab deploy key on a passphrase-less SSH key) and add a cron
+entry:
+
+```cron
+*/10 * * * * /path/to/telegram-code/scripts/self-update.sh >> "$HOME/.local/state/telegram-code/self-update.log" 2>&1
+```
+
+(create the log directory once: `mkdir -p ~/.local/state/telegram-code`).
+
 ## Restart behaviour
 
 On boot the bot:

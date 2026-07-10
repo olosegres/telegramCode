@@ -108,6 +108,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_bound':
       '*Тред привязан к `{subdir}`.*\n' +
       '/claude /opencode — старт агента\n' +
+      '/connect — подключить OpenCode provider API key (по умолчанию OpenAI)\n' +
       '/terminal — открыть shell в этой папке\n' +
       '/new — перезапустить сессию (старая → /sessions)\n' +
       '/model /sessions — переключение\n' +
@@ -308,6 +309,16 @@ const dict: Record<Lang, Record<string, string>> = {
     'rename_session.unsupported_backend': 'Переименование сессии не поддерживается для {label}.',
     'rename_session.success': '✅ Сессия переименована: {title}',
     'rename_session.failed': '⚠️ Не удалось переименовать сессию: {reason}',
+
+    // ── /connect (OpenCode provider API-key auth) ──
+    'connect.prompt_key': '🔑 Пришли API key для `{provider}` следующим сообщением. Я удалю сообщение с ключом из истории.',
+    'connect.empty_key': '❌ API key пустой. Пришли ключ следующим сообщением.',
+    'connect.invalid_provider': '❌ Некорректный provider id `{provider}`. Например: /connect openai',
+    'connect.unsupported_provider': '⚠️ Provider `{provider}` не поддерживает простой API-key вход через этот flow. Используй OpenCode UI/CLI для этого provider.',
+    'connect.unsupported_backend': 'OpenCode provider auth недоступен в этом билде.',
+    'connect.failed': '⚠️ Не удалось подключить `{provider}`: {reason}',
+    'connect.success': '✅ Provider `{provider}` подключён. OpenCode server не перезапускался.',
+    'connect.cancelled': 'Ввод API key отменён.',
 
     // ── /quit-all ──
     'quit_all.none_active': 'Нет активных агентов — нечего останавливать.',
@@ -539,6 +550,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'help.thread_bound':
       '*Thread bound to `{subdir}`.*\n' +
       '/claude /opencode — start an agent\n' +
+      '/connect — connect an OpenCode provider API key (OpenAI by default)\n' +
       '/terminal — open a shell in this folder\n' +
       '/new — restart the session (old one → /sessions)\n' +
       '/model /sessions — switch\n' +
@@ -733,6 +745,16 @@ const dict: Record<Lang, Record<string, string>> = {
     'rename_session.unsupported_backend': 'Session rename is not supported for {label}.',
     'rename_session.success': '✅ Session renamed: {title}',
     'rename_session.failed': '⚠️ Failed to rename the session: {reason}',
+
+    // ── /connect (OpenCode provider API-key auth) ──
+    'connect.prompt_key': '🔑 Send the API key for `{provider}` as the next message. I will delete the key message from history.',
+    'connect.empty_key': '❌ API key is empty. Send the key as the next message.',
+    'connect.invalid_provider': '❌ Invalid provider id `{provider}`. Example: /connect openai',
+    'connect.unsupported_provider': '⚠️ Provider `{provider}` does not support a simple API-key login through this flow. Use the OpenCode UI/CLI for this provider.',
+    'connect.unsupported_backend': 'OpenCode provider auth is not available in this build.',
+    'connect.failed': '⚠️ Failed to connect `{provider}`: {reason}',
+    'connect.success': '✅ Provider `{provider}` connected. OpenCode server was not restarted.',
+    'connect.cancelled': 'API key entry cancelled.',
 
     'quit_all.none_active': 'No agents running — nothing to stop.',
     'quit_all.summary': '🚪 Quit {stopped} of {total} active agents.',

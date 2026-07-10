@@ -821,6 +821,13 @@ let providersCacheTime = 0;
 const providersCacheTtlMs = 5 * 60 * 1000;
 let isProvidersShapeLogged = false;
 
+const providerIdRe = /^[a-z0-9][a-z0-9-_]*$/;
+
+interface OpenCodeProviderAuthMethod {
+  type?: string;
+  prompts?: unknown[];
+}
+
 /**
  * @description Provider → model → variant-names map. Keys are provider ids
  * (e.g. `"anthropic"`, `"openai"`), values are model ids (e.g.
@@ -860,6 +867,37 @@ export function buildPromptBody(
     body.variant = effortLevel;
   }
   return body;
+}
+
+export function checkIsValidProviderId(providerId: string): boolean {
+  return providerIdRe.test(providerId);
+}
+
+export function buildProviderAuthPath(providerId: string): string {
+  return `/auth/${encodeURIComponent(providerId)}`;
+}
+
+export function buildProviderApiAuthPayload(apiKey: string): Record<string, string> {
+  return { type: 'api', key: apiKey };
+}
+
+export function checkProviderSupportsSimpleApiAuth(raw: unknown, providerId: string): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  const root = raw as Record<string, unknown>;
+  const methods = root[providerId];
+  if (!Array.isArray(methods)) return false;
+  return methods.some((method) => {
+    if (!method || typeof method !== 'object') return false;
+    const { type, prompts } = method as OpenCodeProviderAuthMethod;
+    return type === 'api' && (!Array.isArray(prompts) || prompts.length === 0);
+  });
+}
+
+function resetOpenCodeProviderCaches(): void {
+  cachedModels = null;
+  modelsCacheTime = 0;
+  cachedProviders = null;
+  providersCacheTime = 0;
 }
 
 export function parseProvidersResponse(raw: unknown): ParsedProvidersConfig {
@@ -1643,6 +1681,53 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.apiRequest('POST', `/session/${session.sessionId}/abort`).catch((e) => {
         console.error(`[OpenCode] abort error:`, e);
       });
+    }
+  }
+
+  /**
+   * @description Connect an OpenCode provider through the same API-key auth
+   * endpoint the OpenCode UI uses (`PUT /auth/{providerID}`). The provider auth
+   * catalog is checked first so this Telegram flow only accepts providers whose
+   * API method needs just the key; providers with extra prompts still belong in
+   * OpenCode's native UI until the bot grows a multi-step provider form.
+   */
+  async connectProvider(_key: ThreadKey, providerId: string, apiKey: string): Promise<string | null> {
+    const normalizedProviderId = providerId.trim().toLowerCase();
+    if (!checkIsValidProviderId(normalizedProviderId)) {
+      return t('connect.invalid_provider', { provider: providerId });
+    }
+    const trimmedApiKey = apiKey.trim();
+    if (!trimmedApiKey) return t('connect.empty_key');
+
+    try {
+      await this.ensureProviderAuthServerReady();
+
+      const providerAuth = await this.apiRequest<unknown>('GET', '/provider/auth');
+      if (!checkProviderSupportsSimpleApiAuth(providerAuth, normalizedProviderId)) {
+        return t('connect.unsupported_provider', { provider: normalizedProviderId });
+      }
+
+      await this.apiRequest(
+        'PUT',
+        buildProviderAuthPath(normalizedProviderId),
+        buildProviderApiAuthPayload(trimmedApiKey),
+      );
+      resetOpenCodeProviderCaches();
+      console.log(`[OpenCode] Connected provider: ${normalizedProviderId}`);
+      return null;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`[OpenCode] provider connect failed for ${normalizedProviderId}:`, reason);
+      return t('connect.failed', { provider: normalizedProviderId, reason });
+    }
+  }
+
+  private async ensureProviderAuthServerReady(): Promise<void> {
+    if (!checkIsInstalled('opencode')) {
+      await installTool('opencode');
+    }
+    if (!await checkIsOpenCodeServerRunning()) {
+      await ensureOpenCodeServer();
     }
   }
 

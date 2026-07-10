@@ -45,7 +45,7 @@ import { keyToString, keyFromString } from './types';
 import { parseAgentTrigger as checkIsStartAgentPhrase } from './agentTrigger';
 import { checkSessionPickAction } from './sessionPick';
 import { ClaudeCliAdapter, getClaudeReplyRoute } from './adapters/claudeCliAdapter';
-import { OpenCodeAdapter, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
+import { OpenCodeAdapter, checkIsValidProviderId, type OpenCodePendingQuestion } from './adapters/openCodeAdapter';
 import { TerminalAdapter } from './adapters/terminalAdapter';
 import {
   buildQuestionBodyLines,
@@ -1318,6 +1318,17 @@ const startupPromptBuffer = new StartupPromptBuffer();
  */
 const threadSessionLists = new Map<string, string[]>();
 
+interface PendingProviderConnect {
+  providerId: string;
+}
+
+/**
+ * @description Per-thread `/connect` state. The next plain text message is
+ * treated as the provider API key and deleted from Telegram before the adapter
+ * stores it in OpenCode auth.
+ */
+const pendingProviderConnects = new Map<string, PendingProviderConnect>();
+
 /**
  * @description Per-thread "session-pick" arming flag. A thread is added here
  * by `/sessions` (or its `/resume` synonym) and removed when the user picks
@@ -1775,6 +1786,7 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   awaitingModelSelection.delete(k);
   threadSessionLists.delete(k);
   awaitingSessionSelection.delete(k);
+  pendingProviderConnects.delete(k);
   awaitingFolderName.delete(k);
   pinnedStatusTextCache.delete(k);
   statusCoalescers.delete(k);
@@ -3709,6 +3721,11 @@ async function applyModelSelection(
 //  Commands
 // ═══════════════════════════════════════════════════════════════════════════════
 
+function checkIsConnectCommandText(rawText: string): boolean {
+  const [commandName = ''] = stripCommandBotMention(rawText.trim()).split(/\s+/, 1);
+  return commandName === '/connect';
+}
+
 /**
  * @description Wrap a command handler with the gating check.
  *
@@ -3725,7 +3742,12 @@ function command(
     // Running ANY command exits the /bind create-folder await-name mode — the
     // create flow only expects a plain folder-name message, never a command.
     // (The picker's create button re-arms it afterwards via its own callback.)
-    awaitingFolderName.delete(keyToString(key));
+    const keyString = keyToString(key);
+    awaitingFolderName.delete(keyString);
+    const hadPendingProviderConnect = pendingProviderConnects.delete(keyString);
+    if (hadPendingProviderConnect && !checkIsConnectCommandText(ctx.message.text)) {
+      await replyToThread(key, t('connect.cancelled'));
+    }
     await handler(ctx, key);
   });
 }
@@ -4732,6 +4754,85 @@ function handleStartCommand(
 command('claude', (ctx, key) => handleStartCommand(ctx, key, 'claude'));
 command(['opencode', 'oc'], (ctx, key) => handleStartCommand(ctx, key, 'opencode'));
 command('terminal', (ctx, key) => handleStartCommand(ctx, key, 'terminal'));
+
+const defaultConnectProviderId = 'openai';
+
+interface ConnectCommandArgs {
+  providerId: string;
+  apiKey: string | null;
+}
+
+function checkLooksLikeProviderApiKey(value: string): boolean {
+  return value.startsWith('sk-');
+}
+
+function getConnectCommandArgs(rawText: string): ConnectCommandArgs {
+  const [, ...args] = stripCommandBotMention(rawText.trim()).split(/\s+/);
+  if (args.length === 0) return { providerId: defaultConnectProviderId, apiKey: null };
+  if (args.length === 1) {
+    const onlyArg = args[0].trim();
+    if (checkLooksLikeProviderApiKey(onlyArg)) {
+      return { providerId: defaultConnectProviderId, apiKey: onlyArg };
+    }
+    return { providerId: onlyArg.toLowerCase(), apiKey: null };
+  }
+  return {
+    providerId: args[0].trim().toLowerCase(),
+    apiKey: args.slice(1).join(' ').trim(),
+  };
+}
+
+function armProviderConnect(key: ThreadKey, providerId: string): void {
+  const keyString = keyToString(key);
+  awaitingModelSelection.delete(keyString);
+  awaitingSessionSelection.delete(keyString);
+  awaitingFolderName.delete(keyString);
+  pendingProviderConnects.set(keyString, { providerId });
+}
+
+async function handleProviderConnectKey(
+  key: ThreadKey,
+  providerId: string,
+  apiKey: string,
+  secretMessageId: number | null,
+): Promise<void> {
+  if (secretMessageId !== null) {
+    await deleteThreadMessage(key, secretMessageId);
+  }
+  const trimmedApiKey = apiKey.trim();
+  if (!trimmedApiKey) {
+    armProviderConnect(key, providerId);
+    await replyToThread(key, t('connect.empty_key'));
+    return;
+  }
+
+  const adapter = getAdapter('opencode');
+  if (!adapter.connectProvider) {
+    await replyToThread(key, t('connect.unsupported_backend'));
+    return;
+  }
+  const connectError = await adapter.connectProvider(key, providerId, trimmedApiKey);
+  if (connectError) {
+    await replyToThread(key, connectError);
+    return;
+  }
+  await replyToThread(key, t('connect.success', { provider: providerId }));
+}
+
+command('connect', async (ctx, key) => {
+  const { providerId, apiKey } = getConnectCommandArgs(ctx.message.text);
+  if (!checkIsValidProviderId(providerId)) {
+    if (apiKey !== null) await deleteThreadMessage(key, ctx.message.message_id);
+    await replyToThread(key, t('connect.invalid_provider', { provider: providerId }));
+    return;
+  }
+  if (apiKey !== null) {
+    await handleProviderConnectKey(key, providerId, apiKey, ctx.message.message_id);
+    return;
+  }
+  armProviderConnect(key, providerId);
+  await replyToThread(key, t('connect.prompt_key', { provider: providerId }));
+});
 
 /** Human label for a Claude backend name (the two adapters share `label`
  *  "Claude Code", so the picker/notices need a distinguishing name). */
@@ -5760,7 +5861,7 @@ command('clear_messages', async (ctx, key) => {
 // `/where` (or `/stop`) inert instead of typing a meaningless prompt into the
 // agent.
 const botCommands = new Set([
-  'start', 'claude', 'opencode', 'oc', 'terminal', 'agent', 'sessions', 'resume', 'cancel', 'model',
+  'start', 'claude', 'opencode', 'oc', 'terminal', 'agent', 'sessions', 'resume', 'cancel', 'model', 'connect',
   'stop', 'stopall', 'stop-all', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'timestamps', 'schedule', 'thinking', 'tool_results',
@@ -5804,6 +5905,21 @@ bot.on(message('text'), async (ctx) => {
 
   // Always track inbound message ids so /clear can delete user messages too.
   await state.pushMessageId(key, ctx.message.message_id);
+
+  const pendingProviderConnect = pendingProviderConnects.get(kStr);
+  if (pendingProviderConnect && text.startsWith('/')) {
+    pendingProviderConnects.delete(kStr);
+    await replyToThread(key, t('connect.cancelled'));
+  } else if (pendingProviderConnect) {
+    pendingProviderConnects.delete(kStr);
+    await handleProviderConnectKey(
+      key,
+      pendingProviderConnect.providerId,
+      text,
+      ctx.message.message_id,
+    );
+    return;
+  }
 
   // Session is mid-startup → buffer the prompt and replay it once the agent is
   // ready, instead of dropping it into the "no agent running" guidance below.
@@ -8385,6 +8501,7 @@ const COMMANDS_MENU = [
   { command: 'mcp', description: '🔌 List active MCP servers' },
   { command: 'claude', description: '▶️ Start Claude Code' },
   { command: 'opencode', description: '▶️ Start OpenCode' },
+  { command: 'connect', description: '🔑 Connect an OpenCode provider API key' },
   { command: 'terminal', description: '🖥 Open a raw shell in the bound folder' },
   { command: 'new', description: '🆕 Restart session (alias /clear_session)' },
   { command: 'clear_session', description: '🆕 Restart session (alias /new)' },

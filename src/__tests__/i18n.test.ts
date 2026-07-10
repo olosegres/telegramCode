@@ -106,6 +106,21 @@ test('rename-session keys exist in every locale', () => {
   assert.ok(checkKeyInAllLangs('rename_session.failed'), 'rename_session.failed missing in some locale');
 });
 
+test('connect provider-auth keys exist in every locale', () => {
+  for (const code of [
+    'connect.prompt_key',
+    'connect.empty_key',
+    'connect.invalid_provider',
+    'connect.unsupported_provider',
+    'connect.unsupported_backend',
+    'connect.failed',
+    'connect.success',
+    'connect.cancelled',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
 test('rename_session.success substitutes the {title}', () => {
   const out = t('rename_session.success', { title: 'Refactor auth' });
   assert.ok(out.includes('Refactor auth'), `expected the title in "${out}"`);

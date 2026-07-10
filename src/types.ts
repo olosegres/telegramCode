@@ -735,6 +735,16 @@ export interface AgentAdapter extends EventEmitter {
   // — Model selection —
 
   /**
+   * Connect a provider account for this backend using an API key. Same return
+   * convention as {@link setModel}: resolves to `null` on success, or a short
+   * user-facing error string on failure.
+   *
+   * Optional (optional-method pattern): OpenCode implements provider auth;
+   * Claude/Terminal do not.
+   */
+  connectProvider?(key: ThreadKey, providerId: string, apiKey: string): Promise<string | null>;
+
+  /**
    * Set model override. Returns error message on failure, `null` on
    * success. Audit S10 / #39: unified to `Promise<string | null>` —
    * callers used to branch on `void` vs `Promise<string | null>`.

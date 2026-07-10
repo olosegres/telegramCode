@@ -134,7 +134,7 @@ and vice versa.
 ```
 $PWD=/home/user/src                     ← launch `telegramCode` here
 ├── projectAlpha/      ← Topic "projectAlpha"        (claude)
-├── overview/         ← Topic "projB-frontend"       (claude)
+├── projectB/         ← Topic "projB-frontend"       (claude)
 │                     ← Topic "projB-backend"        (opencode)   ← one folder, two topics
 │                     ← Topic "projB-refactor"       (claude)
 └── telegramCode/     ← Topic "telegramCode"       (claude)

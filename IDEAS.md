@@ -25,7 +25,7 @@ decisions" section at the end is the next-action checklist.
    repositories simultaneously** without switching bots, machines,
    or chats.
 
-The current setup (overview's `yarn telegram` + the freshly added
+The current setup (projectB's `yarn telegram` + the freshly added
 projectAlpha copy) is one bot per repo, one docker compose service
 per repo, hardcoded `WORK_DIR=/workspace`. That doesn't scale to
 "manage 10 repos from Telegram".
@@ -132,7 +132,7 @@ relevant but interesting for the "ship as a SaaS" path:
 ┌─ In Telegram ────────────────────────────────────────┐
 │  Private chat with @yourTgcodeBot                    │
 │   ├─ 📁 projectAlpha      ← cwd=/Users/user/src/projectAlpha │
-│   ├─ 📁 overview         ← cwd=/Users/user/src/overview    │
+│   ├─ 📁 projectB         ← cwd=/Users/user/src/projectB    │
 │   ├─ 📁 telegramCode     ← cwd=/Users/user/src/telegramCode│
 │   └─ ⚙️  System          ← /list /add /remove /help        │
 └──────────────────────────────────────────────────────┘
@@ -298,7 +298,7 @@ each topic is the live status board (`cwd`, branch, agent, model,
 
 ## 6. Repo question — new project or evolve `telegramCode/`?
 
-`telegramCode/` today is the bot that overview's `yarn telegram`
+`telegramCode/` today is the bot that projectB's `yarn telegram`
 service runs (and now projectAlpha's, after the May 8 fix in this
 conversation). It was designed as one bot per repo, one
 `WORK_DIR`. Turning it into a multi-workspace daemon with a CLI
@@ -312,8 +312,8 @@ Options:
 | **Evolve `telegramCode/`** | One codebase, fewer moving parts | Drag along legacy single-workspace assumptions; bigger refactor risk |
 
 Working preference: **new repo**, freeze `telegramCode/` as the
-"overview-era" bot. When `tgcode` is feature-complete + stable,
-overview and projectAlpha switch their compose services to use
+"projectB-era" bot. When `tgcode` is feature-complete + stable,
+projectB and projectAlpha switch their compose services to use
 `tgcode` instead.
 
 ---
@@ -328,14 +328,14 @@ next planning session:
   Either push it, or carry the fix forward into `tgcode` and
   retire `telegramCode` once `tgcode` ships.
 - **`claude-node-git` image dependency** — projectAlpha's
-  `yarn telegram` currently builds it from `../overview/Dockerfile.claude`.
+  `yarn telegram` currently builds it from `../projectB/Dockerfile.claude`.
   `tgcode` (as a binary) shouldn't need a Docker image at all —
   the daemon runs natively on the host.
-- **Token conflict** — overview and projectAlpha share
+- **Token conflict** — projectB and projectAlpha share
   `TELEGRAM_BOT_TOKEN`. With the multi-workspace `tgcode` model,
   this becomes a non-issue: ONE bot covers ALL workspaces.
 - **MCP integration** — the existing flow has `MCP_AUTH_TOKEN`
-  passed into the claude container so it can talk to overview's
+  passed into the claude container so it can talk to projectB's
   MCP server. In the multi-workspace world, MCP wiring is
   per-workspace (projectAlpha may not use MCP at all). Move it
   into the per-workspace `.tgcode/config.json`.
@@ -383,5 +383,5 @@ phases:
 4. `sendMessageDraft` streaming.
 5. Single-binary distribution (`bun build --compile`).
 6. Forum-supergroup mode (optional, for shared use).
-7. Cutover: overview + projectAlpha switch their `yarn telegram`
+7. Cutover: projectB + projectAlpha switch their `yarn telegram`
    to use the new binary instead of docker compose.

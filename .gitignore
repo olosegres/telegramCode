@@ -11,6 +11,7 @@ data/
 coverage/
 agent/tmp/
 agent/NOTES.md
+CLAUDE.local.md
 .playwright-mcp/
 .yarn/install-state.gz
 .yarn/cache/

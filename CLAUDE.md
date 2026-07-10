@@ -321,7 +321,7 @@ config/variants, not a per-message API field).
   row whose content LEADS with a logged-out phrase (`not logged in` / `please run
   /login` / `invalid authentication credentials`) — then `classifyAgentApiError`,
   behind a one-shot guard. **Two false-positive guards (both live 2026-07-03,
-  topic 434):** (1) detection scans the NEW pane delta only, never the full pane
+  topic 201):** (1) detection scans the NEW pane delta only, never the full pane
   — a stale `⎿ … /login` row lingers in the scrollback long after re-login, and
   the guard re-arms on redraws, so a full-pane scan re-fired every poll and
   oscillated against the recovery-clear, re-pinning "logged out" AFTER a
@@ -339,7 +339,7 @@ config/variants, not a per-message API field).
   PINNED logged-out notice (Claude → send `/login`; OpenCode → restart the
   server), one notification per episode, cleared on recovery (first real output
   after re-login) and at teardown — pre-fix a logged-out Claude emitted NOTHING
-  and looked hung (live 2026-07-01, topic 434; plan
+  and looked hung (live 2026-07-01, topic 201; plan
   `agent/tasks/completed/2026-07-01-surface-logged-out-agent-notice.md`). On a
   retryable fire the bot posts a notice and nudges the still-live session with a
   neutral "continue" via `forwardPromptToAgent` (NEVER a wait-for-idle path —
@@ -409,7 +409,7 @@ config/variants, not a per-message API field).
 | `utils/tmuxExec.ts` | Generic tmux/shell primitives shared by the claude + terminal backends (relocated from `claudeCliAdapter`): `tmuxAsync`/`tmuxOrThrowAsync` (best-effort vs strict tmux calls), `checkArgsAreSafe` (reject control chars), `shellSingleQuote`, `execFilePromise` |
 | `utils/ansiClean.ts` | Pane-text cleaning shared by both tmux backends (relocated from `claudeCliAdapter`): `convertAnsiToMarkdown` (ANSI→Telegram markdown, OSC-8 strip, spinner-glyph de-bold), `cleanOutput` (full clean pipeline), private `joinBrokenUrls` |
 | `utils/paneDiff.ts` | Pure line-SET diff between two tmux pane captures (relocated from `claudeCliAdapter`): `getNewPaneContent` + `NewPaneContent` (only NEW lines, `startsNewParagraph` out-of-band); imports `normalizeForComparison` from `utils/recentRelayWindow` so both backends share one normalization domain |
-| `utils/paneResizeGuard.ts` | Pure decision logic for the Claude scrape pane-RESIZE guard (live 2026-07-02, topic 39933: an interactive `tmux attach` resized the window → tmux re-wrapped the whole scrollback → the line-SET diff relayed ragged fragments of OLD conversation; the relay window's 16-char short-line exemption let short-line clusters through on EVERY width flap). The poll loop queries `#{pane_width}x#{pane_height}` AFTER each capture (same-poll order = race-free) and on a change swallows the repaint — baseline reseeds, nothing emits — until the capture settles (`getPaneResizeGuardDecision`, capped by `resizeSettleMaxPolls` so a busy pane is never wedged silent; `parsePaneSize` validates the query). To inspect a live pane use `capture-pane`, not `attach` — capture doesn't resize |
+| `utils/paneResizeGuard.ts` | Pure decision logic for the Claude scrape pane-RESIZE guard (live 2026-07-02, topic 202: an interactive `tmux attach` resized the window → tmux re-wrapped the whole scrollback → the line-SET diff relayed ragged fragments of OLD conversation; the relay window's 16-char short-line exemption let short-line clusters through on EVERY width flap). The poll loop queries `#{pane_width}x#{pane_height}` AFTER each capture (same-poll order = race-free) and on a change swallows the repaint — baseline reseeds, nothing emits — until the capture settles (`getPaneResizeGuardDecision`, capped by `resizeSettleMaxPolls` so a busy pane is never wedged silent; `parsePaneSize` validates the query). To inspect a live pane use `capture-pane`, not `attach` — capture doesn't resize |
 | `utils/tmuxSessionName.ts` | Pure parameterized tmux session-name codec shared by the tmux backends: `buildTmuxSessionName(prefix, key)` / `parseTmuxSessionName(prefix, name)` — careful negative-chatId + strict per-half regex so a foreign session sharing a prefix is never mis-adopted. Claude binds the `'claude'` prefix via thin wrappers; terminal the `'term'` prefix |
 | `utils/terminalEmitPlan.ts` | Pure helpers behind `terminalAdapter`: `getTerminalEmitPlan(nextOutputFresh)` (fresh→new message, else continuation — one rolling message per command), `buildTerminalNewSessionArgs` (the `tmux new-session` argv: shell-command + `-c workDir` + size flags, no `--session-id`/permission/MCP), and the named constants (`terminalPaneCols` 200, `terminalPaneRows` 50, `terminalTmuxPrefix` `term`, `defaultShell`) |
 | `utils/claudeStreamJson.ts` | Pure stream-json event core for `claudeJsonStreamAdapter`: newline-delimited JSON reader (partial-line buffering across chunks) + classifier mapping `system` / `stream_event` text_delta / `assistant` / `result` / `control_request` lines to adapter events |
@@ -421,7 +421,7 @@ config/variants, not a per-message API field).
 | File | Responsibility |
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
-| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat. **Auto-dismisses Claude's end-of-turn feedback survey** (never relayed to the topic; one Escape per appearance, signature-deduped): the detector (`extractClaudeSurvey`) is two-factor — a whole-line-anchored header + the `N: Label` option row (≥2 options) — and accepts a CLOSED alternation of the two known header wordings (`How is Claude doing this session?` and `How well is Claude following the instructions you gave earlier in this conversation?`, optional leading `●`/`⏺` bullet + trailing `(optional)`); keep it a closed list, never an open prose pattern (a quoted header once spammed bogus surveys). Wedge symptom of an UNRECOGNISED wording: the survey sits on the pane and swallows the Enter of the next forwarded prompt — the text strands unsubmitted in the TUI input box and the topic looks hung (live 2026-07-02, topic 39933); the fix is adding the new wording to the alternation |
+| `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat. **Auto-dismisses Claude's end-of-turn feedback survey** (never relayed to the topic; one Escape per appearance, signature-deduped): the detector (`extractClaudeSurvey`) is two-factor — a whole-line-anchored header + the `N: Label` option row (≥2 options) — and accepts a CLOSED alternation of the two known header wordings (`How is Claude doing this session?` and `How well is Claude following the instructions you gave earlier in this conversation?`, optional leading `●`/`⏺` bullet + trailing `(optional)`); keep it a closed list, never an open prose pattern (a quoted header once spammed bogus surveys). Wedge symptom of an UNRECOGNISED wording: the survey sits on the pane and swallows the Enter of the next forwarded prompt — the text strands unsubmitted in the TUI input box and the topic looks hung (live 2026-07-02, topic 202); the fix is adding the new wording to the alternation |
 | `claudeJsonStreamAdapter.ts` | 2nd Claude backend — drives `claude -p --input-format stream-json --output-format stream-json` (structured events, NO tmux scrape) as an EXTERNAL tmux-hosted process (`cjson-…`): a wrapper reroutes stdin to a FIFO claude holds `0<>` and stdout to an append-only `stdout.jsonl` the adapter tails, so bot restarts never kill the session — boot ADOPTS it and replays the downtime tail (host layout/primitives in `utils/jsonStreamHost.ts`; transport details in `src/adapters/README.md`). The **DEFAULT** Claude backend now (`getDefaultAdapterName` / `resolveClaudeBackendName`), switchable per-topic on the fly via `/claude_mode` (the pick persists as the thread's adapter name; the switch is a SEAMLESS resume — both backends share the on-disk transcript). Hidden from the generic `/start` agent list (`hiddenAdapterNames`) — reached via the default + `/claude_mode`, not a start entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.) Subscription-billed (non-`--bare`, no `ANTHROPIC_API_KEY`; proof: `system/init` `apiKeySource:"none"` + a `seven_day` `rate_limit_event`). Interactive questions ride a REVERSE-ENGINEERED stdio control protocol (`--permission-prompt-tool stdio` + `initialize` handshake + `can_use_tool`/`control_response`) — full wire format in `src/adapters/README.md`. Sessions cross-resumable with the tmux backend (shared transcript readers) |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; ONE multiplexed `/global/event` stream for the whole server, every event parsed once + routed by envelope `directory` + `sessionID`) |
 | `terminalAdapter.ts` | A raw interactive `$SHELL` in `tmux` — a third adapter sibling to claude/opencode (NO AI logic). Types the user's text in as keystrokes (`send-keys`) and streams the scraped pane back as ONE rolling message per command (generic capture → line-set-diff → `cleanOutput` → emit; no question/survey/sub-agent/tool-result/effort/MCP/resume machinery). Restart-safe: `listExistingTmuxSessions`/`adoptExistingTmuxSession` re-adopt a live `term-…` session at boot (current pane seeds the baseline, no flood). Does NOT extend `ClaudeCliAdapter` and leaves `outputsDeltas` falsy, so the Claude liveness loop never fires for it |
@@ -583,14 +583,14 @@ OpenCode events / bindings).
     the wedged turn → `agent.question_cancelled_for_prompt` notice) and is
     delivered as a fresh prompt. Pre-fix the voice handler had NO question
     handling, so a voice note queued behind the blocked question-turn and the
-    user got no reply (live 2026-06-25, topic «Overview app 1»). Route decision:
+    user got no reply (live 2026-06-25, topic «ProjectB app 1»). Route decision:
     `getQuestionReplyRoute`. **Abandoning a question ALSO rejects it on the
     server** — not just on abandon-by-prompt but on session teardown while it is
     pending (`/new`, `/quit`, leaving the folder), each rejecting BEFORE the
     session is stopped. Without the reject the question stayed "open" in
     OpenCode's registry and `restoreOpenQuestion` (`GET /question` on every
     reattach) re-posted the stale question after a restart (live 2026-07-01,
-    topic 688). Claude has no server-side question concept → no reject. Pure
+    topic 203). Claude has no server-side question concept → no reject. Pure
     reject is the OpenCode adapter's `rejectQuestion` (mirrors `answerQuestion`,
     empty body).
   - **`/login` OAuth code paste.** The login flow's last step shows
@@ -792,7 +792,7 @@ rather than typed into the agent.)
 - **Live-verify on the test thread BEFORE you commit — this is the EXECUTING
   (sub-)agent's job, not deferred to the orchestrator or the user.** A change
   that touches relay / output / rendering must be exercised live on the
-  "Telegram code testing" topic (root `9085`) and confirmed via the always-on
+  "Telegram code testing" topic (root `111`) and confirmed via the always-on
   trace / `get_history` *before* its commit lands. If `telegram-mcp` (the client
   that drives a topic by sending prompts) is not connected, that is a BLOCKER:
   say so explicitly, do NOT commit the change as "verified", and do NOT silently
@@ -813,9 +813,10 @@ rather than typed into the agent.)
   HTML `<pre>` was accepted.
 
 - **Live tests touch ONLY the "Telegram code testing" topic** (root message id
-  `9085` in ExampleGroup `-1001111111111`). Never send commands, prompts, or
-  button presses to any other topic — those are the user's working threads with
-  live agent sessions. (User instruction, 2026-06-04.)
+  `111` in the served group `-1001111111111` — placeholder ids; the real
+  instance values live in untracked `CLAUDE.local.md`). Never send commands,
+  prompts, or button presses to any other topic — those are the user's working
+  threads with live agent sessions. (User instruction, 2026-06-04.)
 
 - **Decode a `t.me/c/<internalId>/…` link the user pastes → query directly, no
   `list_topics`/guessing.** `chat_id` = `-100` + `<internalId>` (e.g.

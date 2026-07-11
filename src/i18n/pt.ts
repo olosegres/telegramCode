@@ -156,6 +156,16 @@ export const ptDict: Record<string, string> = {
   'status.global_header': '📊 *Todos os tópicos* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Ainda sem tópicos.',
+  'language.status':
+    '🌐 Idioma: `{current}` ({source})\nTelegram: {telegram}\nDisponíveis: {locales}\nUsa /language <locale> ou /language auto.',
+  'language.set_success': '✅ Idioma definido para `{locale}` neste chat.',
+  'language.auto_success': '✅ Idioma reposto para automático. Atual: `{locale}`.',
+  'language.invalid': '⚠️ A locale `{locale}` não é suportada. Disponíveis: {locales}.',
+  'language.telegram_unknown': 'desconhecido',
+  'language.source.override': 'definição do chat',
+  'language.source.telegram': 'perfil do Telegram',
+  'language.source.storedTelegram': 'último perfil do Telegram visto',
+  'language.source.fallback': 'fallback',
 
   'agent.ready': '{label} pronto em `{subdir}`{argsSuffix}\nEnvia uma mensagem:',
   'agent.no_session': 'Sem agente em execução. /claude ou /opencode para iniciar.',

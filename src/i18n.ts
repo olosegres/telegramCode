@@ -1,9 +1,9 @@
 /**
  * @description Lightweight i18n for the multi-thread bot.
  *
- * A single source of truth: a dictionary keyed by short stable codes, with
- * the locale picked via `BOT_LANG` (default `ru`). English is the canonical
- * reference — a key missing in any locale falls back to `en`.
+ * A single source of truth: a dictionary keyed by short stable codes. The
+ * active locale is supplied by the Telegram update context (or a persisted
+ * chat override); when no locale is known, English is the fallback.
  *
  * Design choices:
  *
@@ -37,11 +37,11 @@ import { jaDict } from './i18n/ja';
 import { hiDict } from './i18n/hi';
 import { uzDict } from './i18n/uz';
 import { kaDict } from './i18n/ka';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
- * @description Supported locale codes. `en` is the canonical fallback;
- * `ru` is the default (and the hand-maintained reference). The rest are
- * machine-translated from `en`.
+ * @description Supported locale codes. `en` is the canonical fallback. `ru` is
+ * hand-maintained; the rest are machine-translated from `en`.
  */
 export type Locale = 'en' | 'de' | 'fr' | 'es' | 'pt' | 'ru' | 'zh' | 'ja' | 'hi' | 'uz' | 'ka';
 
@@ -70,27 +70,35 @@ const dict: Record<Locale, Record<string, string>> = {
   ka: kaDict,
 };
 
-/** Default locale used when `BOT_LANG` is empty or unknown. */
-const defaultLocale: Locale = 'ru';
+/** Default locale used when Telegram gives no usable language and no override exists. */
+export const defaultLocale: Locale = 'en';
 
 /** Set of recognised locale codes for O(1) validation. */
 const knownLocales = new Set<string>(localeCodes);
 
+const localeStorage = new AsyncLocalStorage<Locale>();
+
 /**
- * @description Active locale, picked once at boot from `BOT_LANG`.
- *
- * Audit S18 / #46: previous code did a literal `=== 'en'` check, so
- * `BOT_LANG=EN` / `English` / `En` silently fell back to ru with no
- * indication anything was off. Now we lowercase + trim and warn loudly
- * on unknown values.
+ * @description Normalise a Telegram/client locale into one of the supported
+ * catalogs. Telegram may send region/script tags (`pt-BR`, `zh-Hans`); the bot
+ * ships base-language catalogs, so exact match wins, then the base tag.
  */
-const lang: Locale = ((): Locale => {
-  const raw = (process.env.BOT_LANG ?? '').trim().toLowerCase();
-  if (raw === '') return defaultLocale;
+export function normalizeLocale(value: string | null | undefined): Locale | null {
+  const raw = value?.trim().toLowerCase().replace(/_/g, '-');
+  if (!raw) return null;
   if (knownLocales.has(raw)) return raw as Locale;
-  console.warn(`[i18n] unknown BOT_LANG="${process.env.BOT_LANG}", falling back to ${defaultLocale}`);
-  return defaultLocale;
-})();
+  const base = raw.split('-')[0];
+  return knownLocales.has(base) ? base as Locale : null;
+}
+
+/** Run code with a locale visible to all nested async work created inside it. */
+export function runWithLocale<T>(locale: Locale, fn: () => T): T {
+  return localeStorage.run(locale, fn);
+}
+
+function getCurrentLocale(): Locale {
+  return localeStorage.getStore() ?? defaultLocale;
+}
 
 /**
  * @description Format a localised message.
@@ -105,7 +113,8 @@ const lang: Locale = ((): Locale => {
  * fallback at least reads naturally while the warning still hits logs.
  */
 export function t(code: string, opts?: Record<string, string | number>): string {
-  const primary = dict[lang][code];
+  const locale = getCurrentLocale();
+  const primary = dict[locale][code];
   const fallback = dict.en[code];
   let template: string;
   if (primary !== undefined) {
@@ -113,7 +122,7 @@ export function t(code: string, opts?: Record<string, string | number>): string 
   } else if (fallback !== undefined) {
     template = fallback;
   } else {
-    console.warn(`[i18n] missing key "${code}" in ${lang} and en`);
+    console.warn(`[i18n] missing key "${code}" in ${locale} and en`);
     template = code.split('.').pop() ?? code;
   }
   if (opts) {
@@ -132,9 +141,9 @@ export function errorMessage(code: string, opts?: Record<string, string | number
   return t(`error.${code}`, opts);
 }
 
-/** Exposed for tests + `/doctor` output ("language: ru"). */
+/** Exposed for tests + debug output (returns the current async context locale). */
 export function getActiveLang(): Locale {
-  return lang;
+  return getCurrentLocale();
 }
 
 /**

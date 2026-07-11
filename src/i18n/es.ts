@@ -156,6 +156,16 @@ export const esDict: Record<string, string> = {
   'status.global_header': '📊 *Todos los hilos* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Aún no hay hilos.',
+  'language.status':
+    '🌐 Idioma: `{current}` ({source})\nTelegram: {telegram}\nDisponibles: {locales}\nUsa /language <locale> o /language auto.',
+  'language.set_success': '✅ Idioma establecido en `{locale}` para este chat.',
+  'language.auto_success': '✅ Idioma restablecido a automático. Actual: `{locale}`.',
+  'language.invalid': '⚠️ La locale `{locale}` no es compatible. Disponibles: {locales}.',
+  'language.telegram_unknown': 'desconocido',
+  'language.source.override': 'ajuste del chat',
+  'language.source.telegram': 'perfil de Telegram',
+  'language.source.storedTelegram': 'último perfil de Telegram visto',
+  'language.source.fallback': 'respaldo',
 
   'agent.ready': '{label} listo en `{subdir}`{argsSuffix}\nEnvía un mensaje:',
   'agent.no_session': 'No hay agente en ejecución. /claude o /opencode para iniciar.',

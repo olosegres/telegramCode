@@ -69,7 +69,6 @@ services:
       - WORK_ROOT=/workspace
       - DATA_DIR=/data
       # ── optional ──
-      - BOT_LANG=${BOT_LANG:-ru}
       # Surfaces: group | dm | both (default). OWNER_USER_ID enables the
       # owner-DM surface in `both`; required for `dm`.
       # - CHAT_MODE=both
@@ -123,7 +122,6 @@ services:
       - ALLOWED_GROUP_ID=${ALLOWED_GROUP_ID_WORK}
       - WORK_ROOT=/workspace
       - DATA_DIR=/data
-      - BOT_LANG=${BOT_LANG:-ru}
       # Surfaces: group | dm | both (default). OWNER_USER_ID enables the
       # owner-DM surface in `both`; required for `dm`.
       # - CHAT_MODE=both

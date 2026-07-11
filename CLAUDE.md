@@ -368,7 +368,7 @@ config/variants, not a per-message API field).
 | `accessControl.ts` | Who may use the bot: `extractAdminIds` + `AdminCache` (the served group's creator/admins, read live via `getChatAdministrators`, cached 1h; a `chat_member` admin-status change in the served group invalidates the cache immediately — `checkShouldInvalidateAdminCache`, subscribed via `allowed_updates` at launch). No allow-list env, no `/grant` |
 | `state.ts` | Persistence (`state.json`): bindings, sessions, pairing; `resolveDataDir()` |
 | `mcpConfig.ts` | Merge MCP server config across the user/group/project/thread hierarchy |
-| `i18n.ts` | `t(key, vars)` translations for all user-facing strings. **11 locales** (`en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`, `ka`); `en` is canonical (missing key falls back to `en`); per-locale modules live in `src/i18n/`. Add a new key to `en.ts` first, then mirror it in every locale. Agent-facing templates (`schedule.*`, `apiRetry.continueNudge`) keep English instructions but bake a per-locale "IN <language>" reply directive |
+| `i18n.ts` | `t(key, vars)` translations for all user-facing strings. **11 locales** (`en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`, `ka`); active locale comes from async Telegram/chat context (`/language` override → Telegram `language_code` → stored chat locale → `en`); `en` is canonical (missing key falls back to `en`); per-locale modules live in `src/i18n/`. Add a new key to `en.ts` first, then mirror it in every locale. Agent-facing templates (`schedule.*`, `apiRetry.continueNudge`) keep English instructions but bake a per-locale "IN <language>" reply directive |
 | `validation.ts` | Input validation for existing-folder `/bind` args (`validateSubdir`, path-traversal/symlink-safe) |
 | `folderName.ts` | Pure validation of a typed NEW folder name for the `/bind` create-folder flow (`validateNewFolderName`) — pre-`mkdir` gate (no slashes/traversal/dots/control chars), distinct from `validateSubdir` which requires the folder to exist |
 | `rateLimiter.ts` | Per-user / per-action rate limiting |
@@ -425,7 +425,7 @@ config/variants, not a per-message API field).
 
 | File | Responsibility |
 |------|----------------|
-| `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot |
+| `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot. Also the DI hub: `registerDisplayPrefsReader` (display prefs at PRODUCE time), `registerSeenWatermarkWriter` / `registerJsonStreamTailWriter` (persistence), `registerThreadLocaleReader` (adapter-side `t(...)` locale context) — same late-wiring idiom for all |
 | `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat. **Auto-dismisses Claude's end-of-turn feedback survey** (never relayed to the topic; one Escape per appearance, signature-deduped): the detector (`extractClaudeSurvey`) is two-factor — a whole-line-anchored header + the `N: Label` option row (≥2 options) — and accepts a CLOSED alternation of the two known header wordings (`How is Claude doing this session?` and `How well is Claude following the instructions you gave earlier in this conversation?`, optional leading `●`/`⏺` bullet + trailing `(optional)`); keep it a closed list, never an open prose pattern (a quoted header once spammed bogus surveys). Wedge symptom of an UNRECOGNISED wording: the survey sits on the pane and swallows the Enter of the next forwarded prompt — the text strands unsubmitted in the TUI input box and the topic looks hung (live 2026-07-02, topic 202); the fix is adding the new wording to the alternation |
 | `claudeJsonStreamAdapter.ts` | 2nd Claude backend — drives `claude -p --input-format stream-json --output-format stream-json` (structured events, NO tmux scrape) as an EXTERNAL tmux-hosted process (`cjson-…`): a wrapper reroutes stdin to a FIFO claude holds `0<>` and stdout to an append-only `stdout.jsonl` the adapter tails, so bot restarts never kill the session — boot ADOPTS it and replays the downtime tail (host layout/primitives in `utils/jsonStreamHost.ts`; transport details in `src/adapters/README.md`). NOT the default Claude backend for now (`getDefaultAdapterName` / `resolveClaudeBackendName` stay on tmux-scrape): it cannot host `/login` yet, so the default flips back to json-stream only when the out-of-band login task ships (plan `agent/tasks/actual/2026-07-11-jsonstream-login-outofband-auth.md`). Switchable per-topic on the fly via `/claude_mode` (the pick persists as the thread's adapter name; the switch is a SEAMLESS resume — both backends share the on-disk transcript). Hidden from the generic `/start` agent list (`hiddenAdapterNames`) — reached via `/claude_mode`, not a start entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.) Subscription-billed (non-`--bare`, no `ANTHROPIC_API_KEY`; proof: `system/init` `apiKeySource:"none"` + a `seven_day` `rate_limit_event`). Interactive questions ride a REVERSE-ENGINEERED stdio control protocol (`--permission-prompt-tool stdio` + `initialize` handshake + `can_use_tool`/`control_response`) — full wire format in `src/adapters/README.md`. Sessions cross-resumable with the tmux backend (shared transcript readers) |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; ONE multiplexed `/global/event` stream for the whole server, every event parsed once + routed by envelope `directory` + `sessionID`) |
@@ -574,7 +574,7 @@ OpenCode events / bindings).
     Template instructions stay English in all locales (agent-facing, not
     user-read), but the TARGET reply language is baked per locale (for example,
     ru → Russian, en → English, de → German): a fresh session's only user-language signal
-    is the bot locale (live 2026-06-06: "in their language" made the agent
+    is the resolved chat locale (live 2026-06-06: "in their language" made the agent
     interview in English). The agent's `schedule_*` MCP tools are injected
     into every bot-started session (see "Agent scheduling tools" above).
   - While a Claude TUI selector is on screen (`isQuestionPending`), a bare
@@ -733,7 +733,11 @@ OpenCode events / bindings).
     `utils/toolResultRender.ts`, `utils/subagentRender.ts`,
     `utils/subagentStatusRender.ts`, `utils/claudeSubagentTail.ts`.
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
-  `/doctor`, `/mcp`, `/trace`, `/timestamps`
+  `/doctor`, `/mcp`, `/trace`, `/timestamps`, `/language` (`/lang`)
+  - `/language [locale|auto]` shows or changes the bot UI language for the
+    current Telegram chat (DM or whole forum group). Resolution order:
+    explicit override → Telegram `from.language_code` → last supported Telegram
+    locale seen in that chat → `en`; logs stay English.
   - `/timestamps on|off` (bare → status) toggles the per-thread prompt
     timestamp: when ON, every prompt forwarded to the agent gets its send time
     prepended as the very top line (`2026-06-27T19:42:10+04:00` — local-offset

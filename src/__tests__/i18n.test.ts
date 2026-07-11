@@ -1,21 +1,53 @@
 /**
  * @description Audit S19 / #50: cover the placeholder substitution
- * pipeline and the missing-key fallback. The module's `lang` is captured
- * at import time from `BOT_LANG`, so we set it BEFORE the static import.
+ * pipeline, locale normalization, async locale scoping, and the missing-key
+ * fallback. The default runtime locale is English; Telegram/chat-specific
+ * locale selection is supplied through `runWithLocale`.
  */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
-// Set BOT_LANG before the dictionary module reads it. Node's ESM/CJS
-// interop in this project uses CommonJS output, so static imports
-// hoist; the env var must be set ahead of the test runner — which it
-// is, in practice, because tests are run fresh per file.
-process.env.BOT_LANG = 'ru';
-
-import { t, checkKeyInAllLangs, getKeyInLang, localeCodes } from '../i18n';
+import {
+  t,
+  checkKeyInAllLangs,
+  getKeyInLang,
+  localeCodes,
+  defaultLocale,
+  getActiveLang,
+  normalizeLocale,
+  runWithLocale,
+} from '../i18n';
 import type { Locale } from '../i18n';
 import { enDict } from '../i18n/en';
+
+test('default active locale is English', () => {
+  assert.equal(defaultLocale, 'en');
+  assert.equal(getActiveLang(), 'en');
+});
+
+test('normalizeLocale accepts Telegram region/script variants', () => {
+  assert.equal(normalizeLocale('EN'), 'en');
+  assert.equal(normalizeLocale('pt-BR'), 'pt');
+  assert.equal(normalizeLocale('zh_Hans'), 'zh');
+  assert.equal(normalizeLocale('zh_Hans_CN'), 'zh');
+  assert.equal(normalizeLocale(' ru '), 'ru');
+  assert.equal(normalizeLocale('xx'), null);
+  assert.equal(normalizeLocale(undefined), null);
+});
+
+test('runWithLocale scopes t across async work and restores the previous locale', async () => {
+  assert.equal(getActiveLang(), 'en');
+
+  const out = await runWithLocale('ru', async () => {
+    assert.equal(getActiveLang(), 'ru');
+    await Promise.resolve();
+    return t('language.source.override');
+  });
+
+  assert.equal(out, 'настройка чата');
+  assert.equal(getActiveLang(), 'en');
+});
 
 test('t substitutes single {name} placeholder', () => {
   // Use any known key that takes a placeholder. `cb.binding_to` was
@@ -31,10 +63,7 @@ test('t substitutes multiple placeholders', () => {
   assert.ok(out.includes('`a`, `b`'));
 });
 
-test('bind.current resolves with the subdir in both locales', () => {
-  // The module reads BOT_LANG once at import (ru here), so we can only
-  // exercise the active locale through `t`. Assert the key is wired and
-  // substitutes; the en fallback path is covered by the unknown-key test.
+test('bind.current resolves with the subdir in the active locale', () => {
   const out = t('bind.current', { subdir: 'overview' });
   assert.ok(out.includes('overview'), `expected "overview" in "${out}"`);
   assert.ok(!out.includes('{subdir}'), `placeholder not substituted: "${out}"`);
@@ -47,10 +76,7 @@ test('bind.current_none resolves to a non-empty message', () => {
 });
 
 test('thread.bind_required resolves in ru (not the bare-code fallback) and names /bind', () => {
-  // Active lang here is ru. A real translation must come back — never the
-  // last-code-segment fallback `bind_required` that `t` returns for a key
-  // missing in BOTH catalogs — and it must point the user at /bind.
-  const out = t('thread.bind_required');
+  const out = runWithLocale('ru', () => t('thread.bind_required'));
   assert.notEqual(out, 'bind_required', 'ru catalog is missing thread.bind_required');
   assert.ok(out.includes('/bind'), `expected "/bind" in "${out}"`);
 });
@@ -195,6 +221,35 @@ test('timestamps toggle keys exist in every locale', () => {
   ]) {
     assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
   }
+});
+
+test('language command keys exist in every locale', () => {
+  for (const code of [
+    'language.status',
+    'language.set_success',
+    'language.auto_success',
+    'language.invalid',
+    'language.telegram_unknown',
+    'language.source.override',
+    'language.source.telegram',
+    'language.source.storedTelegram',
+    'language.source.fallback',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('language.status substitutes all placeholders', () => {
+  const out = t('language.status', {
+    current: 'en',
+    source: 'Telegram profile',
+    telegram: 'en',
+    locales: 'en, ru',
+  });
+  assert.ok(out.includes('en'));
+  assert.ok(out.includes('Telegram profile'));
+  assert.ok(out.includes('en, ru'));
+  assert.ok(!out.includes('{'), `placeholders not substituted: "${out}"`);
 });
 
 test('trace.statusReply substitutes thisThread/allThreads/count placeholders', () => {

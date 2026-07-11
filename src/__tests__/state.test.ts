@@ -604,3 +604,33 @@ test('getTransientFrames: a captured snapshot survives a later REPLACE clobber',
   );
   assert.deepEqual(store.getTransientFrames(), { [keyToString(key1)]: [999] });
 });
+
+test('chatLocaleOverride: set → reload → clear drops the persisted map', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setChatLocaleOverride(key1.chatId, 'de');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getChatLocaleOverride(key1.chatId), 'de');
+
+  await second.setChatLocaleOverride(key1.chatId, null);
+  await second.flush();
+  assert.equal(second.getChatLocaleOverride(key1.chatId), null);
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal('chatLocaleOverrides' in raw, false, 'empty override map must be absent on disk');
+});
+
+test('chatTelegramLocale: persists separately from an explicit override', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setChatTelegramLocale(key1.chatId, 'pt');
+  await first.setChatLocaleOverride(key1.chatId, 'ru');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getChatTelegramLocale(key1.chatId), 'pt');
+  assert.equal(second.getChatLocaleOverride(key1.chatId), 'ru');
+});

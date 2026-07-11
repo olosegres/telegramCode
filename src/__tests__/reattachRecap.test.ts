@@ -4,10 +4,10 @@
  * down, instead of silently dropping it). The bot owns the anti-spam gate; the
  * formatter just shapes a recap it was asked to render.
  *
- * Locale-agnostic (the i18n module reads `BOT_LANG` once at import time): both
- * catalogs share the recap markers — ⚠️ on the count header, 🔄 on the no-count
- * fallback header, ⏳ on the still-working line, and 👤 / 🤖 on the turn body —
- * so the assertions check those rather than locale-specific words.
+ * Locale-agnostic: every catalog shares the recap markers — ⚠️ on the count
+ * header, 🔄 on the no-count fallback header, ⏳ on the still-working line, and
+ * 👤 / 🤖 on the turn body — so the assertions check those rather than
+ * locale-specific words.
  *
  * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.

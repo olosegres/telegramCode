@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import type { Locale } from './i18n';
 
 export interface AgentSession {
   id: string;
@@ -330,6 +331,18 @@ export type DisplayVerbosityMode = 'minimal' | 'short' | 'full';
  * registered, both adapters fall back to all-fields-`minimal`.
  */
 export type DisplayPrefsReader = (key: ThreadKey) => ResolvedThreadDisplayPrefs;
+
+/**
+ * @description Reader for a thread's resolved UI locale, injected into BOTH
+ * adapters at boot (`createAdapter.registerThreadLocaleReader`). The adapters
+ * call `t(...)` on their own hot paths (Claude's poll loop formats question
+ * hints / tool-result status; OpenCode's SSE handler builds delegation status)
+ * OUTSIDE the bot's `withThreadLocale` wrapper — those `t(...)` calls would
+ * otherwise fall back to `en` regardless of the chat's locale. With this
+ * reader the adapter wraps the `t(...)` call in `runWithLocale(reader(key))`.
+ * Until registered, the adapters fall back to {@link defaultLocale} (`en`).
+ */
+export type ThreadLocaleReader = (key: ThreadKey) => Locale;
 
 /**
  * @description Per-thread bot-rendering preferences for agent output

@@ -16,6 +16,7 @@ import {
 } from './types';
 import { defaultDisplayVerbosityMode, normalizeDisplayVerbosityMode } from './utils/displayVerbosity';
 import type { ScheduleRecord } from './scheduler/types';
+import type { Locale } from './i18n';
 
 /**
  * @description On-disk state for the multi-thread telegram bot.
@@ -168,6 +169,18 @@ export interface StateV1 {
    */
   tracedThreads?: string[];
   traceAllThreads?: boolean;
+  /**
+   * Explicit `/language` overrides, keyed by Telegram chat id (DM chat or whole
+   * forum supergroup). These beat Telegram's `from.language_code` until changed
+   * or reset to auto. Optional so older state files stay valid.
+   */
+  chatLocaleOverrides?: Record<string, Locale>;
+  /**
+   * Last supported Telegram client language seen in each chat, keyed by chat id.
+   * Used for bot-originated async events (agent output, scheduled runs) where no
+   * live Telegram update carries `from.language_code`. Optional for old state.
+   */
+  chatTelegramLocales?: Record<string, Locale>;
   /**
    * Threads with the `/timestamps` prompt-injection toggle ON (default OFF —
    * absent list means no thread injects). When ON, every forwarded prompt gets
@@ -999,6 +1012,39 @@ export class StateStore {
     if (uniqueKeys.length > 0) this.state.tracedThreads = uniqueKeys;
     else delete this.state.tracedThreads;
     this.state.traceAllThreads = config.allThreads;
+    this.scheduleSave();
+  }
+
+  // ── per-chat locale (`/language`) ──
+
+  getChatLocaleOverride(chatId: number): Locale | null {
+    return this.state.chatLocaleOverrides?.[chatId.toString()] ?? null;
+  }
+
+  getChatTelegramLocale(chatId: number): Locale | null {
+    return this.state.chatTelegramLocales?.[chatId.toString()] ?? null;
+  }
+
+  async setChatLocaleOverride(chatId: number, locale: Locale | null): Promise<void> {
+    const chatIdKey = chatId.toString();
+    if (locale === null) {
+      if (!this.state.chatLocaleOverrides?.[chatIdKey]) return;
+      delete this.state.chatLocaleOverrides[chatIdKey];
+      if (Object.keys(this.state.chatLocaleOverrides).length === 0) {
+        delete this.state.chatLocaleOverrides;
+      }
+      this.scheduleSave();
+      return;
+    }
+    if (this.state.chatLocaleOverrides?.[chatIdKey] === locale) return;
+    (this.state.chatLocaleOverrides ??= {})[chatIdKey] = locale;
+    this.scheduleSave();
+  }
+
+  async setChatTelegramLocale(chatId: number, locale: Locale): Promise<void> {
+    const chatIdKey = chatId.toString();
+    if (this.state.chatTelegramLocales?.[chatIdKey] === locale) return;
+    (this.state.chatTelegramLocales ??= {})[chatIdKey] = locale;
     this.scheduleSave();
   }
 

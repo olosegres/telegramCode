@@ -28,6 +28,7 @@ import {
   registerDisplayPrefsReader,
   registerSeenWatermarkWriter,
   registerJsonStreamTailWriter,
+  registerThreadLocaleReader,
   stopAllAdaptersFor as sweepAdapters,
   getKnownAdapterNames,
   checkIsClaudeBackend,
@@ -80,7 +81,7 @@ import {
   getUpdateQueueKey,
 } from './updateDispatcher';
 import { classifyBoot } from './bootClassifier';
-import { t } from './i18n';
+import { defaultLocale, localeCodes, normalizeLocale, runWithLocale, t, type Locale } from './i18n';
 import { validateSubdir, resolveBoundWorkDir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { validateNewFolderName, NewFolderNameError } from './folderName';
 import {
@@ -523,6 +524,12 @@ bot.use(async (ctx, next) => {
   });
   return next();
 });
+
+// Locale is a Telegram-chat concern, not a process env knob. Every update runs
+// inside an async i18n context: explicit `/language` override for the DM/group
+// wins, else this sender's Telegram `language_code`, else the last seen Telegram
+// locale for that chat (for async bot-originated events), else English.
+bot.use(async (ctx, next) => runWithLocale(getLocaleForContext(ctx), () => next()));
 
 // Auto-pairing must run before any command / `on` handler so a freshly
 // discovered group id is already in effect by the time the routing gates
@@ -1082,7 +1089,7 @@ function onThreadActivityWhileQuestionPending(key: ThreadKey): void {
   if (s.repostTimer) clearTimeout(s.repostTimer);
   s.repostTimer = setTimeout(() => {
     s.repostTimer = null;
-    void repostPendingQuestionToBottom(key);
+    void withThreadLocale(key, () => repostPendingQuestionToBottom(key));
   }, questionRepostDebounceMs);
 }
 
@@ -1238,6 +1245,10 @@ function handleApiError(key: ThreadKey, cls: AgentApiErrorClass): void {
  * next, later error resets to attempt 1.
  */
 async function fireApiRetry(key: ThreadKey): Promise<void> {
+  return withThreadLocale(key, () => fireApiRetryWithLocale(key));
+}
+
+async function fireApiRetryWithLocale(key: ThreadKey): Promise<void> {
   const k = keyToString(key);
   const entry = apiRetryTimers.get(k);
   if (!entry) return;
@@ -1625,6 +1636,48 @@ function getThreadKey(ctx: Context): ThreadKey | null {
 function checkIsGeneral(key: ThreadKey): boolean {
   const generalThreadId = checkIsDmKey(key) ? DM_GENERAL_THREAD_ID : GENERAL_THREAD_ID;
   return key.threadId === generalThreadId;
+}
+
+type LocaleSource = 'override' | 'telegram' | 'storedTelegram' | 'fallback';
+
+interface ResolvedChatLocale {
+  locale: Locale;
+  source: LocaleSource;
+  telegramLocale: Locale | null;
+}
+
+function getTelegramLocale(ctx: Context): Locale | null {
+  return normalizeLocale(ctx.from?.language_code);
+}
+
+function getResolvedChatLocale(chatId: number, telegramLocale: Locale | null): ResolvedChatLocale {
+  const override = state.getChatLocaleOverride(chatId);
+  if (override) return { locale: override, source: 'override', telegramLocale };
+  if (telegramLocale) return { locale: telegramLocale, source: 'telegram', telegramLocale };
+  const storedTelegramLocale = state.getChatTelegramLocale(chatId);
+  if (storedTelegramLocale) return { locale: storedTelegramLocale, source: 'storedTelegram', telegramLocale };
+  return { locale: defaultLocale, source: 'fallback', telegramLocale };
+}
+
+function getLocaleForContext(ctx: Context): Locale {
+  const telegramLocale = getTelegramLocale(ctx);
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return telegramLocale ?? defaultLocale;
+  if (telegramLocale) {
+    void state
+      .setChatTelegramLocale(chatId, telegramLocale)
+      .catch(e => console.error('[i18n] failed to persist Telegram locale:', e));
+  }
+  return getResolvedChatLocale(chatId, telegramLocale).locale;
+}
+
+function getLocaleForKey(key: ThreadKey): Locale {
+  if (!state) return defaultLocale;
+  return state.getChatLocaleOverride(key.chatId) ?? state.getChatTelegramLocale(key.chatId) ?? defaultLocale;
+}
+
+function withThreadLocale<T>(key: ThreadKey, fn: () => T): T {
+  return runWithLocale(getLocaleForKey(key), fn);
 }
 
 /**
@@ -3146,8 +3199,10 @@ function getWorkDirStartDecision(key: ThreadKey): { ok: true; workDir: string } 
   const binding = state.getBinding(key);
   const decision = resolveBoundWorkDir(ENV.workRoot, binding);
   if (decision.kind === 'proceed') return { ok: true, workDir: decision.workDir };
-  if (decision.kind === 'refuse') return { ok: false, message: t('thread.bind_required') };
-  return { ok: false, message: formatBindErrorMessage(decision.error, binding?.subdir ?? '') };
+  return withThreadLocale(key, () => {
+    if (decision.kind === 'refuse') return { ok: false as const, message: t('thread.bind_required') };
+    return { ok: false as const, message: formatBindErrorMessage(decision.error, binding?.subdir ?? '') };
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3827,6 +3882,52 @@ command('status', async (_ctx, key) => {
       `Folder: ${subdir}\n` +
       `Session: ${isActive ? 'running' : 'stopped'}`,
   );
+});
+
+function getLocaleSourceLabel(source: LocaleSource): string {
+  switch (source) {
+    case 'override': return t('language.source.override');
+    case 'telegram': return t('language.source.telegram');
+    case 'storedTelegram': return t('language.source.storedTelegram');
+    case 'fallback': return t('language.source.fallback');
+  }
+}
+
+function getLanguageCommandArg(text: string): string {
+  const [_command, arg = ''] = stripCommandBotMention(text.trim()).split(/\s+/, 2);
+  return arg.trim().toLowerCase();
+}
+
+command(['language', 'lang'], async (ctx, key) => {
+  const chatId = key.chatId;
+  const locales = localeCodes.join(', ');
+  const arg = getLanguageCommandArg(ctx.message.text);
+
+  if (arg === 'auto' || arg === 'reset') {
+    await state.setChatLocaleOverride(chatId, null);
+    const resolved = getResolvedChatLocale(chatId, getTelegramLocale(ctx));
+    await replyToThread(key, runWithLocale(resolved.locale, () => t('language.auto_success', { locale: resolved.locale })));
+    return;
+  }
+
+  if (arg) {
+    const locale = normalizeLocale(arg);
+    if (!locale) {
+      await replyToThread(key, t('language.invalid', { locale: arg, locales }));
+      return;
+    }
+    await state.setChatLocaleOverride(chatId, locale);
+    await replyToThread(key, runWithLocale(locale, () => t('language.set_success', { locale })));
+    return;
+  }
+
+  const resolved = getResolvedChatLocale(chatId, getTelegramLocale(ctx));
+  await replyToThread(key, t('language.status', {
+    current: resolved.locale,
+    source: getLocaleSourceLabel(resolved.source),
+    telegram: resolved.telegramLocale ?? t('language.telegram_unknown'),
+    locales,
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -5888,7 +5989,7 @@ command('clear_messages', async (ctx, key) => {
 const botCommands = new Set([
   'start', 'claude', 'opencode', 'oc', 'terminal', 'agent', 'sessions', 'resume', 'cancel', 'model', 'connect',
   'stop', 'stopall', 'stop-all', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
-  'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
+  'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help', 'language', 'lang',
   'doctor', 'mcp', 'rename_session', 'trace', 'timestamps', 'schedule', 'thinking', 'tool_results',
   'subagent', 'claude_mode', 'effort', 'verbosity', 'quit', 'q', 'quit-all', 'quitall', 'pair',
 ]);
@@ -6474,8 +6575,8 @@ interface AlbumCollectorItem {
 const albumCollector = createMediaGroupCollector<AlbumCollectorItem>({
   debounceMs: ALBUM_DEBOUNCE_MS,
   onFlush: (groupKey, items) => {
-    void (async () => {
-      const { key } = parseAlbumGroupKey(groupKey);
+    const { key } = parseAlbumGroupKey(groupKey);
+    void withThreadLocale(key, async () => {
       if (items.length === 0) return; // Group existed only to hold a claimed hint.
       // Restore the user's visual order — downloads may have completed (and
       // thus collected) out of order under Telegraf's concurrent dispatch.
@@ -6493,7 +6594,7 @@ const albumCollector = createMediaGroupCollector<AlbumCollectorItem>({
         console.error('[Bot] album flush failed:', err);
         await replyToThread(key, t('file.download_failed')).catch(() => {});
       }
-    })();
+    });
   },
 });
 
@@ -8091,7 +8192,7 @@ function armClaudeLivenessTimer(key: ThreadKey, state: ThreadMessageState): void
   if (state.livenessTimer) clearTimeout(state.livenessTimer);
   state.livenessTimer = setTimeout(() => {
     state.livenessTimer = null;
-    runClaudeLivenessTick(key);
+    withThreadLocale(key, () => runClaudeLivenessTick(key));
   }, CLAUDE_LIVENESS_TICK_MS);
   // Don't keep the event loop alive just for a spinner.
   state.livenessTimer.unref?.();
@@ -8200,11 +8301,11 @@ function armSubagentTimer(key: ThreadKey, state: ThreadMessageState): void {
   state.subagentTimer = setTimeout(() => {
     state.subagentTimer = null;
     if (state.subagentStatusMessageId === null) return;
-    void refreshSubagentStatus(key).finally(() => {
+    void withThreadLocale(key, () => refreshSubagentStatus(key).finally(() => {
       // Re-arm only while the message is still open — a close that landed during
       // the edit nulls the id, so we stop instead of resurrecting the loop.
       if (state.subagentStatusMessageId !== null) armSubagentTimer(key, state);
-    });
+    }));
   }, subagentTickMs);
   state.subagentTimer.unref?.();
 }
@@ -8568,6 +8669,7 @@ const COMMANDS_MENU = [
   { command: 'output', description: '📜 Last 500 lines' },
   { command: 'trace', description: '🛰 Output-trace recorder on/off' },
   { command: 'timestamps', description: '🕒 Prepend send time to forwarded prompts' },
+  { command: 'language', description: '🌐 Bot language for this chat/group' },
   { command: 'whoami', description: '🪪 Show debug ids' },
   { command: 'pair', description: '🔗 Bind this group to the bot' },
   { command: 'version', description: 'ℹ️ Versions of bot + CLI tools' },
@@ -8641,7 +8743,7 @@ export async function postReattachRecap(
       isColdStart,
     });
     if (shouldPost) {
-      const text = formatReattachRecap(recap);
+      const text = withThreadLocale(key, () => formatReattachRecap(recap));
       if (text) await deps.reply(key, text);
     }
     if (recap.headWatermark) {
@@ -9231,11 +9333,12 @@ function wireScheduler(): SchedulerMcpHandle {
    * The engine's bookkeeping sees the paused record and leaves it disarmed.
    */
   const deliver = async (job: ScheduleRecord, fireContext: FireContext): Promise<DeliveryOutcome> => {
-    const outcome = await delivery(job, fireContext);
+    const key = keyFromString(job.threadKey);
+    const outcome = await withThreadLocale(key, () => delivery(job, fireContext));
     if (outcome.status === 'failed' && outcome.error === unboundDeliveryError) {
       await state.setSchedulePaused(job.id, true, 'unbound');
       schedulerEngine?.disarmJob(job.id);
-      await replyToThread(keyFromString(job.threadKey), t('schedule.pausedUnbound', { count: 1 })).catch(() => {});
+      await withThreadLocale(key, () => replyToThread(key, t('schedule.pausedUnbound', { count: 1 }))).catch(() => {});
     }
     return outcome;
   };
@@ -9330,7 +9433,7 @@ export async function startBot(): Promise<void> {
     if (groupId !== null) {
       setImmediate(() => {
         const generalKey: ThreadKey = { chatId: groupId, threadId: GENERAL_THREAD_ID };
-        replyToThread(generalKey, t('error.state.corrupted')).catch(() => {});
+        withThreadLocale(generalKey, () => replyToThread(generalKey, t('error.state.corrupted'))).catch(() => {});
       });
     }
   }
@@ -9341,18 +9444,18 @@ export async function startBot(): Promise<void> {
 
   // 2. Wire adapter events.
   registerAdapterEventHandlers({
-    onOutput: handleAgentOutput,
-    onStatus: handleAdapterStatus,
-    onQuestion: handleAgentQuestion,
-    onThinking: handleAgentThinking,
-    onToolResult: handleAgentToolResult,
-    onSubagentStatus: handleSubagentStatus,
-    onApiError: handleApiError,
-    onQuestionGone: handleQuestionGone,
-    onClosed: handleAgentClosed,
-    onStarted: handleAgentStarted,
-    onStopped: handleAgentStopped,
-    onError: handleAgentError,
+    onOutput: (key, output, meta) => withThreadLocale(key, () => handleAgentOutput(key, output, meta)),
+    onStatus: (key, status) => withThreadLocale(key, () => handleAdapterStatus(key, status)),
+    onQuestion: (key, question) => withThreadLocale(key, () => handleAgentQuestion(key, question)),
+    onThinking: (key, payload) => withThreadLocale(key, () => handleAgentThinking(key, payload)),
+    onToolResult: (key, payload) => withThreadLocale(key, () => handleAgentToolResult(key, payload)),
+    onSubagentStatus: (key, payload) => withThreadLocale(key, () => handleSubagentStatus(key, payload)),
+    onApiError: (key, error) => withThreadLocale(key, () => handleApiError(key, error)),
+    onQuestionGone: (key) => withThreadLocale(key, () => handleQuestionGone(key)),
+    onClosed: (key) => withThreadLocale(key, () => handleAgentClosed(key)),
+    onStarted: (key) => withThreadLocale(key, () => handleAgentStarted(key)),
+    onStopped: (key) => withThreadLocale(key, () => handleAgentStopped(key)),
+    onError: (key, error) => withThreadLocale(key, () => handleAgentError(key, error)),
   });
   // Both adapters branch on the per-thread display prefs while PRODUCING output
   // (OpenCode: child SSE parts on `subagent`; Claude: scrape-chunk relay routing
@@ -9360,6 +9463,12 @@ export async function startBot(): Promise<void> {
   // resolve at render time. Same late-wiring idiom as the event handlers above;
   // before this line they fall back to all-fields-`minimal`.
   registerDisplayPrefsReader((key) => state.getDisplayPrefs(key));
+  // Both adapters format user-facing strings on their own hot paths (Claude's
+  // poll loop: question hints / tool-result status; OpenCode's SSE handler:
+  // delegation status) OUTSIDE the bot's withThreadLocale wrapper. This reader
+  // lets them resolve the thread's locale so those t(...) calls don't fall back
+  // to en regardless of the chat's resolved locale.
+  registerThreadLocaleReader((key) => getLocaleForKey(key));
   // Both adapters advance the per-thread seen-watermark at TURN END through this
   // writer (OpenCode on session.idle, Claude at the ready-prompt turn end) so a
   // later restart can recover output produced while the bot was down. Same

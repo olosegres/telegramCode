@@ -156,6 +156,16 @@ export const hiDict: Record<string, string> = {
   'status.global_header': '📊 *सभी थ्रेड्स* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 अभी तक कोई थ्रेड नहीं।',
+  'language.status':
+    '🌐 भाषा: `{current}` ({source})\nTelegram: {telegram}\nउपलब्ध: {locales}\n/language <locale> या /language auto इस्तेमाल करें।',
+  'language.set_success': '✅ इस चैट की भाषा `{locale}` सेट की गई।',
+  'language.auto_success': '✅ भाषा ऑटो पर रीसेट की गई। मौजूदा: `{locale}`।',
+  'language.invalid': '⚠️ locale `{locale}` समर्थित नहीं है। उपलब्ध: {locales}.',
+  'language.telegram_unknown': 'अज्ञात',
+  'language.source.override': 'चैट सेटिंग',
+  'language.source.telegram': 'Telegram प्रोफाइल',
+  'language.source.storedTelegram': 'आखिरी देखी गई Telegram प्रोफाइल',
+  'language.source.fallback': 'fallback',
 
   'agent.ready': '{label} `{subdir}`{argsSuffix} में तैयार\nएक संदेश भेजें:',
   'agent.no_session': 'कोई एजेंट नहीं चल रहा। /claude या /opencode से शुरू करें।',

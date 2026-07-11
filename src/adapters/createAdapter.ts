@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentApiErrorClass, DisplayPrefsReader, JsonStreamTailWriter, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, DisplayPrefsReader, JsonStreamTailWriter, OutputEventMeta, SeenWatermarkWriter, SubagentStatusEvent, ThinkingEvent, ThreadLocaleReader, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { ClaudeCliAdapter } from './claudeCliAdapter';
 import { OpenCodeAdapter } from './openCodeAdapter';
@@ -24,6 +24,10 @@ const adapterFactories: Record<string, AdapterFactory> = {
  */
 function checkAdapterTakesDisplayPrefs(adapter: AgentAdapter): adapter is AgentAdapter & { setDisplayPrefsReader(reader: DisplayPrefsReader): void } {
   return typeof (adapter as { setDisplayPrefsReader?: unknown }).setDisplayPrefsReader === 'function';
+}
+
+function checkAdapterTakesLocaleReader(adapter: AgentAdapter): adapter is AgentAdapter & { setThreadLocaleReader(reader: ThreadLocaleReader): void } {
+  return typeof (adapter as { setThreadLocaleReader?: unknown }).setThreadLocaleReader === 'function';
 }
 
 function checkAdapterTakesWatermarkWriter(adapter: AgentAdapter): adapter is AgentAdapter & { setSeenWatermarkWriter(writer: SeenWatermarkWriter): void } {
@@ -87,6 +91,25 @@ export function registerDisplayPrefsReader(reader: DisplayPrefsReader): void {
   displayPrefsReader = reader;
   for (const adapter of adapterInstances.values()) {
     if (checkAdapterTakesDisplayPrefs(adapter)) adapter.setDisplayPrefsReader(reader);
+  }
+}
+
+/** Per-thread locale reader for BOTH adapters — same late-wiring idiom as
+ * {@link registerDisplayPrefsReader}: registered once at bot boot, applied to
+ * each instance whether it exists already or is created later. */
+let threadLocaleReader: ThreadLocaleReader | null = null;
+
+/**
+ * @description Register the per-thread locale reader both adapters consult when
+ * formatting user-facing strings on their own hot paths (Claude's poll loop,
+ * OpenCode's SSE handler). Without this, those `t(...)` calls fall back to
+ * `en` regardless of the chat's resolved locale. Wired in `bot.ts` to
+ * `getLocaleForKey`.
+ */
+export function registerThreadLocaleReader(reader: ThreadLocaleReader): void {
+  threadLocaleReader = reader;
+  for (const adapter of adapterInstances.values()) {
+    if (checkAdapterTakesLocaleReader(adapter)) adapter.setThreadLocaleReader(reader);
   }
 }
 
@@ -196,6 +219,9 @@ export function getAdapter(name: string): AgentAdapter {
     wireAdapterEvents(adapter);
     if (displayPrefsReader && checkAdapterTakesDisplayPrefs(adapter)) {
       adapter.setDisplayPrefsReader(displayPrefsReader);
+    }
+    if (threadLocaleReader && checkAdapterTakesLocaleReader(adapter)) {
+      adapter.setThreadLocaleReader(threadLocaleReader);
     }
     if (seenWatermarkWriter && checkAdapterTakesWatermarkWriter(adapter)) {
       adapter.setSeenWatermarkWriter(seenWatermarkWriter);

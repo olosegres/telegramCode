@@ -4,10 +4,9 @@
  * resume instead of flooding the topic with the whole restored transcript;
  * the turn count is the only flood bound — the bot splits over-cap blocks).
  *
- * Locale-agnostic: the i18n module reads `BOT_LANG` once at import time (static
- * imports hoist, so an in-file assignment lands too late to influence it).
- * Both catalogs share the same role emoji (👤 / 🤖) and put the turn count in
- * the header, so the assertions check those rather than a locale-specific word.
+ * Locale-agnostic: every catalog shares the same role emoji (👤 / 🤖) and puts
+ * the turn count in the header, so the assertions check those rather than a
+ * locale-specific word.
  */
 
 import { describe, it } from 'node:test';

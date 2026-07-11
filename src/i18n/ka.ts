@@ -156,6 +156,16 @@ export const kaDict: Record<string, string> = {
   'status.global_header': '📊 *ყველა თემა* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 ჯერ თემები არ არის.',
+  'language.status':
+    '🌐 ენა: `{current}` ({source})\nTelegram: {telegram}\nხელმისაწვდომია: {locales}\nგამოიყენე /language <locale> ან /language auto.',
+  'language.set_success': '✅ ამ ჩატის ენა დაყენდა `{locale}`-ზე.',
+  'language.auto_success': '✅ ენა დაბრუნდა ავტომატურ რეჟიმზე. მიმდინარე: `{locale}`.',
+  'language.invalid': '⚠️ locale `{locale}` არ არის მხარდაჭერილი. ხელმისაწვდომია: {locales}.',
+  'language.telegram_unknown': 'უცნობია',
+  'language.source.override': 'ჩატის პარამეტრი',
+  'language.source.telegram': 'Telegram პროფილი',
+  'language.source.storedTelegram': 'ბოლოს ნანახი Telegram პროფილი',
+  'language.source.fallback': 'fallback',
 
   'agent.ready': '{label} მზადაა `{subdir}`{argsSuffix}-ში\nგამოგვიგზავნეთ შეტყობინება:',
   'agent.no_session': 'აგენტი არ არის გაშვებული. /claude ან /opencode გასაშვებად.',

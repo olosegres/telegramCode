@@ -20,6 +20,7 @@ import type {
   SeenWatermarkWriter,
   SendInputOptions,
   ThreadKey,
+  ThreadLocaleReader,
 } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
@@ -49,7 +50,7 @@ import {
 } from '../utils/claudeScrapeShapes';
 import { checkIsProgressChunk } from '../progressLine';
 import { createSerialQueue, type SerialQueue } from '../utils/serialQueue';
-import { t } from '../i18n';
+import { t, runWithLocale, defaultLocale } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { getClaudeAvailableLevels, checkIsClaudeEffortLevel, defaultEffortLevel } from '../effortLevels';
 import { getNextPollDelay, basePollIntervalMs } from '../utils/pollBackoff';
@@ -2911,6 +2912,19 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     this.displayPrefsReader = reader;
   }
 
+  /** Per-thread locale reader, injected at boot via `createAdapter.registerThreadLocaleReader`. */
+  private threadLocaleReader: ThreadLocaleReader | null = null;
+
+  /** @description Inject the per-thread locale reader (for adapter-side `t(...)` calls). */
+  setThreadLocaleReader(reader: ThreadLocaleReader): void {
+    this.threadLocaleReader = reader;
+  }
+
+  /** @description Run `fn` inside the thread's locale context so `t(...)` resolves correctly. */
+  private tl<T>(key: ThreadKey, fn: () => T): T {
+    return runWithLocale(this.threadLocaleReader?.(key) ?? defaultLocale, fn);
+  }
+
   /**
    * Per-thread seen-watermark writer, injected by the bot at boot via
    * `createAdapter.registerSeenWatermarkWriter`. Called on every idle+ready poll
@@ -4412,7 +4426,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
             session.openToolKind = null; // a question ends any prior tool output
             // `isQuestion`: the bot sends this as its OWN pinnable message and
             // pins it so the muted topic fires a notification.
-            this.emit('output', key, `${question.text}\n\n${t('agent.question_hint')}`, { isQuestion: true });
+            this.emit('output', key, `${question.text}\n\n${this.tl(key, () => t('agent.question_hint'))}`, { isQuestion: true });
           }
         } else {
           // No selector THIS diff. While a question is pending, a single miss is
@@ -4502,7 +4516,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
               // QUIET PATH: keep prose + thinking verbatim, route tool bodies
               // (full keep / short truncate / minimal fold) and ALWAYS fold a
               // sub-agent panel preview into the rolling status frame.
-              const routed = routeClaudeChunkSegments(
+              const routed = this.tl(key, () => routeClaudeChunkSegments(
                 classification.segments,
                 prefs.toolResults,
                 prefs.thinking,
@@ -4511,7 +4525,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
                 () => t('thinking.live'),
                 (seconds) => t('thinking.thoughtForSeconds', { seconds }),
                 t('toolResults.truncated_footer'),
-              );
+              ));
               stripInput = routed.keptText;
               activityLine = routed.activityLine;
             }

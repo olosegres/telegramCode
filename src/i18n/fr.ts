@@ -156,6 +156,16 @@ export const frDict: Record<string, string> = {
   'status.global_header': '📊 *Tous les fils* ({total}) :',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Aucun fil pour l\'instant.',
+  'language.status':
+    '🌐 Langue : `{current}` ({source})\nTelegram : {telegram}\nDisponibles : {locales}\nUtilisez /language <locale> ou /language auto.',
+  'language.set_success': '✅ Langue définie sur `{locale}` pour ce chat.',
+  'language.auto_success': '✅ Langue réinitialisée en automatique. Actuelle : `{locale}`.',
+  'language.invalid': '⚠️ Locale `{locale}` non prise en charge. Disponibles : {locales}.',
+  'language.telegram_unknown': 'inconnue',
+  'language.source.override': 'réglage du chat',
+  'language.source.telegram': 'profil Telegram',
+  'language.source.storedTelegram': 'dernier profil Telegram vu',
+  'language.source.fallback': 'repli',
 
   'agent.ready': '{label} prêt dans `{subdir}`{argsSuffix}\nEnvoyez un message :',
   'agent.no_session': 'Aucun agent en cours. /claude ou /opencode pour démarrer.',

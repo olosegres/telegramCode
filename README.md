@@ -412,8 +412,13 @@ talk to the bot there.
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
 | `CHAT_MODE` | `both` | Which surface(s) this instance serves: `group`, `dm`, or `both` — see [Two surfaces](#two-surfaces-group-topics-bot-dm-or-both) |
 | `OWNER_USER_ID` | — | Numeric Telegram user id of the owner. **Required** for `CHAT_MODE=dm`; optional for `both` (unset → the DM surface stays inert, group-only) |
-| `BOT_LANG` | `ru` | Bot UI language: `en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`, `ka`. Unknown value warns and falls back to `ru`. English is the canonical fallback for missing keys |
 | `GROQ_API_KEY` | — | Recommended for voice transcription. Without it, voice messages are not transcribed unless you intentionally configure the OpenAI fallback |
+
+Bot UI language is automatic per Telegram chat: explicit `/language <locale>`
+override wins, then the sender's Telegram client language, then the last
+supported Telegram locale seen for that chat, then English.
+Supported locales: `en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`,
+`ka`. Use `/language auto` to return a DM/group to automatic selection.
 
 Agent provider/auth setup is normally done inside the agents themselves:
 `claude login` for Claude CLI and OpenCode's own config/plugins for OpenCode.

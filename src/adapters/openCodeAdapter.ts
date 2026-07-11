@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ThreadLocaleReader, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
 import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
@@ -19,7 +19,7 @@ import {
   updateSessionLineage,
   type BoundSessionRef,
 } from '../openCodeSessionRouting';
-import { t } from '../i18n';
+import { t, runWithLocale, defaultLocale } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { stripThreadContextPreamble } from '../threadContextPreamble';
 import { getOpenQuestionForSession } from '../openCodeOpenQuestion';
@@ -1112,6 +1112,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   /** @description Inject the per-thread display-prefs reader (see the field's JSDoc). */
   setDisplayPrefsReader(reader: DisplayPrefsReader): void {
     this.displayPrefsReader = reader;
+  }
+
+  /** Per-thread locale reader, injected at boot via `createAdapter.registerThreadLocaleReader`. */
+  private threadLocaleReader: ThreadLocaleReader | null = null;
+
+  /** @description Inject the per-thread locale reader (for adapter-side `t(...)` calls). */
+  setThreadLocaleReader(reader: ThreadLocaleReader): void {
+    this.threadLocaleReader = reader;
+  }
+
+  /** @description Run `fn` inside the thread's locale context so `t(...)` resolves correctly. */
+  private tl<T>(key: ThreadKey, fn: () => T): T {
+    return runWithLocale(this.threadLocaleReader?.(key) ?? defaultLocale, fn);
   }
 
   /**
@@ -3377,7 +3390,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         if (!isSubagent) this.maybeEmitToolResult(key, session, part);
         return;
       }
-      statusText = buildDelegatingStatusText(this.getDelegationTitle(state));
+      statusText = this.tl(key, () => buildDelegatingStatusText(this.getDelegationTitle(state)));
     } else {
       switch (state.status) {
         case 'pending':

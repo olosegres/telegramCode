@@ -15,6 +15,9 @@
   sent while OpenCode is busy is queued by `prompt_async` and picked up promptly
   instead of aborting the live turn (which only lost work). Claude keeps its
   Escape-and-wait — its TUI ignores typed input mid-turn.
+- **Bot UI language is resolved per Telegram chat.** A `/language` override wins,
+  otherwise the bot uses Telegram `language_code`, then the last seen chat
+  locale, then English; the old global env language knob is removed.
 
 ## 2.1.0 — 2026-05-13
 

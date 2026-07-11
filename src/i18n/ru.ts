@@ -1,5 +1,5 @@
 /**
- * @description Russian catalog — the default locale, hand-maintained. Not
+ * @description Russian catalog — hand-maintained. Not
  * machine-translated; kept as the reference set the project shipped with.
  */
 
@@ -160,6 +160,16 @@ export const ruDict: Record<string, string> = {
   'status.global_header': '📊 *Все треды* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Тредов пока нет.',
+  'language.status':
+    '🌐 Язык: `{current}` ({source})\nTelegram: {telegram}\nДоступно: {locales}\nИспользуй /language <locale> или /language auto.',
+  'language.set_success': '✅ Язык для этого чата: `{locale}`.',
+  'language.auto_success': '✅ Автовыбор языка включён. Сейчас: `{locale}`.',
+  'language.invalid': '⚠️ Локаль `{locale}` не поддерживается. Доступно: {locales}.',
+  'language.telegram_unknown': 'неизвестно',
+  'language.source.override': 'настройка чата',
+  'language.source.telegram': 'профиль Telegram',
+  'language.source.storedTelegram': 'последний язык Telegram',
+  'language.source.fallback': 'резервный язык',
 
   'agent.ready': '{label} готов в `{subdir}`{argsSuffix}\nОтправь сообщение:',
   'agent.no_session': 'Агент не запущен. /claude или /opencode — старт.',

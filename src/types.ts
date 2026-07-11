@@ -586,6 +586,7 @@ export interface SendInputOptions {
  * - 'output'   (key: ThreadKey, text: string, meta?: OutputEventMeta) — permanent text response
  * - 'status'   (key: ThreadKey, text: string)   — transient status (tool calls, thinking); shown as editable message
  * - 'question' (key: ThreadKey, question: { requestId: string, questions: QuestionInfo[] }) — interactive question for user
+ * - 'questionGone' (key: ThreadKey) — Claude-only; the scraped TUI selector left the screen (answered / dismissed), so the bot removes its pin. Claude has no `pendingQuestions` entry, so it can't lean on the OpenCode `clearPendingQuestion` unpin path; this event is the normal-answer unpin trigger. Hard-teardown paths (stop / quit / unbind / closed / error) still route through `clearPendingQuestion` for BOTH backends.
  * - 'thinking' (key: ThreadKey, payload: ThinkingEvent) — chain-of-thought lifecycle (OpenCode); the bot applies the per-thread thinking {@link DisplayVerbosityMode}
  * - 'toolResult' (key: ThreadKey, payload: ToolResultEvent) — a completed tool call's output (OpenCode); the bot applies the per-thread tool-results {@link DisplayVerbosityMode}
  * - 'subagentStatus' (key: ThreadKey, payload: SubagentStatusEvent) — OpenCode delegation lifecycle for `minimal`/`short` `/subagent` modes; the bot owns a dedicated self-updating status message with a ticking elapsed timer

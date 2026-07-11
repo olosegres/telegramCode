@@ -116,8 +116,8 @@ The bot runs anywhere the agent CLIs run:
 ### 4. Run with Docker
 
 ```bash
-git clone https://github.com/anomalyco/telegramCode
-cd telegramCode/examples
+git clone https://github.com/olosegres/telegramcode
+cd telegramcode/examples
 cp .env.example .env       # edit values
 docker compose up -d
 ```
@@ -133,7 +133,7 @@ just the block you want. The pair is set up so they cannot collide
 Skip Docker entirely and install the bot as a Node binary on the host:
 
 ```bash
-git clone https://github.com/anomalyco/telegramCode && cd telegramCode
+git clone https://github.com/olosegres/telegramcode && cd telegramcode
 yarn install && yarn build
 npm install -g .            # registers the `telegramCode` command
 

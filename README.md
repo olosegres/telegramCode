@@ -1,15 +1,18 @@
 <table border="0">
   <tr>
-    <td><h2>Drive Claude Code / OpenCode from a Telegram forum supergroup</h2>
+    <td><h2>Telegram as a terminal for coding agents — every thread is a tab</h2>
 
-One bot per forum supergroup. Each topic is bound to a subfolder under
-`WORK_ROOT` and runs its own `claude` or `opencode` session — fully isolated.
-Open as many topics as you need; you can even pin two threads to the same
-project for parallel work.
+telegramCode turns Telegram into a terminal for running agentic CLIs. A forum
+supergroup is the terminal window; each topic (thread) is a tab of that
+terminal — bound to a subfolder under `WORK_ROOT` and running its own fully
+isolated **Claude Code** or **OpenCode** session. Open as many tabs as you
+need (even two on the same project for parallel work) and drive the agents
+from your phone or tablet, voice messages included.
 
 ### Features
 
 - **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions
+- **Two chat surfaces** — forum-group topics and/or the owner's bot DM (`CHAT_MODE`), tabs on both
 - **Two AI backends** — Claude Code (tmux+pty) and OpenCode (HTTP+SSE), per-thread
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
 - **MCP hierarchy** — user / group / project / thread, with `${VAR}` env expansion
@@ -21,9 +24,47 @@ project for parallel work.
 </table>
 
 > **Breaking 2.0** — the old "one bot = one private chat = one folder" mode
-> is gone. The bot now requires a Telegram forum supergroup; start
+> is gone. The bot now requires a Telegram forum supergroup for the group
+> surface (`CHAT_MODE=dm` works without one); start
 > `telegramCode` from the parent folder containing your projects and that `$PWD`
 > becomes the work root. See [Migration from 1.x](#migration-from-1x).
+
+## Two surfaces: group topics, bot DM, or both
+
+The bot serves two Telegram surfaces, selected by `CHAT_MODE`
+(`group` | `dm` | `both`, default `both`):
+
+- **Forum supergroup** — every topic is a tab. The most familiar UX: a visible
+  topic list, per-topic names and icons, quick switching between agents. The
+  trade-off is Telegram's group throughput cap (about 20 messages/min per
+  group), so the bot paces and coalesces heavy output streams.
+- **The bot's own DM** (owner only, gated by `OWNER_USER_ID`) — the private
+  chat runs in topic mode too, so you get the same thread-per-agent tabs
+  there, and live output streams through Telegram's native draft "cursor":
+  the reply grows in place in one message instead of arriving as a flood of
+  separate messages.
+
+With `both` (the default) one instance serves the group and the owner DM at
+once; if `OWNER_USER_ID` is not set, the DM surface stays inert and the
+instance is effectively group-only.
+
+## Where to run the bot server
+
+The bot runs anywhere the agent CLIs run:
+
+- **Your own working machine** — the simplest start: launch `telegramCode`
+  from your projects parent folder and your laptop/desktop becomes the
+  backend. The catch: agents are only reachable while the machine is on and
+  awake.
+- **A remote server (cloud VPS/VDS or bare metal)** — the more convenient
+  setup: organize your working environment there once (git + your repos,
+  Claude Code / OpenCode, `telegramCode`) and you get an always-on dev box you
+  drive from any device through Telegram — phone, tablet, voice. When picking
+  one, a bare-metal server without virtualization beats a virtualized VPS/VDS:
+  its NVMe drives are usually much faster, which matters once you also build
+  and run a dev server there, not just the agents. Classic terminal access to
+  the very same Claude sessions stays available over SSH via
+  `telegramCode cli claude` (see [Quick Start §4b](#4b-or-run-as-a-global-cli-telegramcode)).
 
 ## Quick Start
 
@@ -229,9 +270,11 @@ group to grant access; demote/remove them to revoke it — the bot subscribes to
 `chat_member` updates, so an admin change invalidates the cache and takes
 effect immediately (the 1h TTL is only the fallback). The bot must be a group
 admin itself (it already needs that to create topics and pin). Anonymous admins
-can't be matched from their messages, so post non-anonymously.
+can't be matched from their messages, so post non-anonymously. The DM surface
+(when enabled) is gated separately: only the configured `OWNER_USER_ID` may
+talk to the bot there.
 
-> **Security model — group admin ⇒ shell on the host.** The agents run with
+> **Security model — group admin (or the DM owner) ⇒ shell on the host.** The agents run with
 > permission checks disabled (`--dangerously-skip-permissions` for Claude,
 > auto-approve for OpenCode) and `/terminal` opens a raw `$SHELL` in the bound
 > folder, so anyone who can talk to the bot can execute arbitrary commands as
@@ -244,6 +287,8 @@ can't be matched from their messages, so post non-anonymously.
 |---|---|---|
 | `ALLOWED_GROUP_ID` | (auto-pair) | Numeric forum supergroup id (`-100…`). Leave empty to auto-pair with the first forum group a group **admin/creator** contacts the bot from (id is saved to `state.json`; re-point with `/pair`). A **name** is not accepted. A numeric value disables auto-pairing |
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
+| `CHAT_MODE` | `both` | Which surface(s) this instance serves: `group`, `dm`, or `both` — see [Two surfaces](#two-surfaces-group-topics-bot-dm-or-both) |
+| `OWNER_USER_ID` | — | Numeric Telegram user id of the owner. **Required** for `CHAT_MODE=dm`; optional for `both` (unset → the DM surface stays inert, group-only) |
 | `DEFAULT_AGENT` | `claude` | `claude` or `opencode` |
 | `BOT_LANG` | `ru` | `ru` or `en` |
 | `GROQ_API_KEY` | — | Recommended for voice transcription. Without it, voice messages are not transcribed unless you intentionally configure the OpenAI fallback |

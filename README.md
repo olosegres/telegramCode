@@ -13,10 +13,10 @@ from your phone or tablet, voice messages included.
 
 - **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions
 - **Two chat surfaces** — forum-group topics and/or the owner's bot DM (`CHAT_MODE`), tabs on both
-- **Two AI backends** — Claude Code (tmux+pty) and OpenCode (HTTP+SSE), per-thread
+- **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and OpenCode (HTTP+SSE), picked per-thread
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
 - **MCP hierarchy** — user / group / project / thread, with `${VAR}` env expansion
-- **Restart-safe** — `state.json` + tmux re-attach (claude) + SSE re-connect (opencode)
+- **Restart-safe** — `state.json` + tmux re-adopt (claude scrape / terminal), external json-stream process adoption with downtime-tail replay, opencode re-resume + server auto-restart
 - **Two-instance ready** — pet vs work, isolated DATA_DIR, group, port
     </td>
 <td width="280"><img src="./demo.gif" width="320" /></td>
@@ -183,41 +183,49 @@ Telegram forum supergroup
 
 Routing key is `(chatId, threadId)` everywhere. Per-thread state lives in
 `${DATA_DIR}/state.json` (atomic writes with `fsync`, archived on
-corruption). tmux sessions are named `claude-${chatId}-${threadId}` and
-opencode sessions are keyed by the same string — two topics on the same
-folder stay independent.
+corruption). Bot-owned tmux sessions are named per backend —
+`claude-<chatId>-<threadId>` (Claude tmux-scrape), `cjson-…` (the Claude
+json-stream host process), `term-…` (terminal) — see
+`src/utils/tmuxSessionName.ts`; opencode sessions are keyed by the same
+`<chatId>:<threadId>` string. Two topics on the same folder stay independent.
 
 ### Adapter pattern
 
 ```
-Telegram <-> bot.ts <-> AgentAdapter <-> { Claude CLI (tmux+pty), OpenCode (HTTP+SSE) }
-                            │
-                            └── state.ts  (bindings, claudeSessionId, opencodeSessionId,
-                                           messages, MCP per-thread overrides)
+Telegram <-> bot.ts <-> AgentAdapter <-> { Claude CLI (tmux scrape) | Claude CLI (stream-json) |
+                 │           │             OpenCode (HTTP+SSE)      | Terminal ($SHELL in tmux) }
+                 │           └── state.ts  (bindings, claudeSessionId, opencodeSessionId,
+                 │                          messages, MCP per-thread overrides)
+                 └── OutputTransport (src/output/) — how output reaches each surface,
+                     picked once at boot by CHAT_MODE: group edit-in-place stream
+                     vs the owner-DM native draft "cursor"
 ```
 
 Each adapter implements `AgentAdapter` from `src/types.ts`:
-- `startSession(key, workDir, args?)` / `stopSession(key)` / `resumeSession(key, workDir, sessionId)`
+- `startSession(key, workDir, args?, sessionId?)` / `stopSession(key)` / `resumeSession(key, workDir, sessionId, options?)`
 - `sendInput(key, text)` / `sendSignal(key, signal)`
-- events: `output`, `status`, `question`, `closed`, `started`, `stopped`, `error`
-  (all emit `ThreadKey` first)
+- events: `output`, `status`, `question`, `questionGone`, `thinking`,
+  `toolResult`, `subagentStatus`, `apiError`, `started`, `stopped`, `closed`,
+  `error` (all emit `ThreadKey` first)
 
 ## Commands
 
-### In any topic (after `/bind`)
+### In any topic
+
+Most commands work in any topic; a binding (`/bind`) is required only to
+actually start an agent or terminal in the folder.
 
 | Command | Description |
 |---|---|
 | `/claude`, `/opencode`, `/oc` | Start agent in this topic's bound folder |
-| `/agent` | Pick agent inline |
 | `/model` | Switch model |
 | `/effort` | Set reasoning effort (per-thread) via inline buttons. Claude: native `/effort` levels (`low…ultracode`). OpenCode: the current model's variants, applied per-prompt. No env configuration |
 | `/verbosity` | Output-verbosity macro (`minimal\|short\|full`): sets the thinking, tool-results and sub-agent display prefs at once; `/thinking`, `/tool_results`, `/subagent` point-override afterwards. Mixed prefs show as "custom" in the picker |
 | `/sessions` | List & resume previous sessions in this folder |
-| `/quit`, `/q` | End the session — Claude: graceful double Ctrl+C; OpenCode/terminal: `stopSession` |
+| `/quit`, `/q` | End the session — Claude: graceful double Ctrl+C; OpenCode/terminal: `stopSession`. Releases the persisted session id, so a bot restart won't auto-reattach it (resume later via `/sessions`) |
 | `/new`, `/clear_session` | End the current session and start a fresh one (same adapter) |
 | `/status` | This thread's status |
-| `/output` | Last 500 lines of agent output |
+| `/output` | Last 500 lines of agent output (sent as at most 5 chunks; the overflow is reported as omitted) |
 | `/c`, `/y`, `/n` | Ctrl+C / "y" / "n" |
 | `/enter`, `/up`, `/down`, `/tab` | tmux key passthrough |
 | `/clear_messages` | Delete bot messages in this topic (up to 48h, Telegram limit) |
@@ -225,19 +233,24 @@ Each adapter implements `AgentAdapter` from `src/types.ts`:
 | `/bind` | Bare: current binding + folder picker, with «leave current dir» (the old `/unbind`) and «create new folder» buttons |
 | `/mcp` | List MCP servers active for this thread |
 
-### In the General topic
+### Info / ops (work anywhere)
 
 | Command | Description |
 |---|---|
 | `/help` | Context-aware help |
 | `/ls` | List subdirs under `WORK_ROOT` |
 | `/list` | List existing topics and their bindings |
-| `/quit-all`, `/quitall` | End every active agent in every bound topic |
-| `/status` | Global view of all topics + active agents |
+| `/status` | This thread's status; in General — a global view of all topics + active agents |
 | `/doctor` | Self-diagnose: admin rights, privacy mode, paths, CLIs |
 | `/version` | Versions: bot, claude, opencode, node, tmux |
 | `/whoami` | Show userId, chatId, threadId, isAllowed, binding |
-| `/pair` | Bind this forum supergroup to the bot (re-point auto-pairing) |
+| `/pair` | Bind this forum supergroup to the bot (re-point auto-pairing) — works from any topic of the target group; a numeric `ALLOWED_GROUP_ID` env locks pairing |
+
+### General-only
+
+| Command | Description |
+|---|---|
+| `/quit-all`, `/quitall` | End every active agent in every bound topic (also releases their session ids) |
 
 ### Natural language
 
@@ -350,12 +363,12 @@ Example `${DATA_DIR}/mcp.json`:
 ```
 
 Inspect what's actually active in a thread with `/mcp`. Adding/removing
-servers in MVP is by editing JSON directly (or `claude mcp add` for the
-user layer); UI commands are planned for Phase 9.
+servers by bot command is not yet supported — edit the JSON directly
+(or use `claude mcp add` for the user layer).
 
 > **OpenCode MCP** is currently configured at the opencode-server level
 > only — one fleet per instance, no per-thread override. Per-thread MCP
-> for opencode is on the Phase 9 roadmap.
+> for opencode is planned but not yet supported.
 
 ## Two instances on one host
 
@@ -408,19 +421,39 @@ entry:
 
 ## Restart behaviour
 
-On boot the bot:
+Bot restarts are designed to be invisible: agents run in external
+processes (`tmux`, `opencode serve`), so the bot re-adopts them instead
+of killing them. On boot the bot:
 
 1. Loads `state.json` (archives to `state.json.corrupted-<ts>` if parse
-   fails, then starts fresh and notifies in General).
-2. Walks `tmux ls`, finds sessions named `claude-<chatId>-<threadId>`,
-   and re-attaches the ones still in `state.json`. Orphan tmux sessions
-   are killed.
-3. For each thread with a stored `opencodeSessionId`, re-opens the SSE
-   stream via `resumeSession(...)` so opencode threads survive the restart
-   as well.
-4. Posts a "bot restarted, session is still alive, continuing" notice
-   in each re-attached topic (see `i18n.ts → agent.reattached`).
+   fails, then starts fresh and notifies in General) and classifies the
+   boot as a hot reload vs cold start from the persisted heartbeat gap.
+2. Re-adopts live sessions per backend:
+   - **Claude tmux-scrape** (`claude-…`) and **terminal** (`term-…`)
+     sessions still in `state.json` are re-attached; orphan bot-owned
+     tmux sessions are killed. The current pane seeds the baseline, so
+     nothing is re-flooded into the topic.
+   - **Claude json-stream** (`cjson-…`) runs as an external process
+     (stdin held on a FIFO, stdout appended to a file), so the restart
+     never kills it: the bot adopts it and replays the downtime tail
+     from the persisted offset — an in-flight turn is delivered
+     end-to-end, and a pending interactive question is restored from its
+     on-disk sidecar.
+   - **OpenCode** threads re-resume their stored session ids over the
+     shared SSE stream. `opencode serve` itself is reconciled: a dead
+     server is auto-restarted and the sessions restored (the in-flight
+     reply is lost); a live server running an outdated binary is killed
+     and respawned on the current one.
+3. Re-arms pending API-error retries and scheduler timers; a run missed
+   during the downtime fires one catch-up annotated with the missed time.
+4. Stays silent on a quiet hot reload; a bounded recap of missed output
+   is posted only when the agent kept working while the bot was down.
 5. Schedules `setMyCommands` so the Telegram client picks up the menu.
+
+Explicit `/quit`, `/quit-all`, and leaving a folder (the `/bind` «leave
+current dir» button) release the persisted session ids — those sessions
+are not auto-reattached on the next boot (they stay reachable via
+`/sessions`).
 
 Closed-but-not-deleted topics keep their binding; only `400: message
 thread not found` from a send triggers binding cleanup. Closed topics
@@ -451,7 +484,7 @@ Verify with `/doctor` — the privacy line should report it as disabled.
 symlink pointing outside `WORK_ROOT`). Run `/ls` to see what's available,
 or fix the host path. Path-traversal attempts (`../`, absolute paths,
 NUL bytes, NFC-vs-NFD mismatches) are rejected by design — see
-`validateSubdir` in `src/bot.ts`.
+`validateSubdir` in `src/validation.ts`.
 
 ### "Missing right" / `/clear_messages` does nothing
 
@@ -484,29 +517,40 @@ different port for the second instance (e.g. `4097`).
 
 ```bash
 yarn install
-yarn dev          # tsx watch
+yarn dev          # tsx watch (fast dev — TS errors crash the process)
 yarn typecheck    # strict tsc --noEmit
+yarn build        # tsc → dist/
+yarn test         # unit/integration (node test runner + tsx); build first —
+                  # some tests exercise the built dist/cli.js
+yarn hot          # hot-reload mode: tsc -w + nodemon on dist/ (also
+                  # `telegramCode hot` from anywhere) — a broken edit can't
+                  # take the bot down, agents survive the reload
 ```
 
-The Docker dev loop:
+The Docker dev loop (never `docker compose restart` — it ignores
+`depends_on`):
 
 ```bash
-docker compose restart telegramcode-pet     # pick up code changes
+docker compose down telegramcode-pet && docker compose up -d telegramcode-pet
 docker compose logs -f telegramcode-pet     # tail logs
 ```
 
 Key files:
 
-- `src/bot.ts` — Telegraf entry, commands, message handling
+- `src/bot.ts` — Telegraf entry, commands, message handling, output streaming
 - `src/state.ts` — JSON state, atomic writes, per-key async lock
-- `src/types.ts` — `ThreadKey`, `AgentAdapter`
-- `src/adapters/claudeCliAdapter.ts` — tmux + pty, session re-attach
-- `src/adapters/openCodeAdapter.ts` — HTTP + SSE
+- `src/types.ts` — `ThreadKey`, `AgentAdapter`, `OutputTransport`
+- `src/adapters/claudeCliAdapter.ts` — Claude via tmux scrape (keystrokes in, capture-pane out)
+- `src/adapters/claudeJsonStreamAdapter.ts` — Claude via stream-json (external tmux-hosted process, survives bot restarts)
+- `src/adapters/openCodeAdapter.ts` — OpenCode via HTTP + SSE
+- `src/adapters/terminalAdapter.ts` — raw `$SHELL` in tmux
+- `src/output/` — output transports: group edit-in-place vs the owner-DM draft cursor
+- `src/scheduler/` — scheduled prompts + the bot-owned MCP server (`schedule_*`, `send_file`)
+- `src/accessControl.ts` — group-admin access (live `getChatAdministrators` cache)
+- `src/validation.ts` — `/bind` input validation (path-traversal/symlink-safe)
 - `src/mcpConfig.ts` — `${VAR}` expansion, tmp-file plumbing
-- `src/rateLimiter.ts` — token-bucket per chat
+- `src/rateLimiter.ts` — `GlobalSendPacer` (process-wide 1-send-per-2s gate) + per-user limits
 - `src/i18n.ts` — `t()` / `errorMessage()` (ru/en)
-- `agent/tasks/actual/2026-05-11-multi-thread-routing.md` — the plan
-  that this README is the docs face of
 
 ## Migration from 1.x
 
@@ -526,7 +570,8 @@ There is no in-place upgrade; the steps are:
 Release notes:
 
 - Routing key is `(chatId, threadId)`, persisted in `state.json`.
-- tmux sessions renamed `claude-${chatId}-${threadId}`.
+- tmux sessions renamed `claude-${chatId}-${threadId}` (the tmux-scrape
+  backend; the json-stream host uses the `cjson-` prefix, terminal `term-`).
 - `claude --session-id <uuid>` is hardcoded — no more interactive picker.
 - `--dangerously-skip-permissions` is hardcoded (symmetry with
   opencode's auto-approve).

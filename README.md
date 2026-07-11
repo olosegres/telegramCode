@@ -11,12 +11,17 @@ from your phone or tablet, voice messages included.
 
 ### Features
 
-- **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions
+- **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions; two topics can share one folder for parallel work
 - **Two chat surfaces** — forum-group topics and/or the owner's bot DM (`CHAT_MODE`), tabs on both
 - **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and OpenCode (HTTP+SSE), picked per-thread
+- **Restart-surviving sessions** — agents run in external processes; a bot restart re-adopts them, and the json-stream backend even replays the output produced while the bot was down
+- **Scheduled prompts** — `/schedule` cron / one-shot / N-times per topic; the agent schedules itself via injected MCP tools
+- **File intake** — photos / documents / video / audio sent to a topic are saved and announced to the agent; albums arrive as one prompt
+- **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
-- **MCP hierarchy** — user / group / project / thread, with `${VAR}` env expansion
-- **Restart-safe** — `state.json` + tmux re-adopt (claude scrape / terminal), external json-stream process adoption with downtime-tail replay, opencode re-resume + server auto-restart
+- **Display verbosity** — `/verbosity` (plus `/thinking`, `/tool_results`, `/subagent`) per topic: `minimal|short|full`
+- **MCP hierarchy** — user / group / project / thread, with `${VAR}` env expansion, plus bot-injected scheduling/file tools
+- **Observability** — always-on output trace (`/trace`), console log buckets, `/timestamps`
 - **Two-instance ready** — pet vs work, isolated DATA_DIR, group, port
     </td>
 <td width="280"><img src="./demo.gif" width="320" /></td>
@@ -218,18 +223,28 @@ actually start an agent or terminal in the folder.
 | Command | Description |
 |---|---|
 | `/claude`, `/opencode`, `/oc` | Start agent in this topic's bound folder |
+| `/terminal` | Open a raw `$SHELL` in the bound folder — see [Raw terminal](#raw-terminal-terminal) |
+| `/claude_mode` | Switch this topic's Claude backend (tmux-scrape ⇄ json-stream); bare shows a picker — see [Claude Code backends](#claude-code-backends-claude_mode) |
 | `/model` | Switch model |
+| `/connect` | Connect an OpenCode provider API key (bare `/connect` arms a paste mode; the message carrying the key is deleted) |
 | `/effort` | Set reasoning effort (per-thread) via inline buttons. Claude: native `/effort` levels (`low…ultracode`). OpenCode: the current model's variants, applied per-prompt. No env configuration |
 | `/verbosity` | Output-verbosity macro (`minimal\|short\|full`): sets the thinking, tool-results and sub-agent display prefs at once; `/thinking`, `/tool_results`, `/subagent` point-override afterwards. Mixed prefs show as "custom" in the picker |
+| `/thinking` | Chain-of-thought display: `full` keeps the reasoning, `short` collapses to "💭 thought for Ns", `minimal` keeps only the live working cue |
+| `/tool_results` | Completed tool-call output: `full` whole body, `short` capped (15 lines / 1200 chars), `minimal` transient 🔧 status only |
+| `/subagent` | Sub-agent transcript: status-only with a ticking elapsed counter (`minimal`/`short`), or streamed "🤖 ⤷" chunks (`full`) |
 | `/sessions` | List & resume previous sessions in this folder |
+| `/rename_session` | Rename the current live session (OpenCode; Claude transcripts have no title) |
 | `/quit`, `/q` | End the session — Claude: graceful double Ctrl+C; OpenCode/terminal: `stopSession`. Releases the persisted session id, so a bot restart won't auto-reattach it (resume later via `/sessions`) |
 | `/new`, `/clear_session` | End the current session and start a fresh one (same adapter) |
 | `/status` | This thread's status |
 | `/output` | Last 500 lines of agent output (sent as at most 5 chunks; the overflow is reported as omitted) |
 | `/c`, `/y`, `/n` | Ctrl+C / "y" / "n" |
 | `/enter`, `/up`, `/down`, `/tab` | tmux key passthrough |
+| `/esc`, `/escape` | Send a raw Escape — interrupt the current turn / dismiss a selector |
+| `/schedule` | Schedule a prompt in free text — the agent parses the time and owns the job; see [Scheduler](#scheduler-schedule) |
 | `/clear_messages` | Delete bot messages in this topic (up to 48h, Telegram limit) |
-| `/clear` | Forwarded to the agent (Claude wipes context; OpenCode plain text) — not a bot command anymore |
+| `/clear` | Forwarded to the agent (Claude wipes context; OpenCode plain text) — not a bot command anymore. Also purges the topic's file-intake dir |
+| `/compact` | Forwarded verbatim to the agent (Claude compacts its context) — not bot-owned |
 | `/bind` | Bare: current binding + folder picker, with «leave current dir» (the old `/unbind`) and «create new folder» buttons |
 | `/mcp` | List MCP servers active for this thread |
 
@@ -237,6 +252,7 @@ actually start an agent or terminal in the folder.
 
 | Command | Description |
 |---|---|
+| `/start` | Intro: work root + available agents |
 | `/help` | Context-aware help |
 | `/ls` | List subdirs under `WORK_ROOT` |
 | `/list` | List existing topics and their bindings |
@@ -244,6 +260,8 @@ actually start an agent or terminal in the folder.
 | `/doctor` | Self-diagnose: admin rights, privacy mode, paths, CLIs |
 | `/version` | Versions: bot, claude, opencode, node, tmux |
 | `/whoami` | Show userId, chatId, threadId, isAllowed, binding |
+| `/trace` | Output-trace recorder (`on`/`off`, `on all`/`off all`; bare = status) — see [Observability](#observability) |
+| `/timestamps` | Prepend the send time to prompts forwarded to the agent (`on`/`off`; bare = status) |
 | `/pair` | Bind this forum supergroup to the bot (re-point auto-pairing) — works from any topic of the target group; a numeric `ALLOWED_GROUP_ID` env locks pairing |
 
 ### General-only
@@ -260,6 +278,94 @@ In a bound topic you can also type:
 
 Voice messages are transcribed via Groq Whisper (free) or OpenAI Whisper
 (fallback) and follow the same routing.
+
+`/terminal` is never started from a natural-language phrase — only the
+explicit command opens a shell.
+
+## Claude Code backends (`/claude_mode`)
+
+"Claude Code" in a topic is one user-facing choice with two interchangeable
+backends:
+
+- **tmux-scrape** (`/claude_mode tmux`) — the classic TUI driven by
+  keystrokes inside tmux; output is scraped from the pane. The current
+  **default**.
+- **json-stream** (`/claude_mode json`) — `claude -p` in stream-json mode as
+  an external tmux-hosted process emitting structured events. Cleaner
+  output, and it survives bot restarts (the bot re-adopts the process and
+  replays what was produced during the downtime). Limitation for now: it
+  cannot host the interactive `/login` flow — switch the topic to
+  tmux-scrape via `/claude_mode` to log in. That is why tmux-scrape is
+  temporarily the default.
+
+Both backends drive the same `claude` CLI against the same on-disk
+transcript, so `/claude_mode` switches a live topic seamlessly — the
+conversation resumes on the other backend. The pick persists per topic
+(▶️ Claude and `/claude` reopen it). Billing note: the json-stream backend
+strips `ANTHROPIC_API_KEY` from the agent's env, so usage bills to your
+Claude subscription rather than an API key.
+
+## Scheduler (`/schedule`)
+
+A topic can have scheduled prompts: at fire time the bot posts the prompt
+into the topic, pins the announcement (pins accumulate as run history),
+waits for a busy agent to go idle (up to 10 min, rather than interrupting
+live work) and delivers it — reusing the active session or starting one
+with the thread's last-used backend.
+
+- `/schedule <free text>` is a thin wrapper — the bot owns no date parsing.
+  The agent interviews you (bare `/schedule`) or parses "every day at 9" /
+  "tomorrow 15:00" itself, then calls the bot-injected `schedule_create` /
+  `schedule_list` / `schedule_cancel` MCP tools (cron, one-shot, or
+  N-times; min interval 5 min; up to 30 jobs per topic).
+- Restart-safe: timers re-arm at boot; a run missed during downtime fires
+  one catch-up annotated with the missed time.
+- Leaving a folder pauses the topic's jobs; `/bind` resumes them (an
+  expired one-shot is dropped). Run history:
+  `DATA_DIR/scheduler-runs.jsonl`.
+
+## Raw terminal (`/terminal`)
+
+`/terminal` binds the topic to a real interactive `$SHELL` (in tmux) in the
+bound folder — a third backend alongside the agents, mutually exclusive
+with them. Every plain message is typed in as a command; output streams
+back as one rolling message per command. Raw keys reuse the TUI commands:
+`/c` (Ctrl-C), `/up` `/down` (history), `/tab` (completion), `/enter`.
+Restart-safe like the agents: the shell survives a bot restart and is
+re-adopted. Known v1 limitation: full-screen TUIs (vim, htop, less) render
+messy; normal commands, builds, and logs stream cleanly. The shell comes
+from the `SHELL` env (fallback `/bin/bash`).
+
+## File intake
+
+Send a file to a bound topic with an active agent and the bot hands it to
+the agent:
+
+- Six kinds: photo, document (incl. PDF), video, video note, audio,
+  animation. Voice is **not** intake — it stays on the transcription path.
+- The file is downloaded to `DATA_DIR/files/<chatId>_<threadId>/`
+  (bot-owned, never inside your project folder) and announced to the agent
+  as `[Telegram file] … saved to: <path>` plus your caption.
+- A media album (several files sent as one message) is batched into ONE
+  combined `[Telegram album]` prompt instead of N separate ones.
+- Limits and cleanup: 20 MB per file (Telegram Bot API cap); forwarding a
+  bare `/clear` purges the topic's intake dir (the agent's context is gone,
+  so the files are useless); files older than 30 days are swept daily.
+
+## Observability
+
+- **Output trace** — ON by default for every thread: each incoming update,
+  adapter emit, and outgoing Bot API call (with outcome, incl. 429 details)
+  is recorded into hourly buckets `DATA_DIR/output-trace-*.jsonl` (pruned
+  after 6h). `/trace off all` turns it off durably; bare `/trace` reports
+  status. This is the source of truth when debugging "a message never
+  reached the topic".
+- **Console tee** — the bot's stdout/stderr is mirrored to
+  `DATA_DIR/bot-console-*.log` (same hourly buckets, same 6h prune), so
+  boot logs stay readable post-incident without the operator's terminal.
+- **`/timestamps on`** — prepends each forwarded prompt's send time
+  (local-offset ISO) so a days-long session knows what "yesterday" means.
+  Agent-facing only, default off, persisted per topic.
 
 ## Environment Variables
 
@@ -319,7 +425,8 @@ before launch if your chosen providers need them.
 | `OPENCODE_BIN` | (auto) | The `opencode` binary is not on PATH or you use a fork |
 | `CLAUDE_BIN` | (auto) | The `claude` binary is not on PATH due to nvm/asdf/systemd PATH differences |
 | `OPENAI_API_KEY` | — | You intentionally use OpenAI Whisper as the voice fallback instead of Groq |
-| `ANTHROPIC_API_KEY` | — | A custom MCP/OpenCode plugin/auth resolver explicitly reads it; not needed for normal Claude CLI auth |
+| `ANTHROPIC_API_KEY` | — | A custom MCP/OpenCode plugin/auth resolver explicitly reads it; not needed for normal Claude CLI auth. The json-stream Claude backend strips it from the agent's env (subscription billing) |
+| `SHELL` | `/bin/bash` | You want `/terminal` to open a different shell than your login shell (host env var, not set by the bot) |
 | `SCHEDULER_MCP_PORT` | `4097` | The default collides with another local port, including this instance's `OPENCODE_URL` port |
 | `CLAUDE_SCRAPE_DEBUG` | off | You are debugging Claude tmux scraping and need full RAW/FILTERED chunks |
 
@@ -369,6 +476,24 @@ servers by bot command is not yet supported — edit the JSON directly
 > **OpenCode MCP** is currently configured at the opencode-server level
 > only — one fleet per instance, no per-thread override. Per-thread MCP
 > for opencode is planned but not yet supported.
+
+### Bot-injected agent tools
+
+Separately from the user-editable hierarchy above, the bot injects its own
+`telegramBot` MCP server into every bot-started session — for Claude via a
+generated `--mcp-config`, for OpenCode via runtime registration. It is
+loopback-only (`127.0.0.1`, port `SCHEDULER_MCP_PORT`, default `4097` —
+that is all this env var is) and authenticated with per-session HMAC bearer
+tokens scoped to the thread / directory. It exposes:
+
+- `schedule_create` / `schedule_list` / `schedule_cancel` — the agent-side
+  scheduling API behind `/schedule`;
+- `send_file` — lets the agent push a file or image from the bound folder
+  into the topic (photo/animation/document, albums, size caps).
+
+This server is bot-owned plumbing: it is not part of the user-editable
+hierarchy and never touches your `mcp.json` files. If its port fails to
+bind, the bot still boots — only these agent-facing tools go inert.
 
 ## Two instances on one host
 

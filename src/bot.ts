@@ -305,7 +305,6 @@ function parseEnv() {
     isDmSurfaceInert,
     allowedGroupId,
     workRoot,
-    defaultAgent: process.env.DEFAULT_AGENT || 'claude',
     openaiApiKey: process.env.OPENAI_API_KEY,
     groqApiKey: process.env.GROQ_API_KEY,
   };
@@ -4917,11 +4916,11 @@ async function applyClaudeBackendSwitch(key: ThreadKey, target: string): Promise
 command('claude_mode', async (ctx, key) => {
   if (checkIsGeneral(key)) { await replyToThread(key, t('error.start_in_general')); return; }
 
-  // Gate on the thread adapter name (a `DEFAULT_AGENT` fallback included) but
-  // compare/✓ against the EFFECTIVE Claude backend — the same resolution the
-  // start path uses. See `getClaudeModeAction` for the live bug this split
-  // resolution fixes (a fresh thread under DEFAULT_AGENT=claude no-oped the
-  // first `/claude_mode tmux`).
+  // Gate on the thread adapter name (the default-adapter fallback included)
+  // but compare/✓ against the EFFECTIVE Claude backend — the same resolution
+  // the start path uses. See `getClaudeModeAction` for the live bug this split
+  // resolution fixes (a fresh thread under a legacy env-forced 'claude'
+  // default no-oped the first `/claude_mode tmux`).
   const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   const action = getClaudeModeAction({
     threadAdapterName: getThreadAdapterName(key),
@@ -6985,7 +6984,7 @@ bot.action(/^ccmode_(.+)$/, async (ctx) => {
   const target = ctx.match[1];
   if (!checkIsClaudeBackend(target)) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   // Compare against the EFFECTIVE backend (what /claude would start), same as
-  // the command handler — the raw thread name may be a legacy DEFAULT_AGENT
+  // the command handler — the raw thread name may be a legacy default-adapter
   // fallback that never matches what a start would actually open.
   const current = resolveClaudeBackendName(key);
   if (target === current) { await ctx.answerCbQuery(t('cb.claudeMode_already')); return; }
@@ -8674,7 +8673,7 @@ async function reattachExistingSessions(
 ): Promise<void> {
   // 0. Rehydrate per-thread adapter choice from state.agents into the
   //    in-memory `threadAdapterNames` map. Without this, every thread
-  //    reverts to DEFAULT_AGENT after a restart, so `getThreadAdapter(key)`
+  //    reverts to the default adapter after a restart, so `getThreadAdapter(key)`
   //    would return the wrong adapter even though the *actual* tmux /
   //    opencode session was correctly adopted below. (Review CRITICAL #3.)
   let rehydrated = 0;

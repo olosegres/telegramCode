@@ -20,8 +20,7 @@ import type { ThreadKey } from '../types';
 
 const key = (threadId: number): ThreadKey => ({ chatId: -100, threadId });
 
-test('default adapter is json-stream Claude (DEFAULT_AGENT unset)', () => {
-  delete process.env.DEFAULT_AGENT;
+test('default adapter is json-stream Claude', () => {
   assert.equal(getDefaultAdapterName(), claudeJsonStreamAdapterName);
 });
 
@@ -56,9 +55,9 @@ test('resolveClaudeBackendName: a non-Claude pick falls to the json-stream defau
 
 // ── /claude_mode decision (live bug 2026-07-06, topic 9085) ─────────────────
 //
-// With DEFAULT_AGENT=claude in the operator env, a NO-pick thread's
-// threadAdapterName is 'claude' (the legacy fallback) while the EFFECTIVE
-// Claude backend (what `/claude` would start) is json-stream. The old handler
+// Under the retired env-forced 'claude' default, a NO-pick thread's
+// threadAdapterName was 'claude' (the legacy fallback) while the EFFECTIVE
+// Claude backend (what `/claude` would start) was json-stream. The old handler
 // compared the requested backend against threadAdapterName, so the first
 // `/claude_mode tmux` replied "already tmux-scrape" without persisting.
 
@@ -73,9 +72,9 @@ test('parseClaudeBackendArg: json aliases → json-stream, tmux aliases → clau
   assert.equal(parseClaudeBackendArg('bogus'), null);
 });
 
-test('getClaudeModeAction: fresh thread under DEFAULT_AGENT=claude + tmux request → SWITCH (the bug)', () => {
+test('getClaudeModeAction: legacy-fallback thread name + tmux request → SWITCH (the bug)', () => {
   const action = getClaudeModeAction({
-    threadAdapterName: 'claude', // no pick; legacy DEFAULT_AGENT fallback
+    threadAdapterName: 'claude', // no pick; legacy env-forced fallback
     effectiveBackendName: claudeJsonStreamAdapterName, // what /claude would start
     requestedBackendName: 'claude',
   });
@@ -115,8 +114,8 @@ test('getClaudeModeAction: opencode/terminal topics are gated to notClaude', () 
 });
 
 test('getClaudeModeAction: bare command → picker with the EFFECTIVE backend as current (✓ target)', () => {
-  // Fresh thread under DEFAULT_AGENT=claude: the picker's ✓ must sit on
-  // json-stream (what /claude would open), not on the legacy fallback name.
+  // Legacy-fallback thread name: the picker's ✓ must sit on json-stream
+  // (what /claude would open), not on the legacy fallback name.
   const action = getClaudeModeAction({
     threadAdapterName: 'claude',
     effectiveBackendName: claudeJsonStreamAdapterName,

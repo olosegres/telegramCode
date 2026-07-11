@@ -69,8 +69,11 @@ services:
       - WORK_ROOT=/workspace
       - DATA_DIR=/data
       # ── optional ──
-      - DEFAULT_AGENT=${DEFAULT_AGENT:-claude}
       - BOT_LANG=${BOT_LANG:-ru}
+      # Surfaces: group | dm | both (default). OWNER_USER_ID enables the
+      # owner-DM surface in `both`; required for `dm`.
+      # - CHAT_MODE=both
+      # - OWNER_USER_ID=${OWNER_USER_ID}
       # OpenCode server port — DIFFERENT from work instance (plan §13.8).
       - OPENCODE_URL=http://localhost:4096
       # Scheduler MCP must not share the OpenCode port inside this container.
@@ -120,8 +123,11 @@ services:
       - ALLOWED_GROUP_ID=${ALLOWED_GROUP_ID_WORK}
       - WORK_ROOT=/workspace
       - DATA_DIR=/data
-      - DEFAULT_AGENT=${DEFAULT_AGENT:-claude}
       - BOT_LANG=${BOT_LANG:-ru}
+      # Surfaces: group | dm | both (default). OWNER_USER_ID enables the
+      # owner-DM surface in `both`; required for `dm`.
+      # - CHAT_MODE=both
+      # - OWNER_USER_ID=${OWNER_USER_ID}
       # DIFFERENT port from pet — otherwise both instances try to bind 4096
       # and share an opencode-server (plan §13.8).
       - OPENCODE_URL=http://localhost:4097

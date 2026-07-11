@@ -236,9 +236,13 @@ export function getAvailableAdapters(): Array<{ name: string; label: string }> {
     });
 }
 
+/**
+ * @description The adapter a thread with no explicit pick gets: Claude Code
+ * (the json-stream backend). Hardcoded — the old env-driven default override
+ * is retired; the only persisted agent choice is per-thread (welcome buttons /
+ * commands / `/claude_mode`).
+ */
 export function getDefaultAdapterName(): string {
-  const env = process.env.DEFAULT_AGENT;
-  if (env && adapterFactories[env]) return env;
   return claudeJsonStreamAdapterName;
 }
 
@@ -291,7 +295,7 @@ export type ClaudeModeAction =
  * picker. The load-bearing subtlety is that the GATE and the COMPARE use two
  * DIFFERENT resolutions:
  *
- *  - `threadAdapterName` (in-memory pick ?? `DEFAULT_AGENT` fallback) answers
+ *  - `threadAdapterName` (in-memory pick ?? default-adapter fallback) answers
  *    "is this a Claude topic at all?" — an opencode/terminal topic gets the
  *    not-Claude hint.
  *  - `effectiveBackendName` ({@link resolveClaudeBackendName}: raw pick if a
@@ -300,12 +304,14 @@ export type ClaudeModeAction =
  *    path uses, so the "already" answer and the picker's ✓ can never disagree
  *    with what `/claude` would really do.
  *
- * The live bug this fixes (2026-07-06, topic 9085): with `DEFAULT_AGENT=claude`
- * in the operator env, a NO-pick thread had `threadAdapterName === 'claude'`,
- * so `/claude_mode tmux` compared against that legacy fallback and replied
- * "already tmux-scrape" WITHOUT persisting — while `/claude` then resolved the
- * effective default and started json-stream. Comparing against the EFFECTIVE
- * backend makes the first `tmux` switch on a fresh thread persist + switch.
+ * The live bug this fixes (2026-07-06, topic 9085): a legacy env override
+ * forced the thread default to `'claude'`, so a NO-pick thread had
+ * `threadAdapterName === 'claude'` and `/claude_mode tmux` compared against
+ * that fallback and replied "already tmux-scrape" WITHOUT persisting — while
+ * `/claude` then resolved the effective default and started json-stream.
+ * Comparing against the EFFECTIVE backend makes the first `tmux` switch on a
+ * fresh thread persist + switch. (That env override is retired; the split
+ * resolution stays as the general guarantee.)
  */
 export function getClaudeModeAction(input: {
   threadAdapterName: string;
@@ -328,7 +334,7 @@ export function getClaudeModeAction(input: {
  * Replaces the old `getUserAdapter(userId)` — see plan §10.4. The bot picks
  * an adapter per-thread (e.g. one thread runs Claude, the next OpenCode in
  * the same folder). If no choice has been made for this thread, falls back
- * to `DEFAULT_AGENT`.
+ * to the default ({@link getDefaultAdapterName}).
  */
 export function getThreadAdapter(key: ThreadKey): AgentAdapter {
   return getAdapter(getThreadAdapterName(key));
@@ -343,7 +349,7 @@ export function getThreadAdapterName(key: ThreadKey): string {
 /**
  * @description The thread's EXPLICIT in-memory adapter pick, or `undefined`
  * when none was made this run. Unlike {@link getThreadAdapterName} this does
- * NOT fold in the `DEFAULT_AGENT` fallback, so a caller building a longer
+ * NOT fold in the default-adapter fallback, so a caller building a longer
  * resolution chain (e.g. in-memory → persisted → snapshot → default) can tell
  * "no pick yet" apart from "picked the default".
  */

@@ -9,11 +9,16 @@ isolated **Claude Code** or **OpenCode** session. Open as many tabs as you
 need (even two on the same project for parallel work) and drive the agents
 from your phone or tablet, voice messages included.
 
+Think **OpenClaw for vibe coding**, driven entirely from Telegram: no complex
+setup, no extra dashboards — direct access to your own **OpenCode** /
+**Claude Code** running on your machine or server.
+
 ### Features
 
 - **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions; two topics can share one folder for parallel work
 - **Two chat surfaces** — forum-group topics and/or the owner's bot DM (`CHAT_MODE`), tabs on both
-- **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and OpenCode (HTTP+SSE), picked per-thread
+- **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and first-class OpenCode (native server API over HTTP+SSE: sessions, models, reasoning effort, interactive questions), picked per-thread
+- **Smart question alerts** — when the agent asks something, the bot pins the question message: a pin pierces muted topics, so you get exactly one notification per question (unpinned once answered)
 - **Restart-surviving sessions** — agents run in external processes; a bot restart re-adopts them, and the json-stream backend even replays the output produced while the bot was down
 - **Scheduled prompts** — `/schedule` cron / one-shot / N-times per topic; the agent schedules itself via injected MCP tools
 - **File intake** — photos / documents / video / audio sent to a topic are saved and announced to the agent; albums arrive as one prompt

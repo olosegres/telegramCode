@@ -13,7 +13,9 @@ import * as assert from 'node:assert/strict';
 // is, in practice, because tests are run fresh per file.
 process.env.BOT_LANG = 'ru';
 
-import { t, checkKeyInAllLangs, getKeyInLang } from '../i18n';
+import { t, checkKeyInAllLangs, getKeyInLang, localeCodes } from '../i18n';
+import type { Locale } from '../i18n';
+import { enDict } from '../i18n/en';
 
 test('t substitutes single {name} placeholder', () => {
   // Use any known key that takes a placeholder. `cb.binding_to` was
@@ -293,7 +295,7 @@ test('thinking.live is the static ••• indicator in every locale (locked de
   // Plan 2026-06-27: the live working cue is the STATIC three-bullet glyph —
   // no animation, no "thinking"/"думаю" word, identical across locales. The
   // native Telegram typing action stays the animated cue.
-  for (const lang of ['ru', 'en']) {
+  for (const lang of localeCodes) {
     assert.equal(getKeyInLang(lang, 'thinking.live'), '•••', `thinking.live must be ••• in ${lang}`);
   }
 });
@@ -363,4 +365,101 @@ test('t handles repeated {name} occurrences (each replaced)', () => {
   // at least once and contains zero literal `{subdir}` placeholders.
   assert.ok(out.includes(value));
   assert.ok(!out.includes('{subdir}'));
+});
+
+// ── multi-locale tests (11 locales: en, de, fr, es, pt, ru, zh, ja, hi, uz, ka) ──
+
+test('localeCodes lists all 11 supported locales', () => {
+  assert.equal(localeCodes.length, 11, `expected 11 locales, got ${localeCodes.length}`);
+  assert.ok(localeCodes.includes('en'));
+  assert.ok(localeCodes.includes('ru'));
+  assert.ok(localeCodes.includes('de'));
+  assert.ok(localeCodes.includes('fr'));
+  assert.ok(localeCodes.includes('es'));
+  assert.ok(localeCodes.includes('pt'));
+  assert.ok(localeCodes.includes('zh'));
+  assert.ok(localeCodes.includes('ja'));
+  assert.ok(localeCodes.includes('hi'));
+  assert.ok(localeCodes.includes('uz'));
+  assert.ok(localeCodes.includes('ka'));
+});
+
+test('every locale has full key parity with en (no missing keys)', () => {
+  // en is the canonical reference — every other locale must have the same set
+  // of keys. A missing key would silently fall back to en at runtime, but the
+  // locked decision is FULL parity for the generated locales.
+  const enKeys = Object.keys(enDict);
+  assert.ok(enKeys.length >= 250, `en key count suspiciously low: ${enKeys.length}`);
+
+  for (const loc of localeCodes) {
+    for (const key of enKeys) {
+      const val = getKeyInLang(loc as Locale, key);
+      assert.ok(val !== undefined, `key "${key}" missing in locale "${loc}"`);
+    }
+  }
+  // Also verify checkKeyInAllLangs is true for every en key
+  for (const key of enKeys) {
+    assert.ok(checkKeyInAllLangs(key), `checkKeyInAllLangs failed for "${key}"`);
+  }
+  // Verify no retired keys are present in ANY locale
+  for (const code of ['new.in_topic', 'new.usage', 'new.created', 'new.created_unbound', 'new.failed', 'new.bind_failed']) {
+    assert.ok(!checkKeyInAllLangs(code), `retired key still present: ${code}`);
+  }
+});
+
+test('every locale has the same key count as en (full parity)', () => {
+  const enKeys = Object.keys(enDict);
+  assert.ok(enKeys.length >= 250, `en key count suspiciously low: ${enKeys.length}`);
+  for (const loc of localeCodes) {
+    let count = 0;
+    for (const key of enKeys) {
+      if (getKeyInLang(loc as Locale, key) !== undefined) count++;
+    }
+    assert.equal(count, enKeys.length, `locale "${loc}" has ${count} keys, expected ${enKeys.length}`);
+  }
+});
+
+test('agent-facing template reply-language directive varies per locale', () => {
+  // The schedule.forwardPromptTemplate keeps English instructions but bakes
+  // the TARGET reply language per locale. Each locale must carry a distinct
+  // "IN <LANGUAGE>" directive (or the existing ru/en ones).
+  const expectedReplyLang: Record<string, string> = {
+    en: 'IN ENGLISH',
+    ru: 'IN RUSSIAN',
+    de: 'IN GERMAN',
+    fr: 'IN FRENCH',
+    es: 'IN SPANISH',
+    pt: 'IN PORTUGUESE',
+    zh: 'IN CHINESE',
+    ja: 'IN JAPANESE',
+    hi: 'IN HINDI',
+    uz: 'IN UZBEK',
+    ka: 'IN GEORGIAN',
+  };
+  for (const loc of localeCodes) {
+    const fwd = getKeyInLang(loc as Locale, 'schedule.forwardPromptTemplate');
+    const ivw = getKeyInLang(loc as Locale, 'schedule.interviewPromptTemplate');
+    assert.ok(fwd, `forwardPromptTemplate missing in ${loc}`);
+    assert.ok(ivw, `interviewPromptTemplate missing in ${loc}`);
+    const expected = expectedReplyLang[loc];
+    assert.ok(expected, `no expected reply-lang for ${loc}`);
+    assert.ok(fwd.includes(expected), `${loc} forwardPromptTemplate must contain "${expected}": "${fwd}"`);
+    assert.ok(ivw.includes(expected), `${loc} interviewPromptTemplate must contain "${expected}": "${ivw}"`);
+    // The instructions stay English in every locale
+    assert.ok(fwd.includes('schedule_create'), `${loc} must name the MCP tool`);
+    assert.ok(ivw.includes('schedule_create'), `${loc} must name the MCP tool`);
+  }
+});
+
+test('apiRetry.continueNudge is translated per locale (agent-facing nudge)', () => {
+  // The continueNudge is agent-facing — it tells the agent to resume. It must
+  // be in the locale's language (mirroring the schedule template rule).
+  for (const loc of localeCodes) {
+    const nudge = getKeyInLang(loc as Locale, 'apiRetry.continueNudge');
+    assert.ok(nudge, `continueNudge missing in ${loc}`);
+    assert.ok(nudge.length > 5, `${loc} continueNudge suspiciously short: "${nudge}"`);
+  }
+  // Spot-check: en and ru have known values
+  assert.equal(getKeyInLang('en' as Locale, 'apiRetry.continueNudge'), 'Continue from where you left off.');
+  assert.equal(getKeyInLang('ru' as Locale, 'apiRetry.continueNudge'), 'Продолжай с того места, где ты остановился.');
 });

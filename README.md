@@ -412,7 +412,7 @@ talk to the bot there.
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
 | `CHAT_MODE` | `both` | Which surface(s) this instance serves: `group`, `dm`, or `both` — see [Two surfaces](#two-surfaces-group-topics-bot-dm-or-both) |
 | `OWNER_USER_ID` | — | Numeric Telegram user id of the owner. **Required** for `CHAT_MODE=dm`; optional for `both` (unset → the DM surface stays inert, group-only) |
-| `BOT_LANG` | `ru` | `ru` or `en` |
+| `BOT_LANG` | `ru` | Bot UI language: `en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`, `ka`. Unknown value warns and falls back to `ru`. English is the canonical fallback for missing keys |
 | `GROQ_API_KEY` | — | Recommended for voice transcription. Without it, voice messages are not transcribed unless you intentionally configure the OpenAI fallback |
 
 Agent provider/auth setup is normally done inside the agents themselves:
@@ -683,7 +683,7 @@ Key files:
 - `src/validation.ts` — `/bind` input validation (path-traversal/symlink-safe)
 - `src/mcpConfig.ts` — `${VAR}` expansion, tmp-file plumbing
 - `src/rateLimiter.ts` — `GlobalSendPacer` (process-wide 1-send-per-2s gate) + per-user limits
-- `src/i18n.ts` — `t()` / `errorMessage()` (ru/en)
+- `src/i18n.ts` — `t()` / `errorMessage()` (11 locales: en/de/fr/es/pt/ru/zh/ja/hi/uz/ka; per-locale modules in `src/i18n/`)
 
 ## Migration from 1.x
 

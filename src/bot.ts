@@ -4750,7 +4750,7 @@ async function handleAgentStart(
     return;
   }
   // "Claude Code" is one user-facing choice with two backends (tmux-scrape vs
-  // json-stream); open the thread's picked backend, default json-stream.
+  // json-stream); open the thread's picked backend, default tmux-scrape (for now).
   if (adapterName === 'claude') adapterName = resolveClaudeBackendName(key);
   await switchThreadAdapter(key, adapterName);
   const adapter = getThreadAdapter(key);

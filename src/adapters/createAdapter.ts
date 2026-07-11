@@ -211,9 +211,8 @@ export function getAdapter(name: string): AgentAdapter {
  * @description Adapters registered in the factory (so `getAdapter`, sweeps, and
  * reattach see them) but HIDDEN from every user-facing surface — the `/start`
  * agent list and the agent-selection keyboard. `claude-json-stream` is reached
- * through the Claude DEFAULT + the `/claude_mode` backend switch, never a
- * start-list entry of its own — listing it next to "Claude Code" would read as
- * two different agents.
+ * through the `/claude_mode` backend switch, never a start-list entry of its
+ * own — listing it next to "Claude Code" would read as two different agents.
  */
 const hiddenAdapterNames = new Set<string>([claudeJsonStreamAdapterName]);
 
@@ -238,22 +237,27 @@ export function getAvailableAdapters(): Array<{ name: string; label: string }> {
 
 /**
  * @description The adapter a thread with no explicit pick gets: Claude Code
- * (the json-stream backend). Hardcoded — the old env-driven default override
- * is retired; the only persisted agent choice is per-thread (welcome buttons /
- * commands / `/claude_mode`).
+ * (the tmux-scrape backend — TEMPORARILY: json-stream cannot host `/login`
+ * yet, so it is reachable per-thread via `/claude_mode` until the login
+ * interception ships and the default flips back; see plan
+ * `agent/tasks/actual/2026-07-11-jsonstream-login-outofband-auth.md`).
+ * Hardcoded — the old env-driven default override is retired; the only
+ * persisted agent choice is per-thread (welcome buttons / commands /
+ * `/claude_mode`).
  */
 export function getDefaultAdapterName(): string {
-  return claudeJsonStreamAdapterName;
+  return 'claude';
 }
 
 /**
  * @description The two Claude Code backends. Both drive the SAME `claude` CLI
  * against the SAME on-disk transcript, so a thread is cross-resumable between
  * them live:
- *  - `'claude'` — the tmux TUI, scraped screen (classic).
+ *  - `'claude'` — the tmux TUI, scraped screen (classic; the DEFAULT for now,
+ *    see {@link getDefaultAdapterName}).
  *  - {@link claudeJsonStreamAdapterName} — an EXTERNAL tmux-hosted process
  *    streaming structured stream-json events over a FIFO + stdout file, so it
- *    survives bot restarts (the DEFAULT; see {@link getDefaultAdapterName}).
+ *    survives bot restarts.
  * `/claude_mode` flips a thread between them.
  */
 export function checkIsClaudeBackend(name: string): boolean {
@@ -263,12 +267,13 @@ export function checkIsClaudeBackend(name: string): boolean {
 /**
  * @description Which Claude backend a fresh "start Claude Code" should open for
  * `key`: the thread's explicit backend pick if it has one, else the default
- * (json-stream). Lets the ▶️ Claude button / `/claude` open json-stream by
- * default while honouring an explicit `/claude_mode` tmux pick.
+ * (tmux-scrape, {@link getDefaultAdapterName}). Lets the ▶️ Claude button /
+ * `/claude` open the default while honouring an explicit `/claude_mode`
+ * json-stream pick.
  */
 export function resolveClaudeBackendName(key: ThreadKey): string {
   const raw = getThreadAdapterNameRaw(key);
-  return raw && checkIsClaudeBackend(raw) ? raw : claudeJsonStreamAdapterName;
+  return raw && checkIsClaudeBackend(raw) ? raw : getDefaultAdapterName();
 }
 
 /**
@@ -299,7 +304,7 @@ export type ClaudeModeAction =
  *    "is this a Claude topic at all?" — an opencode/terminal topic gets the
  *    not-Claude hint.
  *  - `effectiveBackendName` ({@link resolveClaudeBackendName}: raw pick if a
- *    Claude backend, else the json-stream default) answers "which backend
+ *    Claude backend, else the default — tmux-scrape for now) answers "which backend
  *    would a Claude start actually open?" — the same resolution the start
  *    path uses, so the "already" answer and the picker's ✓ can never disagree
  *    with what `/claude` would really do.

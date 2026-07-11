@@ -1,8 +1,10 @@
 /**
- * @description Unit tests for Claude Code backend resolution: json-stream is the
- * DEFAULT, and a thread can hold an explicit tmux-scrape pick that is honoured.
+ * @description Unit tests for Claude Code backend resolution: tmux-scrape is
+ * the DEFAULT (temporarily — json-stream cannot host `/login` yet; see plan
+ * 2026-07-11-jsonstream-login-outofband-auth), and a thread can hold an
+ * explicit json-stream pick that is honoured.
  * Covers getDefaultAdapterName / checkIsClaudeBackend / resolveClaudeBackendName
- * (the /claude_mode per-topic switch + default-json-stream behavior).
+ * (the /claude_mode per-topic switch + default-backend behavior).
  */
 
 import { test } from 'node:test';
@@ -20,8 +22,8 @@ import type { ThreadKey } from '../types';
 
 const key = (threadId: number): ThreadKey => ({ chatId: -100, threadId });
 
-test('default adapter is json-stream Claude', () => {
-  assert.equal(getDefaultAdapterName(), claudeJsonStreamAdapterName);
+test('default adapter is tmux-scrape Claude', () => {
+  assert.equal(getDefaultAdapterName(), 'claude');
 });
 
 test('checkIsClaudeBackend: both Claude backends true, others false', () => {
@@ -31,35 +33,36 @@ test('checkIsClaudeBackend: both Claude backends true, others false', () => {
   assert.equal(checkIsClaudeBackend('terminal'), false);
 });
 
-test('resolveClaudeBackendName: no pick → json-stream default', () => {
-  assert.equal(resolveClaudeBackendName(key(1)), claudeJsonStreamAdapterName);
+test('resolveClaudeBackendName: no pick → tmux-scrape default', () => {
+  assert.equal(resolveClaudeBackendName(key(1)), 'claude');
 });
 
-test('resolveClaudeBackendName: an explicit tmux pick is honoured', () => {
+test('resolveClaudeBackendName: an explicit tmux pick is kept', () => {
   const k = key(2);
   setThreadAdapter(k, 'claude');
   assert.equal(resolveClaudeBackendName(k), 'claude');
 });
 
-test('resolveClaudeBackendName: an explicit json-stream pick is kept', () => {
+test('resolveClaudeBackendName: an explicit json-stream pick is honoured', () => {
   const k = key(3);
   setThreadAdapter(k, claudeJsonStreamAdapterName);
   assert.equal(resolveClaudeBackendName(k), claudeJsonStreamAdapterName);
 });
 
-test('resolveClaudeBackendName: a non-Claude pick falls to the json-stream default', () => {
+test('resolveClaudeBackendName: a non-Claude pick falls to the tmux-scrape default', () => {
   const k = key(4);
   setThreadAdapter(k, 'opencode');
-  assert.equal(resolveClaudeBackendName(k), claudeJsonStreamAdapterName);
+  assert.equal(resolveClaudeBackendName(k), 'claude');
 });
 
 // ── /claude_mode decision (live bug 2026-07-06, topic 9085) ─────────────────
 //
-// Under the retired env-forced 'claude' default, a NO-pick thread's
-// threadAdapterName was 'claude' (the legacy fallback) while the EFFECTIVE
-// Claude backend (what `/claude` would start) was json-stream. The old handler
-// compared the requested backend against threadAdapterName, so the first
-// `/claude_mode tmux` replied "already tmux-scrape" without persisting.
+// Historic shape: under the retired env-forced default, a NO-pick thread's
+// threadAdapterName could DISAGREE with the EFFECTIVE Claude backend (what
+// `/claude` would start). The old handler compared the requested backend
+// against threadAdapterName, so the first `/claude_mode` switch replied
+// "already" without persisting. getClaudeModeAction takes both resolutions
+// as inputs, so the decision stays correct even if they ever diverge again.
 
 test('parseClaudeBackendArg: json aliases → json-stream, tmux aliases → claude, else null', () => {
   for (const alias of ['json', 'jsonstream', 'json-stream', 'stream']) {
@@ -72,7 +75,7 @@ test('parseClaudeBackendArg: json aliases → json-stream, tmux aliases → clau
   assert.equal(parseClaudeBackendArg('bogus'), null);
 });
 
-test('getClaudeModeAction: legacy-fallback thread name + tmux request → SWITCH (the bug)', () => {
+test('getClaudeModeAction: thread name disagreeing with effective backend + that backend requested → SWITCH (the bug)', () => {
   const action = getClaudeModeAction({
     threadAdapterName: 'claude', // no pick; legacy env-forced fallback
     effectiveBackendName: claudeJsonStreamAdapterName, // what /claude would start
@@ -81,24 +84,27 @@ test('getClaudeModeAction: legacy-fallback thread name + tmux request → SWITCH
   assert.deepEqual(action, { kind: 'switch', backendName: 'claude' });
 });
 
-test('getClaudeModeAction: fresh thread + json request → already (json IS the effective default)', () => {
+test('getClaudeModeAction: fresh thread + tmux request → already (tmux IS the effective default)', () => {
   const action = getClaudeModeAction({
-    threadAdapterName: claudeJsonStreamAdapterName,
-    effectiveBackendName: claudeJsonStreamAdapterName,
-    requestedBackendName: claudeJsonStreamAdapterName,
+    threadAdapterName: 'claude',
+    effectiveBackendName: 'claude',
+    requestedBackendName: 'claude',
   });
-  assert.deepEqual(action, { kind: 'already', backendName: claudeJsonStreamAdapterName });
+  assert.deepEqual(action, { kind: 'already', backendName: 'claude' });
 });
 
-test('getClaudeModeAction: explicit tmux pick + tmux request → already; + json request → switch', () => {
-  const base = { threadAdapterName: 'claude', effectiveBackendName: 'claude' };
-  assert.deepEqual(
-    getClaudeModeAction({ ...base, requestedBackendName: 'claude' }),
-    { kind: 'already', backendName: 'claude' },
-  );
+test('getClaudeModeAction: explicit json-stream pick + json request → already; + tmux request → switch', () => {
+  const base = {
+    threadAdapterName: claudeJsonStreamAdapterName,
+    effectiveBackendName: claudeJsonStreamAdapterName,
+  };
   assert.deepEqual(
     getClaudeModeAction({ ...base, requestedBackendName: claudeJsonStreamAdapterName }),
-    { kind: 'switch', backendName: claudeJsonStreamAdapterName },
+    { kind: 'already', backendName: claudeJsonStreamAdapterName },
+  );
+  assert.deepEqual(
+    getClaudeModeAction({ ...base, requestedBackendName: 'claude' }),
+    { kind: 'switch', backendName: 'claude' },
   );
 });
 
@@ -106,7 +112,7 @@ test('getClaudeModeAction: opencode/terminal topics are gated to notClaude', () 
   for (const name of ['opencode', 'terminal']) {
     const action = getClaudeModeAction({
       threadAdapterName: name,
-      effectiveBackendName: claudeJsonStreamAdapterName,
+      effectiveBackendName: 'claude',
       requestedBackendName: 'claude',
     });
     assert.deepEqual(action, { kind: 'notClaude' }, name);
@@ -114,8 +120,8 @@ test('getClaudeModeAction: opencode/terminal topics are gated to notClaude', () 
 });
 
 test('getClaudeModeAction: bare command → picker with the EFFECTIVE backend as current (✓ target)', () => {
-  // Legacy-fallback thread name: the picker's ✓ must sit on json-stream
-  // (what /claude would open), not on the legacy fallback name.
+  // The picker's ✓ must sit on the EFFECTIVE backend (what /claude would
+  // open), not on the raw thread name.
   const action = getClaudeModeAction({
     threadAdapterName: 'claude',
     effectiveBackendName: claudeJsonStreamAdapterName,

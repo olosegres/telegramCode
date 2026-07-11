@@ -192,9 +192,11 @@ interface StreamSession {
  * tool permissions are auto-allowed (operator trusts their own agent — parity
  * with the tmux backend's `bypassPermissions`), so only questions block.
  *
- * The DEFAULT Claude backend (`getDefaultAdapterName`); a topic flips between
- * it and the tmux-scrape backend via `/claude_mode` (they share the on-disk
- * transcript, so the switch resumes the same conversation).
+ * A topic flips between it and the tmux-scrape backend via `/claude_mode`
+ * (they share the on-disk transcript, so the switch resumes the same
+ * conversation). NOT the default backend for now — it cannot host `/login`
+ * yet (`getDefaultAdapterName` stays on tmux-scrape until the out-of-band
+ * login task ships).
  */
 export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapter {
   readonly name = claudeJsonStreamAdapterName;

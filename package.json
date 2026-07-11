@@ -1,10 +1,25 @@
 {
   "name": "telegramcode",
   "version": "2.0.0",
-  "private": true,
   "license": "MIT",
   "author": "Sergei Solo",
   "description": "Telegram forum-supergroup bot for Claude Code / OpenCode — one topic per task, isolated sessions, per-thread MCP",
+  "keywords": [
+    "claude-code",
+    "opencode",
+    "telegram-bot",
+    "ai-agents",
+    "vibe-coding",
+    "remote-development",
+    "tmux"
+  ],
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    ".env.example",
+    "examples/"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/olosegres/telegramcode.git"
@@ -29,6 +44,8 @@
     "hot": "node dist/cli.js hot",
     "install-link": "yarn install && yarn build && npm link",
     "typecheck": "tsc --noEmit",
+    "prepublishOnly": "yarn typecheck && yarn build",
+    "preversion": "yarn typecheck && yarn build && yarn test",
     "test": "node --import tsx --import ./src/__tests__/globalTestSetup.ts --test 'src/__tests__/**/*.test.ts'",
     "claude": "UID=$(id -u) GID=$(id -g) docker compose run --rm claude"
   },

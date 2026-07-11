@@ -356,7 +356,7 @@ config/variants, not a per-message API field).
 
 | File | Responsibility |
 |------|----------------|
-| `cli.ts`, `cli/bot.ts`, `cli/cliClaude.ts` | CLI entrypoints / wiring |
+| `cli.ts`, `cli/bot.ts` | CLI entrypoints / wiring |
 | `cli/envLoader.ts` | Load `.env` (config dir + per-project override) |
 | `cli/lock.ts` | Single-instance lockfile |
 | `bot.ts` | **The bot.** Telegram handlers, all slash commands, output streaming. Large — most logic lives here |
@@ -767,6 +767,18 @@ handler's guard that stops a bot-owned slash from ALSO being re-forwarded to the
 agent as a prompt; omit it and e.g. `/esc` reaches the agent verbatim. (A
 retired command is kept in the set on purpose so a stray `/where` is swallowed
 rather than typed into the agent.)
+
+## Privacy gate — the repo is public
+
+History was scrubbed of real operator identifiers (2026-07-11) — keep it that way:
+
+- Never commit real instance identifiers (chat/topic/user ids, group names,
+  `t.me/c/…` links, home paths with a real username, private project
+  names/remotes, tokens) — in code, tests, docs, plans, or commit messages.
+  Quoting live-debug output is the usual leak path: replace ids first.
+- Examples use the repo's placeholders (`-1001111111111`, `ExampleGroup`,
+  `/home/user/…`); real values live only in untracked `CLAUDE.local.md` / `agent/tmp/`.
+- Pre-commit review sweeps the diff for real-looking identifiers — any hit is a FAIL.
 
 ## Tests & build
 

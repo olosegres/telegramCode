@@ -230,7 +230,7 @@ function parseEnv() {
   // CHAT_MODE selects which surface(s) the instance serves: `group` (forum
   // supergroup only), `dm` (the owner's private chat only), or `both` (one
   // instance serves the owner DM AND the group at once, decided per chat).
-  // Unset → `both`, so a bare `telegramCode` lights up both surfaces. An unknown
+  // Unset → `both`, so a bare `telegramcode` lights up both surfaces. An unknown
   // value fails fast (same intent as the ALLOWED_GROUP_ID numeric gate).
   const chatModeRaw = (process.env.CHAT_MODE ?? '').trim();
   let chatMode: ChatMode = 'both';
@@ -9265,7 +9265,7 @@ function wireScheduler(): SchedulerMcpHandle {
 export async function startBot(): Promise<void> {
   console.log('');
   console.log('=================================');
-  console.log('  Telegram Code Bot (multi-thread) starting...');
+  console.log('  TelegramCode Bot (multi-thread) starting...');
   console.log('=================================');
   console.log('Access:           forum-group admins/creator (live, cached)');
   console.log(`Work root:        ${ENV.workRoot}`);

@@ -1,4 +1,4 @@
-# Two-instance docker-compose for telegramCode 2.0 (forum supergroup mode).
+# Two-instance docker-compose for TelegramCode 2.0 (forum supergroup mode).
 #
 # Pet vs. work: two completely independent bots running on the same host,
 # isolated by:
@@ -46,7 +46,7 @@ services:
       # Your personal/home projects — bot binds threads inside this tree.
       - ${PET_WORK_ROOT:-/home/${USER}/src}:/workspace:rw
       # Bot source. Bind-mount lets you edit the bot without rebuilding.
-      - ../:/telegramCode:ro
+      - ../:/telegramcode:ro
       - ../.docker-entrypoint.sh:/docker-entrypoint.sh:ro
       # Per-instance bot state. MUST differ between instances (plan §10.7).
       - telegramcode_pet_data:/data
@@ -83,7 +83,7 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
-    command: ["npx", "tsx", "/telegramCode/src/index.ts"]
+    command: ["npx", "tsx", "/telegramcode/src/index.ts"]
     restart: unless-stopped
 
   telegramcode-work:
@@ -106,7 +106,7 @@ services:
       retries: 3
     volumes:
       - ${WORK_WORK_ROOT:-/home/${USER}/work}:/workspace:rw
-      - ../:/telegramCode:ro
+      - ../:/telegramcode:ro
       - ../.docker-entrypoint.sh:/docker-entrypoint.sh:ro
       - telegramcode_work_data:/data
       - telegramcode_work_home:/home/agent
@@ -137,7 +137,7 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     entrypoint: ["/bin/bash", "/docker-entrypoint.sh"]
-    command: ["npx", "tsx", "/telegramCode/src/index.ts"]
+    command: ["npx", "tsx", "/telegramcode/src/index.ts"]
     restart: unless-stopped
 
 volumes:

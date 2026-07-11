@@ -4,7 +4,7 @@
  *
  * The load-bearing concern: in hot mode the worker inherits cwd = projectRoot
  * (nodemon's cwd), so without this injection it would default WORK_ROOT to the
- * telegram-code checkout and `/bind` would list the wrong folders. These tests
+ * TelegramCode checkout and `/bind` would list the wrong folders. These tests
  * pin that the operator's launch dir is propagated, while an explicit
  * WORK_ROOT override still wins and unrelated env is untouched.
  */

@@ -1,5 +1,5 @@
 /**
- * Test case: N/A — telegramCode has no Jira tracker
+ * Test case: N/A — TelegramCode has no Jira tracker
  *
  * @description OpenCode provider API-key connection through `/connect`.
  */

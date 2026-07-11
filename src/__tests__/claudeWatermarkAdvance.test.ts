@@ -15,7 +15,7 @@
  *   - not-ready ⇒ never advance (a boot / lifecycle-gate frame is not a relay).
  *   - grew ⇒ advance; not-grown ⇒ skip (idle metadata churn must not write).
  *
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.
  */
 

@@ -10,7 +10,7 @@
  * assistant record carrying non-empty text. A missing/absent watermark id means
  * `isWatermarkKnown:false` (the recap falls back to its no-count path).
  *
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.
  */
 

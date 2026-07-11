@@ -1,4 +1,4 @@
-# telegram-code — project guide
+# TelegramCode — project guide
 
 > Shared rules live in `~/src/.claude/rules/` (loaded automatically). This file is
 > the **project map**: read it first to understand what the code does before
@@ -6,6 +6,10 @@
 
 > **Terminology:** when the user says "чат"/"chat" they mean a **topic** (forum
 > thread), NOT the whole supergroup. Read every such request as per-topic.
+
+> **Naming:** the product in prose is **TelegramCode**; the npm package and the
+> CLI command are lowercase **`telegramcode`** (legacy `telegramCode` bin alias
+> kept; `DATA_DIR` default `~/.telegramCode` deliberately unrenamed).
 
 ## What this project is
 
@@ -95,7 +99,7 @@ config/variants, not a per-message API field).
   server-instance selector: sessions are created and listed in that folder's
   project instance via `?directory=<workDir>`.
 - **Launch path defines the work root.** The normal operator workflow is
-  `cd <projects-parent> && telegramCode`; when `WORK_ROOT` is unset, the
+  `cd <projects-parent> && telegramcode`; when `WORK_ROOT` is unset, the
   wrapper uses `$PWD`. Treat `WORK_ROOT` as an advanced override for services or
   containers where the process cwd cannot be controlled.
 - **Per-thread isolation.** Routing, sessions, MCP config, model/effort prefs,
@@ -234,7 +238,7 @@ config/variants, not a per-message API field).
   (`checkIsDmKey(key) = key.chatId === ownerUserId`, since a DM key carries the
   owner's chat id). `OWNER_USER_ID` is REQUIRED for `dm`; for `both` it is
   OPTIONAL — unset → the DM surface is INERT (group-only, boot logs a notice), so
-  a bare `telegramCode` stays backward-compatible with a group-only deploy and
+  a bare `telegramcode` stays backward-compatible with a group-only deploy and
   lights up DM the moment `OWNER_USER_ID` is set. Access stays per surface: the
   owner id gates the DM chat, the served group's admin cache gates the group chat
   (`checkIsAllowedUser(ctx)` is the single per-chat authority). The bi-surface
@@ -786,7 +790,7 @@ History was scrubbed of real operator identifiers (2026-07-11) — keep it that 
 - `yarn typecheck` — `tsc --noEmit`
 - `yarn build` — `tsc` → `dist/`
 - `yarn dev` — `tsx watch src/cli.ts` (fast dev — TS errors crash the process)
-- `yarn hot` / `telegramCode hot` — hot-reload mode: `tsc -w` + `nodemon`
+- `yarn hot` / `telegramcode hot` — hot-reload mode: `tsc -w` + `nodemon`
   on `dist/`. A broken intermediate edit can't take the bot down (no
   emit until the build is green), and `nodemon` waits for the old PID's
   graceful shutdown before respawning so the lock changes hands cleanly.
@@ -795,7 +799,7 @@ History was scrubbed of real operator identifiers (2026-07-11) — keep it that 
   them silently if the downtime gap is short (hot reload), with a
   per-topic notice if it's long (cold start). Globally-installed bin
   resolves the project root via `fs.realpathSync(__dirname)`, so
-  `telegramCode hot` works from any CWD.
+  `telegramcode hot` works from any CWD.
 
 - **Verifying code you wrote is YOUR job — do it yourself, never hand the check
   back to the user.** Run it, exercise it, drive the real surface. If the usual

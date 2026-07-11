@@ -2,7 +2,7 @@
   <tr>
     <td><h2>Telegram as a terminal for coding agents — every thread is a tab</h2>
 
-telegramCode turns Telegram into a terminal for running agentic CLIs. A forum
+TelegramCode turns Telegram into a terminal for running agentic CLIs. A forum
 supergroup is the terminal window; each topic (thread) is a tab of that
 terminal — bound to a subfolder under `WORK_ROOT` and running its own fully
 isolated **Claude Code** or **OpenCode** session. Open as many tabs as you
@@ -36,7 +36,7 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 > **Breaking 2.0** — the old "one bot = one private chat = one folder" mode
 > is gone. The bot now requires a Telegram forum supergroup for the group
 > surface (`CHAT_MODE=dm` works without one); start
-> `telegramCode` from the parent folder containing your projects and that `$PWD`
+> `telegramcode` from the parent folder containing your projects and that `$PWD`
 > becomes the work root. See [Migration from 1.x](#migration-from-1x).
 
 ## Two surfaces: group topics, bot DM, or both
@@ -62,13 +62,13 @@ instance is effectively group-only.
 
 The bot runs anywhere the agent CLIs run:
 
-- **Your own working machine** — the simplest start: launch `telegramCode`
+- **Your own working machine** — the simplest start: launch `telegramcode`
   from your projects parent folder and your laptop/desktop becomes the
   backend. The catch: agents are only reachable while the machine is on and
   awake.
 - **A remote server (cloud VPS/VDS or bare metal)** — the more convenient
   setup: organize your working environment there once (git + your repos,
-  Claude Code / OpenCode, `telegramCode`) and you get an always-on dev box you
+  Claude Code / OpenCode, `telegramcode`) and you get an always-on dev box you
   drive from any device through Telegram — phone, tablet, voice. When picking
   one, a bare-metal server without virtualization beats a virtualized VPS/VDS:
   its NVMe drives are usually much faster, which matters once you also build
@@ -128,32 +128,35 @@ just the block you want. The pair is set up so they cannot collide
 (separate tokens, groups, data volumes, opencode ports — see
 [Two instances on one host](#two-instances-on-one-host)).
 
-### 4b. Or run as a global CLI (`telegramCode`)
+### 4b. Or run as a global CLI (`telegramcode`)
 
 Skip Docker entirely and install the bot as a Node binary on the host:
 
 ```bash
 git clone https://github.com/olosegres/telegramcode && cd telegramcode
 yarn install && yarn build
-npm install -g .            # registers the `telegramCode` command
+npm install -g .            # registers the `telegramcode` command
+                            # (the legacy `telegramCode` spelling still works as an alias)
 
-mkdir -p ~/.config/telegram-code
-cp .env.example ~/.config/telegram-code/.env
-$EDITOR ~/.config/telegram-code/.env   # fill TELEGRAM_BOT_TOKEN (group auto-pairs; access = its admins)
+mkdir -p ~/.config/telegramcode
+cp .env.example ~/.config/telegramcode/.env
+$EDITOR ~/.config/telegramcode/.env    # fill TELEGRAM_BOT_TOKEN (group auto-pairs; access = its admins)
 
-cd ~/projects && telegramCode          # WORK_ROOT defaults to $PWD = ~/projects
+cd ~/projects && telegramcode          # WORK_ROOT defaults to $PWD = ~/projects
 ```
 
 Shortcut: `yarn install-link` runs `yarn install && yarn build && npm link`
-in one shot — `npm link` symlinks the global `telegramCode` to this folder, so
+in one shot — `npm link` symlinks the global `telegramcode` to this folder, so
 later rebuilds (`yarn build`) are picked up without re-installing.
 
 The wrapper looks for env in two places (in order):
 
-1. `~/.config/telegram-code/.env` — base, set once, used everywhere
+1. `~/.config/telegramcode/.env` — base, set once, used everywhere
+   (the legacy `~/.config/telegram-code/.env` is still read as a fallback
+   when the new path does not exist)
 2. `$PWD/.env` — per-project override
 
-`telegramCode` should normally be launched from your projects parent; that
+`telegramcode` should normally be launched from your projects parent; that
 directory becomes the work root. A single-instance lockfile
 (`$DATA_DIR/instance.lock`) prevents a second bot starting under the same
 user; cross-user instances are naturally isolated by `HOME`-derived
@@ -179,12 +182,12 @@ in the terminal (`claude --resume`) and vice versa.
 ## Architecture
 
 ```
-$PWD=/home/user/src                     ← launch `telegramCode` here
+$PWD=/home/user/src                     ← launch `telegramcode` here
 ├── projectAlpha/     ← Topic "projectAlpha"    (claude)
 ├── projectB/         ← Topic "projB-frontend"  (claude)
 │                     ← Topic "projB-backend"   (opencode)   ← one folder, two topics
 │                     ← Topic "projB-refactor"  (claude)
-└── telegramCode/     ← Topic "telegramCode"    (claude)
+└── telegramcode/     ← Topic "telegramcode"    (claude)
 
 Telegram forum supergroup
 ├── Bot is admin with can_manage_topics + can_delete_messages + can_pin_messages
@@ -380,7 +383,7 @@ the agent:
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
 
-Start from the parent folder containing your projects: `cd ~/projects && telegramCode`.
+Start from the parent folder containing your projects: `cd ~/projects && telegramcode`.
 That `$PWD` is the work root; do not set `WORK_ROOT` for normal use.
 
 **Access control.** There is no user allow-list. Whoever is a **creator or
@@ -422,7 +425,7 @@ before launch if your chosen providers need them.
 
 | Variable | Default | Set only when |
 |---|---|---|
-| `WORK_ROOT` | `$PWD` | You cannot control the process cwd; normal launch uses `cd <projects-parent> && telegramCode` |
+| `WORK_ROOT` | `$PWD` | You cannot control the process cwd; normal launch uses `cd <projects-parent> && telegramcode` |
 | `OPENCODE_URL` | `http://localhost:4096` | You use a custom OpenCode port or external server; the port must differ per instance |
 | `OPENCODE_USERNAME` | `opencode` | `OPENCODE_PASSWORD` is set for a protected OpenCode server |
 | `OPENCODE_PASSWORD` | — | Connecting to a protected OpenCode server |
@@ -531,23 +534,23 @@ blindly (e.g. from cron):
   a dev clone that is ahead of origin is never touched;
 - `yarn install --immutable` runs only when `yarn.lock` / `package.json`
   changed;
-- a hot-mode instance (`telegramCode hot`) rebuilds and restarts the worker
+- a hot-mode instance (`telegramcode hot`) rebuilds and restarts the worker
   by itself (after a dependency install the script touches `tsconfig.json`
   so `tsc -w` recompiles with the new modules); a non-hot instance gets
   `yarn build` plus a restart notice — the script never kills processes;
 - changes to the hot supervisor itself (`src/cli.ts`, `src/cli/hot.ts`,
   `nodemon.json`) are flagged with a warning: those need a manual
-  `telegramCode hot` restart (nodemon reloads only the worker).
+  `telegramcode hot` restart (nodemon reloads only the worker).
 
 For unattended updates give the deploying user read access to the repo (e.g.
 a read-only GitLab deploy key on a passphrase-less SSH key) and add a cron
 entry:
 
 ```cron
-*/10 * * * * /path/to/telegram-code/scripts/self-update.sh >> "$HOME/.local/state/telegram-code/self-update.log" 2>&1
+*/10 * * * * /path/to/telegramcode/scripts/self-update.sh >> "$HOME/.local/state/telegramcode/self-update.log" 2>&1
 ```
 
-(create the log directory once: `mkdir -p ~/.local/state/telegram-code`).
+(create the log directory once: `mkdir -p ~/.local/state/telegramcode`).
 
 ## Restart behaviour
 
@@ -653,7 +656,7 @@ yarn build        # tsc → dist/
 yarn test         # unit/integration (node test runner + tsx); build first —
                   # some tests exercise the built dist/cli.js
 yarn hot          # hot-reload mode: tsc -w + nodemon on dist/ (also
-                  # `telegramCode hot` from anywhere) — a broken edit can't
+                  # `telegramcode hot` from anywhere) — a broken edit can't
                   # take the bot down, agents survive the reload
 ```
 
@@ -690,7 +693,7 @@ There is no in-place upgrade; the steps are:
 1. Stop the old bot.
 2. Create a forum supergroup, add the bot, follow [Quick Start §2-3](#2-create-the-forum-supergroup).
 3. Remove the old `WORK_DIR` env and launch from the projects parent:
-   `cd /home/user/src && telegramCode`.
+   `cd /home/user/src && telegramcode`.
 4. Leave `ALLOWED_GROUP_ID` empty to auto-pair on first contact (or set
    the numeric id by hand).
 5. Set `DATA_DIR` if you run two instances on the same host.

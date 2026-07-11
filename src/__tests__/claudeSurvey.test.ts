@@ -1,5 +1,5 @@
 /**
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  *
  * @description Bug #12. Claude CLI renders a periodic session-feedback SURVEY
  * that takes a BARE digit with NO Enter:
@@ -392,7 +392,7 @@ test('stripSurveyChromeLines: keeps real agent prose interleaved with the survey
 
 test('checkIsClaudeLoginPaste keys off the live bottom input row, not the marker in scrollback', () => {
   // Regression (live 2026-06-25, topic 434): the marker phrase is quoted in this
-  // repo's OWN source + CLAUDE.md. When a Claude TUI working on telegramCode
+  // repo's OWN source + CLAUDE.md. When a Claude TUI working on TelegramCode
   // rendered that code/doc, a whole-pane match false-fired and the bot ate the
   // user's next message as a one-time login code. The detector must look only at
   // the live input region (pane tail), so the phrase up in scrollback above a

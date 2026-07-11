@@ -14,7 +14,7 @@
  * (`routeSseData`). Private members are reached via runtime bracket access
  * (tests are type-stripped by tsx, so this does not affect `yarn typecheck`).
  *
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.
  */
 

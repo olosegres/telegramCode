@@ -17,7 +17,7 @@
  * The adapter's private members are reached via runtime bracket access (tests
  * are type-stripped by tsx), same pattern as claudeJsonStreamWatermarkAdvance.
  *
- * Test case: N/A — telegramCode has no Jira tracker.
+ * Test case: N/A — TelegramCode has no Jira tracker.
  */
 
 import { describe, it, afterEach } from 'node:test';

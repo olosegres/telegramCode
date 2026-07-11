@@ -28,7 +28,7 @@ test('R9 — re-attach to surviving tmux session after bot restart', { skip: 'in
    *      Confirm the bot answered.
    *
    *   3. Kill the bot HARD (`kill -9 $(pidof node)` or `docker compose
-   *      kill telegram-code`). DO NOT use Ctrl-C — the graceful shutdown
+   *      kill telegramcode-pet`). DO NOT use Ctrl-C — the graceful shutdown
    *      path stops sessions, which would defeat the test.
    *
    *   4. `tmux ls` should still show `claude-<C>-<T>` and the original

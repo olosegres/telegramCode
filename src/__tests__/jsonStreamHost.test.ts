@@ -16,7 +16,7 @@
  *   a line-boundary offset that excludes the pending partial line (so a
  *   restarted tail re-reads the unprocessed remainder, nothing twice).
  *
- * Test case: N/A — telegramCode has no Jira tracker.
+ * Test case: N/A — TelegramCode has no Jira tracker.
  */
 
 import { describe, it, after } from 'node:test';

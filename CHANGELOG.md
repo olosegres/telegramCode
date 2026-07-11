@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Changed
-- **`WORK_DIR` is no longer fatal.** Launch `telegramCode` from the parent
+- **`WORK_DIR` is no longer fatal.** Launch `telegramcode` from the parent
   folder containing your projects — that `$PWD` becomes the work root.
   `WORK_ROOT` is now an advanced override (services / containers where the
   process cwd can't be controlled); a stray legacy `WORK_DIR` is ignored, not a

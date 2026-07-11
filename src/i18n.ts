@@ -121,7 +121,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/bind — управление binding',
 
     // ── /doctor self-diagnostics ──
-    'doctor.header': '🔍 *Telegram Code Doctor*',
+    'doctor.header': '🔍 *TelegramCode Doctor*',
     'doctor.ok': '✅ {label}',
     'doctor.warn': '⚠️ {label} — {hint}',
     'doctor.fail': '❌ {label} — {hint}',
@@ -153,7 +153,7 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── auto-welcome when bot is added to group ──
     'onboarding.welcome':
-      '👋 *Telegram Code Bot 2.0*\n\n' +
+      '👋 *TelegramCode Bot 2.0*\n\n' +
       'Готовность к работе:\n' +
       '1️⃣ Сделай меня админом группы с правами:\n' +
       '   • Manage Topics, Delete Messages, Pin Messages\n' +
@@ -563,7 +563,7 @@ const dict: Record<Lang, Record<string, string>> = {
       '/bind — manage binding',
 
     // ── /doctor self-diagnostics ──
-    'doctor.header': '🔍 *Telegram Code Doctor*',
+    'doctor.header': '🔍 *TelegramCode Doctor*',
     'doctor.ok': '✅ {label}',
     'doctor.warn': '⚠️ {label} — {hint}',
     'doctor.fail': '❌ {label} — {hint}',
@@ -590,7 +590,7 @@ const dict: Record<Lang, Record<string, string>> = {
 
     // ── auto-welcome when bot is added to group ──
     'onboarding.welcome':
-      '👋 *Telegram Code Bot 2.0*\n\n' +
+      '👋 *TelegramCode Bot 2.0*\n\n' +
       'Ready-to-work checklist:\n' +
       '1️⃣ Make me a group admin with rights:\n' +
       '   • Manage Topics, Delete Messages, Pin Messages\n' +

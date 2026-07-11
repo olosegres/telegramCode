@@ -11,7 +11,7 @@
  * length of the "already seen" prefix so the byte-slice tail is exercised, not
  * faked.
  *
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.
  */
 

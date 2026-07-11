@@ -9,7 +9,7 @@
  * fallback header, ⏳ on the still-working line, and 👤 / 🤖 on the turn body —
  * so the assertions check those rather than locale-specific words.
  *
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.
  */
 

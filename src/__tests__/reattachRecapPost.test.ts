@@ -17,7 +17,7 @@
  * `./reattachRecapPost.testSetup` is imported FIRST so `bot.ts`'s boot-time
  * `parseEnv()` finds a token + a valid `WORK_ROOT` before the module evaluates.
  *
- * Test case: N/A — telegramCode has no Jira tracker. TODO: add a test-case key
+ * Test case: N/A — TelegramCode has no Jira tracker. TODO: add a test-case key
  * if one is ever created.
  */
 import './reattachRecapPost.testSetup';

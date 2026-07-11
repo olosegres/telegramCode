@@ -571,9 +571,9 @@ OpenCode events / bindings).
     `deliverPromptOrBuffer` forwards to the live agent or buffers it
     mid-startup. The agent does all the work (parse time → cron/one-shot, call
     the `schedule_create` / `schedule_list` / `schedule_cancel` MCP tools).
-    Template instructions stay English in both locales (agent-facing, not
-    user-read), but the TARGET reply language is baked per locale (ru → reply
-    in Russian, en → in English): a fresh session's only user-language signal
+    Template instructions stay English in all locales (agent-facing, not
+    user-read), but the TARGET reply language is baked per locale (for example,
+    ru → Russian, en → English, de → German): a fresh session's only user-language signal
     is the bot locale (live 2026-06-06: "in their language" made the agent
     interview in English). The agent's `schedule_*` MCP tools are injected
     into every bot-started session (see "Agent scheduling tools" above).
@@ -677,7 +677,7 @@ OpenCode events / bindings).
     names). All offer inline mode buttons (✓ on current) and work with no
     session running. **`/thinking`** (default `minimal`) controls what REMAINS
     of the chain-of-thought — the live `•••` indicator (`thinking.live`, a
-    STATIC three-bullet glyph in both locales — the minimal "agent is working"
+    STATIC three-bullet glyph in every locale — the minimal "agent is working"
     cue; the animated cue stays the native typing action) shows in ALL
     modes: `full` keeps the full reasoning, `short` collapses it to "💭 thought
     for {N}s" (OpenCode times it from ms; Claude scrapes the duration from the

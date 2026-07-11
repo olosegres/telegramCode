@@ -1,13 +1,22 @@
 {
-  "name": "telegram-code",
+  "name": "telegramcode",
   "version": "2.0.0",
   "private": true,
   "license": "MIT",
   "author": "Sergei Solo",
   "description": "Telegram forum-supergroup bot for Claude Code / OpenCode — one topic per task, isolated sessions, per-thread MCP",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olosegres/telegramcode.git"
+  },
+  "homepage": "https://github.com/olosegres/telegramcode#readme",
+  "bugs": {
+    "url": "https://github.com/olosegres/telegramcode/issues"
+  },
   "main": "dist/cli.js",
   "bin": {
-    "telegramCode": "./dist/cli.js"
+    "telegramCode": "./dist/cli.js",
+    "telegramcode": "./dist/cli.js"
   },
   "engines": {
     "node": ">=22"

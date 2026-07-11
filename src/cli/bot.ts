@@ -5,7 +5,7 @@ import { resolveDataDir } from '../state';
 import { installConsoleFileTap } from '../utils/consoleFileTap';
 
 /**
- * @description Wrapper-entry for the `telegramCode` / `telegramCode bot` form.
+ * @description Wrapper-entry for the `telegramcode` / `telegramcode bot` form.
  *
  * Responsibilities executed in order:
  *
@@ -14,7 +14,7 @@ import { installConsoleFileTap } from '../utils/consoleFileTap';
  *      `process.env.*` values at top-level (TELEGRAM_BOT_TOKEN, WORK_ROOT,
  *      ALLOWED_GROUP_ID, etc.).
  *   2. Default `WORK_ROOT` to `process.cwd()` if still unset. This is the
- *      normal path: start `telegramCode` from the parent folder containing
+ *      normal path: start `telegramcode` from the parent folder containing
  *      the projects/topics you want to bind.
  *   3. Validate `WORK_ROOT` resolves to an existing directory — fail fast
  *      with a clear message if not.
@@ -38,7 +38,7 @@ export async function runBot(): Promise<void> {
 
   if (loaded.length === 0) {
     process.stderr.write(
-      `Warning: no .env file found in $PWD or ~/.config/telegram-code/. ` +
+      `Warning: no .env file found in $PWD or ~/.config/telegramcode/. ` +
         `Required env (TELEGRAM_BOT_TOKEN) ` +
         `must come from the shell instead. ALLOWED_GROUP_ID is optional ` +
         `(auto-pairs on first contact if unset; access = the group's admins).\n`,

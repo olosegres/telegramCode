@@ -1,5 +1,5 @@
 /**
- * @description End-to-end coverage for the `telegramCode` CLI dispatcher.
+ * @description End-to-end coverage for the `telegramcode` CLI dispatcher.
  *
  * Spawns the CLI as a subprocess (via `tsx`, the same way `yarn dev` runs
  * it) and asserts on stdio + exit code. This catches integration concerns
@@ -183,7 +183,7 @@ test('runBot refuses to start when a foreign lockfile holds the data dir', () =>
   });
 
   assert.equal(r.status, 1);
-  assert.match(r.stderr, /telegramCode is already running/);
+  assert.match(r.stderr, /telegramcode is already running/);
   assert.match(r.stderr, /pid:\s+1/);
   assert.match(r.stderr, /cwd:\s+\/somewhere-else/);
 

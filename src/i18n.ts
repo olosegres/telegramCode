@@ -200,7 +200,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'pair.not_paired': 'группа ещё не привязана (режим pairing)',
     'pair.dm': 'ℹ️ /pair не нужен в режиме DM — бот работает в твоём личном чате.',
     'version.report':
-      '*telegramCode {bot}*\n' +
+      '*TelegramCode {bot}*\n' +
       'Node: {node}\n' +
       'tmux: {tmux}\n' +
       'claude: {claude}\n' +
@@ -637,7 +637,7 @@ const dict: Record<Lang, Record<string, string>> = {
     'pair.not_paired': 'group not paired yet (pairing mode)',
     'pair.dm': "ℹ️ /pair isn't needed in DM mode — the bot serves your private chat.",
     'version.report':
-      '*telegramCode {bot}*\n' +
+      '*TelegramCode {bot}*\n' +
       'Node: {node}\n' +
       'tmux: {tmux}\n' +
       'claude: {claude}\n' +

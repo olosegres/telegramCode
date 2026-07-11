@@ -266,7 +266,7 @@ export async function acquireLock(): Promise<void> {
 
   if (r.reason === 'live-holder') {
     process.stderr.write(
-      `telegramCode is already running:\n` +
+      `telegramcode is already running:\n` +
         `  pid:        ${r.holder.pid}\n` +
         `  cwd:        ${r.holder.cwd}\n` +
         `  started:    ${r.holder.startedAt}\n` +
@@ -276,7 +276,7 @@ export async function acquireLock(): Promise<void> {
     );
   } else {
     process.stderr.write(
-      `telegramCode could not acquire ${r.lockPath} after retry. ` +
+      `telegramcode could not acquire ${r.lockPath} after retry. ` +
         `Another instance is likely starting concurrently.\n`,
     );
   }

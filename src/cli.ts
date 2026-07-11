@@ -17,21 +17,21 @@ import { runHot } from './cli/hot';
  * @description Print top-level usage to stderr.
  *
  * Keeps the message short and copy-pastable. Detailed docs live in README;
- * we surface just enough here for someone running `telegramCode --help`
+ * we surface just enough here for someone running `telegramcode --help`
  * cold to know what to try next.
  */
 function printUsage(): void {
   process.stderr.write(
     `Usage:\n` +
-      `  telegramCode                  Start the bot (WORK_ROOT defaults to $PWD)\n` +
-      `  telegramCode bot              Same as above\n` +
-      `  telegramCode hot              Hot-reload dev mode: tsc -w + nodemon on dist/\n` +
+      `  telegramcode                  Start the bot (WORK_ROOT defaults to $PWD)\n` +
+      `  telegramcode bot              Same as above\n` +
+      `  telegramcode hot              Hot-reload dev mode: tsc -w + nodemon on dist/\n` +
       `                                  (rebuilds + restarts the bot on src/ edits;\n` +
       `                                   in-flight agent sessions are reattached)\n` +
-      `  telegramCode --help, -h       Show this help\n` +
+      `  telegramcode --help, -h       Show this help\n` +
       `\n` +
       `Environment:\n` +
-      `  Loaded from ~/.config/telegram-code/.env (base) then $PWD/.env (override).\n` +
+      `  Loaded from ~/.config/telegramcode/.env (base) then $PWD/.env (override).\n` +
       `  Required for 'bot': TELEGRAM_BOT_TOKEN.\n` +
       `  Access = creator + admins of the served forum group (read live; no user list).\n` +
       `  ALLOWED_GROUP_ID is optional — leave it empty to auto-pair with your\n` +

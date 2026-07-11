@@ -6,11 +6,13 @@
  * at is also under the tmp dir (not the developer's real `~`).
  *
  * Key invariants under test:
- *   - $PWD/.env overrides ~/.config/telegram-code/.env on a per-key basis
+ *   - $PWD/.env overrides ~/.config/telegramcode/.env on a per-key basis
  *   - Pre-existing process.env values win against the global config (because
  *     globals are loaded with `override: false`) but lose to a local .env
  *   - Neither file present → no throw, `loaded: []`
  *   - The `loaded` array reflects actual load order (global first, local last)
+ *   - Global config dir resolution: `~/.config/telegramcode` preferred, the
+ *     legacy `~/.config/telegram-code` read as a fallback (first existing wins)
  */
 
 import { test, beforeEach, afterEach } from 'node:test';
@@ -23,6 +25,7 @@ import { loadEnvFiles } from '../cli/envLoader';
 let tmpRoot: string;
 let projectDir: string;
 let globalEnvDir: string;
+let legacyGlobalEnvDir: string;
 let originalHome: string | undefined;
 let originalCwd: string;
 // Keys we'll mutate — captured once so afterEach can restore them precisely
@@ -32,6 +35,7 @@ const TOUCHED = [
   'ENV_LOADER_TEST_LOCAL_ONLY',
   'ENV_LOADER_TEST_OVERRIDE',
   'ENV_LOADER_TEST_PREEXISTING',
+  'ENV_LOADER_TEST_DIR_PICK',
 ];
 let savedEnv: Record<string, string | undefined>;
 
@@ -43,9 +47,11 @@ function getExpectedLocalEnvPath(): string {
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcode-env-'));
   projectDir = path.join(tmpRoot, 'project');
-  globalEnvDir = path.join(tmpRoot, '.config', 'telegram-code');
+  globalEnvDir = path.join(tmpRoot, '.config', 'telegramcode');
+  legacyGlobalEnvDir = path.join(tmpRoot, '.config', 'telegram-code');
   fs.mkdirSync(projectDir, { recursive: true });
   fs.mkdirSync(globalEnvDir, { recursive: true });
+  fs.mkdirSync(legacyGlobalEnvDir, { recursive: true });
 
   originalHome = process.env.HOME;
   process.env.HOME = tmpRoot;
@@ -85,7 +91,7 @@ test('loads global config when only global exists', () => {
   const { loaded } = loadEnvFiles();
 
   assert.equal(loaded.length, 1);
-  assert.match(loaded[0], /\.config\/telegram-code\/\.env$/);
+  assert.match(loaded[0], /\.config\/telegramcode\/\.env$/);
   assert.equal(process.env.ENV_LOADER_TEST_GLOBAL_ONLY, 'from-global');
 });
 
@@ -118,7 +124,7 @@ test('local .env overrides global on per-key basis, leaves global-only keys inta
 
   assert.equal(loaded.length, 2);
   // Order matters for documentation / banner output: global first, local last.
-  assert.match(loaded[0], /\.config\/telegram-code\/\.env$/);
+  assert.match(loaded[0], /\.config\/telegramcode\/\.env$/);
   assert.equal(loaded[1], getExpectedLocalEnvPath());
 
   assert.equal(process.env.ENV_LOADER_TEST_GLOBAL_ONLY, 'g-only');
@@ -148,4 +154,34 @@ test('shell-set env wins against global (override:false), local .env still wins 
   // so the user editing it should see their changes take effect immediately
   // without needing to `unset` their shell first.
   assert.equal(process.env.ENV_LOADER_TEST_OVERRIDE, 'from-local');
+});
+
+test('prefers ~/.config/telegramcode over the legacy dir when both exist', () => {
+  fs.writeFileSync(
+    path.join(globalEnvDir, '.env'),
+    'ENV_LOADER_TEST_DIR_PICK=from-canonical\n',
+  );
+  fs.writeFileSync(
+    path.join(legacyGlobalEnvDir, '.env'),
+    'ENV_LOADER_TEST_DIR_PICK=from-legacy\n',
+  );
+
+  const { loaded } = loadEnvFiles();
+
+  assert.equal(loaded.length, 1);
+  assert.match(loaded[0], /\.config\/telegramcode\/\.env$/);
+  assert.equal(process.env.ENV_LOADER_TEST_DIR_PICK, 'from-canonical');
+});
+
+test('falls back to the legacy ~/.config/telegram-code dir when only it exists', () => {
+  fs.writeFileSync(
+    path.join(legacyGlobalEnvDir, '.env'),
+    'ENV_LOADER_TEST_DIR_PICK=from-legacy\n',
+  );
+
+  const { loaded } = loadEnvFiles();
+
+  assert.equal(loaded.length, 1);
+  assert.match(loaded[0], /\.config\/telegram-code\/\.env$/);
+  assert.equal(process.env.ENV_LOADER_TEST_DIR_PICK, 'from-legacy');
 });

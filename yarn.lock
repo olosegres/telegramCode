@@ -2024,9 +2024,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"telegram-code@workspace:.":
+"telegramcode@workspace:.":
   version: 0.0.0-use.local
-  resolution: "telegram-code@workspace:."
+  resolution: "telegramcode@workspace:."
   dependencies:
     "@modelcontextprotocol/sdk": "npm:^1.29.0"
     "@types/node": "npm:^22.10.0"
@@ -2041,6 +2041,7 @@ __metadata:
     zod: "npm:^4.4.3"
   bin:
     telegramCode: ./dist/cli.js
+    telegramcode: ./dist/cli.js
   languageName: unknown
   linkType: soft
 

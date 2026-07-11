@@ -3,15 +3,34 @@ import * as path from 'path';
 import * as os from 'os';
 import * as dotenv from 'dotenv';
 
+/** Canonical per-user config dir name under `~/.config` (post-rename). */
+const configDirName = 'telegramcode';
 /**
- * @description Path to the per-user global config file
- * (`~/.config/telegram-code/.env`).
+ * Pre-rename config dir name — still honoured as a fallback so installs
+ * that predate the `telegramcode` rename keep working without moving files.
+ */
+const legacyConfigDirName = 'telegram-code';
+
+function buildGlobalEnvPath(dirName: string): string {
+  return path.join(os.homedir(), '.config', dirName, '.env');
+}
+
+/**
+ * @description Path to the per-user global config file.
  *
- * Lifted as a constant so tests can spy on it via the home-dir override.
+ * Prefers the canonical `~/.config/telegramcode/.env`; falls back to the
+ * legacy `~/.config/telegram-code/.env` when only that one exists. When
+ * neither exists the canonical path is returned, so callers report the
+ * location a fresh install should use.
+ *
  * Resolved lazily per call — tests may swap `HOME` between cases.
  */
 export function globalEnvPath(): string {
-  return path.join(os.homedir(), '.config', 'telegram-code', '.env');
+  const canonicalPath = buildGlobalEnvPath(configDirName);
+  if (fs.existsSync(canonicalPath)) return canonicalPath;
+  const legacyPath = buildGlobalEnvPath(legacyConfigDirName);
+  if (fs.existsSync(legacyPath)) return legacyPath;
+  return canonicalPath;
 }
 
 /** @description Path to the local `$PWD/.env`. */
@@ -32,7 +51,7 @@ export function localEnvPath(): string {
  * then forces an override only for keys it explicitly sets.
  *
  * Returns the list of paths actually read, in load order. Useful for the
- * `telegramCode` startup banner and for test assertions.
+ * `telegramcode` startup banner and for test assertions.
  */
 export function loadEnvFiles(): { loaded: string[] } {
   const loaded: string[] = [];
@@ -41,6 +60,12 @@ export function loadEnvFiles(): { loaded: string[] } {
   if (fs.existsSync(globalPath)) {
     dotenv.config({ path: globalPath, override: false });
     loaded.push(globalPath);
+    if (globalPath === buildGlobalEnvPath(legacyConfigDirName)) {
+      process.stderr.write(
+        `Using legacy config ${globalPath} — preferred location: ` +
+          `~/.config/${configDirName}/.env\n`,
+      );
+    }
   }
 
   const localPath = localEnvPath();

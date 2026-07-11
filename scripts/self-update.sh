@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# telegram-code self-update — pull-based deployment refresh, no root required.
+# telegramcode self-update — pull-based deployment refresh, no root required.
 #
 # Run as the checkout's OWNING user (interactively or from cron). Safe by
 # construction: fast-forward only; skips silently when the tree has tracked
 # changes, a merge/rebase is in progress, or local history diverged from the
 # upstream (a dev clone that is ahead of origin is normal and is never touched).
 #
-# A hot-mode instance (`telegramCode hot`: tsc -w + nodemon) picks the pulled
+# A hot-mode instance (`telegramcode hot`: tsc -w + nodemon) picks the pulled
 # source up automatically; a non-hot instance gets `yarn build` here plus a
 # restart notice — this script never kills or restarts processes itself.
 set -euo pipefail
@@ -91,7 +91,7 @@ else
 fi
 
 # The hot SUPERVISOR does not reload itself (nodemon restarts only the worker):
-# changes to these files need a manual `telegramCode hot` restart by the operator.
+# changes to these files need a manual `telegramcode hot` restart by the operator.
 if checkChanged 'src/cli\.ts|src/cli/hot\.ts|nodemon\.json'; then
-  log "WARNING: hot-supervisor files changed (src/cli.ts / src/cli/hot.ts / nodemon.json) — restart 'telegramCode hot' manually"
+  log "WARNING: hot-supervisor files changed (src/cli.ts / src/cli/hot.ts / nodemon.json) — restart 'telegramcode hot' manually"
 fi

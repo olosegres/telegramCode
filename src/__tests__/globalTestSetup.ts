@@ -21,6 +21,6 @@ import { mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const testDataDir = path.join(os.tmpdir(), `telegramCode-test-${process.pid}`);
+const testDataDir = path.join(os.tmpdir(), `telegramcode-test-${process.pid}`);
 mkdirSync(testDataDir, { recursive: true });
 process.env.DATA_DIR = testDataDir;

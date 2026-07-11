@@ -3,7 +3,7 @@ import * as path from 'path';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 
 /**
- * @description Wrapper-entry for `telegramCode hot` — hot-reload mode for
+ * @description Wrapper-entry for `telegramcode hot` — hot-reload mode for
  * the global terminal bin.
  *
  * **What it does:** runs `tsc -w` and `nodemon` side-by-side from the
@@ -14,7 +14,7 @@ import { spawn, spawnSync, type ChildProcess } from 'child_process';
  * outlive the reload and are re-attached on the next boot.
  *
  * **Why it lives in the bin** (not only as `yarn hot`): the user runs
- * `telegramCode` as a globally-installed `npm link` symlink, so they don't
+ * `telegramcode` as a globally-installed `npm link` symlink, so they don't
  * have a yarn project in front of them. Exposing hot reload as a
  * subcommand makes the same workflow reachable from any CWD — we just
  * resolve the project root from the bin's own realpath. `yarn hot` in the
@@ -36,7 +36,7 @@ import { spawn, spawnSync, type ChildProcess } from 'child_process';
  */
 export async function runHot(): Promise<void> {
   // The operator's real launch directory (e.g. `~/src`). Captured BEFORE any
-  // spawn so it reflects where `telegramCode hot` was invoked — the worker
+  // spawn so it reflects where `telegramcode hot` was invoked — the worker
   // can't derive it later, because nodemon runs it with cwd = projectRoot.
   const launchCwd = process.cwd();
   const projectRoot = resolveProjectRoot();
@@ -46,7 +46,7 @@ export async function runHot(): Promise<void> {
 
   if (!fs.existsSync(tscBin) || !fs.existsSync(nodemonBin)) {
     process.stderr.write(
-      `telegramCode hot: missing devDependencies in ${projectRoot}.\n` +
+      `telegramcode hot: missing devDependencies in ${projectRoot}.\n` +
         `  expected: ${tscBin}\n` +
         `  expected: ${nodemonBin}\n` +
         `Run \`yarn install\` (or \`npm install\`) in the project root and retry.\n`,
@@ -60,14 +60,14 @@ export async function runHot(): Promise<void> {
   // an existing `dist/` are fast (sub-second on this project), so the cost
   // when the user already has a build is negligible.
   if (!fs.existsSync(distEntry)) {
-    process.stderr.write(`telegramCode hot: dist/ missing, running initial tsc...\n`);
+    process.stderr.write(`telegramcode hot: dist/ missing, running initial tsc...\n`);
     const initial = spawnSync(tscBin, [], {
       cwd: projectRoot,
       stdio: 'inherit',
     });
     if (initial.status !== 0) {
       process.stderr.write(
-        `telegramCode hot: initial tsc failed (exit ${initial.status}). ` +
+        `telegramcode hot: initial tsc failed (exit ${initial.status}). ` +
           `Fix the TypeScript errors above and retry.\n`,
       );
       process.exit(initial.status ?? 1);
@@ -76,8 +76,8 @@ export async function runHot(): Promise<void> {
   }
 
   process.stderr.write(
-    `telegramCode hot: project=${projectRoot}\n` +
-      `telegramCode hot: spawning \`tsc -w\` and \`nodemon\` — Ctrl-C to stop both.\n`,
+    `telegramcode hot: project=${projectRoot}\n` +
+      `telegramcode hot: spawning \`tsc -w\` and \`nodemon\` — Ctrl-C to stop both.\n`,
   );
 
   // Spawn the two watchers as children of this wrapper. Both inherit
@@ -124,7 +124,7 @@ export async function runHot(): Promise<void> {
           c.on('exit', (code, signal) => {
             const label = idx === 0 ? 'tsc -w' : 'nodemon';
             process.stderr.write(
-              `telegramCode hot: ${label} exited ` +
+              `telegramcode hot: ${label} exited ` +
                 `(code=${code ?? 'null'}, signal=${signal ?? 'null'})\n`,
             );
             // Propagate the first non-zero code we see; if we're already
@@ -139,7 +139,7 @@ export async function runHot(): Promise<void> {
           });
           c.on('error', (err) => {
             process.stderr.write(
-              `telegramCode hot: child error (${idx === 0 ? 'tsc' : 'nodemon'}): ${err.message}\n`,
+              `telegramcode hot: child error (${idx === 0 ? 'tsc' : 'nodemon'}): ${err.message}\n`,
             );
             if (finalCode === 0) finalCode = 1;
             forwardSignal('SIGTERM');
@@ -158,8 +158,8 @@ export async function runHot(): Promise<void> {
  * In hot mode the supervisor runs `nodemon` with cwd = projectRoot (it must,
  * to watch `dist/`), and the worker (`node dist/cli.js bot`) inherits that
  * cwd. Left alone the worker would default `WORK_ROOT` to `process.cwd()` =
- * the project checkout, so `/bind` would list folders inside telegram-code
- * instead of the operator's projects parent. We hand the worker the real
+ * the project checkout, so `/bind` would list folders inside the TelegramCode
+ * checkout instead of the operator's projects parent. We hand the worker the real
  * launch dir as `WORK_ROOT` so it binds against where the wrapper was started.
  *
  * An explicit `WORK_ROOT` in the inherited env always wins (advanced

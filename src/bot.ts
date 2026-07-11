@@ -5890,7 +5890,7 @@ const botCommands = new Set([
   'stop', 'stopall', 'stop-all', 'status', 'c', 'y', 'n', 'enter', 'up', 'down', 'tab', 'esc', 'escape', 'output', 'clear_messages',
   'bind', 'unbind', 'where', 'ls', 'list', 'new', 'clear_session', 'whoami', 'version', 'help',
   'doctor', 'mcp', 'rename_session', 'trace', 'timestamps', 'schedule', 'thinking', 'tool_results',
-  'subagent', 'claude_mode',
+  'subagent', 'claude_mode', 'effort', 'verbosity', 'quit', 'q', 'quit-all', 'quitall', 'pair',
 ]);
 
 /**
@@ -8548,12 +8548,13 @@ const COMMANDS_MENU = [
   { command: 'opencode', description: '▶️ Start OpenCode' },
   { command: 'connect', description: '🔑 Connect an OpenCode provider API key' },
   { command: 'terminal', description: '🖥 Open a raw shell in the bound folder' },
+  { command: 'claude_mode', description: '🔀 Claude backend: tmux-scrape ⇄ json-stream' },
   { command: 'new', description: '🆕 Restart session (alias /clear_session)' },
   { command: 'clear_session', description: '🆕 Restart session (alias /new)' },
   { command: 'model', description: '🧠 Switch model' },
   { command: 'effort', description: '⚙️ Reasoning effort' },
   { command: 'verbosity', description: '🔊 Output verbosity (thinking+tools+sub-agents)' },
-  { command: 'thinking', description: '☁️ Thinking verbosity (OpenCode)' },
+  { command: 'thinking', description: '☁️ Thinking verbosity' },
   { command: 'tool_results', description: '🔧 Tool-results verbosity' },
   { command: 'subagent', description: '🤖 Sub-agent verbosity' },
   { command: 'sessions', description: '📋 Previous sessions (alias /resume)' },
@@ -8565,6 +8566,8 @@ const COMMANDS_MENU = [
   { command: 'schedule', description: '⏰ Schedule a prompt (agent does the work)' },
   { command: 'status', description: '📊 Show status' },
   { command: 'output', description: '📜 Last 500 lines' },
+  { command: 'trace', description: '🛰 Output-trace recorder on/off' },
+  { command: 'timestamps', description: '🕒 Prepend send time to forwarded prompts' },
   { command: 'whoami', description: '🪪 Show debug ids' },
   { command: 'pair', description: '🔗 Bind this group to the bot' },
   { command: 'version', description: 'ℹ️ Versions of bot + CLI tools' },
@@ -9269,9 +9272,11 @@ export async function startBot(): Promise<void> {
   console.log(`Default agent:    ${getDefaultAdapterName()}`);
   console.log(`Available agents: ${getAvailableAdapters().map(a => a.name).join(', ')}`);
 
-  // 1. State store.
+  // 1. State store. The `[startup] DATA_DIR=` shape is load-bearing: the
+  // README's two-instances troubleshooting tells the operator to compare this
+  // exact line across instances.
   state = await getStateStore();
-  console.log(`Data dir:         ${path.dirname(state.stateFilePath)}`);
+  console.log(`[startup] DATA_DIR=${path.dirname(state.stateFilePath)}`);
 
   // Snapshot the persisted transient status-frame ids (S2) NOW, before reattach
   // can run any frame-id setter. A reattached session's first frame lifecycle

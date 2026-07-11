@@ -11,7 +11,6 @@ import * as dns from 'dns';
 dns.setDefaultResultOrder('ipv4first');
 
 import { runBot } from './cli/bot';
-import { runClaudeCli } from './cli/cliClaude';
 import { runHot } from './cli/hot';
 
 /**
@@ -29,7 +28,6 @@ function printUsage(): void {
       `  telegramCode hot              Hot-reload dev mode: tsc -w + nodemon on dist/\n` +
       `                                  (rebuilds + restarts the bot on src/ edits;\n` +
       `                                   in-flight agent sessions are reattached)\n` +
-      `  telegramCode cli claude [..]  Run 'claude --dangerously-skip-permissions' in $PWD\n` +
       `  telegramCode --help, -h       Show this help\n` +
       `\n` +
       `Environment:\n` +
@@ -47,17 +45,20 @@ function printUsage(): void {
  *
  * Branches on `argv[2]`:
  *   - missing | `bot`  → start the Telegram bot
- *   - `cli <tool> ...` → forward to the matching CLI runner (currently only
- *     `claude`; `opencode` planned for iter 2 per
- *     `agent/tasks/actual/2026-05-16-telegramcode-cli-wrapper.md`)
+ *   - `hot`            → hot-reload dev mode
  *   - `-h | --help | help` → usage
  *   - anything else → usage + exit 2
+ *
+ * The old `cli claude` passthrough is REMOVED: running plain
+ * `claude --dangerously-skip-permissions` in the project folder shares
+ * sessions with the bot naturally (same `~/.claude/projects/<cwd-slug>/`
+ * transcript store), so the wrapper added nothing.
  *
  * Exit 2 (not 1) for unknown commands matches the convention used by most
  * Unix tools to distinguish "bad invocation" from "ran but failed".
  */
 async function main(): Promise<void> {
-  const [sub, ...rest] = process.argv.slice(2);
+  const [sub] = process.argv.slice(2);
 
   if (sub === undefined || sub === 'bot') {
     await runBot();
@@ -66,20 +67,6 @@ async function main(): Promise<void> {
 
   if (sub === 'hot') {
     await runHot();
-    return;
-  }
-
-  if (sub === 'cli') {
-    const [tool, ...toolArgs] = rest;
-    if (tool === 'claude') {
-      await runClaudeCli(toolArgs);
-      return;
-    }
-    process.stderr.write(
-      `Unknown cli tool: ${tool ?? '(missing — try "claude")'}\n\n`,
-    );
-    printUsage();
-    process.exit(2);
     return;
   }
 

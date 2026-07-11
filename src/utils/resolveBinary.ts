@@ -1,5 +1,4 @@
 import { execFileSync } from 'child_process';
-import * as fs from 'fs';
 import * as path from 'path';
 
 /**
@@ -16,9 +15,6 @@ import * as path from 'path';
  * Always returns a string — never `null`. This matches the prior in-adapter
  * helper at `claudeCliAdapter.ts:57-69`, which the `claude-cli` runtime path
  * depends on for module-load-time `const claudePath = resolveClaudeBinary()`.
- *
- * Use {@link resolveClaudeBinaryStrict} when you need a missing-binary signal
- * (e.g. the `telegramCode cli claude` wrapper that prints a hint and exits).
  */
 export function resolveClaudeBinary(): string {
   if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
@@ -36,36 +32,4 @@ export function resolveClaudeBinary(): string {
     // PATH lookup failed; fall through.
   }
   return path.join(process.env.HOME || '/tmp', '.npm-global', 'bin', 'claude');
-}
-
-/**
- * @description Existence-checked variant of {@link resolveClaudeBinary}.
- *
- * Returns `null` if no candidate exists on disk, so the caller can produce
- * a user-friendly error instead of `ENOENT` from `spawn`.
- *
- * Walks the same candidate list (env → PATH → npm-global), but each candidate
- * is gated by `fs.existsSync`.
- */
-export function resolveClaudeBinaryStrict(): string | null {
-  const envBin = process.env.CLAUDE_BIN;
-  if (envBin && fs.existsSync(envBin)) return envBin;
-  try {
-    const which = execFileSync('which', ['claude'], {
-      encoding: 'utf8',
-      timeout: 1500,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (which && fs.existsSync(which)) return which;
-  } catch {
-    // PATH lookup failed; fall through.
-  }
-  const fallback = path.join(
-    process.env.HOME || '/tmp',
-    '.npm-global',
-    'bin',
-    'claude',
-  );
-  if (fs.existsSync(fallback)) return fallback;
-  return null;
 }

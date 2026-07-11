@@ -63,8 +63,10 @@ The bot runs anywhere the agent CLIs run:
   one, a bare-metal server without virtualization beats a virtualized VPS/VDS:
   its NVMe drives are usually much faster, which matters once you also build
   and run a dev server there, not just the agents. Classic terminal access to
-  the very same Claude sessions stays available over SSH via
-  `telegramCode cli claude` (see [Quick Start §4b](#4b-or-run-as-a-global-cli-telegramcode)).
+  the very same Claude sessions stays available over SSH — run plain `claude`
+  in the project folder: it reads the same `~/.claude/projects/<cwd-slug>/`
+  session store the bot uses, so a session started in a Telegram thread can
+  be picked up in the terminal and vice versa.
 
 ## Quick Start
 
@@ -147,17 +149,11 @@ directory becomes the work root. A single-instance lockfile
 user; cross-user instances are naturally isolated by `HOME`-derived
 `DATA_DIR`. Stale locks (after `kill -9`) are reclaimed automatically.
 
-The wrapper also exposes a CLI passthrough so you can continue the same
-sessions from a terminal:
-
-```bash
-cd ~/projects/myapp && telegramCode cli claude [args...]
-```
-
-This is exactly `claude --dangerously-skip-permissions` in `$PWD` — same
-binary, same `~/.claude/projects/` session store the bot uses, so a
-session started in a Telegram thread can be picked up in the terminal
-and vice versa.
+To continue the same sessions from a terminal, no wrapper is needed: run
+`claude --dangerously-skip-permissions` in the project folder. It is the
+same binary and the same `~/.claude/projects/<cwd-slug>/` session store
+the bot uses, so a session started in a Telegram thread can be picked up
+in the terminal (`claude --resume`) and vice versa.
 
 ### 5. Use it
 

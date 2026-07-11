@@ -1,13 +1,9 @@
 /**
  * @description Coverage for `src/utils/resolveBinary.ts`.
  *
- * Two functions under test:
- *   - `resolveClaudeBinary()` — always returns a string (preserves the
- *     pre-extraction behaviour relied on by `claudeCliAdapter.ts`'s
- *     module-load-time const).
- *   - `resolveClaudeBinaryStrict()` — existence-checked, returns `null` if
- *     no candidate is on disk. Powers the friendly error in
- *     `telegramCode cli claude`.
+ * `resolveClaudeBinary()` — always returns a string (preserves the
+ * pre-extraction behaviour relied on by `claudeCliAdapter.ts`'s
+ * module-load-time const).
  *
  * Tests manipulate `CLAUDE_BIN`, `HOME`, and `PATH` so the discovery walks
  * deterministically against tmpdir fixtures rather than the developer's
@@ -19,10 +15,7 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import {
-  resolveClaudeBinary,
-  resolveClaudeBinaryStrict,
-} from '../utils/resolveBinary';
+import { resolveClaudeBinary } from '../utils/resolveBinary';
 
 let tmpRoot: string;
 let saved: Record<string, string | undefined>;
@@ -84,35 +77,4 @@ test('resolveClaudeBinary uses PATH via which when available', () => {
   // existing executable named `claude` is acceptable, but our planted one
   // is preferred because it's earlier on PATH.
   assert.equal(got, plantedPath);
-});
-
-test('resolveClaudeBinaryStrict returns null when nothing exists', () => {
-  // No CLAUDE_BIN, empty PATH, fallback path doesn't exist either.
-  assert.equal(resolveClaudeBinaryStrict(), null);
-});
-
-test('resolveClaudeBinaryStrict returns CLAUDE_BIN only if it exists', () => {
-  const planted = plantClaudeIn(path.join(tmpRoot, 'custom'));
-  process.env.CLAUDE_BIN = planted;
-  assert.equal(resolveClaudeBinaryStrict(), planted);
-
-  process.env.CLAUDE_BIN = '/nonexistent/path/to/claude';
-  // CLAUDE_BIN is set but absent → falls through to PATH and fallback;
-  // both also empty → null.
-  assert.equal(resolveClaudeBinaryStrict(), null);
-});
-
-test('resolveClaudeBinaryStrict returns PATH-resolved binary when present', () => {
-  const binDir = path.join(tmpRoot, 'bin');
-  const plantedPath = plantClaudeIn(binDir);
-  process.env.PATH = `${binDir}:/usr/bin:/bin`;
-
-  assert.equal(resolveClaudeBinaryStrict(), plantedPath);
-});
-
-test('resolveClaudeBinaryStrict returns npm-global fallback when it exists on disk', () => {
-  // PATH empty, CLAUDE_BIN unset → only the fallback candidate.
-  const fallback = path.join(tmpRoot, '.npm-global', 'bin', 'claude');
-  plantClaudeIn(path.dirname(fallback));
-  assert.equal(resolveClaudeBinaryStrict(), fallback);
 });

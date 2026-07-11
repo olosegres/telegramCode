@@ -5,15 +5,13 @@
  * it) and asserts on stdio + exit code. This catches integration concerns
  * the per-module unit tests miss:
  *
- *   - argv branching (`bot` vs `cli claude` vs unknown)
- *   - `--dangerously-skip-permissions` is auto-injected by `cli claude`
- *   - the user's extra args are appended after the auto-injected flag
- *   - exit code is forwarded from the child claude process
- *   - `CLAUDE_BIN` from env is honoured (we point it at a tiny shim)
+ *   - argv branching (`bot` vs unknown; the removed `cli` passthrough stays
+ *     an unknown command)
+ *   - the bot preflight (env load, WORK_ROOT default, lock acquire) runs
  *
- * The bot path is not exercised here — booting the real `startBot()` would
- * try to connect to Telegram. The bot's preflight (WORK_ROOT defaulting,
- * lockfile) is covered separately by `state.test.ts` and `lock.test.ts`.
+ * The bot path is not exercised past preflight — booting the real
+ * `startBot()` would try to connect to Telegram. The preflight internals
+ * are covered separately by `state.test.ts` and `lock.test.ts`.
  */
 
 import { test, beforeEach, afterEach, before } from 'node:test';
@@ -40,20 +38,10 @@ before(() => {
 
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcode-cli-e2e-'));
-  // A tiny shim that records argv + cwd to a file, then exits with the code
-  // we passed in via TEST_CLAUDE_EXIT_CODE (defaults to 0). The recording
-  // lets the test verify the wrapper passed the right args.
+  // A tiny no-op shim CLAUDE_BIN points at, so no spawned subprocess can
+  // ever invoke a real claude on the dev machine.
   claudeShim = path.join(tmpRoot, 'claude-shim');
-  fs.writeFileSync(
-    claudeShim,
-    [
-      '#!/bin/sh',
-      `echo "argv=$@" > "${tmpRoot}/recorded.txt"`,
-      `echo "cwd=$PWD" >> "${tmpRoot}/recorded.txt"`,
-      'exit ${TEST_CLAUDE_EXIT_CODE:-0}',
-    ].join('\n'),
-    { mode: 0o755 },
-  );
+  fs.writeFileSync(claudeShim, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 });
 
 afterEach(() => {
@@ -90,45 +78,6 @@ function getRegexEscapedCanonicalPath(filePath: string): string {
   return fs.realpathSync(filePath).replace(/\//g, '\\/');
 }
 
-test('cli claude injects --dangerously-skip-permissions and forwards extra args', () => {
-  const { status } = runCli(['cli', 'claude', '--print', 'hello world']);
-  assert.equal(status, 0);
-
-  const recorded = fs.readFileSync(path.join(tmpRoot, 'recorded.txt'), 'utf8');
-  // The shim writes `argv=$@` — should contain our flag first, then the
-  // user-supplied args verbatim.
-  assert.match(
-    recorded,
-    /argv=--dangerously-skip-permissions --print hello world/,
-  );
-  assert.match(recorded, new RegExp(`cwd=${getRegexEscapedCanonicalPath(tmpRoot)}`));
-});
-
-test('cli claude forwards non-zero exit code from the child', () => {
-  const { status } = runCli(['cli', 'claude'], {
-    TEST_CLAUDE_EXIT_CODE: '7',
-  });
-  assert.equal(status, 7);
-});
-
-test('cli claude with no args still injects --dangerously-skip-permissions', () => {
-  const { status } = runCli(['cli', 'claude']);
-  assert.equal(status, 0);
-  const recorded = fs.readFileSync(path.join(tmpRoot, 'recorded.txt'), 'utf8');
-  assert.match(recorded, /argv=--dangerously-skip-permissions\s*$/m);
-});
-
-test('cli claude prints helpful error when CLAUDE_BIN is missing', () => {
-  const { status, stderr } = runCli(['cli', 'claude'], {
-    CLAUDE_BIN: path.join(tmpRoot, 'does-not-exist'),
-    // Empty PATH so the strict resolver can't find a system claude either.
-    PATH: '',
-  });
-  assert.equal(status, 1);
-  assert.match(stderr, /claude binary not found/);
-  assert.match(stderr, /npm install -g @anthropic-ai\/claude-code/);
-});
-
 test('unknown subcommand exits 2 with usage', () => {
   const { status, stderr } = runCli(['frobnicate']);
   assert.equal(status, 2);
@@ -136,10 +85,10 @@ test('unknown subcommand exits 2 with usage', () => {
   assert.match(stderr, /Usage:/);
 });
 
-test('cli with unknown tool exits 2 with usage', () => {
-  const { status, stderr } = runCli(['cli', 'banana']);
+test('removed `cli` passthrough is an unknown command (exit 2, no claude spawn)', () => {
+  const { status, stderr } = runCli(['cli', 'claude']);
   assert.equal(status, 2);
-  assert.match(stderr, /Unknown cli tool: banana/);
+  assert.match(stderr, /Unknown command: cli/);
   assert.match(stderr, /Usage:/);
 });
 
@@ -147,60 +96,8 @@ test('--help prints usage and exits 0', () => {
   const { status, stderr } = runCli(['--help']);
   assert.equal(status, 0);
   assert.match(stderr, /Usage:/);
-  assert.match(stderr, /telegramCode cli claude/);
-});
-
-test('cli claude forwards SIGINT and dies by signal (preserves canonical exit status)', async () => {
-  // The shim must die BY signal — not trap and `exit 130`. A normal-exit-
-  // with-code-130 wouldn't exercise the bug fix at cliClaude.ts:60-66
-  // (which only kicks in when `child.on('exit', ..., signal)` reports a
-  // non-null `signal`). `exec sleep 5` replaces the /bin/sh process with
-  // sleep, so the kernel delivers SIGINT to sleep with no shell trap in
-  // between → sleep dies by signal, the wrapper sees signal=SIGINT, and
-  // (with the fix) removes its handlers and re-raises on itself.
-  fs.writeFileSync(
-    claudeShim,
-    ['#!/bin/sh', 'exec sleep 5'].join('\n'),
-    { mode: 0o755 },
-  );
-
-  // Use async spawn instead of spawnSync so we can send a signal while the
-  // child is alive. (`spawnSync` blocks the whole event loop, leaving no
-  // window to call .kill().)
-  const { spawn } = await import('child_process');
-  const proc = spawn(process.execPath, [cliPath, 'cli', 'claude'], {
-    env: {
-      ...process.env,
-      CLAUDE_BIN: claudeShim,
-      HOME: tmpRoot,
-      DATA_DIR: tmpRoot,
-    },
-    cwd: tmpRoot,
-    stdio: 'pipe',
-  });
-
-  // Give the shim time to exec sleep (~100ms is plenty).
-  await new Promise((r) => setTimeout(r, 150));
-  proc.kill('SIGINT');
-
-  const result = await new Promise<{
-    code: number | null;
-    signal: NodeJS.Signals | null;
-  }>((resolve) => {
-    proc.on('exit', (code, signal) => resolve({ code, signal }));
-  });
-
-  // The wrapper itself died by SIGINT (not exit 0 / not exit 1), so the
-  // parent shell gets the canonical signal-exit status — the contract
-  // documented at cliClaude.ts:60-66. If our signal-listener cleanup
-  // regresses, this assertion catches it: re-raising SIGINT while the
-  // wrapper's own SIGINT handler is still installed turns into a no-op
-  // (handler runs, child already dead, event loop drains → exit 0).
-  assert.equal(
-    result.signal,
-    'SIGINT',
-    `expected wrapper to exit by SIGINT, got signal=${result.signal} code=${result.code}`,
-  );
+  // The removed passthrough must not be advertised any more.
+  assert.doesNotMatch(stderr, /cli claude/);
 });
 
 test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () => {

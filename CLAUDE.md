@@ -382,7 +382,7 @@ config/variants, not a per-message API field).
 | `accessControl.ts` | Who may use the bot: `extractAdminIds` + `AdminCache` (the served group's creator/admins, read live via `getChatAdministrators`, cached 1h; a `chat_member` admin-status change in the served group invalidates the cache immediately — `checkShouldInvalidateAdminCache`, subscribed via `allowed_updates` at launch). No allow-list env, no `/grant` |
 | `state.ts` | Persistence (`state.json`): bindings, sessions, pairing; `resolveDataDir()` |
 | `mcpConfig.ts` | Merge MCP server config across the user/group/project/thread hierarchy |
-| `i18n.ts` | `t(key, vars)` translations for all user-facing strings. **11 locales** (`en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`, `ka`); active locale comes from async Telegram/chat context (`/language` override → Telegram `language_code` → stored chat locale → `en`); `en` is canonical (missing key falls back to `en`); per-locale modules live in `src/i18n/`. Add a new key to `en.ts` first, then mirror it in every locale. Agent-facing templates (`schedule.*`, `apiRetry.continueNudge`) keep English instructions but bake a per-locale "IN <language>" reply directive |
+| `i18n.ts` | `t(key, vars)` translations for all user-facing strings. **12 locales** (`en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`, `ka`, `uk`); active locale comes from async Telegram/chat context (`/language` override → Telegram `language_code` → stored chat locale → `en`); `en` is canonical (missing key falls back to `en`); per-locale modules live in `src/i18n/`. Add a new key to `en.ts` first, then mirror it in every locale. Agent-facing templates (`schedule.*`, `apiRetry.continueNudge`) keep English instructions but bake a per-locale "IN <language>" reply directive |
 | `validation.ts` | Input validation for existing-folder `/bind` args (`validateSubdir`, path-traversal/symlink-safe) |
 | `folderName.ts` | Pure validation of a typed NEW folder name for the `/bind` create-folder flow (`validateNewFolderName`) — pre-`mkdir` gate (no slashes/traversal/dots/control chars), distinct from `validateSubdir` which requires the folder to exist |
 | `rateLimiter.ts` | Per-user / per-action rate limiting |
@@ -754,7 +754,7 @@ OpenCode events / bindings).
     SINGLE-PAGE inline picker (pure builder in `utils/languagePicker.ts`): one
     ENDONYM button per locale (each language written in itself — `English,
     Deutsch, …, 中文, ქართული`), two per row, `✓` on the current selection, and a
-    full-width `🌐 Auto` reset row (`lang_<code>` / `lang_auto` callbacks). All 11
+    full-width `🌐 Auto` reset row (`lang_<code>` / `lang_auto` callbacks). All 12
     locales fit in ONE message (Telegram allows ~100 inline buttons), so there is
     NO pagination / nav row. Tapping a locale sets the override, tapping `🌐 Auto`
     clears it — and either way the picker message is edited to a short

@@ -2,7 +2,7 @@
  * `buildLanguagePicker` — the endonym, single-page `/language` picker.
  *
  * Load-bearing facts proven here (not just "renders a keyboard"):
- *   • All 11 locales fit in ONE message — every `lang_<code>` button is present,
+ *   • All 12 locales fit in ONE message — every `lang_<code>` button is present,
  *     no pagination / nav row.
  *   • Button labels are the ENDONYMS (each language written in itself), with a
  *     leading `✓` on the current override and none elsewhere.

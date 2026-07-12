@@ -261,7 +261,7 @@ test('every locale has a non-empty endonym, kept in code (parity-neutral)', () =
     const endonym = getLocaleEndonym(loc);
     assert.ok(endonym && endonym.trim().length > 0, `empty endonym for "${loc}"`);
   }
-  // Exactly the 11 supported locales, no orphans / extras.
+  // Exactly the 12 supported locales, no orphans / extras.
   assert.deepEqual(Object.keys(localeEndonyms).sort(), [...localeCodes].sort());
 });
 
@@ -269,6 +269,7 @@ test('endonyms are the expected native names (each language written in itself)',
   const expected: Record<string, string> = {
     en: 'English', de: 'Deutsch', fr: 'Français', es: 'Español', pt: 'Português',
     ru: 'Русский', zh: '中文', ja: '日本語', hi: 'हिन्दी', uz: 'Oʻzbekcha', ka: 'ქართული',
+    uk: 'Українська',
   };
   for (const loc of localeCodes) {
     assert.equal(getLocaleEndonym(loc), expected[loc], `wrong endonym for "${loc}"`);
@@ -478,10 +479,10 @@ test('t handles repeated {name} occurrences (each replaced)', () => {
   assert.ok(!out.includes('{subdir}'));
 });
 
-// ── multi-locale tests (11 locales: en, de, fr, es, pt, ru, zh, ja, hi, uz, ka) ──
+// ── multi-locale tests (12 locales: en, de, fr, es, pt, ru, zh, ja, hi, uz, ka, uk) ──
 
-test('localeCodes lists all 11 supported locales', () => {
-  assert.equal(localeCodes.length, 11, `expected 11 locales, got ${localeCodes.length}`);
+test('localeCodes lists all 12 supported locales', () => {
+  assert.equal(localeCodes.length, 12, `expected 12 locales, got ${localeCodes.length}`);
   assert.ok(localeCodes.includes('en'));
   assert.ok(localeCodes.includes('ru'));
   assert.ok(localeCodes.includes('de'));
@@ -493,6 +494,7 @@ test('localeCodes lists all 11 supported locales', () => {
   assert.ok(localeCodes.includes('hi'));
   assert.ok(localeCodes.includes('uz'));
   assert.ok(localeCodes.includes('ka'));
+  assert.ok(localeCodes.includes('uk'));
 });
 
 test('every locale has full key parity with en (no missing keys)', () => {
@@ -552,6 +554,7 @@ test('agent-facing template reply-language directive varies per locale', () => {
     hi: 'IN HINDI',
     uz: 'IN UZBEK',
     ka: 'IN GEORGIAN',
+    uk: 'IN UKRAINIAN',
   };
   for (const loc of localeCodes) {
     const fwd = getKeyInLang(loc as Locale, 'schedule.forwardPromptTemplate');

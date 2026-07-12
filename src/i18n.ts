@@ -37,16 +37,17 @@ import { jaDict } from './i18n/ja';
 import { hiDict } from './i18n/hi';
 import { uzDict } from './i18n/uz';
 import { kaDict } from './i18n/ka';
+import { ukDict } from './i18n/uk';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
  * @description Supported locale codes. `en` is the canonical fallback. `ru` is
  * hand-maintained; the rest are machine-translated from `en`.
  */
-export type Locale = 'en' | 'de' | 'fr' | 'es' | 'pt' | 'ru' | 'zh' | 'ja' | 'hi' | 'uz' | 'ka';
+export type Locale = 'en' | 'de' | 'fr' | 'es' | 'pt' | 'ru' | 'zh' | 'ja' | 'hi' | 'uz' | 'ka' | 'uk';
 
 /** Ordered list of every supported locale — used for parity checks. */
-export const localeCodes: Locale[] = ['en', 'de', 'fr', 'es', 'pt', 'ru', 'zh', 'ja', 'hi', 'uz', 'ka'];
+export const localeCodes: Locale[] = ['en', 'de', 'fr', 'es', 'pt', 'ru', 'zh', 'ja', 'hi', 'uz', 'ka', 'uk'];
 
 /**
  * @description Endonyms — each language's name written in itself. Kept in CODE
@@ -66,6 +67,7 @@ export const localeEndonyms: Record<Locale, string> = {
   hi: 'हिन्दी',
   uz: 'Oʻzbekcha',
   ka: 'ქართული',
+  uk: 'Українська',
 };
 
 /** The endonym (native name) of a locale — e.g. `ru → Русский`. */
@@ -109,6 +111,7 @@ const dict: Record<Locale, Record<string, string>> = {
   hi: hiDict,
   uz: uzDict,
   ka: kaDict,
+  uk: ukDict,
 };
 
 /** Default locale used when Telegram gives no usable language and no override exists. */

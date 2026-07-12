@@ -2,7 +2,7 @@
  * @description Pure builder for the `/language` inline picker keyboard — the
  * endonym-button replacement for the old plain comma-separated code list. One
  * button per LOCALE labelled with its endonym, two per row, plus a full-width
- * `🌐 Auto` reset row. All 11 locales fit in ONE message (Telegram allows ~100
+ * `🌐 Auto` reset row. All 12 locales fit in ONE message (Telegram allows ~100
  * buttons per inline keyboard), so there is no pagination / nav row.
  *
  * Kept pure (no `t()`, no bot state) so the layout — `✓` placement, endonym
@@ -28,7 +28,7 @@ function buildLocaleButton(locale: Locale, current: Locale | null) {
 }
 
 /**
- * @description Build the single-page `/language` picker (all 11 locales).
+ * @description Build the single-page `/language` picker (all 12 locales).
  *
  * @param current the chat's explicit override locale, or `null` for auto (drives
  *   which button carries the `✓` — a locale button when set, the `🌐 Auto` row

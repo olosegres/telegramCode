@@ -49,6 +49,47 @@ export type Locale = 'en' | 'de' | 'fr' | 'es' | 'pt' | 'ru' | 'zh' | 'ja' | 'hi
 export const localeCodes: Locale[] = ['en', 'de', 'fr', 'es', 'pt', 'ru', 'zh', 'ja', 'hi', 'uz', 'ka'];
 
 /**
+ * @description Endonyms — each language's name written in itself. Kept in CODE
+ * (not the per-key `dict`) on purpose: an endonym is the SAME regardless of the
+ * active UI locale (Русский is «Русский» on an English UI too), so it needs no
+ * per-locale translation and must not inflate the key-parity surface.
+ */
+export const localeEndonyms: Record<Locale, string> = {
+  en: 'English',
+  de: 'Deutsch',
+  fr: 'Français',
+  es: 'Español',
+  pt: 'Português',
+  ru: 'Русский',
+  zh: '中文',
+  ja: '日本語',
+  hi: 'हिन्दी',
+  uz: 'Oʻzbekcha',
+  ka: 'ქართული',
+};
+
+/** The endonym (native name) of a locale — e.g. `ru → Русский`. */
+export function getLocaleEndonym(locale: Locale): string {
+  return localeEndonyms[locale];
+}
+
+/**
+ * @description Human-readable display of a chat's resolved language.
+ *
+ * - explicit chat override → the endonym alone (e.g. `Русский`).
+ * - any auto source (Telegram profile / last-seen / fallback) → `auto (<endonym>)`,
+ *   so the user sees BOTH that it's auto AND which language auto landed on.
+ *
+ * Pure and structural: it needs only the resolved locale + whether the source is
+ * an explicit override, so it stays decoupled from the `ResolvedChatLocale` shape
+ * that lives in `bot.ts` (`'override'` is that type's discriminant tag).
+ */
+export function formatLanguageDisplay(resolved: { locale: Locale; source: string }): string {
+  const endonym = getLocaleEndonym(resolved.locale);
+  return resolved.source === 'override' ? endonym : `auto (${endonym})`;
+}
+
+/**
  * @description Dictionary of user-facing strings.
  *
  * Top key = locale, nested key = message code. We keep the type permissive

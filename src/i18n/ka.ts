@@ -157,9 +157,9 @@ export const kaDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 ჯერ თემები არ არის.',
   'language.status':
-    '🌐 ენა: `{current}` ({source})\nTelegram: {telegram}\nხელმისაწვდომია: {locales}\nგამოიყენე /language <locale> ან /language auto.',
+    '🌐 ენა: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ ამ ჩატის ენა დაყენდა `{locale}`-ზე.',
-  'language.auto_success': '✅ ენა დაბრუნდა ავტომატურ რეჟიმზე. მიმდინარე: `{locale}`.',
+  'language.auto_success': '✅ ენა დაბრუნდა ავტომატურ რეჟიმზე. მიმდინარე: {display}.',
   'language.invalid': '⚠️ locale `{locale}` არ არის მხარდაჭერილი. ხელმისაწვდომია: {locales}.',
   'language.telegram_unknown': 'უცნობია',
   'language.source.override': 'ჩატის პარამეტრი',

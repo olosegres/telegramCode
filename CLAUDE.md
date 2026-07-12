@@ -745,9 +745,20 @@ OpenCode events / bindings).
 - **Info / ops:** `/start`, `/status`, `/whoami`, `/version`, `/help`,
   `/doctor`, `/mcp`, `/trace`, `/timestamps`, `/language` (`/lang`)
   - `/language [locale|auto]` shows or changes the bot UI language for the
-    current Telegram chat (DM or whole forum group). Resolution order:
-    explicit override → Telegram `from.language_code` → last supported Telegram
-    locale seen in that chat → `en`; logs stay English.
+    current Telegram chat (DM or whole forum group). Bare `/language` opens a
+    paginated inline picker (mirrors the `/bind` picker; pure builder in
+    `utils/languagePicker.ts`): one ENDONYM button per locale (each language
+    written in itself — `English, Deutsch, …, 中文, ქართული`), `✓` on the current
+    selection, a full-width `🌐 Auto` reset button on every page, and
+    `⬅️ Prev / n·N / Next ➡️` nav (`lang_<code>` / `lang_auto` / `lang_page_<n>`
+    callbacks). Tapping a locale sets the override and re-renders the status line
+    in that language; `🌐 Auto` clears it. The status line shows the resolved
+    language via `formatLanguageDisplay` (`i18n.ts`) — the endonym for an explicit
+    override, `auto (English)` for any auto source; endonyms live in CODE
+    (`localeEndonyms`), NOT the per-key dict, so key parity is unaffected. The
+    `/language <locale>` / `/language auto` text commands keep working. Resolution
+    order: explicit override → Telegram `from.language_code` → last supported
+    Telegram locale seen in that chat → `en`; logs stay English.
   - `/timestamps on|off` (bare → status) toggles the per-thread prompt
     timestamp: when ON, every prompt forwarded to the agent gets its send time
     prepended as the very top line (`2026-06-27T19:42:10+04:00` — local-offset

@@ -157,9 +157,9 @@ export const jaDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 まだスレッドがありません。',
   'language.status':
-    '🌐 言語: `{current}` ({source})\nTelegram: {telegram}\n利用可能: {locales}\n/language <locale> または /language auto を使ってください。',
+    '🌐 言語: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ このチャットの言語を `{locale}` に設定しました。',
-  'language.auto_success': '✅ 言語を自動に戻しました。現在: `{locale}`。',
+  'language.auto_success': '✅ 言語を自動に戻しました。現在: {display}。',
   'language.invalid': '⚠️ locale `{locale}` はサポートされていません。利用可能: {locales}。',
   'language.telegram_unknown': '不明',
   'language.source.override': 'チャット設定',

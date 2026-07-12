@@ -157,9 +157,9 @@ export const zhDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 暂无话题。',
   'language.status':
-    '🌐 语言：`{current}`（{source}）\nTelegram：{telegram}\n可用：{locales}\n使用 /language <locale> 或 /language auto。',
+    '🌐 语言：{display} · {source}\nTelegram：{telegram}',
   'language.set_success': '✅ 此聊天的语言已设为 `{locale}`。',
-  'language.auto_success': '✅ 语言已重置为自动。当前：`{locale}`。',
+  'language.auto_success': '✅ 语言已重置为自动。当前：{display}。',
   'language.invalid': '⚠️ 不支持 locale `{locale}`。可用：{locales}。',
   'language.telegram_unknown': '未知',
   'language.source.override': '聊天设置',

@@ -157,9 +157,9 @@ export const hiDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 अभी तक कोई थ्रेड नहीं।',
   'language.status':
-    '🌐 भाषा: `{current}` ({source})\nTelegram: {telegram}\nउपलब्ध: {locales}\n/language <locale> या /language auto इस्तेमाल करें।',
+    '🌐 भाषा: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ इस चैट की भाषा `{locale}` सेट की गई।',
-  'language.auto_success': '✅ भाषा ऑटो पर रीसेट की गई। मौजूदा: `{locale}`।',
+  'language.auto_success': '✅ भाषा ऑटो पर रीसेट की गई। मौजूदा: {display}।',
   'language.invalid': '⚠️ locale `{locale}` समर्थित नहीं है। उपलब्ध: {locales}.',
   'language.telegram_unknown': 'अज्ञात',
   'language.source.override': 'चैट सेटिंग',

@@ -157,9 +157,9 @@ export const deDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Noch keine Threads.',
   'language.status':
-    '🌐 Sprache: `{current}` ({source})\nTelegram: {telegram}\nVerfügbar: {locales}\nNutze /language <locale> oder /language auto.',
+    '🌐 Sprache: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ Sprache für diesen Chat auf `{locale}` gesetzt.',
-  'language.auto_success': '✅ Sprache auf automatisch zurückgesetzt. Aktuell: `{locale}`.',
+  'language.auto_success': '✅ Sprache auf automatisch zurückgesetzt. Aktuell: {display}.',
   'language.invalid': '⚠️ Locale `{locale}` wird nicht unterstützt. Verfügbar: {locales}.',
   'language.telegram_unknown': 'unbekannt',
   'language.source.override': 'Chat-Einstellung',

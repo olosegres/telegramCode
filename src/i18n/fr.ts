@@ -157,9 +157,9 @@ export const frDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Aucun fil pour l\'instant.',
   'language.status':
-    '🌐 Langue : `{current}` ({source})\nTelegram : {telegram}\nDisponibles : {locales}\nUtilisez /language <locale> ou /language auto.',
+    '🌐 Langue : {display} · {source}\nTelegram : {telegram}',
   'language.set_success': '✅ Langue définie sur `{locale}` pour ce chat.',
-  'language.auto_success': '✅ Langue réinitialisée en automatique. Actuelle : `{locale}`.',
+  'language.auto_success': '✅ Langue réinitialisée en automatique. Actuelle : {display}.',
   'language.invalid': '⚠️ Locale `{locale}` non prise en charge. Disponibles : {locales}.',
   'language.telegram_unknown': 'inconnue',
   'language.source.override': 'réglage du chat',

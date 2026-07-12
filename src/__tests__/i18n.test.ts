@@ -13,6 +13,9 @@ import {
   checkKeyInAllLangs,
   getKeyInLang,
   localeCodes,
+  localeEndonyms,
+  getLocaleEndonym,
+  formatLanguageDisplay,
   defaultLocale,
   getActiveLang,
   normalizeLocale,
@@ -239,17 +242,59 @@ test('language command keys exist in every locale', () => {
   }
 });
 
-test('language.status substitutes all placeholders', () => {
+test('language.status renders {display} + {source} + {telegram} (endonym picker rework)', () => {
+  // The old comma-separated {current}/{locales} code list is gone — the status
+  // line now carries the human display (endonym or "auto (…)"), the source
+  // label, and the Telegram profile locale; the picker buttons replace the list.
   const out = t('language.status', {
-    current: 'en',
+    display: 'auto (English)',
     source: 'Telegram profile',
     telegram: 'en',
-    locales: 'en, ru',
   });
-  assert.ok(out.includes('en'));
-  assert.ok(out.includes('Telegram profile'));
-  assert.ok(out.includes('en, ru'));
+  assert.ok(out.includes('auto (English)'), `expected the display in "${out}"`);
+  assert.ok(out.includes('Telegram profile'), `expected the source label in "${out}"`);
+  assert.ok(out.includes('en'), `expected the telegram locale in "${out}"`);
   assert.ok(!out.includes('{'), `placeholders not substituted: "${out}"`);
+});
+
+test('language.auto_success renders the {display} of the resolved language', () => {
+  const out = t('language.auto_success', { display: 'auto (English)' });
+  assert.ok(out.includes('auto (English)'), `expected the display in "${out}"`);
+  assert.ok(!out.includes('{locale}') && !out.includes('{display}'),
+    `placeholder not substituted: "${out}"`);
+});
+
+// ── endonyms + formatLanguageDisplay (kept in code, not the per-key dict) ──
+
+test('every locale has a non-empty endonym, kept in code (parity-neutral)', () => {
+  for (const loc of localeCodes) {
+    const endonym = getLocaleEndonym(loc);
+    assert.ok(endonym && endonym.trim().length > 0, `empty endonym for "${loc}"`);
+  }
+  // Exactly the 11 supported locales, no orphans / extras.
+  assert.deepEqual(Object.keys(localeEndonyms).sort(), [...localeCodes].sort());
+});
+
+test('endonyms are the expected native names (each language written in itself)', () => {
+  const expected: Record<string, string> = {
+    en: 'English', de: 'Deutsch', fr: 'Français', es: 'Español', pt: 'Português',
+    ru: 'Русский', zh: '中文', ja: '日本語', hi: 'हिन्दी', uz: 'Oʻzbekcha', ka: 'ქართული',
+  };
+  for (const loc of localeCodes) {
+    assert.equal(getLocaleEndonym(loc), expected[loc], `wrong endonym for "${loc}"`);
+  }
+});
+
+test('formatLanguageDisplay: explicit override → the endonym alone', () => {
+  assert.equal(formatLanguageDisplay({ locale: 'ru', source: 'override' }), 'Русский');
+  assert.equal(formatLanguageDisplay({ locale: 'ka', source: 'override' }), 'ქართული');
+});
+
+test('formatLanguageDisplay: any auto source → "auto (<endonym>)"', () => {
+  // telegram / storedTelegram / fallback are all non-override → auto form.
+  assert.equal(formatLanguageDisplay({ locale: 'en', source: 'telegram' }), 'auto (English)');
+  assert.equal(formatLanguageDisplay({ locale: 'de', source: 'storedTelegram' }), 'auto (Deutsch)');
+  assert.equal(formatLanguageDisplay({ locale: 'en', source: 'fallback' }), 'auto (English)');
 });
 
 test('trace.statusReply substitutes thisThread/allThreads/count placeholders', () => {

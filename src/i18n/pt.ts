@@ -157,9 +157,9 @@ export const ptDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Ainda sem tópicos.',
   'language.status':
-    '🌐 Idioma: `{current}` ({source})\nTelegram: {telegram}\nDisponíveis: {locales}\nUsa /language <locale> ou /language auto.',
+    '🌐 Idioma: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ Idioma definido para `{locale}` neste chat.',
-  'language.auto_success': '✅ Idioma reposto para automático. Atual: `{locale}`.',
+  'language.auto_success': '✅ Idioma reposto para automático. Atual: {display}.',
   'language.invalid': '⚠️ A locale `{locale}` não é suportada. Disponíveis: {locales}.',
   'language.telegram_unknown': 'desconhecido',
   'language.source.override': 'definição do chat',

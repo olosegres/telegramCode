@@ -418,7 +418,9 @@ Bot UI language is automatic per Telegram chat: explicit `/language <locale>`
 override wins, then the sender's Telegram client language, then the last
 supported Telegram locale seen for that chat, then English.
 Supported locales: `en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`,
-`ka`. Use `/language auto` to return a DM/group to automatic selection.
+`ka`. Bare `/language` opens a paginated inline picker with each language shown
+by its own name (endonym) and a `🌐 Auto` button; `/language auto` (or the
+button) returns a DM/group to automatic selection.
 
 Agent provider/auth setup is normally done inside the agents themselves:
 `claude login` for Claude CLI and OpenCode's own config/plugins for OpenCode.

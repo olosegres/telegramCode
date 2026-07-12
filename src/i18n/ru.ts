@@ -161,9 +161,9 @@ export const ruDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Тредов пока нет.',
   'language.status':
-    '🌐 Язык: `{current}` ({source})\nTelegram: {telegram}\nДоступно: {locales}\nИспользуй /language <locale> или /language auto.',
+    '🌐 Язык: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ Язык для этого чата: `{locale}`.',
-  'language.auto_success': '✅ Автовыбор языка включён. Сейчас: `{locale}`.',
+  'language.auto_success': '✅ Автовыбор языка включён. Сейчас: {display}.',
   'language.invalid': '⚠️ Локаль `{locale}` не поддерживается. Доступно: {locales}.',
   'language.telegram_unknown': 'неизвестно',
   'language.source.override': 'настройка чата',

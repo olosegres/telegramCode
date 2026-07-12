@@ -157,9 +157,9 @@ export const esDict: Record<string, string> = {
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Aún no hay hilos.',
   'language.status':
-    '🌐 Idioma: `{current}` ({source})\nTelegram: {telegram}\nDisponibles: {locales}\nUsa /language <locale> o /language auto.',
+    '🌐 Idioma: {display} · {source}\nTelegram: {telegram}',
   'language.set_success': '✅ Idioma establecido en `{locale}` para este chat.',
-  'language.auto_success': '✅ Idioma restablecido a automático. Actual: `{locale}`.',
+  'language.auto_success': '✅ Idioma restablecido a automático. Actual: {display}.',
   'language.invalid': '⚠️ La locale `{locale}` no es compatible. Disponibles: {locales}.',
   'language.telegram_unknown': 'desconocido',
   'language.source.override': 'ajuste del chat',

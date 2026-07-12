@@ -385,4 +385,22 @@ export const ruDict: Record<string, string> = {
     '⚠️ Claude разлогинен — отправь /login, чтобы продолжить.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: неверные учётные данные — перезапусти opencode-сервер.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Готов — я могу обрабатывать сообщения в ваших темах и группе.',
+  'startup.header_not_ready':
+    '⚠️ Настройка не завершена. Чтобы начать работу со мной, выполните эти шаги:',
+  'startup.item.create_group':
+    'Создайте форум-супергруппу с включёнными темами (Topics) и отправьте мне там сообщение, чтобы привязать её.',
+  'startup.item.grant_admin':
+    'Сделайте меня админом с правами: {missing}.',
+  'startup.item.bind_topic':
+    'Создайте тему и привяжите её к папке командой /bind.',
+  'startup.item.install_agent':
+    'Установите агентский CLI — claude или opencode.',
+  'startup.item.optional_groq':
+    '(необязательно) Добавьте GROQ_API_KEY в .env и перезапустите, чтобы включить голосовой ввод.',
+  'startup.item.optional_owner':
+    '(необязательно) Задайте OWNER_USER_ID, чтобы получать этот статус в личном чате.',
 };

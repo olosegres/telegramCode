@@ -385,4 +385,22 @@ export const enDict: Record<string, string> = {
     '⚠️ Claude is logged out — run /login to continue.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: invalid credentials — restart the opencode server.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Ready — I can handle messages in your topics and the group.',
+  'startup.header_not_ready':
+    '⚠️ Setup incomplete. To start working with me, please finish these steps:',
+  'startup.item.create_group':
+    'Create a forum supergroup with Topics enabled, then send me a message there to pair it.',
+  'startup.item.grant_admin':
+    'Make me an admin with these rights: {missing}.',
+  'startup.item.bind_topic':
+    'Create a topic and bind it to a folder with /bind.',
+  'startup.item.install_agent':
+    'Install an agent CLI — claude or opencode.',
+  'startup.item.optional_groq':
+    '(optional) Add GROQ_API_KEY to your .env and restart to enable voice input.',
+  'startup.item.optional_owner':
+    '(optional) Set OWNER_USER_ID to receive this status in your private chat.',
 };

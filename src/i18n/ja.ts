@@ -381,4 +381,22 @@ export const jaDict: Record<string, string> = {
     '⚠️ Claude がログアウトしています — 続行するには /login を実行してください。',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: 認証情報が無効です — opencode サーバーを再起動してください。',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ 準備完了 — トピックとグループのメッセージを処理できます。',
+  'startup.header_not_ready':
+    '⚠️ セットアップが未完了です。私と作業を始めるには、次の手順を完了してください：',
+  'startup.item.create_group':
+    'トピックを有効にしたフォーラム・スーパーグループを作成し、そこで私にメッセージを送ってペアリングしてください。',
+  'startup.item.grant_admin':
+    '次の権限を付与して私を管理者にしてください：{missing}。',
+  'startup.item.bind_topic':
+    'トピックを作成し、/bind でフォルダーに紐付けてください。',
+  'startup.item.install_agent':
+    'エージェント CLI をインストールしてください — claude または opencode。',
+  'startup.item.optional_groq':
+    '（任意）音声入力を有効にするには、.env に GROQ_API_KEY を追加して再起動してください。',
+  'startup.item.optional_owner':
+    '（任意）このステータスをプライベートチャットで受け取るには OWNER_USER_ID を設定してください。',
 };

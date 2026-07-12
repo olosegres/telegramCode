@@ -381,4 +381,22 @@ export const hiDict: Record<string, string> = {
     '⚠️ Claude लॉगआउट है — जारी रखने के लिए /login चलाएँ।',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: अमान्य क्रेडेंशियल — opencode सर्वर पुनः प्रारंभ करें।',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ तैयार — मैं आपके टॉपिक और ग्रुप में संदेश संभाल सकता हूँ।',
+  'startup.header_not_ready':
+    '⚠️ सेटअप अधूरा है। मेरे साथ काम शुरू करने के लिए, कृपया ये चरण पूरे करें:',
+  'startup.item.create_group':
+    'Topics सक्षम के साथ एक फ़ोरम सुपरग्रुप बनाएँ, फिर उसे जोड़ने के लिए वहाँ मुझे एक संदेश भेजें।',
+  'startup.item.grant_admin':
+    'मुझे इन अधिकारों के साथ एडमिन बनाएँ: {missing}।',
+  'startup.item.bind_topic':
+    'एक टॉपिक बनाएँ और /bind से उसे किसी फ़ोल्डर से बाँधें।',
+  'startup.item.install_agent':
+    'एक एजेंट CLI इंस्टॉल करें — claude या opencode।',
+  'startup.item.optional_groq':
+    '(वैकल्पिक) वॉइस इनपुट सक्षम करने के लिए अपनी .env में GROQ_API_KEY जोड़ें और पुनः आरंभ करें।',
+  'startup.item.optional_owner':
+    '(वैकल्पिक) यह स्थिति अपने निजी चैट में पाने के लिए OWNER_USER_ID सेट करें।',
 };

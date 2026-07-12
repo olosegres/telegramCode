@@ -71,7 +71,15 @@ import {
 import {
   stopOpenCodeServer,
   ensureOpenCodeServer,
+  checkIsInstalled,
 } from './installManager';
+import {
+  buildReadinessReport,
+  buildStartupStatusText,
+  checkShouldSendStartupStatus,
+  type BotAdminRights,
+  type ReadinessFacts,
+} from './utils/startupReadiness';
 import { getStateStore, KeyLock, type StateStore } from './state';
 import { releaseLock } from './cli/lock';
 import { gracefulShutdown } from './shutdown';
@@ -9365,6 +9373,110 @@ function wireScheduler(): SchedulerMcpHandle {
   });
 }
 
+/**
+ * @description Resolve the bot's admin rights in the paired group, or `null`
+ * when it is not an administrator / the rights cannot be read. A bot can never
+ * be a group `creator`, so only `administrator` carries the three permission
+ * flags (mirrors the `/doctor` probe). Best-effort — any failure yields `null`,
+ * which the readiness report treats as all three rights missing.
+ */
+async function resolveBotAdminRights(
+  groupId: number,
+  botUserId: number,
+): Promise<BotAdminRights | null> {
+  try {
+    const member = await bot.telegram.getChatMember(groupId, botUserId);
+    if (member.status !== 'administrator') return null;
+    return {
+      manageTopics: !!member.can_manage_topics,
+      pin: !!member.can_pin_messages,
+      delete: !!member.can_delete_messages,
+    };
+  } catch (e) {
+    console.warn('[startup-status] getChatMember failed:', e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+/**
+ * @description Boot-time readiness status (plan 2026-07-12): on startup tell the
+ * owner whether the bot can process messages, or list the setup steps still
+ * missing. Delivery target resolves in order: owner DM (`OWNER_USER_ID`), else —
+ * on a 403 (DM never opened) or an unset owner — the paired group's General
+ * topic, else console log only. Cold start always sends; a hot reload stays
+ * silent when fully ready (no spam on frequent rebuilds). Best-effort: any send
+ * failure is logged, never thrown into the boot path.
+ */
+async function sendStartupStatus(isHotReload: boolean): Promise<void> {
+  const groupId = getAllowedGroupId();
+  const ownerUserId = getOwnerUserId();
+  const ownerSet = Number.isFinite(ownerUserId);
+
+  const botUserId = bot.botInfo?.id ?? (await bot.telegram.getMe()).id;
+  const botRights =
+    groupId !== null ? await resolveBotAdminRights(groupId, botUserId) : null;
+  const hasBinding =
+    groupId !== null && state.listBindings().some(({ key }) => key.chatId === groupId);
+  const availableAgents = (['claude', 'opencode'] as const).filter((name) =>
+    checkIsInstalled(name),
+  );
+
+  // When the owner is unset we fall back to General up front; a SET-but-unopened
+  // owner DM surfaces later as a 403 at send time. `usedGeneralFallback` only
+  // feeds the `optional_owner` hint, which itself requires `ownerSet` false — so
+  // the text is identical whether it lands in the owner DM or General.
+  const facts: ReadinessFacts = {
+    groupPaired: groupId !== null,
+    botRights,
+    hasBinding,
+    availableAgents,
+    hasGroq: !!ENV.groqApiKey,
+    ownerSet,
+    usedGeneralFallback: !ownerSet,
+  };
+  const report = buildReadinessReport(facts);
+
+  if (!checkShouldSendStartupStatus({ isHotReload, isReady: report.isReady })) {
+    console.log(`[startup-status] hot reload + ready → skipping status message`);
+    return;
+  }
+
+  const ownerKey: ThreadKey | null = ownerSet
+    ? { chatId: ownerUserId, threadId: DM_GENERAL_THREAD_ID }
+    : null;
+  const generalKey: ThreadKey | null =
+    groupId !== null ? { chatId: groupId, threadId: GENERAL_THREAD_ID } : null;
+
+  const trySend = async (key: ThreadKey): Promise<boolean> => {
+    const text = withThreadLocale(key, () =>
+      buildStartupStatusText(report, (code, opts) => t(code, opts)),
+    );
+    try {
+      await bot.telegram.sendMessage(key.chatId, text);
+      return true;
+    } catch (e) {
+      console.warn(
+        `[startup-status] send to ${keyToString(key)} failed:`,
+        e instanceof Error ? e.message : e,
+      );
+      return false;
+    }
+  };
+
+  if (ownerKey) {
+    console.log(`[startup-status] sending (ready=${report.isReady}) to owner DM ${ownerUserId}`);
+    if (await trySend(ownerKey)) return;
+    console.log('[startup-status] owner DM unreachable — falling back to General');
+  }
+  if (generalKey) {
+    console.log(`[startup-status] sending (ready=${report.isReady}) to group General ${groupId}`);
+    if (await trySend(generalKey)) return;
+  }
+  console.warn(
+    '[startup-status] no reachable target (owner DM + General both unavailable) — status not delivered',
+  );
+}
+
 export async function startBot(): Promise<void> {
   console.log('');
   console.log('=================================');
@@ -9771,6 +9883,20 @@ export async function startBot(): Promise<void> {
   //    ~1s reload window still routes to its live agent; on a cold start
   //    we drop stale updates that piled up while the bot was actually
   //    down (otherwise the user gets a flood of replies to old messages).
+  // 9. Readiness status (plan 2026-07-12): tell the owner whether the bot can
+  //    work, or what setup is still missing. Sent BEFORE bot.launch() on
+  //    purpose: Telegraf v4's long-poll `launch()` awaits the polling loop and
+  //    does NOT resolve until the bot STOPS, so anything after `await
+  //    bot.launch()` runs only on shutdown (the "Bot is running!" logs below
+  //    share that fate). Everything this needs — the paired group and botInfo
+  //    (via a getMe fallback) — is already known, and sending is a direct Bot
+  //    API call independent of polling. Best-effort so it can never fail boot.
+  try {
+    await sendStartupStatus(bootMode.isHotReload);
+  } catch (e) {
+    console.warn('[startup-status] failed:', e instanceof Error ? e.message : e);
+  }
+
   console.log(`Launching Telegraf bot (long polling, dropPendingUpdates=${bootMode.dropPendingUpdates})...`);
   try {
     await bot.launch({

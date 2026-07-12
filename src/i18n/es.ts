@@ -381,4 +381,22 @@ export const esDict: Record<string, string> = {
     '⚠️ Claude está desconectado — ejecuta /login para continuar.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: credenciales inválidas — reinicia el servidor opencode.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Listo — puedo procesar mensajes en tus temas y en el grupo.',
+  'startup.header_not_ready':
+    '⚠️ Configuración incompleta. Para empezar a trabajar conmigo, completa estos pasos:',
+  'startup.item.create_group':
+    'Crea un supergrupo de foro con los Temas activados y envíame un mensaje allí para vincularlo.',
+  'startup.item.grant_admin':
+    'Hazme administrador con estos permisos: {missing}.',
+  'startup.item.bind_topic':
+    'Crea un tema y vincúlalo a una carpeta con /bind.',
+  'startup.item.install_agent':
+    'Instala una CLI de agente — claude u opencode.',
+  'startup.item.optional_groq':
+    '(opcional) Añade GROQ_API_KEY a tu .env y reinicia para habilitar la entrada de voz.',
+  'startup.item.optional_owner':
+    '(opcional) Configura OWNER_USER_ID para recibir este estado en tu chat privado.',
 };

@@ -329,6 +329,27 @@ test('schedule.forwardPromptTemplate substitutes {text} verbatim (markdown + quo
   assert.ok(!out.includes('{text}'), `placeholder not substituted: "${out}"`);
 });
 
+test('startup readiness status keys exist in every locale', () => {
+  for (const code of [
+    'startup.ready',
+    'startup.header_not_ready',
+    'startup.item.create_group',
+    'startup.item.grant_admin',
+    'startup.item.bind_topic',
+    'startup.item.install_agent',
+    'startup.item.optional_groq',
+    'startup.item.optional_owner',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('startup.item.grant_admin substitutes the {missing} rights list', () => {
+  const out = t('startup.item.grant_admin', { missing: 'Manage Topics, Pin Messages' });
+  assert.ok(out.includes('Manage Topics, Pin Messages'), `expected the rights in "${out}"`);
+  assert.ok(!out.includes('{missing}'), `placeholder not substituted: "${out}"`);
+});
+
 test('thinking (/thinking) keys exist in every locale (S2)', () => {
   for (const code of [
     'thinking.live',

@@ -381,4 +381,22 @@ export const uzDict: Record<string, string> = {
     '⚠️ Claude tizimdan chiqdi — davom etish uchun /login ni ishga tushiring.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: yaroqsiz e\'tilbar ma\'lumotlar — opencode serverini qayta ishga tushiring.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Tayyor — mavzularingiz va guruhdagi xabarlarni qayta ishlay olaman.',
+  'startup.header_not_ready':
+    '⚠️ Sozlash tugallanmagan. Men bilan ishlashni boshlash uchun quyidagi qadamlarni bajaring:',
+  'startup.item.create_group':
+    'Mavzular (Topics) yoqilgan forum superguruhini yarating, so‘ng uni bog‘lash uchun u yerda menga xabar yuboring.',
+  'startup.item.grant_admin':
+    'Meni quyidagi huquqlar bilan administrator qiling: {missing}.',
+  'startup.item.bind_topic':
+    'Mavzu yarating va uni /bind buyrug‘i bilan papkaga bog‘lang.',
+  'startup.item.install_agent':
+    'Agent CLI o‘rnating — claude yoki opencode.',
+  'startup.item.optional_groq':
+    '(ixtiyoriy) Ovozli kiritishni yoqish uchun .env fayliga GROQ_API_KEY qo‘shing va qayta ishga tushiring.',
+  'startup.item.optional_owner':
+    '(ixtiyoriy) Ushbu holatni shaxsiy chatingizda olish uchun OWNER_USER_ID ni belgilang.',
 };

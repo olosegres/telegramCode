@@ -381,4 +381,22 @@ export const frDict: Record<string, string> = {
     '⚠️ Claude est déconnecté — lancez /login pour continuer.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode : identifiants invalides — redémarrez le serveur opencode.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Prêt — je peux traiter les messages dans vos sujets et le groupe.',
+  'startup.header_not_ready':
+    '⚠️ Configuration incomplète. Pour commencer à travailler avec moi, veuillez terminer ces étapes :',
+  'startup.item.create_group':
+    'Créez un supergroupe de forum avec les Sujets activés, puis envoyez-moi un message là-bas pour l’associer.',
+  'startup.item.grant_admin':
+    'Faites de moi un administrateur avec ces droits : {missing}.',
+  'startup.item.bind_topic':
+    'Créez un sujet et liez-le à un dossier avec /bind.',
+  'startup.item.install_agent':
+    'Installez un CLI d’agent — claude ou opencode.',
+  'startup.item.optional_groq':
+    '(optionnel) Ajoutez GROQ_API_KEY à votre .env et redémarrez pour activer la saisie vocale.',
+  'startup.item.optional_owner':
+    '(optionnel) Définissez OWNER_USER_ID pour recevoir ce statut dans votre chat privé.',
 };

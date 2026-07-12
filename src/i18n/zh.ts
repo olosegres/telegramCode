@@ -381,4 +381,22 @@ export const zhDict: Record<string, string> = {
     '⚠️ Claude 已登出 — 运行 /login 继续。',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: 凭据无效 — 重启 opencode 服务器。',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ 已就绪 — 我可以处理你的话题和群组中的消息。',
+  'startup.header_not_ready':
+    '⚠️ 设置尚未完成。要开始与我协作，请完成以下步骤：',
+  'startup.item.create_group':
+    '创建一个启用了话题的论坛超级群组，然后在其中给我发送一条消息以完成配对。',
+  'startup.item.grant_admin':
+    '将我设为管理员并授予以下权限：{missing}。',
+  'startup.item.bind_topic':
+    '创建一个话题，并使用 /bind 将其绑定到一个文件夹。',
+  'startup.item.install_agent':
+    '安装一个智能体 CLI —— claude 或 opencode。',
+  'startup.item.optional_groq':
+    '（可选）将 GROQ_API_KEY 添加到你的 .env 并重启以启用语音输入。',
+  'startup.item.optional_owner':
+    '（可选）设置 OWNER_USER_ID 以在你的私聊中接收此状态。',
 };

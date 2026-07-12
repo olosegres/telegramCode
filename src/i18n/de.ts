@@ -381,4 +381,22 @@ export const deDict: Record<string, string> = {
     '⚠️ Claude ist abgemeldet — führe /login aus, um fortzufahren.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: ungültige Anmeldedaten — starte den opencode-Server neu.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Bereit — ich kann Nachrichten in deinen Themen und der Gruppe verarbeiten.',
+  'startup.header_not_ready':
+    '⚠️ Einrichtung unvollständig. Um mit mir zu arbeiten, schließe bitte diese Schritte ab:',
+  'startup.item.create_group':
+    'Erstelle eine Forum-Supergruppe mit aktivierten Themen und schreibe mir dort eine Nachricht, um sie zu koppeln.',
+  'startup.item.grant_admin':
+    'Mache mich zum Admin mit diesen Rechten: {missing}.',
+  'startup.item.bind_topic':
+    'Erstelle ein Thema und binde es mit /bind an einen Ordner.',
+  'startup.item.install_agent':
+    'Installiere ein Agent-CLI — claude oder opencode.',
+  'startup.item.optional_groq':
+    '(optional) Füge GROQ_API_KEY zu deiner .env hinzu und starte neu, um Spracheingabe zu aktivieren.',
+  'startup.item.optional_owner':
+    '(optional) Setze OWNER_USER_ID, um diesen Status in deinem privaten Chat zu erhalten.',
 };

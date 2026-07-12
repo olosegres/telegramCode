@@ -381,4 +381,22 @@ export const ptDict: Record<string, string> = {
     '⚠️ Claude está desconectado — executa /login para continuar.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: credenciais inválidas — reinicia o servidor opencode.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ Pronto — posso processar mensagens nos seus tópicos e no grupo.',
+  'startup.header_not_ready':
+    '⚠️ Configuração incompleta. Para começar a trabalhar comigo, conclua estas etapas:',
+  'startup.item.create_group':
+    'Crie um supergrupo de fórum com os Tópicos ativados e envie-me uma mensagem lá para emparelhá-lo.',
+  'startup.item.grant_admin':
+    'Torne-me administrador com estes direitos: {missing}.',
+  'startup.item.bind_topic':
+    'Crie um tópico e vincule-o a uma pasta com /bind.',
+  'startup.item.install_agent':
+    'Instale uma CLI de agente — claude ou opencode.',
+  'startup.item.optional_groq':
+    '(opcional) Adicione GROQ_API_KEY ao seu .env e reinicie para ativar a entrada de voz.',
+  'startup.item.optional_owner':
+    '(opcional) Defina OWNER_USER_ID para receber este status no seu chat privado.',
 };

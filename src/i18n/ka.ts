@@ -381,4 +381,22 @@ export const kaDict: Record<string, string> = {
     '⚠️ Claude გამოსულია — გასაგრძელებლად გაუშვით /login.',
   'apiRetry.loggedOutOpenCode':
     '⚠️ OpenCode: არასწორი ავტორიზაციის მონაცემები — გადატვირთეთ opencode სერვერი.',
+
+  // ── startup readiness status (boot-time owner notice) ──
+  'startup.ready':
+    '✅ მზადაა — შემიძლია დავამუშავო შეტყობინებები თქვენს თემებსა და ჯგუფში.',
+  'startup.header_not_ready':
+    '⚠️ კონფიგურაცია დაუსრულებელია. ჩემთან სამუშაოდ, გთხოვთ, დაასრულოთ ეს ნაბიჯები:',
+  'startup.item.create_group':
+    'შექმენით ფორუმ-სუპერჯგუფი ჩართული თემებით (Topics) და მომწერეთ იქ, რომ დაწყვილდეს.',
+  'startup.item.grant_admin':
+    'გამხადეთ ადმინი შემდეგი უფლებებით: {missing}.',
+  'startup.item.bind_topic':
+    'შექმენით თემა და მიაბით საქაღალდეს /bind ბრძანებით.',
+  'startup.item.install_agent':
+    'დააინსტალირეთ აგენტის CLI — claude ან opencode.',
+  'startup.item.optional_groq':
+    '(არასავალდებულო) ხმოვანი შეყვანის ჩასართავად დაამატეთ GROQ_API_KEY თქვენს .env-ში და გადატვირთეთ.',
+  'startup.item.optional_owner':
+    '(არასავალდებულო) დააყენეთ OWNER_USER_ID, რომ ეს სტატუსი მიიღოთ თქვენს პირად ჩატში.',
 };

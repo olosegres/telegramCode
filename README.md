@@ -2,12 +2,9 @@
   <tr>
     <td><h2>Telegram bot/group as a terminal for OpenCode, Claude Code — every thread like a terminal tab + scheduling, voice control</h2>
 
-TelegramCode turns Telegram into a terminal for running agentic CLIs. A forum
-supergroup is the terminal window; each topic (thread) is a tab of that
-terminal — bound to one of your project folders and running its own fully
-isolated **Claude Code** or **OpenCode** session. Open as many tabs as you
-need (even two on the same project for parallel work) and drive the agents
-from your phone or tablet, voice messages included.
+TelegramCode turns Telegram into a terminal for running agentic CLIs. Open as
+many tabs as you need — even two on the same project for parallel work — and
+drive the agents from your phone or tablet, voice messages included.
 
 Think **OpenClaw for vibe coding**, driven entirely from Telegram: no complex
 setup, no extra dashboards — direct access to your own **OpenCode** /
@@ -15,9 +12,10 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 
 ### Features
 
-- **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions; two topics can share one folder for parallel work
+- **Simple setup & management** — install the CLI, put your bot token in one `.env`, bind a topic to a folder, and run; everything after is managed from Telegram — no dashboards
+- **Multi-thread / topic** — one topic per directory with your agent; two topics can share one folder for parallel work — run almost unlimited agents in parallel
 - **Two chat surfaces** — forum-group topics and the owner's bot DM, both served at once by default, with tabs on either
-- **Agent backends** — first-class OpenCode (native server API over HTTP+SSE: sessions, models, reasoning effort, interactive questions) and Claude Code (tmux-scrape or stream-json backend, `/claude_mode`), picked per-thread
+- **Agent backends** — OpenCode (native server API over HTTP+SSE) and Claude Code (two backends — tmux and json-stream)
 - **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Notifications** — when the agent asks a question, the bot pins that message so even a muted topic notifies you: the pin pierces mute, giving exactly one notification per question (unpinned once you answer)
 - **Scheduled & self-driving runs** — `/schedule` arms cron / one-shot / N-times jobs per topic, and the agent can schedule *itself* via injected MCP tools: nightly reviews, recurring reports, a "finish this tomorrow at 9" hand-off. Each job fires as a fresh session with your prompt; restart-safe, with one catch-up for a run missed while the bot was down
@@ -26,7 +24,6 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
 - **Display verbosity** — `/verbosity` (plus `/thinking`, `/tool_results`, `/subagent`) per topic: `minimal|short|full`
 - **Time-aware prompts** — `/timestamps on` prepends each forwarded prompt's send time (local-offset ISO), so a days-long session knows what "yesterday" or "2 days ago" means; agent-facing only, per topic
-- **Two bots side by side** — run separate instances for, say, work and personal ("pet") projects on the same machine; each is fully isolated, so their tasks, sessions and chats never mix
     </td>
 <td width="280"><img src="./demo.gif" width="320" /></td>
   </tr>
@@ -240,6 +237,31 @@ Shortcut: `yarn install-link` runs `yarn install && yarn build && npm link` in
 one shot — `npm link` symlinks the global `telegramcode` to this folder, so
 later rebuilds (`yarn build`) are picked up without re-installing. Config and
 launch are identical to steps 2–5 above.
+
+## Required files structure
+
+Launch `telegramcode` from the parent folder that holds your project repos —
+that `$PWD` is the work root, and every topic binds to a subfolder under it:
+
+```
+$PWD=/home/user/src                     ← run the bot here ($PWD = work root)
+├── projectA/         ← Topic "projectA"        (claude)
+├── projectB/         ← Topic "projB-frontend"  (claude)
+│                     ← Topic "projB-backend"   (opencode)   ← one folder, two topics
+│                     ← Topic "projB-refactor"  (claude)
+└── projectC/         ← Topic "projectC"         (opencode)
+
+Telegram forum supergroup
+├── Bot is admin with can_manage_topics + can_delete_messages + can_pin_messages
+└── Routes each topic by (chatId, threadId) → remembered in state.json
+```
+
+**What the bot remembers (`state.json`).** So a restart is seamless, the bot
+saves which topic is bound to which folder, each topic's live agent session (to
+re-attach it after a reboot), your per-topic preferences (agent, model,
+reasoning effort, language, display verbosity), scheduled prompts, and the
+paired group id. This file lives in `DATA_DIR` (default `~/.telegramCode`) and
+is written safely, so a crash can't corrupt it.
 
 ## Commands
 

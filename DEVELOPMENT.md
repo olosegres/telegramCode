@@ -6,18 +6,8 @@ behavior, see [`CLAUDE.md`](CLAUDE.md).
 
 ## Architecture
 
-```
-$PWD=/home/user/src                     ← launch `telegramcode` here
-├── projectAlpha/     ← Topic "projectAlpha"    (claude)
-├── projectB/         ← Topic "projB-frontend"  (claude)
-│                     ← Topic "projB-backend"   (opencode)   ← one folder, two topics
-│                     ← Topic "projB-refactor"  (claude)
-└── telegramcode/     ← Topic "telegramcode"    (claude)
-
-Telegram forum supergroup
-├── Bot is admin with can_manage_topics + can_delete_messages + can_pin_messages
-└── Routes by ThreadKey = (chatId, threadId)  →  src/state.ts persists bindings
-```
+The per-topic folder layout is in the README under
+[Required files structure](README.md#required-files-structure).
 
 Routing key is `(chatId, threadId)` everywhere. Per-thread state lives in
 `${DATA_DIR}/state.json` (atomic writes with `fsync`, archived on

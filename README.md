@@ -25,6 +25,7 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 - **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
 - **Display verbosity** — `/verbosity` (plus `/thinking`, `/tool_results`, `/subagent`) per topic: `minimal|short|full`
+- **Localized in 12 languages** — the bot UI (commands, buttons, notices) speaks 中文, English, Français, ქართული, Deutsch, हिन्दी, 日本語, Português, Русский, Español, Українська, Oʻzbekcha; auto-detected per Telegram chat, switch any time with `/language`
 - **MCP hierarchy** — user / group / project / thread, with `${VAR}` env expansion, plus bot-injected scheduling/file tools
 - **Observability** — always-on output trace (`/trace`), console log buckets, `/timestamps`
 - **Two-instance ready** — pet vs work, isolated DATA_DIR, group, port
@@ -270,6 +271,7 @@ actually start an agent or terminal in the folder.
 | `/whoami` | Show userId, chatId, threadId, isAllowed, binding |
 | `/trace` | Output-trace recorder (`on`/`off`, `on all`/`off all`; bare = status) — see [Observability](#observability) |
 | `/timestamps` | Prepend the send time to prompts forwarded to the agent (`on`/`off`; bare = status) |
+| `/language`, `/lang` | Set the bot UI language for this chat; bare opens an endonym picker (sorted A→Z by English name), `/language auto` returns to automatic per-chat detection |
 | `/pair` | Bind this forum supergroup to the bot (re-point auto-pairing) — works from any topic of the target group; a numeric `ALLOWED_GROUP_ID` env locks pairing |
 
 ### General-only
@@ -676,23 +678,6 @@ The Docker dev loop (never `docker compose restart` — it ignores
 docker compose down telegramcode-pet && docker compose up -d telegramcode-pet
 docker compose logs -f telegramcode-pet     # tail logs
 ```
-
-Key files:
-
-- `src/bot.ts` — Telegraf entry, commands, message handling, output streaming
-- `src/state.ts` — JSON state, atomic writes, per-key async lock
-- `src/types.ts` — `ThreadKey`, `AgentAdapter`, `OutputTransport`
-- `src/adapters/claudeCliAdapter.ts` — Claude via tmux scrape (keystrokes in, capture-pane out)
-- `src/adapters/claudeJsonStreamAdapter.ts` — Claude via stream-json (external tmux-hosted process, survives bot restarts)
-- `src/adapters/openCodeAdapter.ts` — OpenCode via HTTP + SSE
-- `src/adapters/terminalAdapter.ts` — raw `$SHELL` in tmux
-- `src/output/` — output transports: group edit-in-place vs the owner-DM draft cursor
-- `src/scheduler/` — scheduled prompts + the bot-owned MCP server (`schedule_*`, `send_file`)
-- `src/accessControl.ts` — group-admin access (live `getChatAdministrators` cache)
-- `src/validation.ts` — `/bind` input validation (path-traversal/symlink-safe)
-- `src/mcpConfig.ts` — `${VAR}` expansion, tmp-file plumbing
-- `src/rateLimiter.ts` — `GlobalSendPacer` (process-wide 1-send-per-2s gate) + per-user limits
-- `src/i18n.ts` — `t()` / `errorMessage()` (12 locales: en/de/fr/es/pt/ru/zh/ja/hi/uz/ka/uk; per-locale modules in `src/i18n/`)
 
 ## Migration from 1.x
 

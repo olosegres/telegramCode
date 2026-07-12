@@ -3,16 +3,19 @@
  * the DEFAULT (temporarily — json-stream cannot host `/login` yet; see plan
  * 2026-07-11-jsonstream-login-outofband-auth), and a thread can hold an
  * explicit json-stream pick that is honoured.
- * Covers getDefaultAdapterName / checkIsClaudeBackend / resolveClaudeBackendName
- * (the /claude_mode per-topic switch + default-backend behavior).
+ * Covers getDefaultClaudeBackendName / checkIsClaudeBackend / resolveClaudeBackendName
+ * / getThreadAdapterNameRaw (the /claude_mode per-topic switch + default-backend
+ * behavior; the default is confined to the Claude-backend resolver — a no-pick
+ * thread's raw name stays `undefined`, never silently 'claude').
  */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
-  getDefaultAdapterName,
+  getDefaultClaudeBackendName,
   checkIsClaudeBackend,
   resolveClaudeBackendName,
+  getThreadAdapterNameRaw,
   setThreadAdapter,
   parseClaudeBackendArg,
   getClaudeModeAction,
@@ -22,8 +25,21 @@ import type { ThreadKey } from '../types';
 
 const key = (threadId: number): ThreadKey => ({ chatId: -100, threadId });
 
-test('default adapter is tmux-scrape Claude', () => {
-  assert.equal(getDefaultAdapterName(), 'claude');
+test('default Claude backend is tmux-scrape', () => {
+  assert.equal(getDefaultClaudeBackendName(), 'claude');
+});
+
+test('getThreadAdapterNameRaw: no pick → undefined (never silently the default agent)', () => {
+  assert.equal(getThreadAdapterNameRaw(key(20)), undefined);
+});
+
+test('getThreadAdapterNameRaw: an explicit pick is returned verbatim (any backend)', () => {
+  const oc = key(21);
+  setThreadAdapter(oc, 'opencode');
+  assert.equal(getThreadAdapterNameRaw(oc), 'opencode');
+  const js = key(22);
+  setThreadAdapter(js, claudeJsonStreamAdapterName);
+  assert.equal(getThreadAdapterNameRaw(js), claudeJsonStreamAdapterName);
 });
 
 test('checkIsClaudeBackend: both Claude backends true, others false', () => {

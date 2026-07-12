@@ -141,7 +141,7 @@ flow is reused verbatim; `answerQuestion` / `rejectQuestion` emit the matching
 
 ## Selecting it (default + `/claude_mode`)
 
-This is the **DEFAULT** Claude backend (`getDefaultAdapterName` /
+This is the **DEFAULT** Claude backend (`getDefaultClaudeBackendName` /
 `resolveClaudeBackendName`): ▶️ Claude / `/claude` open it unless the thread
 explicitly picked tmux. `/claude_mode` switches a topic between the two backends
 on the fly — the pick persists as the thread's adapter name and the switch

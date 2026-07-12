@@ -16,8 +16,10 @@ import type { DeliveryOutcome, FireContext, ScheduleRecord } from './types';
  *      (do NOT interrupt live work), then forward (forwarding interrupts only as
  *      the timeout fallback — existing `forwardPromptToAgent` semantics). If no
  *      session, start one (with the job's `lastAdapterName` snapshot as the
- *      adapter fallback). An unbound topic → outcome `failed` with a distinct
- *      error string the engine records (S8 turns that into a pause).
+ *      adapter fallback — a topic that never picked an agent and carries no
+ *      snapshot fails with `no agent selected`). An unbound topic → outcome
+ *      `failed` with a distinct error string the engine records (S8 turns that
+ *      into a pause).
  *   4. forward — hand the prefixed prompt to the agent.
  *
  * It owns NO bot.ts import: every side effect is injected via
@@ -45,12 +47,13 @@ export const unboundDeliveryError = 'thread is unbound';
  * @description What {@link ScheduleDeliveryDeps.ensureSession} reports back. It
  * mirrors bot.ts's `ensureAgentSession` outcome without importing it: `ok` means
  * a session is ready (active, mid-startup, or just started — a prompt forwarded
- * now is delivered or buffered-then-replayed); `unbound`/`start-failed` are the
- * two failure reasons.
+ * now is delivered or buffered-then-replayed); `unbound`/`no-adapter`/
+ * `start-failed` are the three failure reasons (`no-adapter` = bound topic that
+ * never picked an agent and the job carried no `lastAdapterName`).
  */
 export type EnsureSessionResult =
   | { ok: true }
-  | { ok: false; reason: 'unbound' | 'start-failed' };
+  | { ok: false; reason: 'unbound' | 'no-adapter' | 'start-failed' };
 
 /**
  * @name ScheduleDeliveryDeps
@@ -165,8 +168,14 @@ export function createScheduleDelivery(
     const session = await deps.ensureSession(threadKey, job.lastAdapterName);
     if (!session.ok) {
       // Unbound → distinct error the engine records; S8 pauses the job on it.
-      // A start failure surfaces its own readable reason.
-      const error = session.reason === 'unbound' ? unboundDeliveryError : 'failed to start agent session';
+      // no-adapter → the topic never picked an agent; start-failed → a start
+      // that threw. Both surface their own readable ledger reason.
+      const error =
+        session.reason === 'unbound'
+          ? unboundDeliveryError
+          : session.reason === 'no-adapter'
+            ? 'no agent selected for this topic'
+            : 'failed to start agent session';
       return { status: 'failed', error };
     }
 

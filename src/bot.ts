@@ -19,11 +19,10 @@ const execFileAsync = promisify(execFile);
 import {
   getAdapter,
   getThreadAdapter,
-  getThreadAdapterName,
   getThreadAdapterNameRaw,
   setThreadAdapter,
   getAvailableAdapters,
-  getDefaultAdapterName,
+  getDefaultClaudeBackendName,
   registerAdapterEventHandlers,
   registerDisplayPrefsReader,
   registerSeenWatermarkWriter,
@@ -1315,7 +1314,7 @@ async function surfaceLoggedOutNotice(key: ThreadKey): Promise<void> {
   authNoticePinnedMessageId.set(k, authNoticePendingSentinel);
 
   const messageKey =
-    getThreadAdapterName(key) === 'opencode' ? 'apiRetry.loggedOutOpenCode' : 'apiRetry.loggedOutClaude';
+    getThreadAdapterNameRaw(key) === 'opencode' ? 'apiRetry.loggedOutOpenCode' : 'apiRetry.loggedOutClaude';
   const id = await replyToThread(key, t(messageKey));
   if (id === null) {
     // Send failed — release the reservation so a later error can retry surfacing.
@@ -3406,8 +3405,8 @@ async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof s
  * 'Login successful' on every message" bug reported 2026-05-15.
  */
 async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<void> {
-  const prevName = getThreadAdapterName(key);
-  if (prevName !== newName) {
+  const prevName = getThreadAdapterNameRaw(key);
+  if (prevName && prevName !== newName) {
     try {
       const prev = getAdapter(prevName);
       if (prev.checkIsActive(key)) {
@@ -3538,13 +3537,14 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
  * async startup window (prompts get buffered + replayed on ready), or it was
  * just started. `message` is the localized text the caller MAY surface (the
  * `agent.ready` notice on a fresh start, empty when nothing user-facing
- * happened). On failure, `reason` distinguishes a missing binding (`unbound`)
- * from a start that threw (`start-failed`), and `message` carries the
- * matching localized text.
+ * happened). On failure, `reason` distinguishes a missing binding (`unbound`),
+ * a bound topic that has never picked an agent and none was supplied
+ * (`no-adapter` — refuse rather than silently launch a default), and a start
+ * that threw (`start-failed`); `message` carries the matching localized text.
  */
 export type EnsureAgentSessionResult =
   | { ok: true; message: string }
-  | { ok: false; reason: 'unbound' | 'start-failed'; message: string };
+  | { ok: false; reason: 'unbound' | 'no-adapter' | 'start-failed'; message: string };
 
 /**
  * @name EnsureAgentSessionOptions
@@ -3552,9 +3552,11 @@ export type EnsureAgentSessionResult =
  *  - `preferredAdapterName` — an EXPLICIT user choice that outranks every
  *    resolved name (the natural-language-start path passes the matched
  *    `/claude` vs `/opencode` adapter here).
- *  - `fallbackAdapterName` — used only when nothing else resolves (the
+ *  - `fallbackAdapterName` — the LAST resort when nothing else resolves (the
  *    scheduler passes a job's `lastAdapterName` snapshot for a start after a
- *    rebind, where the thread has no live or persisted adapter).
+ *    rebind, where the thread has no live or persisted adapter). When it too is
+ *    absent and nothing resolved, `ensureAgentSession` fails with `no-adapter`
+ *    rather than silently launching a default backend.
  *  - `args` — forwarded to `startAgentSession` (e.g. the natural-language
  *    start phrase's trailing args).
  */
@@ -3577,9 +3579,14 @@ export interface EnsureAgentSessionOptions {
  *  - already active                → `{ ok: true }` (no message; nothing started).
  *  - mid-startup (window open)     → `{ ok: true }` (prompts will buffer + replay).
  *  - no session, no binding        → `{ ok: false, reason: 'unbound' }`.
+ *  - no session, has binding, but no adapter resolves (no explicit pick, no
+ *    in-memory/persisted choice, no `fallbackAdapterName`) →
+ *    `{ ok: false, reason: 'no-adapter' }` — refuse rather than silently launch
+ *    a default backend (interactive starts always pass `preferredAdapterName`,
+ *    so this only bites a `/schedule`/scheduler fire on a never-started topic).
  *  - no session, has binding       → resolve the adapter name (explicit
  *    `preferredAdapterName` → in-memory thread pick → persisted
- *    `agents[key].name` → `fallbackAdapterName` → default), `switchThreadAdapter`
+ *    `agents[key].name` → `fallbackAdapterName`), `switchThreadAdapter`
  *    + `startAgentSession`, then report `ok` from whether the session came up.
  */
 async function ensureAgentSession(
@@ -3595,14 +3602,19 @@ async function ensureAgentSession(
   }
 
   // Resolve which adapter to start. `getThreadAdapterNameRaw` returns the
-  // in-memory pick WITHOUT the default fallback, so "no pick yet" stays
-  // distinguishable from "picked the default" and the chain doesn't short out.
+  // in-memory pick WITHOUT any default fallback, so "no pick yet" stays
+  // distinguishable and the chain never silently defaults to a backend. When
+  // nothing resolves (bound topic that never picked an agent, no caller
+  // fallback) we REFUSE — the user must start/pick an agent first.
   const adapterName =
     options.preferredAdapterName ??
     getThreadAdapterNameRaw(key) ??
     state.getAgent(key)?.name ??
-    options.fallbackAdapterName ??
-    getDefaultAdapterName();
+    options.fallbackAdapterName;
+
+  if (!adapterName) {
+    return { ok: false, reason: 'no-adapter', message: t('agent.no_session') };
+  }
 
   await switchThreadAdapter(key, adapterName);
   const message = await startAgentSession(key, options.args);
@@ -3882,13 +3894,14 @@ command('status', async (_ctx, key) => {
   }
   const adapter = getThreadAdapter(key);
   const isActive = adapter.checkIsActive(key);
-  const adapterName = getThreadAdapterName(key);
+  const adapterName = getThreadAdapterNameRaw(key);
+  const agentLine = adapterName ? `${adapter.label} (${adapterName})` : 'none (start /claude or /opencode)';
   const binding = state.getBinding(key);
   const subdir = binding?.subdir ?? '(no binding — WORK_ROOT)';
   await replyToThread(
     key,
     'Status:\n\n' +
-      `Agent: ${adapter.label} (${adapterName})\n` +
+      `Agent: ${agentLine}\n` +
       `Folder: ${subdir}\n` +
       `Session: ${isActive ? 'running' : 'stopped'}`,
   );
@@ -5018,14 +5031,15 @@ async function applyClaudeBackendSwitch(key: ThreadKey, target: string): Promise
 command('claude_mode', async (ctx, key) => {
   if (checkIsGeneral(key)) { await replyToThread(key, t('error.start_in_general')); return; }
 
-  // Gate on the thread adapter name (the default-adapter fallback included)
-  // but compare/✓ against the EFFECTIVE Claude backend — the same resolution
-  // the start path uses. See `getClaudeModeAction` for the live bug this split
-  // resolution fixes (a fresh thread under a legacy env-forced 'claude'
-  // default no-oped the first `/claude_mode tmux`).
+  // Gate on the thread adapter name — the raw pick, else the Claude default via
+  // `resolveClaudeBackendName` so a fresh no-pick topic still reads as a Claude
+  // topic — but compare/✓ against the EFFECTIVE Claude backend, the same
+  // resolution the start path uses. See `getClaudeModeAction` for the live bug
+  // this split resolution fixes (a fresh thread under a legacy env-forced
+  // 'claude' default no-oped the first `/claude_mode tmux`).
   const arg = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   const action = getClaudeModeAction({
-    threadAdapterName: getThreadAdapterName(key),
+    threadAdapterName: getThreadAdapterNameRaw(key) ?? resolveClaudeBackendName(key),
     effectiveBackendName: resolveClaudeBackendName(key),
     requestedBackendName: parseClaudeBackendArg(arg),
   });
@@ -5626,7 +5640,7 @@ command(['quit', 'q'], async (_ctx, key) => {
   cancelApiRetry(key);
   clearAuthNotice(key); // /quit teardown → retire any pinned logged-out notice
   const adapter = getThreadAdapter(key);
-  const adapterName = getThreadAdapterName(key);
+  const adapterName = getThreadAdapterNameRaw(key);
   const primaryActive = adapter.checkIsActive(key);
 
   // Defensive: any *other* adapter that's also active for this thread is
@@ -7528,7 +7542,7 @@ async function applyQuestionAnswerInner(key: ThreadKey, answerForCurrent: string
  * here (the group transport is the thin `queueOutput` path).
  */
 function checkAdapterSupportsDraftStreaming(key: ThreadKey): boolean {
-  const name = getThreadAdapterName(key);
+  const name = getThreadAdapterNameRaw(key);
   return name === 'opencode' || name === 'claude' || name === claudeJsonStreamAdapterName;
 }
 
@@ -8869,7 +8883,7 @@ async function reattachExistingSessions(
         // A thread whose resolved backend is json-stream must never re-adopt a
         // stale tmux-claude session — kill it and let the json-stream reattach
         // (2b) own this thread instead.
-        if (getThreadAdapterName(key) === claudeJsonStreamAdapterName) {
+        if (getThreadAdapterNameRaw(key) === claudeJsonStreamAdapterName) {
           await claudeAdapter.killOrphanTmuxSession(sessionName);
           killed += 1;
           continue;
@@ -9544,7 +9558,7 @@ export async function startBot(): Promise<void> {
   console.log('=================================');
   console.log('Access:           forum-group admins/creator (live, cached)');
   console.log(`Work root:        ${ENV.workRoot}`);
-  console.log(`Default agent:    ${getDefaultAdapterName()}`);
+  console.log(`Default Claude backend: ${getDefaultClaudeBackendName()}`);
   console.log(`Available agents: ${getAvailableAdapters().map(a => a.name).join(', ')}`);
 
   // 1. State store. The `[startup] DATA_DIR=` shape is load-bearing: the

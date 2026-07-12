@@ -205,6 +205,17 @@ test('ensureSession start-failed → outcome failed with a readable reason; no f
   assert.ok(!callLog.some((e) => e.step === 'forward'));
 });
 
+test('ensureSession no-adapter → outcome failed with a distinct "no agent selected" reason; no forward', async () => {
+  const { deps, callLog } = createHarness({ ensureResult: { ok: false, reason: 'no-adapter' } });
+  const deliver = createScheduleDelivery(deps);
+  const outcome = await deliver(makeJob(), onTime);
+
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.error, 'no agent selected for this topic');
+  assert.notEqual(outcome.error, unboundDeliveryError, 'no-adapter is distinct from unbound');
+  assert.ok(!callLog.some((e) => e.step === 'forward'), 'a topic with no agent never forwards');
+});
+
 test('forward throws → outcome failed carrying the thrown message', async () => {
   const { deps } = createHarness({ forwardThrows: true });
   const deliver = createScheduleDelivery(deps);

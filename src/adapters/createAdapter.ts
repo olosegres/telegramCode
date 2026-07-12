@@ -262,16 +262,19 @@ export function getAvailableAdapters(): Array<{ name: string; label: string }> {
 }
 
 /**
- * @description The adapter a thread with no explicit pick gets: Claude Code
- * (the tmux-scrape backend — TEMPORARILY: json-stream cannot host `/login`
- * yet, so it is reachable per-thread via `/claude_mode` until the login
+ * @description The default Claude Code BACKEND — the one a `/claude` start opens
+ * when the thread has made no explicit `/claude_mode` pick. Used ONLY by
+ * {@link resolveClaudeBackendName}; it is NOT a general "default agent" fallback.
+ * A thread with no adapter pick at all has NO agent — the bot refuses to start
+ * one until the user picks Claude/OpenCode (welcome buttons / commands), rather
+ * than silently launching a default.
+ *
+ * Currently the tmux-scrape backend (TEMPORARILY: json-stream cannot host
+ * `/login` yet, so it is reachable per-thread via `/claude_mode` until the login
  * interception ships and the default flips back; see plan
  * `agent/tasks/actual/2026-07-11-jsonstream-login-outofband-auth.md`).
- * Hardcoded — the old env-driven default override is retired; the only
- * persisted agent choice is per-thread (welcome buttons / commands /
- * `/claude_mode`).
  */
-export function getDefaultAdapterName(): string {
+export function getDefaultClaudeBackendName(): string {
   return 'claude';
 }
 
@@ -280,7 +283,7 @@ export function getDefaultAdapterName(): string {
  * against the SAME on-disk transcript, so a thread is cross-resumable between
  * them live:
  *  - `'claude'` — the tmux TUI, scraped screen (classic; the DEFAULT for now,
- *    see {@link getDefaultAdapterName}).
+ *    see {@link getDefaultClaudeBackendName}).
  *  - {@link claudeJsonStreamAdapterName} — an EXTERNAL tmux-hosted process
  *    streaming structured stream-json events over a FIFO + stdout file, so it
  *    survives bot restarts.
@@ -293,13 +296,15 @@ export function checkIsClaudeBackend(name: string): boolean {
 /**
  * @description Which Claude backend a fresh "start Claude Code" should open for
  * `key`: the thread's explicit backend pick if it has one, else the default
- * (tmux-scrape, {@link getDefaultAdapterName}). Lets the ▶️ Claude button /
+ * (tmux-scrape, {@link getDefaultClaudeBackendName}). Lets the ▶️ Claude button /
  * `/claude` open the default while honouring an explicit `/claude_mode`
- * json-stream pick.
+ * json-stream pick. This is the SOLE sanctioned consumer of
+ * {@link getDefaultClaudeBackendName} — every other "no pick" site must treat an
+ * absent pick as "no agent", not silently default.
  */
 export function resolveClaudeBackendName(key: ThreadKey): string {
   const raw = getThreadAdapterNameRaw(key);
-  return raw && checkIsClaudeBackend(raw) ? raw : getDefaultAdapterName();
+  return raw && checkIsClaudeBackend(raw) ? raw : getDefaultClaudeBackendName();
 }
 
 /**
@@ -326,9 +331,9 @@ export type ClaudeModeAction =
  * picker. The load-bearing subtlety is that the GATE and the COMPARE use two
  * DIFFERENT resolutions:
  *
- *  - `threadAdapterName` (in-memory pick ?? default-adapter fallback) answers
- *    "is this a Claude topic at all?" — an opencode/terminal topic gets the
- *    not-Claude hint.
+ *  - `threadAdapterName` (raw pick ?? the Claude default via
+ *    {@link resolveClaudeBackendName}) answers "is this a Claude topic at all?"
+ *    — an opencode/terminal topic gets the not-Claude hint.
  *  - `effectiveBackendName` ({@link resolveClaudeBackendName}: raw pick if a
  *    Claude backend, else the default — tmux-scrape for now) answers "which backend
  *    would a Claude start actually open?" — the same resolution the start
@@ -364,25 +369,23 @@ export function getClaudeModeAction(input: {
  *
  * Replaces the old `getUserAdapter(userId)` — see plan §10.4. The bot picks
  * an adapter per-thread (e.g. one thread runs Claude, the next OpenCode in
- * the same folder). If no choice has been made for this thread, falls back
- * to the default ({@link getDefaultAdapterName}).
+ * the same folder). If no choice has been made for this thread, returns the
+ * Claude default via {@link resolveClaudeBackendName} — a PROBE-only fallback
+ * (a no-pick thread has no live session, so `checkIsActive`/`checkIsBusy`
+ * report false regardless of which adapter this hands back). It never STARTS
+ * an agent, so it is not a silent "default agent": launching goes through
+ * `ensureAgentSession`, which refuses when no adapter is picked.
  */
 export function getThreadAdapter(key: ThreadKey): AgentAdapter {
-  return getAdapter(getThreadAdapterName(key));
-}
-
-/** Returns the adapter NAME for a thread (without instantiating it): the
- *  in-memory pick, else the default ({@link getDefaultAdapterName}). */
-export function getThreadAdapterName(key: ThreadKey): string {
-  return threadAdapterNames.get(keyToString(key)) ?? getDefaultAdapterName();
+  return getAdapter(getThreadAdapterNameRaw(key) ?? resolveClaudeBackendName(key));
 }
 
 /**
  * @description The thread's EXPLICIT in-memory adapter pick, or `undefined`
- * when none was made this run. Unlike {@link getThreadAdapterName} this does
- * NOT fold in the default-adapter fallback, so a caller building a longer
- * resolution chain (e.g. in-memory → persisted → snapshot → default) can tell
- * "no pick yet" apart from "picked the default".
+ * when none was made this run. It does NOT fold in any default fallback, so a
+ * caller building a longer resolution chain (e.g. in-memory → persisted →
+ * snapshot) can tell "no pick yet" apart from "picked a concrete adapter", and
+ * a no-agent thread stays distinguishable rather than masquerading as Claude.
  */
 export function getThreadAdapterNameRaw(key: ThreadKey): string | undefined {
   return threadAdapterNames.get(keyToString(key));

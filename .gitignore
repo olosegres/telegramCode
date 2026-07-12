@@ -17,3 +17,6 @@ CLAUDE.local.md
 .yarn/cache/
 .yarn/unplugged/
 logs/
+
+# local-only: machine-specific instruction paths (../agent-configs sibling)
+opencode.jsonc

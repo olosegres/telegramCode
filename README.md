@@ -20,7 +20,7 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 - **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and first-class OpenCode (native server API over HTTP+SSE: sessions, models, reasoning effort, interactive questions), picked per-thread
 - **Smart question alerts** — when the agent asks something, the bot pins the question message: a pin pierces muted topics, so you get exactly one notification per question (unpinned once answered)
 - **Restart-surviving sessions** — agents run in external processes; a bot restart re-adopts them, and the json-stream backend even replays the output produced while the bot was down
-- **Scheduled prompts** — `/schedule` cron / one-shot / N-times per topic; the agent schedules itself via injected MCP tools
+- **Scheduled & self-driving runs** — `/schedule` arms cron / one-shot / N-times jobs per topic, and the agent can schedule *itself* via injected MCP tools: nightly reviews, recurring reports, a "finish this tomorrow at 9" hand-off. Each job fires as a fresh session with your prompt; restart-safe, with one catch-up for a run missed while the bot was down
 - **File intake** — photos / documents / video / audio sent to a topic are saved and announced to the agent; albums arrive as one prompt
 - **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
@@ -33,12 +33,6 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 <td width="280"><img src="./demo.gif" width="320" /></td>
   </tr>
 </table>
-
-> **Breaking 2.0** — the old "one bot = one private chat = one folder" mode
-> is gone. The bot now requires a Telegram forum supergroup for the group
-> surface (`CHAT_MODE=dm` works without one); start
-> `telegramcode` from the parent folder containing your projects and that `$PWD`
-> becomes the work root. See [Migration from 1.x](#migration-from-1x).
 
 ## Two surfaces: group topics, bot DM, or both
 
@@ -81,40 +75,151 @@ The bot runs anywhere the agent CLIs run:
 
 ## Quick Start
 
-### 1. Create the bot
+Five steps: install the CLI, create a bot, (optionally) set up a group, launch
+from your projects folder, bind a topic to an agent.
+
+> **[manual]** tags a step you must do by hand in the Telegram app — an agent
+> running on the host can't do it for you. Everything unmarked is a host-side
+> command (or file edit) that can be automated.
+
+### 1. Install the CLI
+
+```bash
+npm install -g telegramcode      # needs Node ≥ 22
+```
+
+This registers the `telegramcode` command (the legacy `telegramCode` spelling
+stays as an alias). Prefer containers, or want two isolated instances on one
+host? Use [Run with Docker](#run-with-docker) instead — every other step is the
+same. To hack on the bot itself, see [Run from source](#run-from-source).
+
+### 2. Create the bot
+
+**[manual]** In Telegram, with @BotFather:
 
 1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, follow prompts.
 2. Save the token (`123456789:ABCdef...`).
 3. **Disable privacy mode** — same chat: `/setprivacy` → pick this bot →
    `Disable`. Without this the bot only sees `/commands`, not free-form text.
 
-### 2. Create the forum supergroup
+<p><img src="docs/images/01-botfather.png" width="360" alt="@BotFather: /newbot to get the token, then /setprivacy → this bot → Disable" /></p>
 
-1. In Telegram client: `New Group` → name it → add the bot.
+Put the token where the bot reads it — the global config `.env`:
+
+```bash
+mkdir -p ~/.config/telegramcode
+$EDITOR ~/.config/telegramcode/.env
+```
+
+```dotenv
+# ~/.config/telegramcode/.env — the one place your keys live
+TELEGRAM_BOT_TOKEN=123456789:ABCdef...
+# GROQ_API_KEY=...     # optional: free voice transcription
+# OWNER_USER_ID=...    # set to drive the bot from its DM (step 3)
+```
+
+All keys the bot needs live in this one file — the bot token and the optional
+`GROQ_API_KEY` for voice sit side by side, no separate stores. (Agent
+provider auth is the exception, and lives inside the agents themselves:
+`claude login` for Claude, `/connect` or OpenCode's own config for OpenCode —
+see [Environment Variables](#environment-variables).) The wrapper loads env
+from two locations, in order — a global base and an optional per-project
+override:
+
+1. `~/.config/telegramcode/.env` — base, set once, used everywhere.
+2. `$PWD/.env` — per-project tweaks (last write wins).
+
+The full annotated template is `.env.example` (shipped with the package and in
+the repo).
+
+### 3. Set up a group (optional) or DM
+
+The bot serves a **forum supergroup**, the **owner's private chat (DM)**, or
+both at once (`CHAT_MODE`, default `both`). The group is the nicest UX — a
+visible topic list, per-topic names/icons, quick agent switching — but it is
+**optional**: with `OWNER_USER_ID` set you can run entirely from the bot's DM.
+
+**To use a group (recommended)** — **[manual]**, all in the Telegram client:
+
+1. In a Telegram client: `New Group` → name it → add the bot.
 2. Open group settings → enable **Topics** (Forum mode).
 3. Promote the bot to admin with these rights:
    - `Manage Topics` (required — bind/create threads)
    - `Delete Messages` (for `/clear_messages`)
-   - `Pin Messages` (per-thread status banner — `/doctor` warns if missing
-     but the bot still operates without it)
+   - `Pin Messages` (per-thread status banner + question alerts; `/doctor`
+     warns if missing, but the bot still runs without it)
 4. **Remove the bot from the group and add it again.** Telegram caches the
-   privacy-mode flag on join; without re-adding the bot keeps the old
-   private-mode and ignores free-form messages. See
-   [Troubleshooting → Bot doesn't see text](#bot-doesnt-see-text).
+   privacy-mode flag on join; without re-adding, the bot keeps private-mode and
+   ignores free-form messages (see
+   [Troubleshooting → Bot doesn't see text](#bot-doesnt-see-text)).
 
-### 3. Find your user id (group id is automatic)
+<p>
+  <img src="docs/images/02-enable-topics.png" width="360" alt="Group settings → Topics toggle enabled (Forum mode)" />
+  <img src="docs/images/03-promote-admin.png" width="360" alt="Bot admin rights: Manage Topics, Delete Messages, Pin Messages ticked" />
+</p>
 
-- Your user id: send `/start` to [@userinfobot](https://t.me/userinfobot).
-- Group id: **you don't need to find it.** Leave `ALLOWED_GROUP_ID`
-  empty. The bot auto-pairs with the first forum supergroup an allowed
-  user contacts it from — it captures the `-100…` id, saves it to
-  `state.json`, and replies a confirmation. Re-point later with `/pair`
-  inside another group.
-  - To pin a specific id by hand instead, set `ALLOWED_GROUP_ID` to the
-    numeric value (a group **name** is not accepted — Telegram addresses
-    chats only by numeric id). A numeric env value disables auto-pairing.
+The group **id is automatic** — leave `ALLOWED_GROUP_ID` empty and the bot
+auto-pairs with the first forum supergroup an admin talks to it from (the
+`-100…` id is saved to `state.json`; re-point later with `/pair`). To pin a
+specific id by hand, set `ALLOWED_GROUP_ID` to the numeric value (a group
+**name** is not accepted) — that also disables auto-pairing. **Access control:**
+whoever is a creator/administrator of that group may drive the bot — there is no
+separate allow-list.
 
-### 4. Run with Docker
+**To use the DM instead (or as well):** **[manual]** send `/start` to
+[@userinfobot](https://t.me/userinfobot) for your numeric user id, then add it
+(host-side) to the same `.env`:
+
+```dotenv
+OWNER_USER_ID=987654321
+```
+
+With the default `CHAT_MODE=both`, an unset `OWNER_USER_ID` just leaves the DM
+surface inert (group-only); set it and the DM lights up alongside the group. Use
+`CHAT_MODE=dm` to skip the group entirely.
+
+### 4. Launch from your projects folder
+
+```bash
+cd ~/projects && telegramcode
+```
+
+That `$PWD` — the parent folder holding your repositories — becomes the work
+root; each topic binds to a subfolder under it. Do not set `WORK_ROOT` for
+normal use. A single-instance lockfile (`$DATA_DIR/instance.lock`) stops a
+second bot starting under the same user; stale locks (after `kill -9`) are
+reclaimed automatically.
+
+### 5. Bind a topic and talk to an agent
+
+This step is **[manual]** — it all happens inside the Telegram app.
+
+**In the group:**
+
+1. Open the group; in the General topic send `/ls` — the bot lists subfolders
+   under the work root.
+2. Create a topic (the `+` button).
+3. In the new topic: `/bind <subdir>` (auto-bound if the topic name matches a
+   subdir).
+4. `/claude` or `/opencode` → talk to the agent (text or voice).
+
+<p><img src="docs/images/04-bind-and-run.png" width="360" alt="A topic bound with /bind, /claude started, and the agent replying" /></p>
+
+**In the DM:** the same commands, one thread per agent — `/ls`,
+`/bind <subdir>`, then `/claude` or `/opencode`.
+
+Then: `/quit` ends the session; bare `/bind` inspects/reconfigures the binding;
+`/clear_messages` deletes the topic's bot messages.
+
+> **Continue the same session from a terminal.** No wrapper needed: run
+> `claude --dangerously-skip-permissions` in the project folder. It is the same
+> binary and the same `~/.claude/projects/<cwd-slug>/` session store the bot
+> uses, so a thread started in Telegram can be picked up with `claude --resume`
+> and vice versa.
+
+### Run with Docker
+
+Skip the global install and run in containers instead:
 
 ```bash
 git clone https://github.com/olosegres/telegramcode
@@ -124,61 +229,25 @@ docker compose up -d
 ```
 
 The compose file ships **two services** — `telegramcode-pet` and
-`telegramcode-work`. If you only need one, comment out the other or copy
-just the block you want. The pair is set up so they cannot collide
-(separate tokens, groups, data volumes, opencode ports — see
+`telegramcode-work`. If you only need one, comment out the other or copy just
+the block you want. The pair is set up so they cannot collide (separate tokens,
+groups, data volumes, opencode ports — see
 [Two instances on one host](#two-instances-on-one-host)).
 
-### 4b. Or run as a global CLI (`telegramcode`)
+### Run from source
 
-Skip Docker entirely and install the bot as a Node binary on the host:
+To hack on the bot itself:
 
 ```bash
 git clone https://github.com/olosegres/telegramcode && cd telegramcode
 yarn install && yarn build
 npm install -g .            # registers the `telegramcode` command
-                            # (the legacy `telegramCode` spelling still works as an alias)
-
-mkdir -p ~/.config/telegramcode
-cp .env.example ~/.config/telegramcode/.env
-$EDITOR ~/.config/telegramcode/.env    # fill TELEGRAM_BOT_TOKEN (group auto-pairs; access = its admins)
-
-cd ~/projects && telegramcode          # WORK_ROOT defaults to $PWD = ~/projects
 ```
 
-Shortcut: `yarn install-link` runs `yarn install && yarn build && npm link`
-in one shot — `npm link` symlinks the global `telegramcode` to this folder, so
-later rebuilds (`yarn build`) are picked up without re-installing.
-
-The wrapper looks for env in two places (in order):
-
-1. `~/.config/telegramcode/.env` — base, set once, used everywhere
-   (the legacy `~/.config/telegram-code/.env` is still read as a fallback
-   when the new path does not exist)
-2. `$PWD/.env` — per-project override
-
-`telegramcode` should normally be launched from your projects parent; that
-directory becomes the work root. A single-instance lockfile
-(`$DATA_DIR/instance.lock`) prevents a second bot starting under the same
-user; cross-user instances are naturally isolated by `HOME`-derived
-`DATA_DIR`. Stale locks (after `kill -9`) are reclaimed automatically.
-
-To continue the same sessions from a terminal, no wrapper is needed: run
-`claude --dangerously-skip-permissions` in the project folder. It is the
-same binary and the same `~/.claude/projects/<cwd-slug>/` session store
-the bot uses, so a session started in a Telegram thread can be picked up
-in the terminal (`claude --resume`) and vice versa.
-
-### 5. Use it
-
-1. Open the group in Telegram.
-2. In the General topic, send `/ls` — bot lists subfolders under `WORK_ROOT`.
-3. Create a topic (`+` button).
-4. In the new topic: `/bind <subdir>` (auto-bound if the topic name
-   matches a subdir).
-5. `/claude` or `/opencode` → talk to the agent.
-6. `/quit` to end the session; bare `/bind` to inspect the binding;
-   `/clear_messages` to delete the topic's bot messages.
+Shortcut: `yarn install-link` runs `yarn install && yarn build && npm link` in
+one shot — `npm link` symlinks the global `telegramcode` to this folder, so
+later rebuilds (`yarn build`) are picked up without re-installing. Config and
+launch are identical to steps 2–5 above.
 
 ## Architecture
 
@@ -680,31 +749,6 @@ The Docker dev loop (never `docker compose restart` — it ignores
 docker compose down telegramcode-pet && docker compose up -d telegramcode-pet
 docker compose logs -f telegramcode-pet     # tail logs
 ```
-
-## Migration from 1.x
-
-The 1.x "one bot = one private chat = one folder" mode is **removed**.
-There is no in-place upgrade; the steps are:
-
-1. Stop the old bot.
-2. Create a forum supergroup, add the bot, follow [Quick Start §2-3](#2-create-the-forum-supergroup).
-3. Remove the old `WORK_DIR` env and launch from the projects parent:
-   `cd /home/user/src && telegramcode`.
-4. Leave `ALLOWED_GROUP_ID` empty to auto-pair on first contact (or set
-   the numeric id by hand).
-5. Set `DATA_DIR` if you run two instances on the same host.
-6. The old `~/.telegram-bot-messages.json` is moved to `.bak` on first
-   start — no migration of message ids, fresh `state.json`.
-
-Release notes:
-
-- Routing key is `(chatId, threadId)`, persisted in `state.json`.
-- tmux sessions renamed `claude-${chatId}-${threadId}` (the tmux-scrape
-  backend; the json-stream host uses the `cjson-` prefix, terminal `term-`).
-- `claude --session-id <uuid>` is hardcoded — no more interactive picker.
-- `--dangerously-skip-permissions` is hardcoded (symmetry with
-  opencode's auto-approve).
-- Privacy mode must be disabled and the bot re-added.
 
 ## License
 

@@ -263,8 +263,17 @@ config/variants, not a per-message API field).
   isolated `DATA_DIR`, group, and OpenCode port. (Orthogonal to `CHAT_MODE=both`,
   which serves both surfaces from ONE instance — use two instances when you want
   process-level isolation/distribution instead.)
-- **MCP hierarchy.** MCP servers merge across user / group / project / thread
-  scopes with `${VAR}` env expansion.
+- **MCP hierarchy (opt-in, mostly dormant — NOT a documented feature).** MCP
+  servers merge across user / group / project / thread scopes with `${VAR}` env
+  expansion, BUT the group (`${DATA_DIR}/mcp.json`) and thread
+  (`${DATA_DIR}/threads/<key>.json`) layers are opt-in: `prepareMcpFlags`
+  (`mcpConfig.ts`) emits a `--mcp-config` for them ONLY when the file exists, so
+  a default install passes none. In practice the always-on consumer of the
+  `--mcp-config` plumbing is the bot's OWN injected `telegramBot` server (next
+  bullet) — the user-editable group/thread hierarchy exists in code but is
+  unused by default, so the README deliberately does NOT document it (cut
+  2026-07-12). User + project layers are claude-native (auto-loaded,
+  bot-independent).
 - **Agent scheduling tools (injected).** Separately from that user hierarchy,
   the bot injects its OWN `telegramBot` MCP server (HTTP, loopback `127.0.0.1`,
   per-session thread/dir-scoped HMAC tokens) into EVERY bot-started session —

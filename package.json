@@ -16,6 +16,8 @@
   "files": [
     "dist/",
     "README.md",
+    "DEVELOPMENT.md",
+    "MIGRATION_1_TO_2.md",
     "LICENSE",
     ".env.example",
     "examples/"

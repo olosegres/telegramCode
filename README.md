@@ -4,7 +4,7 @@
 
 TelegramCode turns Telegram into a terminal for running agentic CLIs. A forum
 supergroup is the terminal window; each topic (thread) is a tab of that
-terminal — bound to a subfolder under `WORK_ROOT` and running its own fully
+terminal — bound to one of your project folders and running its own fully
 isolated **Claude Code** or **OpenCode** session. Open as many tabs as you
 need (even two on the same project for parallel work) and drive the agents
 from your phone or tablet, voice messages included.
@@ -16,19 +16,19 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 ### Features
 
 - **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions; two topics can share one folder for parallel work
-- **Two chat surfaces** — forum-group topics and/or the owner's bot DM (`CHAT_MODE`), tabs on both
+- **Two chat surfaces** — forum-group topics and the owner's bot DM, both served at once by default, with tabs on either
 - **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and first-class OpenCode (native server API over HTTP+SSE: sessions, models, reasoning effort, interactive questions), picked per-thread
-- **Smart question alerts** — when the agent asks something, the bot pins the question message: a pin pierces muted topics, so you get exactly one notification per question (unpinned once answered)
-- **Restart-surviving sessions** — agents run in external processes; a bot restart re-adopts them, and the json-stream backend even replays the output produced while the bot was down
+- **Notifications** — when the agent asks a question, the bot pins that message so even a muted topic notifies you: the pin pierces mute, giving exactly one notification per question (unpinned once you answer)
 - **Scheduled & self-driving runs** — `/schedule` arms cron / one-shot / N-times jobs per topic, and the agent can schedule *itself* via injected MCP tools: nightly reviews, recurring reports, a "finish this tomorrow at 9" hand-off. Each job fires as a fresh session with your prompt; restart-safe, with one catch-up for a run missed while the bot was down
-- **File intake** — photos / documents / video / audio sent to a topic are saved and announced to the agent; albums arrive as one prompt
+- **Inbound files** — photos / documents / video / audio sent to a topic are saved and announced to the agent; albums arrive as one prompt
+- **Outbound files** — the agent sends files back to you — a generated chart, a screenshot, a log, a rendered PDF — single files or albums, straight into the topic
 - **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
 - **Display verbosity** — `/verbosity` (plus `/thinking`, `/tool_results`, `/subagent`) per topic: `minimal|short|full`
 - **Localized in 12 languages** — the bot UI (commands, buttons, notices) speaks 中文, English, Français, ქართული, Deutsch, हिन्दी, 日本語, Português, Русский, Español, Українська, Oʻzbekcha; auto-detected per Telegram chat, switch any time with `/language`
-- **MCP hierarchy** — user / group / project / thread, with `${VAR}` env expansion, plus bot-injected scheduling/file tools
-- **Observability** — always-on output trace (`/trace`), console log buckets, `/timestamps`
-- **Two-instance ready** — pet vs work, isolated DATA_DIR, group, port
+- **Works with your MCP servers** — Claude's native user- and project-level MCP configs just work; the bot also injects its own scheduling and file-sending tools into every session
+- **Time-aware prompts** — `/timestamps on` prepends each forwarded prompt's send time (local-offset ISO), so a days-long session knows what "yesterday" or "2 days ago" means; agent-facing only, per topic
+- **Two bots side by side** — run separate instances for, say, work and personal ("pet") projects on the same machine; each is fully isolated, so their tasks, sessions and chats never mix
     </td>
 <td width="280"><img src="./demo.gif" width="320" /></td>
   </tr>
@@ -184,9 +184,9 @@ surface inert (group-only); set it and the DM lights up alongside the group. Use
 cd ~/projects && telegramcode
 ```
 
-That `$PWD` — the parent folder holding your repositories — becomes the work
-root; each topic binds to a subfolder under it. Do not set `WORK_ROOT` for
-normal use. A single-instance lockfile (`$DATA_DIR/instance.lock`) stops a
+That `$PWD` — the parent folder holding your repositories — is the folder the
+bot works in; each topic binds to a subfolder under it. There's nothing else to
+configure for it. A single-instance lockfile (`$DATA_DIR/instance.lock`) stops a
 second bot starting under the same user; stale locks (after `kill -9`) are
 reclaimed automatically.
 
@@ -249,48 +249,6 @@ one shot — `npm link` symlinks the global `telegramcode` to this folder, so
 later rebuilds (`yarn build`) are picked up without re-installing. Config and
 launch are identical to steps 2–5 above.
 
-## Architecture
-
-```
-$PWD=/home/user/src                     ← launch `telegramcode` here
-├── projectAlpha/     ← Topic "projectAlpha"    (claude)
-├── projectB/         ← Topic "projB-frontend"  (claude)
-│                     ← Topic "projB-backend"   (opencode)   ← one folder, two topics
-│                     ← Topic "projB-refactor"  (claude)
-└── telegramcode/     ← Topic "telegramcode"    (claude)
-
-Telegram forum supergroup
-├── Bot is admin with can_manage_topics + can_delete_messages + can_pin_messages
-└── Routes by ThreadKey = (chatId, threadId)  →  src/state.ts persists bindings
-```
-
-Routing key is `(chatId, threadId)` everywhere. Per-thread state lives in
-`${DATA_DIR}/state.json` (atomic writes with `fsync`, archived on
-corruption). Bot-owned tmux sessions are named per backend —
-`claude-<chatId>-<threadId>` (Claude tmux-scrape), `cjson-…` (the Claude
-json-stream host process), `term-…` (terminal) — see
-`src/utils/tmuxSessionName.ts`; opencode sessions are keyed by the same
-`<chatId>:<threadId>` string. Two topics on the same folder stay independent.
-
-### Adapter pattern
-
-```
-Telegram <-> bot.ts <-> AgentAdapter <-> { Claude CLI (tmux scrape) | Claude CLI (stream-json) |
-                 │           │             OpenCode (HTTP+SSE)      | Terminal ($SHELL in tmux) }
-                 │           └── state.ts  (bindings, claudeSessionId, opencodeSessionId,
-                 │                          messages, MCP per-thread overrides)
-                 └── OutputTransport (src/output/) — how output reaches each surface,
-                     picked once at boot by CHAT_MODE: group edit-in-place stream
-                     vs the owner-DM native draft "cursor"
-```
-
-Each adapter implements `AgentAdapter` from `src/types.ts`:
-- `startSession(key, workDir, args?, sessionId?)` / `stopSession(key)` / `resumeSession(key, workDir, sessionId, options?)`
-- `sendInput(key, text)` / `sendSignal(key, signal)`
-- events: `output`, `status`, `question`, `questionGone`, `thinking`,
-  `toolResult`, `subagentStatus`, `apiError`, `started`, `stopped`, `closed`,
-  `error` (all emit `ThreadKey` first)
-
 ## Commands
 
 ### In any topic
@@ -332,7 +290,7 @@ actually start an agent or terminal in the folder.
 |---|---|
 | `/start` | Intro: work root + available agents |
 | `/help` | Context-aware help |
-| `/ls` | List subdirs under `WORK_ROOT` |
+| `/ls` | List the project subfolders of the folder the bot was launched from |
 | `/list` | List existing topics and their bindings |
 | `/status` | This thread's status; in General — a global view of all topics + active agents |
 | `/doctor` | Self-diagnose: admin rights, privacy mode, paths, CLIs |
@@ -457,7 +415,7 @@ the agent:
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
 
 Start from the parent folder containing your projects: `cd ~/projects && telegramcode`.
-That `$PWD` is the work root; do not set `WORK_ROOT` for normal use.
+That `$PWD` is the folder the bot works in — nothing else to set for it.
 
 **Access control.** There is no user allow-list. Whoever is a **creator or
 administrator of the served forum group** may talk to the agent — read live from
@@ -523,67 +481,23 @@ before launch if your chosen providers need them.
 > `WORK_DIR` (1.x) is retired. Use the wrapper from the desired parent folder
 > instead of carrying the old env forward.
 
-## MCP servers — user / group / project / thread
+## Bot-injected agent tools
 
-The bot integrates with [Claude's MCP system](https://docs.anthropic.com/en/docs/build-with-claude/mcp)
-through four layers, additively merged:
-
-| Layer | File | Scope | How loaded |
-|---|---|---|---|
-| **User** | `~/.claude/settings.json` | All claude invocations of this Linux user | claude auto-loads |
-| **Group** | `${DATA_DIR}/mcp.json` | All threads of this bot instance | bot passes `--mcp-config` |
-| **Project** | `${workDir}/.mcp.json` | All threads bound to this folder | claude auto-loads from cwd |
-| **Thread** | `${DATA_DIR}/threads/<chatId>:<threadId>.json` | One specific thread | bot passes `--mcp-config` |
-
-Group + thread files go through `${VAR}` expansion (read from
-`process.env`) before claude sees them — the CLI doesn't shell-expand
-inside `--mcp-config` JSON. The expanded copy is written to
-`${DATA_DIR}/tmp/` with mode `0600` and cleaned up on `stopSession`.
-
-Example `${DATA_DIR}/mcp.json`:
-
-```jsonc
-{
-  "mcpServers": {
-    "corp-jira": {
-      "command": "npx",
-      "args": ["-y", "@atlassian/mcp-jira"],
-      "env": { "JIRA_API_TOKEN": "${JIRA_API_TOKEN}" }
-    },
-    "corp-confluence": {
-      "type": "http",
-      "url": "https://mcp.corp.com/confluence",
-      "headers": { "Authorization": "Bearer ${CONFLUENCE_TOKEN}" }
-    }
-  }
-}
-```
-
-Inspect what's actually active in a thread with `/mcp`. Adding/removing
-servers by bot command is not yet supported — edit the JSON directly
-(or use `claude mcp add` for the user layer).
-
-> **OpenCode MCP** is currently configured at the opencode-server level
-> only — one fleet per instance, no per-thread override. Per-thread MCP
-> for opencode is planned but not yet supported.
-
-### Bot-injected agent tools
-
-Separately from the user-editable hierarchy above, the bot injects its own
-`telegramBot` MCP server into every bot-started session — for Claude via a
-generated `--mcp-config`, for OpenCode via runtime registration. It is
-loopback-only (`127.0.0.1`, port `SCHEDULER_MCP_PORT`, default `4097` —
-that is all this env var is) and authenticated with per-session HMAC bearer
-tokens scoped to the thread / directory. It exposes:
+The bot injects its own `telegramBot` MCP server into every bot-started session
+— for Claude via a generated `--mcp-config`, for OpenCode via runtime
+registration. It is loopback-only (`127.0.0.1`, port `SCHEDULER_MCP_PORT`,
+default `4097` — that is all this env var is) and authenticated with per-session
+HMAC bearer tokens scoped to the thread / directory. It exposes:
 
 - `schedule_create` / `schedule_list` / `schedule_cancel` — the agent-side
   scheduling API behind `/schedule`;
-- `send_file` — lets the agent push a file or image from the bound folder
-  into the topic (photo/animation/document, albums, size caps).
+- `send_file` — lets the agent push a file or image from the bound folder into
+  the topic (photo/animation/document, albums, size caps).
 
-This server is bot-owned plumbing: it is not part of the user-editable
-hierarchy and never touches your `mcp.json` files. If its port fails to
-bind, the bot still boots — only these agent-facing tools go inert.
+This server is bot-owned plumbing; if its port fails to bind, the bot still
+boots — only these agent-facing tools go inert. (Your own MCP servers still work
+independently: Claude auto-loads them from `~/.claude/settings.json` and a
+project's `.mcp.json`; inspect what's active in a thread with `/mcp`.)
 
 ## Two instances on one host
 
@@ -695,9 +609,9 @@ Verify with `/doctor` — the privacy line should report it as disabled.
 
 ### `/bind` says "folder not found"
 
-`WORK_ROOT` doesn't contain a subfolder with that name (or it's a
-symlink pointing outside `WORK_ROOT`). Run `/ls` to see what's available,
-or fix the host path. Path-traversal attempts (`../`, absolute paths,
+The folder you launched from doesn't contain a subfolder with that name (or
+it's a symlink pointing outside it). Run `/ls` to see what's available, or fix
+the host path. Path-traversal attempts (`../`, absolute paths,
 NUL bytes, NFC-vs-NFD mismatches) are rejected by design — see
 `validateSubdir` in `src/validation.ts`.
 
@@ -728,27 +642,10 @@ first use, see `src/installManager.ts`).
 Two instances on the same host with the same `OPENCODE_URL`. Pick a
 different port for the second instance (e.g. `4097`).
 
-## Development
+## Documentation
 
-```bash
-yarn install
-yarn dev          # tsx watch (fast dev — TS errors crash the process)
-yarn typecheck    # strict tsc --noEmit
-yarn build        # tsc → dist/
-yarn test         # unit/integration (node test runner + tsx); build first —
-                  # some tests exercise the built dist/cli.js
-yarn hot          # hot-reload mode: tsc -w + nodemon on dist/ (also
-                  # `telegramcode hot` from anywhere) — a broken edit can't
-                  # take the bot down, agents survive the reload
-```
-
-The Docker dev loop (never `docker compose restart` — it ignores
-`depends_on`):
-
-```bash
-docker compose down telegramcode-pet && docker compose up -d telegramcode-pet
-docker compose logs -f telegramcode-pet     # tail logs
-```
+- **[DEVELOPMENT.md](DEVELOPMENT.md)** — architecture and local development (build, test, hot-reload, Docker dev loop).
+- **[MIGRATION_1_TO_2.md](MIGRATION_1_TO_2.md)** — upgrading a 1.x install to 2.0.
 
 ## License
 

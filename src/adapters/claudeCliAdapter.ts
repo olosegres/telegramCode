@@ -30,6 +30,7 @@ import { resolveDataDir } from '../state';
 import { threadContextPreambleHeader } from '../threadContextPreamble';
 import { getSessionTitleCandidate } from '../utils/claudeSessionTitle';
 import { resolveClaudeBinary } from '../utils/resolveBinary';
+import { claudeLoginPastePromptRe } from '../utils/claudeAuthLogin';
 import {
   SPINNER_TICK_RE,
   POST_THINKING_TRAILER_RE,
@@ -1249,8 +1250,9 @@ export function getClaudeReplyRoute(input: {
  * `code#state` value. The marker string is stable (verified in the claude.exe
  * string table, 2026-06-13). Used by {@link ClaudeCliAdapter.isLoginPastePending}
  * so the bot routes the pasted code verbatim instead of as a fresh prompt.
+ * The marker regex is shared with the json-stream out-of-band `/login` flow
+ * ({@link claudeLoginPastePromptRe}) so the marker string has a single definition.
  */
-const CLAUDE_LOGIN_PASTE_RE = /Paste code here if prompted/;
 /**
  * Lines from the pane BOTTOM that count as the live input region. The real
  * `/login` "paste code" prompt is the active bottom input row; matching the
@@ -1263,7 +1265,7 @@ const CLAUDE_LOGIN_PASTE_RE = /Paste code here if prompted/;
 const loginPasteTailLineCount = 10;
 export function checkIsClaudeLoginPaste(paneText: string): boolean {
   const tail = paneText.split('\n').slice(-loginPasteTailLineCount).join('\n');
-  return CLAUDE_LOGIN_PASTE_RE.test(tail);
+  return claudeLoginPastePromptRe.test(tail);
 }
 
 /**

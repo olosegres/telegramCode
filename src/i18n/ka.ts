@@ -174,6 +174,9 @@ export const kaDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ წინა შეკითხვა გაუქმებულია — თქვენი ახალი მოთხოვნა მუშაობს.',
   'agent.question_cancelled_msg_label': '❌ შეკითხვა გაუქმებულია: {header}',
   'agent.login_code_relayed': '🔐 შესვლის კოდი გადაგზავნილია Claude-სთვის — ტოკენის შეტყობინება ისტორიიდან წაშლილია.',
+  'agent.login_url': '🔐 Claude-ში შესასვლელად გახსენით ეს ბმული, დაასრულეთ შესვლა და ჩასვით კოდი აქ:\n{url}',
+  'agent.login_success': '✅ Claude-ში შესვლა შესრულდა.',
+  'agent.login_failed': '⚠️ Claude-ში შესვლა ვერ მოხერხდა. ხელახლა საცდელად გაუშვით /login.',
   'agent.workingIndicator': '{glyph} ვმუშაობ…',
   'terminal.ready': '🖥 ტერმინალი მზადაა `{subdir}`{argsSuffix}-ში\nთითოეული შეტყობინება შესრულდება როგორც ბრძანება. /c — Ctrl+C, /up /down — ისტორია, /tab — შევსება, /quit — დახურვა.',
 

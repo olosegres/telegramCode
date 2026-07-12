@@ -152,6 +152,19 @@ at boot. `hiddenAdapterNames` (in `createAdapter.ts`) keeps it out of the generi
 `/start` agent list — it is reached via the default + `/claude_mode`, not a start
 entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.)
 
+## `/login` — out-of-band (no TUI)
+
+This backend has no TUI to host Claude's interactive `/login`, so the bot runs it
+out-of-band: `getLoginCommandRoute` (in `utils/claudeAuthLogin.ts`) intercepts
+`/login` on a json-stream thread and `startClaudeAuthLogin` (in `bot.ts`) spawns
+`claude auth login --claudeai` in a bot-owned pty (`node-pty`; `ANTHROPIC_API_KEY`
+stripped → subscription login). It relays the sign-in URL to the topic, takes the
+user's pasted code into the pty (message deleted, 🔐 ack — same secret handling as
+the tmux login-paste flow), and confirms via `claude auth status --json` (exit
+code as the fallback), clearing the pinned logged-out notice on success. The pty
+is a bot child (NOT restart-safe). The tmux backend's `/login` is unchanged (its
+TUI hosts the paste flow itself).
+
 ## Shared session store
 
 Both Claude backends drive the same `claude` binary against

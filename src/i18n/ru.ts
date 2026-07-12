@@ -178,6 +178,9 @@ export const ruDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
   'agent.question_cancelled_msg_label': '❌ Вопрос отменён: {header}',
   'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',
+  'agent.login_url': '🔐 Чтобы войти в Claude, откройте эту ссылку, завершите вход и вставьте код сюда:\n{url}',
+  'agent.login_success': '✅ Вход в Claude выполнен.',
+  'agent.login_failed': '⚠️ Не удалось войти в Claude. Наберите /login, чтобы повторить.',
   'agent.workingIndicator': '{glyph} работаю…',
   'terminal.ready': '🖥 Терминал готов в `{subdir}`{argsSuffix}\nЛюбое сообщение выполнится как команда. /c — Ctrl+C, /up /down — история, /tab — автодополнение, /quit — закрыть.',
 

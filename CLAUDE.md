@@ -395,6 +395,7 @@ config/variants, not a per-message API field).
 | `botFileStorage.ts` | Per-thread intake dir layout + janitor: `resolveThreadFilesDir`, `ensureThreadFilesDir`, `purgeThreadFiles` (on `/clear`), `sweepExpiredThreadFiles` (boot + daily age sweep, `fileRetentionDays = 30`) |
 | `sendErrorClassifier.ts` | Classify Telegram send failures |
 | `apiErrorRetry.ts` | Pure auto-retry decision layer for agent **API** errors: `classifyAgentApiError` (transient / usageLimit / null-for-auth; markers from the claude.exe strings), `parseResetAt`, `getRetryPlan` (backoff schedule), `decideRetryAction` (arm/ignore/giveUp + grace-window dedup). The `bot.ts` manager owns the timer + kick |
+| `utils/claudeAuthLogin.ts` | Pure helpers behind the json-stream `/login` out-of-band flow: `parseClaudeAuthLoginUrl` (clean OAuth URL out of the ANSI/OSC-8 pty output — stops at the BEL), `checkIsClaudeAuthLoginCodePrompt` (the "paste code" gate; shares `claudeLoginPastePromptRe` with the tmux login-paste detection), `parseAuthStatusLoggedIn` + `checkIsAuthLoginSucceeded` (status-authoritative, exit-code fallback), `getLoginCommandRoute` (`outOfBand` only for a json-stream RAW pick, else `forwardToAgent`). The impure pty driver + per-thread state live in `bot.ts` (`startClaudeAuthLogin` / `submitClaudeAuthLoginCode` / `cancelClaudeAuthLogin`) |
 | `openCodeSessionRouting.ts` | Pure helpers: match an SSE event to its owning session via child→parent lineage (`checkIsEventForSession`), record lineage (`updateSessionLineage`), verify strict descent (`getLineageDepthToAncestor` — busy tracking records a busy CHILD only for a verified descendant, so a dir-fallback-routed foreign sibling's busy=true never pins the thread busy) |
 | `utils/sseStreamLifecycle.ts` | Pure decision logic for the OpenCode adapter's single `/global/event` stream: open/close edge detection (`getSseStreamTransition`, driven by the TOTAL active-session count — open on first session anywhere, close on last). The per-directory helpers (`countActiveSessionsForDirectory`, `getWantedStreamDirectories`) now serve scheduler-MCP per-directory tracking, not the stream |
 | `utils/displayVerbosity.ts` | THE shared display-verbosity vocabulary for `/thinking` / `/tool_results` / `/subagent`: option order (`displayVerbosityModeOptions`: minimal, short, full), the locked default (`defaultDisplayVerbosityMode` = `minimal`), the type guard (`checkIsDisplayVerbosityMode`), and the legacy-name normalization (`normalizeDisplayVerbosityMode`: `detailed`→`full`, `brief`→`short`, `hide`→`minimal`, `compact`→`short`; unknown→null) used both for old persisted values and old command/callback aliases |
@@ -442,7 +443,7 @@ config/variants, not a per-message API field).
 |------|----------------|
 | `createAdapter.ts` | Factory: pick adapter by tool kind; wire adapter events → bot. Also the DI hub: `registerDisplayPrefsReader` (display prefs at PRODUCE time), `registerSeenWatermarkWriter` / `registerJsonStreamTailWriter` (persistence), `registerThreadLocaleReader` (adapter-side `t(...)` locale context) — same late-wiring idiom for all |
 | `claudeCliAdapter.ts` | Claude Code via `tmux` (keystroke driving, adaptive capture-pane polling/scraping; the poll tick also tails the on-disk sub-agent transcripts for `/subagent full`). Owns the Claude-TUI scrape logic + table stabilizer; the GENERIC tmux/ANSI/diff primitives now live in `utils/tmuxExec`, `utils/ansiClean`, `utils/paneDiff`, `utils/tmuxSessionName` (shared with the terminal backend) and are re-exported here for back-compat. **Auto-dismisses Claude's end-of-turn feedback survey** (never relayed to the topic; one Escape per appearance, signature-deduped): the detector (`extractClaudeSurvey`) is two-factor — a whole-line-anchored header + the `N: Label` option row (≥2 options) — and accepts a CLOSED alternation of the two known header wordings (`How is Claude doing this session?` and `How well is Claude following the instructions you gave earlier in this conversation?`, optional leading `●`/`⏺` bullet + trailing `(optional)`); keep it a closed list, never an open prose pattern (a quoted header once spammed bogus surveys). Wedge symptom of an UNRECOGNISED wording: the survey sits on the pane and swallows the Enter of the next forwarded prompt — the text strands unsubmitted in the TUI input box and the topic looks hung (live 2026-07-02, topic 202); the fix is adding the new wording to the alternation |
-| `claudeJsonStreamAdapter.ts` | 2nd Claude backend — drives `claude -p --input-format stream-json --output-format stream-json` (structured events, NO tmux scrape) as an EXTERNAL tmux-hosted process (`cjson-…`): a wrapper reroutes stdin to a FIFO claude holds `0<>` and stdout to an append-only `stdout.jsonl` the adapter tails, so bot restarts never kill the session — boot ADOPTS it and replays the downtime tail (host layout/primitives in `utils/jsonStreamHost.ts`; transport details in `src/adapters/README.md`). NOT the default Claude backend for now (`getDefaultClaudeBackendName` / `resolveClaudeBackendName` stay on tmux-scrape): it cannot host `/login` yet, so the default flips back to json-stream only when the out-of-band login task ships (plan `agent/tasks/actual/2026-07-11-jsonstream-login-outofband-auth.md`). Switchable per-topic on the fly via `/claude_mode` (the pick persists as the thread's adapter name; the switch is a SEAMLESS resume — both backends share the on-disk transcript). Hidden from the generic `/start` agent list (`hiddenAdapterNames`) — reached via `/claude_mode`, not a start entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.) Subscription-billed (non-`--bare`, no `ANTHROPIC_API_KEY`; proof: `system/init` `apiKeySource:"none"` + a `seven_day` `rate_limit_event`). Interactive questions ride a REVERSE-ENGINEERED stdio control protocol (`--permission-prompt-tool stdio` + `initialize` handshake + `can_use_tool`/`control_response`) — full wire format in `src/adapters/README.md`. Sessions cross-resumable with the tmux backend (shared transcript readers) |
+| `claudeJsonStreamAdapter.ts` | 2nd Claude backend — drives `claude -p --input-format stream-json --output-format stream-json` (structured events, NO tmux scrape) as an EXTERNAL tmux-hosted process (`cjson-…`): a wrapper reroutes stdin to a FIFO claude holds `0<>` and stdout to an append-only `stdout.jsonl` the adapter tails, so bot restarts never kill the session — boot ADOPTS it and replays the downtime tail (host layout/primitives in `utils/jsonStreamHost.ts`; transport details in `src/adapters/README.md`). The **DEFAULT** Claude backend (`getDefaultClaudeBackendName` / `resolveClaudeBackendName`): `/login` is handled OUT-OF-BAND by the bot (`claude auth login --claudeai` in a pty — `getLoginCommandRoute` + `startClaudeAuthLogin`, see the `/login` command section), so it no longer needs a TUI to sign in. Switchable per-topic on the fly via `/claude_mode` (the pick persists as the thread's adapter name; the switch is a SEAMLESS resume — both backends share the on-disk transcript). Hidden from the generic `/start` agent list (`hiddenAdapterNames`) — reached via the default + `/claude_mode`, not a start entry. (The old `CLAUDE_JSON_STREAM_THREADS` env gate is RETIRED.) Subscription-billed (non-`--bare`, no `ANTHROPIC_API_KEY`; proof: `system/init` `apiKeySource:"none"` + a `seven_day` `rate_limit_event`). Interactive questions ride a REVERSE-ENGINEERED stdio control protocol (`--permission-prompt-tool stdio` + `initialize` handshake + `can_use_tool`/`control_response`) — full wire format in `src/adapters/README.md`. Sessions cross-resumable with the tmux backend (shared transcript readers) |
 | `openCodeAdapter.ts` | OpenCode via HTTP + SSE (POST prompts; ONE multiplexed `/global/event` stream for the whole server, every event parsed once + routed by envelope `directory` + `sessionID`) |
 | `terminalAdapter.ts` | A raw interactive `$SHELL` in `tmux` — a third adapter sibling to claude/opencode (NO AI logic). Types the user's text in as keystrokes (`send-keys`) and streams the scraped pane back as ONE rolling message per command (generic capture → line-set-diff → `cleanOutput` → emit; no question/survey/sub-agent/tool-result/effort/MCP/resume machinery). Restart-safe: `listExistingTmuxSessions`/`adoptExistingTmuxSession` re-adopt a live `term-…` session at boot (current pane seeds the baseline, no flood). Does NOT extend `ClaudeCliAdapter` and leaves `outputsDeltas` falsy, so the Claude liveness loop never fires for it |
 
@@ -567,10 +568,8 @@ OpenCode events / bindings).
     one (`applyClaudeBackendSwitch` → `switchThreadAdapter` keeps `claudeSessionId`
     for both backends). Bare `/claude_mode` shows a picker (✓ on current); persists
     as the thread's adapter name, so ▶️ Claude / `/claude` reopen the picked backend
-    (default **tmux-scrape** for now, `resolveClaudeBackendName` — json-stream
-    cannot host `/login` yet, so switch to tmux via `/claude_mode` to log in;
-    the default flips back to json-stream with plan
-    `agent/tasks/actual/2026-07-11-jsonstream-login-outofband-auth.md`). Only
+    (default **json-stream**, `resolveClaudeBackendName`; its `/login` is handled
+    out-of-band, see the `/login` command section). Only
     for Claude topics (OpenCode/terminal → a hint). Replaces the retired
     `CLAUDE_JSON_STREAM_THREADS` env gate.
   - `/esc` (alias `/escape`) sends a raw Escape keystroke to the live agent
@@ -619,15 +618,34 @@ OpenCode events / bindings).
     topic 203). Claude has no server-side question concept → no reject. Pure
     reject is the OpenCode adapter's `rejectQuestion` (mirrors `answerQuestion`,
     empty body).
-  - **`/login` OAuth code paste.** The login flow's last step shows
-    `Paste code here if prompted >` (a plain `>` box, not `❯`/a selector).
-    While it is up (`isLoginPastePending`, `checkIsClaudeLoginPaste` off the
-    last pane) ANY text reply is typed VERBATIM via `sendInput` — no Escape, no
-    thread-context preamble — then the user's message is deleted from the topic
-    (the code is a single-use secret) and a `🔐 code relayed` confirmation is
-    posted. Pre-fix the long code fell to the prompt path, whose Escape
-    cancelled the login and whose preamble corrupted the code ("login can't be
-    done via the bot").
+  - **`/login` — per-backend.** The two Claude backends host the OAuth sign-in
+    differently:
+    - **tmux-scrape** (`'claude'`): `/login` is forwarded to the TUI. Its last
+      step shows `Paste code here if prompted >` (a plain `>` box, not `❯`/a
+      selector); while it is up (`isLoginPastePending`, `checkIsClaudeLoginPaste`
+      off the last pane) ANY text reply is typed VERBATIM via `sendInput` — no
+      Escape, no thread-context preamble — then the user's message is deleted
+      from the topic (the code is a single-use secret) and a `🔐 code relayed`
+      confirmation is posted. Pre-fix the long code fell to the prompt path,
+      whose Escape cancelled the login and whose preamble corrupted the code.
+    - **json-stream** (`claudeJsonStreamAdapterName`, the default): has no TUI to
+      host `/login`, so the bot runs it OUT-OF-BAND. `getLoginCommandRoute`
+      (reads the thread's RAW backend pick, so OpenCode/terminal threads are
+      never wrongly intercepted) routes `/login` to `startClaudeAuthLogin`, which
+      spawns `claude auth login --claudeai` in a bot-owned **pty** (via
+      `node-pty`; `ANTHROPIC_API_KEY` stripped → subscription login), relays the
+      sign-in URL to the topic (`agent.login_url`) once the "paste code" prompt
+      renders, then arms per-thread pending state — the next plain text is the
+      OAuth code: written into the pty, the message deleted, `🔐 code relayed`
+      posted. On exit `claude auth status --json` is authoritative (exit code is
+      the fallback): success → clear the pinned logged-out notice + confirm
+      (`agent.login_success`); else a distinct `agent.login_failed`. A 120s
+      URL-timeout covers a firewall-held OAuth-init call. Pending state is
+      cleared on success/failure and on any teardown (`/quit`/`/new`/unbind —
+      `cancelClaudeAuthLogin`); the pty is a bot child (NOT restart-safe — a
+      restart drops the in-flight login, which is correct). Pure parse/decision
+      helpers in `utils/claudeAuthLogin.ts`; impure pty driver + state in
+      `bot.ts`.
   - `/model` picked with NO running session persists as the thread pref and
     applies on the next agent start (OpenCode; Claude refuses — its model
     switch is a TUI keystroke with nothing to persist).

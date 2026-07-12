@@ -269,24 +269,24 @@ export function getAvailableAdapters(): Array<{ name: string; label: string }> {
  * one until the user picks Claude/OpenCode (welcome buttons / commands), rather
  * than silently launching a default.
  *
- * Currently the tmux-scrape backend (TEMPORARILY: json-stream cannot host
- * `/login` yet, so it is reachable per-thread via `/claude_mode` until the login
- * interception ships and the default flips back; see plan
- * `agent/tasks/actual/2026-07-11-jsonstream-login-outofband-auth.md`).
+ * The json-stream backend (structured stream-json over an external tmux-hosted
+ * process — survives bot restarts). Its `/login` is handled out-of-band by the
+ * bot (`claude auth login` in a pty; see `getLoginCommandRoute` +
+ * `startClaudeAuthLogin` in `bot.ts`), so it no longer needs the tmux TUI to sign
+ * in. The tmux-scrape backend stays reachable per-thread via `/claude_mode`.
  */
 export function getDefaultClaudeBackendName(): string {
-  return 'claude';
+  return claudeJsonStreamAdapterName;
 }
 
 /**
  * @description The two Claude Code backends. Both drive the SAME `claude` CLI
  * against the SAME on-disk transcript, so a thread is cross-resumable between
  * them live:
- *  - `'claude'` — the tmux TUI, scraped screen (classic; the DEFAULT for now,
- *    see {@link getDefaultClaudeBackendName}).
+ *  - `'claude'` — the tmux TUI, scraped screen (classic).
  *  - {@link claudeJsonStreamAdapterName} — an EXTERNAL tmux-hosted process
  *    streaming structured stream-json events over a FIFO + stdout file, so it
- *    survives bot restarts.
+ *    survives bot restarts (the DEFAULT, see {@link getDefaultClaudeBackendName}).
  * `/claude_mode` flips a thread between them.
  */
 export function checkIsClaudeBackend(name: string): boolean {
@@ -296,9 +296,9 @@ export function checkIsClaudeBackend(name: string): boolean {
 /**
  * @description Which Claude backend a fresh "start Claude Code" should open for
  * `key`: the thread's explicit backend pick if it has one, else the default
- * (tmux-scrape, {@link getDefaultClaudeBackendName}). Lets the ▶️ Claude button /
+ * (json-stream, {@link getDefaultClaudeBackendName}). Lets the ▶️ Claude button /
  * `/claude` open the default while honouring an explicit `/claude_mode`
- * json-stream pick. This is the SOLE sanctioned consumer of
+ * tmux-scrape pick. This is the SOLE sanctioned consumer of
  * {@link getDefaultClaudeBackendName} — every other "no pick" site must treat an
  * absent pick as "no agent", not silently default.
  */
@@ -335,7 +335,7 @@ export type ClaudeModeAction =
  *    {@link resolveClaudeBackendName}) answers "is this a Claude topic at all?"
  *    — an opencode/terminal topic gets the not-Claude hint.
  *  - `effectiveBackendName` ({@link resolveClaudeBackendName}: raw pick if a
- *    Claude backend, else the default — tmux-scrape for now) answers "which backend
+ *    Claude backend, else the default — json-stream) answers "which backend
  *    would a Claude start actually open?" — the same resolution the start
  *    path uses, so the "already" answer and the picker's ✓ can never disagree
  *    with what `/claude` would really do.

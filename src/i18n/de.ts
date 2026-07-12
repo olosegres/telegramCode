@@ -174,6 +174,9 @@ export const deDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Vorherige Frage abgebrochen — führe deine neue Anfrage aus.',
   'agent.question_cancelled_msg_label': '❌ Frage abgebrochen: {header}',
   'agent.login_code_relayed': '🔐 Login-Code an Claude weitergeleitet — die Token-Nachricht wurde aus dem Verlauf gelöscht.',
+  'agent.login_url': '🔐 Um dich bei Claude anzumelden, öffne diesen Link, schließe die Anmeldung ab und füge den Code hier ein:\n{url}',
+  'agent.login_success': '✅ Bei Claude angemeldet.',
+  'agent.login_failed': '⚠️ Anmeldung bei Claude fehlgeschlagen. Führe /login aus, um es erneut zu versuchen.',
   'agent.workingIndicator': '{glyph} arbeite…',
   'terminal.ready': '🖥 Terminal bereit in `{subdir}`{argsSuffix}\nJede Nachricht wird als Befehl ausgeführt. /c — Ctrl+C, /up /down — Verlauf, /tab — Vervollständigung, /quit — schließen.',
 

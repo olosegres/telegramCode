@@ -174,6 +174,9 @@ export const hiDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ पिछला प्रश्न रद्द — आपका नया अनुरोध चल रहा है।',
   'agent.question_cancelled_msg_label': '❌ प्रश्न रद्द: {header}',
   'agent.login_code_relayed': '🔐 लॉगिन कोड Claude को भेजा गया — टोकन संदेश इतिहास से हटाया गया।',
+  'agent.login_url': '🔐 Claude में साइन इन करने के लिए यह लिंक खोलें, साइन-इन पूरा करें, फिर कोड यहाँ पेस्ट करें:\n{url}',
+  'agent.login_success': '✅ Claude में साइन इन हो गए।',
+  'agent.login_failed': '⚠️ Claude साइन-इन विफल। पुनः प्रयास के लिए /login चलाएँ।',
   'agent.workingIndicator': '{glyph} काम कर रहा है…',
   'terminal.ready': '🖥 `{subdir}`{argsSuffix} में टर्मिनल तैयार\nहर संदेश एक कमांड के रूप में चलता है। /c — Ctrl+C, /up /down — इतिहास, /tab — पूर्णता, /quit — बंद।',
 

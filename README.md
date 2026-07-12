@@ -297,16 +297,18 @@ explicit command opens a shell.
 "Claude Code" in a topic is one user-facing choice with two interchangeable
 backends:
 
-- **tmux-scrape** (`/claude_mode tmux`) — the classic TUI driven by
-  keystrokes inside tmux; output is scraped from the pane. The current
-  **default**.
 - **json-stream** (`/claude_mode json`) — `claude -p` in stream-json mode as
   an external tmux-hosted process emitting structured events. Cleaner
   output, and it survives bot restarts (the bot re-adopts the process and
-  replays what was produced during the downtime). Limitation for now: it
-  cannot host the interactive `/login` flow — switch the topic to
-  tmux-scrape via `/claude_mode` to log in. That is why tmux-scrape is
-  temporarily the default.
+  replays what was produced during the downtime). The **default**.
+- **tmux-scrape** (`/claude_mode tmux`) — the classic TUI driven by
+  keystrokes inside tmux; output is scraped from the pane.
+
+`/login` works on both backends. tmux-scrape hosts the sign-in inside its
+TUI; json-stream (which has no TUI) runs it **out-of-band** — the bot spawns
+`claude auth login` in a pty, posts the sign-in link into the topic, and takes
+your pasted code back (the code message is deleted and a 🔐 confirmation is
+posted).
 
 Both backends drive the same `claude` CLI against the same on-disk
 transcript, so `/claude_mode` switches a live topic seamlessly — the

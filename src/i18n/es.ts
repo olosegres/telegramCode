@@ -174,6 +174,9 @@ export const esDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Pregunta anterior cancelada — ejecutando tu nueva solicitud.',
   'agent.question_cancelled_msg_label': '❌ Pregunta cancelada: {header}',
   'agent.login_code_relayed': '🔐 Código de inicio de sesión enviado a Claude — el mensaje con el token se eliminó del historial.',
+  'agent.login_url': '🔐 Para iniciar sesión en Claude, abre este enlace, completa el inicio de sesión y pega el código aquí:\n{url}',
+  'agent.login_success': '✅ Sesión iniciada en Claude.',
+  'agent.login_failed': '⚠️ Error al iniciar sesión en Claude. Ejecuta /login para intentarlo de nuevo.',
   'agent.workingIndicator': '{glyph} trabajando…',
   'terminal.ready': '🖥 Terminal listo en `{subdir}`{argsSuffix}\nCada mensaje se ejecuta como un comando. /c — Ctrl+C, /up /down — historial, /tab — autocompletar, /quit — cerrar.',
 

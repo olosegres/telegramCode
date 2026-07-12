@@ -174,6 +174,9 @@ export const ptDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Pergunta anterior cancelada — a executar o teu novo pedido.',
   'agent.question_cancelled_msg_label': '❌ Pergunta cancelada: {header}',
   'agent.login_code_relayed': '🔐 Código de login retransmitido para o Claude — a mensagem com o token foi apagada do histórico.',
+  'agent.login_url': '🔐 Para entrar no Claude, abra este link, conclua o login e cole o código aqui:\n{url}',
+  'agent.login_success': '✅ Login no Claude concluído.',
+  'agent.login_failed': '⚠️ Falha no login do Claude. Execute /login para tentar novamente.',
   'agent.workingIndicator': '{glyph} a trabalhar…',
   'terminal.ready': '🖥 Terminal pronto em `{subdir}`{argsSuffix}\nCada mensagem executa como um comando. /c — Ctrl+C, /up /down — histórico, /tab — autocompletar, /quit — fechar.',
 

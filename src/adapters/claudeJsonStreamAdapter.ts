@@ -194,9 +194,9 @@ interface StreamSession {
  *
  * A topic flips between it and the tmux-scrape backend via `/claude_mode`
  * (they share the on-disk transcript, so the switch resumes the same
- * conversation). NOT the default backend for now — it cannot host `/login`
- * yet (`getDefaultClaudeBackendName` stays on tmux-scrape until the out-of-band
- * login task ships).
+ * conversation). The DEFAULT Claude backend (`getDefaultClaudeBackendName`):
+ * `/login` is handled out-of-band by the bot (`claude auth login` in a pty),
+ * so it no longer needs a TUI to sign in.
  */
 export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapter {
   readonly name = claudeJsonStreamAdapterName;

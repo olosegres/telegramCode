@@ -174,6 +174,9 @@ export const jaDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ 前の質問をキャンセル — 新しいリクエストを実行中。',
   'agent.question_cancelled_msg_label': '❌ 質問キャンセル: {header}',
   'agent.login_code_relayed': '🔐 ログインコードを Claude に中継 — トークンを含むメッセージを履歴から削除しました。',
+  'agent.login_url': '🔐 Claude にサインインするには、このリンクを開いてサインインを完了し、コードをここに貼り付けてください：\n{url}',
+  'agent.login_success': '✅ Claude にサインインしました。',
+  'agent.login_failed': '⚠️ Claude のサインインに失敗しました。/login を実行して再試行してください。',
   'agent.workingIndicator': '{glyph} 作業中…',
   'terminal.ready': '🖥 `{subdir}`{argsSuffix} でターミナル準備完了\n各メッセージはコマンドとして実行されます。/c — Ctrl+C、/up /down — 履歴、/tab — 補完、/quit — 閉じる。',
 

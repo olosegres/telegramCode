@@ -174,6 +174,9 @@ export const uzDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Oldingi savol bekor qilindi — yangi so‘rovingiz bajarilmoqda.',
   'agent.question_cancelled_msg_label': '❌ Savol bekor qilindi: {header}',
   'agent.login_code_relayed': '🔐 Kirish kodi Claude ga yuborildi — token xabari tarixdan o‘chirildi.',
+  'agent.login_url': '🔐 Claude ga kirish uchun ushbu havolani oching, kirishni yakunlang va kodni shu yerga joylashtiring:\n{url}',
+  'agent.login_success': '✅ Claude ga kirildi.',
+  'agent.login_failed': '⚠️ Claude ga kirib bo‘lmadi. Qayta urinish uchun /login ni ishga tushiring.',
   'agent.workingIndicator': '{glyph} ishlamoqda…',
   'terminal.ready': '🖥 `{subdir}`{argsSuffix} da terminal tayyor\nHar bir xabar buyruq sifatida bajariladi. /c — Ctrl+C, /up /down — tarix, /tab — to‘ldirish, /quit — yopish.',
 

@@ -178,6 +178,9 @@ export const enDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
   'agent.question_cancelled_msg_label': '❌ Question cancelled: {header}',
   'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',
+  'agent.login_url': '🔐 To sign in to Claude, open this link, complete sign-in, then paste the code back here:\n{url}',
+  'agent.login_success': '✅ Signed in to Claude.',
+  'agent.login_failed': '⚠️ Claude sign-in failed. Run /login to try again.',
   'agent.workingIndicator': '{glyph} working…',
   'terminal.ready': '🖥 Terminal ready in `{subdir}`{argsSuffix}\nEvery message runs as a command. /c — Ctrl+C, /up /down — history, /tab — completion, /quit — close.',
 

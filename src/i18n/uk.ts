@@ -180,6 +180,9 @@ export const ukDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Попереднє питання скасовано — виконую твій новий запит.',
   'agent.question_cancelled_msg_label': '❌ Питання скасовано: {header}',
   'agent.login_code_relayed': '🔐 Код входу передано в Claude — повідомлення з токеном видалено з історії.',
+  'agent.login_url': '🔐 Щоб увійти в Claude, відкрийте це посилання, завершіть вхід і вставте код сюди:\n{url}',
+  'agent.login_success': '✅ Вхід у Claude виконано.',
+  'agent.login_failed': '⚠️ Не вдалося увійти в Claude. Запустіть /login, щоб повторити.',
   'agent.workingIndicator': '{glyph} працюю…',
   'terminal.ready': '🖥 Термінал готовий у `{subdir}`{argsSuffix}\nКожне повідомлення виконується як команда. /c — Ctrl+C, /up /down — історія, /tab — автодоповнення, /quit — закрити.',
 

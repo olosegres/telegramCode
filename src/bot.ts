@@ -218,6 +218,15 @@ import { getThreadKeysForDirectory } from './scheduler/directoryThreads';
 import { getRebindResumeAction } from './scheduler/rebindResume';
 import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/types';
 import { decideRetryAction, classifyAgentApiError } from './apiErrorRetry';
+import { spawn as spawnPty, type IPty } from 'node-pty';
+import { resolveClaudeBinary } from './utils/resolveBinary';
+import {
+  parseClaudeAuthLoginUrl,
+  checkIsClaudeAuthLoginCodePrompt,
+  parseAuthStatusLoggedIn,
+  checkIsAuthLoginSucceeded,
+  getLoginCommandRoute,
+} from './utils/claudeAuthLogin';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -1351,6 +1360,196 @@ function formatLocalClock(epochMs: number): string {
   return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  json-stream `/login` — out-of-band OAuth via `claude auth login` in a pty
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The json-stream Claude backend has no TUI to host Claude's interactive `/login`,
+// so the bot drives `claude auth login --claudeai` in a pty and relays it through
+// the topic: sign-in URL out → pasted code in (the code message is deleted, with
+// the 🔐 ack — same secret-handling as the tmux login-paste + /connect flows). On
+// success the pinned logged-out notice clears (the normal recovery path). Pure
+// parse/decision helpers live in `utils/claudeAuthLogin.ts`; this is the impure
+// pty driver + per-thread state (mirrors the apiErrorRetry pure-layer / manager
+// split). The pty is a bot child, NOT restart-safe — a bot restart kills it and
+// drops the in-flight login, which is correct (a half-done login has no state to
+// preserve; the user just re-runs /login).
+
+interface PendingAuthLogin {
+  readonly pty: IPty;
+  /** Accumulated pty output (ANSI included) — re-parsed on each chunk. */
+  output: string;
+  /** The sign-in URL has been relayed to the topic. */
+  urlRelayed: boolean;
+  /** Fires if no sign-in URL appears in the window (OAuth-init call blocked). */
+  readonly timeoutTimer: NodeJS.Timeout;
+}
+
+/** Per-thread in-flight `claude auth login` flows, keyed by `keyToString(key)`. */
+const pendingAuthLogins = new Map<string, PendingAuthLogin>();
+
+/**
+ * How long to wait for the sign-in URL before giving up. The host egress firewall
+ * can hold the OAuth-init network call (decision window up to ~2 min), so this is
+ * generous; a permitted call returns the URL sub-second.
+ */
+const authLoginUrlTimeoutMs = 120_000;
+const authLoginPtyCols = 100;
+const authLoginPtyRows = 40;
+const authStatusProbeTimeoutMs = 5_000;
+
+/**
+ * @description Whether the thread's `/login` flow has reached the "paste code"
+ * stage — the sign-in URL was relayed and the next plain text is the OAuth code.
+ * Mirrors the tmux backend's `isLoginPastePending` (true only once the paste
+ * prompt is live), so a message typed in the pre-URL boot window is NOT
+ * swallowed/deleted as a code. Teardown still keys off the map itself, not this.
+ */
+function checkIsAuthLoginAwaitingCode(key: ThreadKey): boolean {
+  return pendingAuthLogins.get(keyToString(key))?.urlRelayed === true;
+}
+
+/** Kill + forget a thread's in-flight login (idempotent). Reports nothing. */
+function cancelClaudeAuthLogin(key: ThreadKey): void {
+  const k = keyToString(key);
+  const pending = pendingAuthLogins.get(k);
+  if (!pending) return;
+  pendingAuthLogins.delete(k);
+  clearTimeout(pending.timeoutTimer);
+  try {
+    pending.pty.kill();
+  } catch {
+    /* already exited */
+  }
+}
+
+/** Read `claude auth status --json` → loggedIn, or `null` if the probe fails. */
+async function readAuthLoginStatus(): Promise<boolean | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      resolveClaudeBinary(),
+      ['auth', 'status', '--json'],
+      { timeout: authStatusProbeTimeoutMs },
+    );
+    return parseAuthStatusLoggedIn(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @description Start the out-of-band `/login` flow for a json-stream thread: spawn
+ * `claude auth login --claudeai` in a pty, relay the sign-in URL when it appears,
+ * and arm the pending-code state (the thread's next plain text is written into the
+ * pty as the code). Re-running `/login` while a flow is pending restarts it.
+ */
+async function startClaudeAuthLogin(key: ThreadKey): Promise<void> {
+  const k = keyToString(key);
+  cancelClaudeAuthLogin(key); // clean restart on a repeated /login
+
+  let child: IPty;
+  try {
+    // Force subscription login (never metered): `--claudeai` picks the Claude
+    // subscription and dropping ANTHROPIC_API_KEY keeps the metered console path
+    // out of the way. cwd is irrelevant — login writes to `~/.claude` globally.
+    const env: Record<string, string | undefined> = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
+    child = spawnPty(resolveClaudeBinary(), ['auth', 'login', '--claudeai'], {
+      name: 'xterm-256color',
+      cols: authLoginPtyCols,
+      rows: authLoginPtyRows,
+      cwd: process.cwd(),
+      env,
+    });
+  } catch (e) {
+    console.warn(`[login] ${k} pty spawn failed:`, e);
+    await replyToThread(key, t('agent.login_failed'));
+    return;
+  }
+
+  const pending: PendingAuthLogin = {
+    pty: child,
+    output: '',
+    urlRelayed: false,
+    timeoutTimer: setTimeout(() => {
+      void onAuthLoginUrlTimeout(key, child);
+    }, authLoginUrlTimeoutMs),
+  };
+  pendingAuthLogins.set(k, pending);
+
+  child.onData((chunk) => {
+    const current = pendingAuthLogins.get(k);
+    if (!current || current.pty !== child) return; // cancelled/replaced
+    current.output += chunk;
+    // Relay the URL only once the "paste code" prompt is up — that guarantees the
+    // full URL block already rendered (never a chunk-split half-URL).
+    if (!current.urlRelayed && checkIsClaudeAuthLoginCodePrompt(current.output)) {
+      const url = parseClaudeAuthLoginUrl(current.output);
+      if (url) {
+        current.urlRelayed = true;
+        clearTimeout(current.timeoutTimer);
+        void replyToThread(key, t('agent.login_url', { url }));
+      }
+    }
+  });
+
+  child.onExit(({ exitCode }) => {
+    void onAuthLoginExit(key, child, exitCode);
+  });
+}
+
+/**
+ * @description The pending flow's next plain text is the OAuth code: type it into
+ * the pty, delete the user's message (the code is a single-use secret), and post
+ * the 🔐 ack. The final success/failure notice comes from {@link onAuthLoginExit}.
+ */
+async function submitClaudeAuthLoginCode(
+  key: ThreadKey,
+  code: string,
+  messageId: number,
+): Promise<void> {
+  const pending = pendingAuthLogins.get(keyToString(key));
+  if (!pending) return;
+  pending.pty.write(`${code.trim()}\r`);
+  await deleteThreadMessage(key, messageId);
+  await replyToThread(key, t('agent.login_code_relayed'));
+}
+
+/** No sign-in URL within the window → the OAuth-init call was likely blocked. */
+async function onAuthLoginUrlTimeout(key: ThreadKey, child: IPty): Promise<void> {
+  const k = keyToString(key);
+  const pending = pendingAuthLogins.get(k);
+  if (!pending || pending.pty !== child || pending.urlRelayed) return;
+  cancelClaudeAuthLogin(key);
+  await replyToThread(key, t('agent.login_failed'));
+}
+
+/**
+ * @description The `claude auth login` process exited. If the thread's flow is
+ * still active (not cancelled/replaced), report the outcome: `claude auth status`
+ * is authoritative, exit code is the fallback. On success clear the pinned
+ * logged-out notice (recovery). A cancelled flow already dropped its entry, so
+ * this no-ops for it (never reports a false "success" on a teardown kill).
+ */
+async function onAuthLoginExit(
+  key: ThreadKey,
+  child: IPty,
+  exitCode: number,
+): Promise<void> {
+  const k = keyToString(key);
+  const pending = pendingAuthLogins.get(k);
+  if (!pending || pending.pty !== child) return; // cancelled/replaced → no report
+  clearTimeout(pending.timeoutTimer);
+  pendingAuthLogins.delete(k);
+  const loggedIn = await readAuthLoginStatus();
+  if (checkIsAuthLoginSucceeded({ exitCode, loggedIn })) {
+    clearAuthNotice(key); // recovery → retire any pinned logged-out notice
+    await replyToThread(key, t('agent.login_success'));
+  } else {
+    await replyToThread(key, t('agent.login_failed'));
+  }
+}
+
 /**
  * @description Buffers prompts typed while an agent session is still booting so
  * they are replayed once it's ready, instead of being dropped into the
@@ -1873,6 +2072,7 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   // The thread is going away (/unbind, topic deleted) → cancel any pending
   // API-error retry silently; there's nothing left to resume into.
   cancelApiRetry(key);
+  cancelClaudeAuthLogin(key); // teardown → kill any in-flight /login pty
   clearAuthNotice(key); // teardown → retire any pinned logged-out notice
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
@@ -3376,6 +3576,7 @@ async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof s
   // before the session is released, so the kick never lands in a torn-down
   // session.
   cancelApiRetry(key);
+  cancelClaudeAuthLogin(key); // session released → kill any in-flight /login pty
   clearAuthNotice(key); // session released → retire any pinned logged-out notice
   // Session is going away → no output is coming, so stop the "working" loader
   // (covers the release half of /new before its fresh start re-arms it).
@@ -5638,6 +5839,7 @@ command(['quit', 'q'], async (_ctx, key) => {
   // does NOT go through releaseThreadSession (it stops adapters + clears ids
   // inline), so the cancel is wired here explicitly.
   cancelApiRetry(key);
+  cancelClaudeAuthLogin(key); // /quit teardown → kill any in-flight /login pty
   clearAuthNotice(key); // /quit teardown → retire any pinned logged-out notice
   const adapter = getThreadAdapter(key);
   const adapterName = getThreadAdapterNameRaw(key);
@@ -6047,10 +6249,37 @@ bot.on(message('text'), async (ctx) => {
   if (text.startsWith('/')) {
     const cmd = text.slice(1).split(' ')[0].split('@')[0].toLowerCase();
     if (botCommands.has(cmd)) return;
+    // `/login` on a json-stream Claude thread has no TUI to host the OAuth flow →
+    // run it out-of-band (spawn `claude auth login`, relay the URL). Every other
+    // backend keeps the verbatim forward (tmux's TUI hosts /login itself). The
+    // route reads the RAW backend pick, so an OpenCode/terminal thread is never
+    // wrongly intercepted once json-stream is the default.
+    const loginRoute = getLoginCommandRoute({
+      command: cmd,
+      rawBackendName: getThreadAdapterNameRaw(key),
+      jsonStreamBackendName: claudeJsonStreamAdapterName,
+    });
+    if (loginRoute === 'outOfBand') {
+      await state.pushMessageId(key, ctx.message.message_id);
+      await startClaudeAuthLogin(key);
+      return;
+    }
   }
 
   // Always track inbound message ids so /clear can delete user messages too.
   await state.pushMessageId(key, ctx.message.message_id);
+
+  // json-stream `/login` has reached the "paste code" stage → the next plain text
+  // is the OAuth code. Mirror the /connect secret handling and the tmux login-paste
+  // route: type it into the auth process, delete the message, ack. Gating on the
+  // relayed-URL stage (not merely "a flow exists") keeps a message typed in the
+  // pre-URL boot window from being swallowed/deleted as a code. A slash command
+  // falls through (so /quit, /new, etc. still run and their teardown cancels the
+  // pending login).
+  if (checkIsAuthLoginAwaitingCode(key) && !text.startsWith('/')) {
+    await submitClaudeAuthLoginCode(key, text, ctx.message.message_id);
+    return;
+  }
 
   const pendingProviderConnect = pendingProviderConnects.get(kStr);
   if (pendingProviderConnect && text.startsWith('/')) {

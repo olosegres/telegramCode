@@ -174,6 +174,9 @@ export const frDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ Question précédente annulée — exécution de votre nouvelle requête.',
   'agent.question_cancelled_msg_label': '❌ Question annulée : {header}',
   'agent.login_code_relayed': '🔐 Code de connexion transmis à Claude — le message avec le jeton a été supprimé de l\'historique.',
+  'agent.login_url': '🔐 Pour te connecter à Claude, ouvre ce lien, termine la connexion, puis colle le code ici :\n{url}',
+  'agent.login_success': '✅ Connecté à Claude.',
+  'agent.login_failed': '⚠️ Échec de la connexion à Claude. Lance /login pour réessayer.',
   'agent.workingIndicator': '{glyph} travail…',
   'terminal.ready': '🖥 Terminal prêt dans `{subdir}`{argsSuffix}\nChaque message est exécuté comme une commande. /c — Ctrl+C, /up /down — historique, /tab — complétion, /quit — fermer.',
 

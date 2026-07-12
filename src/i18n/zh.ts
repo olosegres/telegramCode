@@ -174,6 +174,9 @@ export const zhDict: Record<string, string> = {
   'agent.question_cancelled_for_prompt': '⚠️ 上一个问题已取消 — 正在执行你的新请求。',
   'agent.question_cancelled_msg_label': '❌ 问题已取消：{header}',
   'agent.login_code_relayed': '🔐 登录码已转发给 Claude — 包含 token 的消息已从历史中删除。',
+  'agent.login_url': '🔐 要登录 Claude，请打开此链接，完成登录，然后把代码粘贴回这里：\n{url}',
+  'agent.login_success': '✅ 已登录 Claude。',
+  'agent.login_failed': '⚠️ Claude 登录失败。运行 /login 重试。',
   'agent.workingIndicator': '{glyph} 工作中…',
   'terminal.ready': '🖥 终端已就绪，在 `{subdir}`{argsSuffix}\n每条消息作为命令执行。/c — Ctrl+C，/up /down — 历史，/tab — 补全，/quit — 关闭。',
 

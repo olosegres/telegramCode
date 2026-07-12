@@ -16,7 +16,7 @@
  */
 import { Markup } from 'telegraf';
 
-import { getLocaleEndonym, localeCodes, type Locale } from '../i18n';
+import { getLocaleEndonym, getLocaleEnglishName, localeCodes, type Locale } from '../i18n';
 
 /** «Reset to auto» button — clears the chat's explicit locale override. */
 export const languageAutoCallback = 'lang_auto';
@@ -28,17 +28,23 @@ function buildLocaleButton(locale: Locale, current: Locale | null) {
 }
 
 /**
- * @description Build the single-page `/language` picker (all 12 locales).
+ * @description Build the single-page `/language` picker (all 12 locales),
+ * ordered A→Z by the language's ENGLISH NAME (the buttons themselves stay
+ * endonym-labelled). Only the DISPLAY order is sorted here — the global
+ * `localeCodes` array stays `en`-first canonical for fallback/parity.
  *
  * @param current the chat's explicit override locale, or `null` for auto (drives
  *   which button carries the `✓` — a locale button when set, the `🌐 Auto` row
  *   when `null`).
  */
 export function buildLanguagePicker(current: Locale | null) {
+  const orderedCodes = [...localeCodes].sort((a, b) =>
+    getLocaleEnglishName(a).localeCompare(getLocaleEnglishName(b)),
+  );
   const rows = [];
-  for (let i = 0; i < localeCodes.length; i += 2) {
-    const row = [buildLocaleButton(localeCodes[i], current)];
-    if (localeCodes[i + 1]) row.push(buildLocaleButton(localeCodes[i + 1], current));
+  for (let i = 0; i < orderedCodes.length; i += 2) {
+    const row = [buildLocaleButton(orderedCodes[i], current)];
+    if (orderedCodes[i + 1]) row.push(buildLocaleButton(orderedCodes[i + 1], current));
     rows.push(row);
   }
 

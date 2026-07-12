@@ -419,8 +419,8 @@ override wins, then the sender's Telegram client language, then the last
 supported Telegram locale seen for that chat, then English.
 Supported locales: `en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`,
 `ka`, `uk`. Bare `/language` opens a single-message inline picker with each language
-shown by its own name (endonym) and a `🌐 Auto` button (all 12 fit at once — no
-pagination). Tapping a language (or `🌐 Auto`) applies it, then the menu
+shown by its own name (endonym), sorted A→Z by English name, and a `🌐 Auto` button
+(all 12 fit at once — no pagination). Tapping a language (or `🌐 Auto`) applies it, then the menu
 disappears and a short confirmation stays in the chosen language;
 `/language auto` returns a DM/group to automatic selection.
 

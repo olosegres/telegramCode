@@ -76,6 +76,32 @@ export function getLocaleEndonym(locale: Locale): string {
 }
 
 /**
+ * @description English names — each language's name written in English. Kept in
+ * CODE alongside {@link localeEndonyms} (same rationale: locale-independent, so
+ * no per-key translation and no key-parity inflation). Used to ORDER the
+ * `/language` picker A→Z by English name while the buttons stay endonym-labelled.
+ */
+export const localeEnglishNames: Record<Locale, string> = {
+  en: 'English',
+  de: 'German',
+  fr: 'French',
+  es: 'Spanish',
+  pt: 'Portuguese',
+  ru: 'Russian',
+  zh: 'Chinese',
+  ja: 'Japanese',
+  hi: 'Hindi',
+  uz: 'Uzbek',
+  ka: 'Georgian',
+  uk: 'Ukrainian',
+};
+
+/** The English name of a locale — e.g. `ru → Russian`. */
+export function getLocaleEnglishName(locale: Locale): string {
+  return localeEnglishNames[locale];
+}
+
+/**
  * @description Human-readable display of a chat's resolved language.
  *
  * - explicit chat override → the endonym alone (e.g. `Русский`).

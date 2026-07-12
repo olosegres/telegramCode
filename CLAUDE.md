@@ -752,8 +752,10 @@ OpenCode events / bindings).
   - `/language [locale|auto]` shows or changes the bot UI language for the
     current Telegram chat (DM or whole forum group). Bare `/language` opens a
     SINGLE-PAGE inline picker (pure builder in `utils/languagePicker.ts`): one
-    ENDONYM button per locale (each language written in itself — `English,
-    Deutsch, …, 中文, ქართული`), two per row, `✓` on the current selection, and a
+    ENDONYM button per locale (each language written in itself — `中文, English,
+    Français, …`), sorted A→Z by the language's ENGLISH name (Chinese first …
+    Uzbek last; only the DISPLAY order is sorted — `localeCodes` stays `en`-first
+    canonical), two per row, `✓` on the current selection, and a
     full-width `🌐 Auto` reset row (`lang_<code>` / `lang_auto` callbacks). All 12
     locales fit in ONE message (Telegram allows ~100 inline buttons), so there is
     NO pagination / nav row. Tapping a locale sets the override, tapping `🌐 Auto`

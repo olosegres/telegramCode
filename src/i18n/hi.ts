@@ -378,7 +378,7 @@ export const hiDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ तैयार — मैं आपके टॉपिक और ग्रुप में संदेश संभाल सकता हूँ।',
+    '✅ तैयार — मैं बॉट थ्रेड और ग्रुप टॉपिक में संदेश संभाल सकता हूँ।',
   'startup.header_not_ready':
     '⚠️ सेटअप अधूरा है। मेरे साथ काम शुरू करने के लिए, कृपया ये चरण पूरे करें:',
   'startup.item.create_group':

@@ -378,7 +378,7 @@ export const jaDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ 準備完了 — トピックとグループのメッセージを処理できます。',
+    '✅ 準備完了 — ボットのスレッドとグループのトピックのメッセージを処理できます。',
   'startup.header_not_ready':
     '⚠️ セットアップが未完了です。私と作業を始めるには、次の手順を完了してください：',
   'startup.item.create_group':

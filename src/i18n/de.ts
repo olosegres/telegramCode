@@ -378,7 +378,7 @@ export const deDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Bereit — ich kann Nachrichten in deinen Themen und der Gruppe verarbeiten.',
+    '✅ Bereit — ich kann Nachrichten in Bot-Threads und Gruppenthemen verarbeiten.',
   'startup.header_not_ready':
     '⚠️ Einrichtung unvollständig. Um mit mir zu arbeiten, schließe bitte diese Schritte ab:',
   'startup.item.create_group':

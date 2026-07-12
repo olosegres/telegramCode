@@ -156,6 +156,37 @@ export function checkShouldSendStartupStatus(input: {
   return !(input.isHotReload && input.isReady);
 }
 
+/** A resolved delivery surface for the boot-time status: the owner DM or the group's General topic. */
+export type StartupTarget = 'owner' | 'general';
+
+/**
+ * @description Resolve the ordered delivery targets for the boot-time status.
+ *
+ * The READY status is only meaningful in the owner's private DM, so it is
+ * DM-ONLY and NEVER falls back to the group's General topic (a "✅ Ready" in the
+ * shared group is pure noise). If there is no owner DM, a ready status resolves
+ * to an empty list — nothing is delivered (the caller logs it).
+ *
+ * The NOT-READY checklist is actionable, so it uses the owner DM when available
+ * and falls back to General otherwise (owner first):
+ *
+ *   ready      → hasOwnerTarget ? ['owner'] : []            (private-only, never 'general')
+ *   not-ready  → ['owner', 'general'] filtered to the available surfaces (owner first)
+ */
+export function resolveStartupTargets(
+  isReady: boolean,
+  hasOwnerTarget: boolean,
+  hasGeneralTarget: boolean,
+): StartupTarget[] {
+  if (isReady) {
+    return hasOwnerTarget ? ['owner'] : [];
+  }
+  const targets: StartupTarget[] = [];
+  if (hasOwnerTarget) targets.push('owner');
+  if (hasGeneralTarget) targets.push('general');
+  return targets;
+}
+
 /** Injected translate — `(code, opts) => string`, so composition is testable without the i18n runtime. */
 export type StartupStatusTranslate = (code: string, opts?: Record<string, string>) => string;
 

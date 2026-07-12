@@ -378,7 +378,7 @@ export const ptDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Pronto — posso processar mensagens nos seus tópicos e no grupo.',
+    '✅ Pronto — posso processar mensagens nas conversas do bot e nos tópicos de grupo.',
   'startup.header_not_ready':
     '⚠️ Configuração incompleta. Para começar a trabalhar comigo, conclua estas etapas:',
   'startup.item.create_group':

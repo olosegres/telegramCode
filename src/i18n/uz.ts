@@ -378,7 +378,7 @@ export const uzDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Tayyor — mavzularingiz va guruhdagi xabarlarni qayta ishlay olaman.',
+    '✅ Tayyor — bot tredlari va guruh mavzularidagi xabarlarni qayta ishlay olaman.',
   'startup.header_not_ready':
     '⚠️ Sozlash tugallanmagan. Men bilan ishlashni boshlash uchun quyidagi qadamlarni bajaring:',
   'startup.item.create_group':

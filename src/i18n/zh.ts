@@ -378,7 +378,7 @@ export const zhDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ 已就绪 — 我可以处理你的话题和群组中的消息。',
+    '✅ 已就绪 — 我可以处理机器人会话和群组话题中的消息。',
   'startup.header_not_ready':
     '⚠️ 设置尚未完成。要开始与我协作，请完成以下步骤：',
   'startup.item.create_group':

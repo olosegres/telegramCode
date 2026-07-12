@@ -15,6 +15,7 @@ import {
   checkShouldSendStartupStatus,
   formatMissingRights,
   getMissingBotRights,
+  resolveStartupTargets,
   type BotAdminRights,
   type ReadinessFacts,
 } from '../utils/startupReadiness';
@@ -170,6 +171,32 @@ test('cadence: cold start always sends (ready or not)', () => {
 test('cadence: hot reload sends only when something is missing', () => {
   assert.equal(checkShouldSendStartupStatus({ isHotReload: true, isReady: true }), false);
   assert.equal(checkShouldSendStartupStatus({ isHotReload: true, isReady: false }), true);
+});
+
+// ── delivery target resolution ───────────────────────────────────────────────
+
+test('ready → owner DM only, NEVER falls back to General', () => {
+  // Both surfaces available but ready ⇒ owner only (a "✅ Ready" in the shared
+  // group is noise).
+  assert.deepEqual(resolveStartupTargets(true, true, true), ['owner']);
+  // Owner available, no group ⇒ still just the owner.
+  assert.deepEqual(resolveStartupTargets(true, true, false), ['owner']);
+});
+
+test('ready + no owner DM → empty list (nothing delivered, never General)', () => {
+  // No owner DM: a ready status is NOT delivered to General even when it exists.
+  assert.deepEqual(resolveStartupTargets(true, false, true), []);
+  assert.deepEqual(resolveStartupTargets(true, false, false), []);
+});
+
+test('not-ready → owner first then General, filtered to available surfaces', () => {
+  assert.deepEqual(resolveStartupTargets(false, true, true), ['owner', 'general']);
+  assert.deepEqual(resolveStartupTargets(false, true, false), ['owner']);
+  assert.deepEqual(resolveStartupTargets(false, false, true), ['general']);
+});
+
+test('not-ready + no surfaces at all → empty list', () => {
+  assert.deepEqual(resolveStartupTargets(false, false, false), []);
 });
 
 // ── message composition (injected translate) ─────────────────────────────────

@@ -382,7 +382,7 @@ export const enDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Ready — I can handle messages in your topics and the group.',
+    '✅ Ready — I can handle messages in bot threads and group topics.',
   'startup.header_not_ready':
     '⚠️ Setup incomplete. To start working with me, please finish these steps:',
   'startup.item.create_group':

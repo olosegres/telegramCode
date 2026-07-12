@@ -378,7 +378,7 @@ export const frDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Prêt — je peux traiter les messages dans vos sujets et le groupe.',
+    '✅ Prêt — je peux traiter les messages dans les fils du bot et les sujets de groupe.',
   'startup.header_not_ready':
     '⚠️ Configuration incomplète. Pour commencer à travailler avec moi, veuillez terminer ces étapes :',
   'startup.item.create_group':

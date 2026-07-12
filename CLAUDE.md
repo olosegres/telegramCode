@@ -150,9 +150,14 @@ config/variants, not a per-message API field).
 - **Boot readiness status.** At startup the bot tells the owner whether it can
   work, or lists the setup steps still missing (create+pair a forum group, grant
   the bot Manage Topics / Pin / Delete, bind a topic, install an agent CLI; plus
-  optional groq/owner hints). Delivered to the owner DM (`OWNER_USER_ID`), falling
-  back to the group's General on a 403 / unset owner, else console-only. Cold
-  start always sends; a hot reload stays silent when fully ready. Decision logic
+  optional groq/owner hints). **Delivery depends on readiness
+  (`resolveStartupTargets`):** the "✅ Ready" status is owner-DM-ONLY
+  (`OWNER_USER_ID`) — it is noise in the shared group, so it NEVER falls back to
+  General (and a ready-status owner-DM 403 does NOT fall back either); no owner DM
+  ⇒ nothing is sent (log only). The General fallback is reserved for the
+  ACTIONABLE not-ready checklist, which tries the owner DM first then General on a
+  403 / unset owner, else console-only. Cold start always sends; a hot reload
+  stays silent when fully ready. Decision logic
   is pure (`utils/startupReadiness.ts`); `bot.ts` gathers live facts + sends it
   just BEFORE `bot.launch()` (Telegraf v4's long-poll `launch()` never resolves
   until the bot stops, so post-launch code would only run on shutdown).
@@ -418,7 +423,7 @@ config/variants, not a per-message API field).
 | `utils/rotatingLogFile.ts` | Shared hourly time-bucket helper for the observability logs: `getHourBucketPath(dir,base,ext,nowMs)` (`<base>-YYYYMMDDHH.<ext>`, host-local hour) + `pruneExpiredBuckets(...)` (best-effort unlink of buckets + their `.1` siblings older than `retentionHours = 6`; never throws). Used by BOTH the trace writer and the console tee |
 | `utils/consoleFileTap.ts` | TEE of `process.stdout`/`process.stderr` to `DATA_DIR/bot-console-*.log` (hourly bucket): `installConsoleFileTap(dir)` wraps `write` so each chunk ALSO `fs.appendFileSync`s to the bucket (best-effort, swallows IO errors, NO `console.*` inside → no recursion), original write + return value untouched (terminal preserved). Installed as early as possible at the bot entry (`cli/bot.ts`, after env load). Buckets pruned at 6h by the janitor |
 | `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
-| `utils/startupReadiness.ts` | Pure decision layer for the boot-time readiness status (plan `agent/tasks/actual/2026-07-12-startup-readiness-status.md`): `buildReadinessReport(facts)` → `{isReady, unmetKeys, missingRights}` (required items = paired group + all bot admin rights + a binding + an installed agent CLI; optional groq/owner never block ready), `checkShouldSendStartupStatus` (cold always, hot only-if-missing), `buildStartupStatusText` (ready line vs numbered checklist, via an injected translate). `bot.ts` gathers the live facts + sends |
+| `utils/startupReadiness.ts` | Pure decision layer for the boot-time readiness status (plan `agent/tasks/actual/2026-07-12-startup-readiness-status.md`): `buildReadinessReport(facts)` → `{isReady, unmetKeys, missingRights}` (required items = paired group + all bot admin rights + a binding + an installed agent CLI; optional groq/owner never block ready), `checkShouldSendStartupStatus` (cold always, hot only-if-missing), `resolveStartupTargets(isReady, hasOwner, hasGeneral)` → ordered `('owner'\|'general')[]` (ready ⇒ owner-DM-only, NEVER General; not-ready ⇒ owner then General), `buildStartupStatusText` (ready line vs numbered checklist, via an injected translate). `bot.ts` gathers the live facts + sends |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `utils/pollBackoff.ts` | Pure adaptive poll cadence: `getNextPollDelay` (300ms while the pane changes → ×2 up to 1.5s after 10 unchanged polls; any write/change snaps back) |
 | `utils/tmuxExec.ts` | Generic tmux/shell primitives shared by the claude + terminal backends (relocated from `claudeCliAdapter`): `tmuxAsync`/`tmuxOrThrowAsync` (best-effort vs strict tmux calls), `checkArgsAreSafe` (reject control chars), `shellSingleQuote`, `execFilePromise` |

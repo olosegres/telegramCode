@@ -378,7 +378,7 @@ export const kaDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ მზადაა — შემიძლია დავამუშავო შეტყობინებები თქვენს თემებსა და ჯგუფში.',
+    '✅ მზადაა — შემიძლია დავამუშავო შეტყობინებები ბოტის თრედებსა და ჯგუფის თემებში.',
   'startup.header_not_ready':
     '⚠️ კონფიგურაცია დაუსრულებელია. ჩემთან სამუშაოდ, გთხოვთ, დაასრულოთ ეს ნაბიჯები:',
   'startup.item.create_group':

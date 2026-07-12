@@ -77,8 +77,10 @@ import {
   buildReadinessReport,
   buildStartupStatusText,
   checkShouldSendStartupStatus,
+  resolveStartupTargets,
   type BotAdminRights,
   type ReadinessFacts,
+  type StartupTarget,
 } from './utils/startupReadiness';
 import { getStateStore, KeyLock, type StateStore } from './state';
 import { releaseLock } from './cli/lock';
@@ -9440,11 +9442,13 @@ async function resolveBotAdminRights(
 /**
  * @description Boot-time readiness status (plan 2026-07-12): on startup tell the
  * owner whether the bot can process messages, or list the setup steps still
- * missing. Delivery target resolves in order: owner DM (`OWNER_USER_ID`), else —
- * on a 403 (DM never opened) or an unset owner — the paired group's General
- * topic, else console log only. Cold start always sends; a hot reload stays
- * silent when fully ready (no spam on frequent rebuilds). Best-effort: any send
- * failure is logged, never thrown into the boot path.
+ * missing. Delivery target depends on readiness (`resolveStartupTargets`): the
+ * "✅ Ready" status is owner-DM-ONLY (`OWNER_USER_ID`) — it is pure noise in the
+ * shared group, so it NEVER falls back to General; no owner DM ⇒ nothing is sent
+ * (log only). The actionable NOT-READY checklist tries the owner DM first, then
+ * falls back to the paired group's General topic. Cold start always sends; a hot
+ * reload stays silent when fully ready (no spam on frequent rebuilds).
+ * Best-effort: any send failure is logged, never thrown into the boot path.
  */
 async function sendStartupStatus(isHotReload: boolean): Promise<void> {
   const groupId = getAllowedGroupId();
@@ -9502,18 +9506,35 @@ async function sendStartupStatus(isHotReload: boolean): Promise<void> {
     }
   };
 
-  if (ownerKey) {
-    console.log(`[startup-status] sending (ready=${report.isReady}) to owner DM ${ownerUserId}`);
-    if (await trySend(ownerKey)) return;
-    console.log('[startup-status] owner DM unreachable — falling back to General');
+  // Ready → owner DM only (never General); not-ready → owner then General.
+  const targets = resolveStartupTargets(report.isReady, ownerKey !== null, generalKey !== null);
+  if (targets.length === 0) {
+    // Reachable two ways: a READY status with no owner DM (never goes to General),
+    // or a NOT-READY status on a bot with neither an owner DM nor a paired group.
+    console.log(
+      report.isReady
+        ? '[startup-status] ready + no owner DM → not delivered (log only)'
+        : '[startup-status] not ready + no reachable surface → not delivered (log only)',
+    );
+    return;
   }
-  if (generalKey) {
-    console.log(`[startup-status] sending (ready=${report.isReady}) to group General ${groupId}`);
-    if (await trySend(generalKey)) return;
+
+  const keyByTarget: Record<StartupTarget, ThreadKey | null> = {
+    owner: ownerKey,
+    general: generalKey,
+  };
+  for (const target of targets) {
+    const key = keyByTarget[target];
+    if (!key) continue; // resolveStartupTargets already filtered to available surfaces
+    if (target === 'owner') {
+      console.log(`[startup-status] sending (ready=${report.isReady}) to owner DM ${ownerUserId}`);
+    } else {
+      console.log(`[startup-status] sending (ready=${report.isReady}) to group General ${groupId}`);
+    }
+    if (await trySend(key)) return;
+    if (target === 'owner') console.log('[startup-status] owner DM unreachable');
   }
-  console.warn(
-    '[startup-status] no reachable target (owner DM + General both unavailable) — status not delivered',
-  );
+  console.warn('[startup-status] no reachable target — status not delivered');
 }
 
 export async function startBot(): Promise<void> {

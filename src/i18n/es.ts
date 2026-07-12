@@ -378,7 +378,7 @@ export const esDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Listo — puedo procesar mensajes en tus temas y en el grupo.',
+    '✅ Listo — puedo procesar mensajes en los hilos del bot y los temas de grupo.',
   'startup.header_not_ready':
     '⚠️ Configuración incompleta. Para empezar a trabajar conmigo, completa estos pasos:',
   'startup.item.create_group':

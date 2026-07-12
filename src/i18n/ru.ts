@@ -382,7 +382,7 @@ export const ruDict: Record<string, string> = {
 
   // ── startup readiness status (boot-time owner notice) ──
   'startup.ready':
-    '✅ Готов — я могу обрабатывать сообщения в ваших темах и группе.',
+    '✅ Готов — я могу обрабатывать сообщения в тредах бота и темах группы.',
   'startup.header_not_ready':
     '⚠️ Настройка не завершена. Чтобы начать работу со мной, выполните эти шаги:',
   'startup.item.create_group':

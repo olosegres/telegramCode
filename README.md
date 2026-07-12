@@ -1,6 +1,6 @@
 <table border="0">
   <tr>
-    <td><h2>Telegram as a terminal for coding agents — every thread is a tab</h2>
+    <td><h2>Telegram bot/group as a terminal for OpenCode, Claude Code — every thread like a terminal tab + scheduling, voice control</h2>
 
 TelegramCode turns Telegram into a terminal for running agentic CLIs. A forum
 supergroup is the terminal window; each topic (thread) is a tab of that
@@ -17,16 +17,14 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 
 - **Multi-thread routing** — one topic per task, isolated tmux + opencode sessions; two topics can share one folder for parallel work
 - **Two chat surfaces** — forum-group topics and the owner's bot DM, both served at once by default, with tabs on either
-- **Agent backends** — Claude Code (tmux-scrape or stream-json backend, `/claude_mode`) and first-class OpenCode (native server API over HTTP+SSE: sessions, models, reasoning effort, interactive questions), picked per-thread
+- **Agent backends** — first-class OpenCode (native server API over HTTP+SSE: sessions, models, reasoning effort, interactive questions) and Claude Code (tmux-scrape or stream-json backend, `/claude_mode`), picked per-thread
+- **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Notifications** — when the agent asks a question, the bot pins that message so even a muted topic notifies you: the pin pierces mute, giving exactly one notification per question (unpinned once you answer)
 - **Scheduled & self-driving runs** — `/schedule` arms cron / one-shot / N-times jobs per topic, and the agent can schedule *itself* via injected MCP tools: nightly reviews, recurring reports, a "finish this tomorrow at 9" hand-off. Each job fires as a fresh session with your prompt; restart-safe, with one catch-up for a run missed while the bot was down
 - **Inbound files** — photos / documents / video / audio sent to a topic are saved and announced to the agent; albums arrive as one prompt
 - **Outbound files** — the agent sends files back to you — a generated chart, a screenshot, a log, a rendered PDF — single files or albums, straight into the topic
-- **Raw terminal** — `/terminal` binds a topic to a real `$SHELL` in the project folder
 - **Voice input** — Whisper transcription via Groq (preferred) or OpenAI
 - **Display verbosity** — `/verbosity` (plus `/thinking`, `/tool_results`, `/subagent`) per topic: `minimal|short|full`
-- **Localized in 12 languages** — the bot UI (commands, buttons, notices) speaks 中文, English, Français, ქართული, Deutsch, हिन्दी, 日本語, Português, Русский, Español, Українська, Oʻzbekcha; auto-detected per Telegram chat, switch any time with `/language`
-- **Works with your MCP servers** — Claude's native user- and project-level MCP configs just work; the bot also injects its own scheduling and file-sending tools into every session
 - **Time-aware prompts** — `/timestamps on` prepends each forwarded prompt's send time (local-offset ISO), so a days-long session knows what "yesterday" or "2 days ago" means; agent-facing only, per topic
 - **Two bots side by side** — run separate instances for, say, work and personal ("pet") projects on the same machine; each is fully isolated, so their tasks, sessions and chats never mix
     </td>
@@ -36,22 +34,17 @@ setup, no extra dashboards — direct access to your own **OpenCode** /
 
 ## Two surfaces: group topics, bot DM, or both
 
-The bot serves two Telegram surfaces, selected by `CHAT_MODE`
-(`group` | `dm` | `both`, default `both`):
+The bot serves two Telegram surfaces:
 
 - **Forum supergroup** — every topic is a tab. The most familiar UX: a visible
   topic list, per-topic names and icons, quick switching between agents. The
   trade-off is Telegram's group throughput cap (about 20 messages/min per
   group), so the bot paces and coalesces heavy output streams.
-- **The bot's own DM** (owner only, gated by `OWNER_USER_ID`) — the private
+- **The bot's own DM** (owner only) — the private
   chat runs in topic mode too, so you get the same thread-per-agent tabs
   there, and live output streams through Telegram's native draft "cursor":
   the reply grows in place in one message instead of arriving as a flood of
   separate messages.
-
-With `both` (the default) one instance serves the group and the owner DM at
-once; if `OWNER_USER_ID` is not set, the DM surface stays inert and the
-instance is effectively group-only.
 
 ## Where to run the bot server
 
@@ -88,8 +81,7 @@ from your projects folder, bind a topic to an agent.
 npm install -g telegramcode      # needs Node ≥ 22
 ```
 
-This registers the `telegramcode` command (the legacy `telegramCode` spelling
-stays as an alias). Prefer containers, or want two isolated instances on one
+This registers the `telegramcode` command. Prefer containers, or want two isolated instances on one
 host? Use [Run with Docker](#run-with-docker) instead — every other step is the
 same. To hack on the bot itself, see [Run from source](#run-from-source).
 
@@ -442,12 +434,15 @@ talk to the bot there.
 | `ALLOWED_GROUP_ID` | (auto-pair) | Numeric forum supergroup id (`-100…`). Leave empty to auto-pair with the first forum group a group **admin/creator** contacts the bot from (id is saved to `state.json`; re-point with `/pair`). A **name** is not accepted. A numeric value disables auto-pairing |
 | `DATA_DIR` | `~/.telegramCode` | Per-instance state. **Mandatory** if you run two bots on the same host — otherwise both share `state.json` and `mcp.json` and corrupt each other |
 | `CHAT_MODE` | `both` | Which surface(s) this instance serves: `group`, `dm`, or `both` — see [Two surfaces](#two-surfaces-group-topics-bot-dm-or-both) |
-| `OWNER_USER_ID` | — | Numeric Telegram user id of the owner. **Required** for `CHAT_MODE=dm`; optional for `both` (unset → the DM surface stays inert, group-only) |
+| `OWNER_USER_ID` | — | **Optional.** Numeric Telegram user id of the owner — leave it unset to run group-only (the DM surface stays inert; a group works fully without it). Set it only to enable the owner-DM surface; **required** solely for `CHAT_MODE=dm` |
 | `GROQ_API_KEY` | — | Recommended for voice transcription. Without it, voice messages are not transcribed unless you intentionally configure the OpenAI fallback |
 
-Bot UI language is automatic per Telegram chat: explicit `/language <locale>`
-override wins, then the sender's Telegram client language, then the last
-supported Telegram locale seen for that chat, then English.
+**Localized in 12 languages** — the bot UI (commands, buttons, notices) speaks
+中文, English, Français, ქართული, Deutsch, हिन्दी, 日本語, Português, Русский,
+Español, Українська, Oʻzbekcha. The language is automatic per Telegram chat:
+explicit `/language <locale>` override wins, then the sender's Telegram client
+language, then the last supported Telegram locale seen for that chat, then
+English.
 Supported locales: `en`, `de`, `fr`, `es`, `pt`, `ru`, `zh`, `ja`, `hi`, `uz`,
 `ka`, `uk`. Bare `/language` opens a single-message inline picker with each language
 shown by its own name (endonym), sorted A→Z by English name, and a `🌐 Auto` button

@@ -160,16 +160,10 @@ export const enDict: Record<string, string> = {
   'status.global_header': '📊 *All threads* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 No threads yet.',
-  'language.status':
-    '🌐 Language: {display} · {source}\nTelegram: {telegram}',
+  'language.status': '🌐 Language: {display}',
   'language.set_success': '✅ Language set to `{locale}` for this chat.',
   'language.auto_success': '✅ Language reset to auto. Current: {display}.',
   'language.invalid': '⚠️ Locale `{locale}` is not supported. Available: {locales}.',
-  'language.telegram_unknown': 'unknown',
-  'language.source.override': 'chat override',
-  'language.source.telegram': 'Telegram profile',
-  'language.source.storedTelegram': 'last seen Telegram profile',
-  'language.source.fallback': 'fallback',
 
   'agent.ready': '{label} ready in `{subdir}`{argsSuffix}\nSend a message:',
   'agent.no_session': 'No agent running. /claude or /opencode to start.',

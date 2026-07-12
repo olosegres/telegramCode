@@ -186,9 +186,9 @@ export function findAutobindSubdir(
   return null;
 }
 
-export interface BindPage<T = string> {
-  /** Slice of items visible on the current page. */
-  slice: T[];
+export interface BindPage {
+  /** Slice of subdirs visible on the current page. */
+  slice: string[];
   /** Resolved page index (`page` clamped to `[0, totalPages-1]`). */
   currentPage: number;
   /** Total number of pages, ≥ 1 even for an empty list. */
@@ -196,30 +196,30 @@ export interface BindPage<T = string> {
 }
 
 /**
- * @description Pure, generic pagination math for the inline-button pickers.
- * Extracted here so the slice / clamp logic can be unit-tested without booting
- * Telegraf. Wrapped by `buildBindKeyboard` (folder list, `T = string`) in
- * `bot.ts` and by `buildLanguagePicker` (locale codes, `T = Locale`) in
- * `utils/languagePicker.ts` — one clamp implementation, no duplication.
+ * @description Pure pagination math for the `/bind` keyboard. Extracted
+ * here so the slice / clamp logic can be unit-tested without booting
+ * Telegraf (which is what `buildBindKeyboard` in `bot.ts` wraps it with).
  *
- * Plan §11 Этап 7 polish — pagination kicks in once the list surfaces more than
- * `pageSize` items. `pageSize` must be positive; `/bind` uses `BIND_PAGE_SIZE =
- * 20`. Out-of-range `page` values are clamped silently — a stale callback after
- * the underlying list shrank just lands on the last available page.
+ * Plan §11 Этап 7 polish — pagination kicks in once `listAvailableSubdirs`
+ * surfaces more than `pageSize` folders.
+ *
+ * `pageSize` must be positive; the bot uses `BIND_PAGE_SIZE = 20`. Out-of-
+ * range `page` values are clamped silently — a stale callback after the
+ * disk state shrank just lands on the last available page.
  */
-export function paginateBindList<T>(
-  items: readonly T[],
+export function paginateBindList(
+  subdirs: readonly string[],
   page: number,
   pageSize: number,
-): BindPage<T> {
+): BindPage {
   if (!Number.isInteger(pageSize) || pageSize <= 0) {
     throw new Error(`paginateBindList: pageSize must be a positive integer, got ${pageSize}`);
   }
-  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(subdirs.length / pageSize));
   const clampedPage = Math.max(0, Math.min(Math.floor(page) || 0, totalPages - 1));
   const start = clampedPage * pageSize;
   return {
-    slice: items.slice(start, start + pageSize),
+    slice: subdirs.slice(start, start + pageSize),
     currentPage: clampedPage,
     totalPages,
   };

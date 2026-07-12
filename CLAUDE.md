@@ -746,19 +746,23 @@ OpenCode events / bindings).
   `/doctor`, `/mcp`, `/trace`, `/timestamps`, `/language` (`/lang`)
   - `/language [locale|auto]` shows or changes the bot UI language for the
     current Telegram chat (DM or whole forum group). Bare `/language` opens a
-    paginated inline picker (mirrors the `/bind` picker; pure builder in
-    `utils/languagePicker.ts`): one ENDONYM button per locale (each language
-    written in itself — `English, Deutsch, …, 中文, ქართული`), `✓` on the current
-    selection, a full-width `🌐 Auto` reset button on every page, and
-    `⬅️ Prev / n·N / Next ➡️` nav (`lang_<code>` / `lang_auto` / `lang_page_<n>`
-    callbacks). Tapping a locale sets the override and re-renders the status line
-    in that language; `🌐 Auto` clears it. The status line shows the resolved
-    language via `formatLanguageDisplay` (`i18n.ts`) — the endonym for an explicit
-    override, `auto (English)` for any auto source; endonyms live in CODE
-    (`localeEndonyms`), NOT the per-key dict, so key parity is unaffected. The
-    `/language <locale>` / `/language auto` text commands keep working. Resolution
-    order: explicit override → Telegram `from.language_code` → last supported
-    Telegram locale seen in that chat → `en`; logs stay English.
+    SINGLE-PAGE inline picker (pure builder in `utils/languagePicker.ts`): one
+    ENDONYM button per locale (each language written in itself — `English,
+    Deutsch, …, 中文, ქართული`), two per row, `✓` on the current selection, and a
+    full-width `🌐 Auto` reset row (`lang_<code>` / `lang_auto` callbacks). All 11
+    locales fit in ONE message (Telegram allows ~100 inline buttons), so there is
+    NO pagination / nav row. Tapping a locale sets the override, tapping `🌐 Auto`
+    clears it — and either way the picker message is edited to a short
+    confirmation in the resolved language and the KEYBOARD DISAPPEARS (no
+    re-showable menu once a choice is made). The confirmation / status line shows
+    ONLY the resolved language via `formatLanguageDisplay` (`i18n.ts`) — the
+    endonym for an explicit override (`🌐 Language: Русский`), `auto (English)`
+    for any auto source (`🌐 Language: auto (English)`); no Telegram-profile /
+    source label is shown. Endonyms live in CODE (`localeEndonyms`), NOT the
+    per-key dict, so key parity is unaffected. The `/language <locale>` /
+    `/language auto` text commands keep working. Resolution order: explicit
+    override → Telegram `from.language_code` → last supported Telegram locale seen
+    in that chat → `en`; logs stay English.
   - `/timestamps on|off` (bare → status) toggles the per-thread prompt
     timestamp: when ON, every prompt forwarded to the agent gets its send time
     prepended as the very top line (`2026-06-27T19:42:10+04:00` — local-offset

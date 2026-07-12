@@ -160,16 +160,10 @@ export const ruDict: Record<string, string> = {
   'status.global_header': '📊 *Все треды* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Тредов пока нет.',
-  'language.status':
-    '🌐 Язык: {display} · {source}\nTelegram: {telegram}',
+  'language.status': '🌐 Язык: {display}',
   'language.set_success': '✅ Язык для этого чата: `{locale}`.',
   'language.auto_success': '✅ Автовыбор языка включён. Сейчас: {display}.',
   'language.invalid': '⚠️ Локаль `{locale}` не поддерживается. Доступно: {locales}.',
-  'language.telegram_unknown': 'неизвестно',
-  'language.source.override': 'настройка чата',
-  'language.source.telegram': 'профиль Telegram',
-  'language.source.storedTelegram': 'последний язык Telegram',
-  'language.source.fallback': 'резервный язык',
 
   'agent.ready': '{label} готов в `{subdir}`{argsSuffix}\nОтправь сообщение:',
   'agent.no_session': 'Агент не запущен. /claude или /opencode — старт.',

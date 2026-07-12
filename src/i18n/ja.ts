@@ -156,16 +156,10 @@ export const jaDict: Record<string, string> = {
   'status.global_header': '📊 *全スレッド* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 まだスレッドがありません。',
-  'language.status':
-    '🌐 言語: {display} · {source}\nTelegram: {telegram}',
+  'language.status': '🌐 言語: {display}',
   'language.set_success': '✅ このチャットの言語を `{locale}` に設定しました。',
   'language.auto_success': '✅ 言語を自動に戻しました。現在: {display}。',
   'language.invalid': '⚠️ locale `{locale}` はサポートされていません。利用可能: {locales}。',
-  'language.telegram_unknown': '不明',
-  'language.source.override': 'チャット設定',
-  'language.source.telegram': 'Telegram プロフィール',
-  'language.source.storedTelegram': '最後に見た Telegram プロフィール',
-  'language.source.fallback': 'フォールバック',
 
   'agent.ready': '{label} が `{subdir}`{argsSuffix} で準備完了\nメッセージを送信:',
   'agent.no_session': 'エージェントが実行中ではありません。/claude または /opencode で起動。',

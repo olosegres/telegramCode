@@ -156,16 +156,10 @@ export const deDict: Record<string, string> = {
   'status.global_header': '📊 *Alle Threads* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Noch keine Threads.',
-  'language.status':
-    '🌐 Sprache: {display} · {source}\nTelegram: {telegram}',
+  'language.status': '🌐 Sprache: {display}',
   'language.set_success': '✅ Sprache für diesen Chat auf `{locale}` gesetzt.',
   'language.auto_success': '✅ Sprache auf automatisch zurückgesetzt. Aktuell: {display}.',
   'language.invalid': '⚠️ Locale `{locale}` wird nicht unterstützt. Verfügbar: {locales}.',
-  'language.telegram_unknown': 'unbekannt',
-  'language.source.override': 'Chat-Einstellung',
-  'language.source.telegram': 'Telegram-Profil',
-  'language.source.storedTelegram': 'zuletzt gesehenes Telegram-Profil',
-  'language.source.fallback': 'Fallback',
 
   'agent.ready': '{label} bereit in `{subdir}`{argsSuffix}\nSende eine Nachricht:',
   'agent.no_session': 'Kein Agent läuft. /claude oder /opencode zum Starten.',

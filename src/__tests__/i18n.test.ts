@@ -45,10 +45,10 @@ test('runWithLocale scopes t across async work and restores the previous locale'
   const out = await runWithLocale('ru', async () => {
     assert.equal(getActiveLang(), 'ru');
     await Promise.resolve();
-    return t('language.source.override');
+    return t('status.global_empty');
   });
 
-  assert.equal(out, 'настройка чата');
+  assert.equal(out, '📊 Тредов пока нет.');
   assert.equal(getActiveLang(), 'en');
 });
 
@@ -232,28 +232,18 @@ test('language command keys exist in every locale', () => {
     'language.set_success',
     'language.auto_success',
     'language.invalid',
-    'language.telegram_unknown',
-    'language.source.override',
-    'language.source.telegram',
-    'language.source.storedTelegram',
-    'language.source.fallback',
   ]) {
     assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
   }
 });
 
-test('language.status renders {display} + {source} + {telegram} (endonym picker rework)', () => {
-  // The old comma-separated {current}/{locales} code list is gone — the status
-  // line now carries the human display (endonym or "auto (…)"), the source
-  // label, and the Telegram profile locale; the picker buttons replace the list.
-  const out = t('language.status', {
-    display: 'auto (English)',
-    source: 'Telegram profile',
-    telegram: 'en',
-  });
+test('language.status renders ONLY the {display} — no source / Telegram line', () => {
+  // The status line now carries just the human display (endonym or "auto (…)");
+  // the Telegram-profile + source labels were dropped (the picker buttons and
+  // the display line replace them).
+  const out = t('language.status', { display: 'auto (English)' });
   assert.ok(out.includes('auto (English)'), `expected the display in "${out}"`);
-  assert.ok(out.includes('Telegram profile'), `expected the source label in "${out}"`);
-  assert.ok(out.includes('en'), `expected the telegram locale in "${out}"`);
+  assert.ok(!/Telegram/i.test(out), `Telegram line should be gone: "${out}"`);
   assert.ok(!out.includes('{'), `placeholders not substituted: "${out}"`);
 });
 
@@ -523,7 +513,13 @@ test('every locale has full key parity with en (no missing keys)', () => {
     assert.ok(checkKeyInAllLangs(key), `checkKeyInAllLangs failed for "${key}"`);
   }
   // Verify no retired keys are present in ANY locale
-  for (const code of ['new.in_topic', 'new.usage', 'new.created', 'new.created_unbound', 'new.failed', 'new.bind_failed']) {
+  for (const code of [
+    'new.in_topic', 'new.usage', 'new.created', 'new.created_unbound', 'new.failed', 'new.bind_failed',
+    // /language status no longer shows the Telegram-profile / source labels.
+    'language.telegram_unknown',
+    'language.source.override', 'language.source.telegram',
+    'language.source.storedTelegram', 'language.source.fallback',
+  ]) {
     assert.ok(!checkKeyInAllLangs(code), `retired key still present: ${code}`);
   }
 });

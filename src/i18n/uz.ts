@@ -156,16 +156,10 @@ export const uzDict: Record<string, string> = {
   'status.global_header': '📊 *Barcha mavzular* ({total}):',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 Hali mavzular yo‘q.',
-  'language.status':
-    '🌐 Til: {display} · {source}\nTelegram: {telegram}',
+  'language.status': '🌐 Til: {display}',
   'language.set_success': '✅ Bu chat tili `{locale}` qilib o‘rnatildi.',
   'language.auto_success': '✅ Til avtomatik rejimga qaytarildi. Joriy: {display}.',
   'language.invalid': '⚠️ `{locale}` locale qo‘llab-quvvatlanmaydi. Mavjud: {locales}.',
-  'language.telegram_unknown': 'noma’lum',
-  'language.source.override': 'chat sozlamasi',
-  'language.source.telegram': 'Telegram profili',
-  'language.source.storedTelegram': 'oxirgi ko‘rilgan Telegram profili',
-  'language.source.fallback': 'zaxira',
 
   'agent.ready': '{label} `{subdir}`{argsSuffix} da tayyor\nXabar yuboring:',
   'agent.no_session': 'Agent ishlamayapti. /claude yoki /opencode bilan boshlang.',

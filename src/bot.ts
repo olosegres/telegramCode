@@ -90,7 +90,7 @@ import {
 } from './updateDispatcher';
 import { classifyBoot } from './bootClassifier';
 import { defaultLocale, formatLanguageDisplay, localeCodes, normalizeLocale, runWithLocale, t, type Locale } from './i18n';
-import { buildLanguagePicker, getLocalePageIndex, languageAutoCallback, languagePageNoopCallback } from './utils/languagePicker';
+import { buildLanguagePicker, languageAutoCallback } from './utils/languagePicker';
 import { validateSubdir, resolveBoundWorkDir, BindError, findAutobindSubdir, paginateBindList } from './validation';
 import { validateNewFolderName, NewFolderNameError } from './folderName';
 import {
@@ -1652,7 +1652,6 @@ type LocaleSource = 'override' | 'telegram' | 'storedTelegram' | 'fallback';
 interface ResolvedChatLocale {
   locale: Locale;
   source: LocaleSource;
-  telegramLocale: Locale | null;
 }
 
 function getTelegramLocale(ctx: Context): Locale | null {
@@ -1661,11 +1660,11 @@ function getTelegramLocale(ctx: Context): Locale | null {
 
 function getResolvedChatLocale(chatId: number, telegramLocale: Locale | null): ResolvedChatLocale {
   const override = state.getChatLocaleOverride(chatId);
-  if (override) return { locale: override, source: 'override', telegramLocale };
-  if (telegramLocale) return { locale: telegramLocale, source: 'telegram', telegramLocale };
+  if (override) return { locale: override, source: 'override' };
+  if (telegramLocale) return { locale: telegramLocale, source: 'telegram' };
   const storedTelegramLocale = state.getChatTelegramLocale(chatId);
-  if (storedTelegramLocale) return { locale: storedTelegramLocale, source: 'storedTelegram', telegramLocale };
-  return { locale: defaultLocale, source: 'fallback', telegramLocale };
+  if (storedTelegramLocale) return { locale: storedTelegramLocale, source: 'storedTelegram' };
+  return { locale: defaultLocale, source: 'fallback' };
 }
 
 function getLocaleForContext(ctx: Context): Locale {
@@ -3893,15 +3892,6 @@ command('status', async (_ctx, key) => {
   );
 });
 
-function getLocaleSourceLabel(source: LocaleSource): string {
-  switch (source) {
-    case 'override': return t('language.source.override');
-    case 'telegram': return t('language.source.telegram');
-    case 'storedTelegram': return t('language.source.storedTelegram');
-    case 'fallback': return t('language.source.fallback');
-  }
-}
-
 function getLanguageCommandArg(text: string): string {
   const [_command, arg = ''] = stripCommandBotMention(text.trim()).split(/\s+/, 2);
   return arg.trim().toLowerCase();
@@ -3934,14 +3924,8 @@ command(['language', 'lang'], async (ctx, key) => {
   const override = state.getChatLocaleOverride(chatId);
   await replyToThread(
     key,
-    t('language.status', {
-      display: formatLanguageDisplay(resolved),
-      source: getLocaleSourceLabel(resolved.source),
-      telegram: resolved.telegramLocale ?? t('language.telegram_unknown'),
-    }),
-    // Open on the page holding the current override (if any) so its ✓ is visible
-    // immediately — consistent with `refreshLanguagePickerMessage`.
-    buildLanguagePicker(override, override ? getLocalePageIndex(override) : 0),
+    t('language.status', { display: formatLanguageDisplay(resolved) }),
+    buildLanguagePicker(override),
   );
 });
 
@@ -7024,66 +7008,40 @@ bot.action(/^bind_(.+)$/, async (ctx) => {
   if (result.ok) await sendBindingWelcome(key, result.subdir);
 });
 
-// ─── /language inline picker callbacks (mirror the /bind picker) ─────────────
+// ─── /language inline picker callbacks ───────────────────────────────────────
 //
-// Registration order matters: `lang_page_(\d+)`, `lang_page_noop` and
-// `lang_auto` are registered BEFORE the generic `lang_(.+)` so the latter's
-// `.+` can't swallow them (first-match-wins, same as bind_page vs bind_).
+// Registration order matters: `lang_auto` is registered BEFORE the generic
+// `lang_(.+)` so the latter's `.+` can't swallow it (first-match-wins).
 
 /**
- * @description Edit the picker message in place after the chat's language
- * changed: re-render the status line in the NEW effective locale and refresh the
- * keyboard so the `✓` follows the selection (jumping to the page that holds it).
- * Wrapped in `runWithLocale` because the per-update locale middleware resolved
- * the OLD locale before the override was written (mirrors the text set/auto
- * success paths).
+ * @description Finalise a language pick: edit the picker message to a short
+ * confirmation in the NEW effective locale and DROP the inline keyboard (the
+ * menu disappears once a choice is made). Wrapped in `runWithLocale` because the
+ * per-update locale middleware resolved the OLD locale before the override was
+ * written (mirrors the text set/auto success paths).
  */
-async function refreshLanguagePickerMessage(ctx: Context): Promise<void> {
+async function confirmLanguageSelection(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id;
   if (chatId === undefined) return;
   const resolved = getResolvedChatLocale(chatId, getTelegramLocale(ctx));
-  const override = state.getChatLocaleOverride(chatId);
-  const page = override ? getLocalePageIndex(override) : 0;
   const text = runWithLocale(resolved.locale, () =>
-    t('language.status', {
-      display: formatLanguageDisplay(resolved),
-      source: getLocaleSourceLabel(resolved.source),
-      telegram: resolved.telegramLocale ?? t('language.telegram_unknown'),
-    }),
+    t('language.status', { display: formatLanguageDisplay(resolved) }),
   );
   try {
-    await ctx.editMessageText(text, buildLanguagePicker(override, page));
+    // No reply_markup → the inline keyboard is removed, leaving only the text.
+    await ctx.editMessageText(text);
   } catch (e) {
     const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
     if (!/message is not modified/i.test(desc)) console.warn('[lang_cb] edit failed:', desc || e);
   }
 }
 
-bot.action(/^lang_page_(\d+)$/, async (ctx) => {
-  const key = await authoriseContext(ctx);
-  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
-  const page = parseInt(ctx.match[1], 10);
-  const keyboard = buildLanguagePicker(state.getChatLocaleOverride(key.chatId), page);
-  try {
-    await ctx.editMessageReplyMarkup(keyboard.reply_markup);
-  } catch (e) {
-    const desc = checkIsApiError(e) ? getErrorDescription(e) : '';
-    if (!/message is not modified/i.test(desc)) console.warn('[lang_page] edit failed:', desc || e);
-  }
-  await ctx.answerCbQuery();
-});
-
-// Middle "n/N" pill in the nav row — pure UI, no state change.
-bot.action(languagePageNoopCallback, async (ctx) => {
-  await ctx.answerCbQuery();
-});
-
 bot.action(languageAutoCallback, async (ctx) => {
   const key = await authoriseContext(ctx);
   if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
   await state.setChatLocaleOverride(key.chatId, null);
   await ctx.answerCbQuery();
-  await refreshLanguagePickerMessage(ctx);
+  await confirmLanguageSelection(ctx);
 });
 
 bot.action(/^lang_(.+)$/, async (ctx) => {
@@ -7095,7 +7053,7 @@ bot.action(/^lang_(.+)$/, async (ctx) => {
   if (!locale) { await ctx.answerCbQuery(); return; }
   await state.setChatLocaleOverride(key.chatId, locale);
   await ctx.answerCbQuery();
-  await refreshLanguagePickerMessage(ctx);
+  await confirmLanguageSelection(ctx);
 });
 
 bot.action(/^model_(.+)$/, async (ctx) => {

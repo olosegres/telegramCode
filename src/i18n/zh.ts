@@ -156,16 +156,10 @@ export const zhDict: Record<string, string> = {
   'status.global_header': '📊 *所有话题*（{total}）：',
   'status.global_row': '• `{key}` → `{subdir}` · {agent} · {status}',
   'status.global_empty': '📊 暂无话题。',
-  'language.status':
-    '🌐 语言：{display} · {source}\nTelegram：{telegram}',
+  'language.status': '🌐 语言：{display}',
   'language.set_success': '✅ 此聊天的语言已设为 `{locale}`。',
   'language.auto_success': '✅ 语言已重置为自动。当前：{display}。',
   'language.invalid': '⚠️ 不支持 locale `{locale}`。可用：{locales}。',
-  'language.telegram_unknown': '未知',
-  'language.source.override': '聊天设置',
-  'language.source.telegram': 'Telegram 个人资料',
-  'language.source.storedTelegram': '上次看到的 Telegram 个人资料',
-  'language.source.fallback': '回退',
 
   'agent.ready': '{label} 已就绪，在 `{subdir}`{argsSuffix}\n发送消息：',
   'agent.no_session': '没有运行中的代理。运行 /claude 或 /opencode 启动。',

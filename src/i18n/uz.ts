@@ -356,6 +356,8 @@ export const uzDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Pauzadagi rejalalar: {count} — mavzu papkasidan uzildi. /buy ularni qaytaradi.',
   'schedule.resumedRebind': '▶️ Rejalar davom etdi: {count} (keyingi ishga tushirish hozirdan qayta hisoblanadi).',
+  'schedule.noAgent':
+    "⚠️ Hech narsa rejalashtirilmadi — bu mavzuda hech qanday agent ishlamayapti, shuning uchun rejalashtirilgan ishga tushirish uchun hech narsa bo'lmaydi. Avval /claude yoki /opencode ni ishga tushiring.",
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN UZBEK what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

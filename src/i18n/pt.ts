@@ -356,6 +356,8 @@ export const ptDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Agendamentos em pausa: {count} — o tópico foi desvinculado da sua pasta. /bind irá restaurá-los.',
   'schedule.resumedRebind': '▶️ Agendamentos retomados: {count} (próximo recalculado a partir de agora).',
+  'schedule.noAgent':
+    '⚠️ Nada agendado — nenhum agente está ativo neste tópico, então uma execução agendada não teria nada para iniciar. Inicie /claude ou /opencode primeiro.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN PORTUGUESE what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

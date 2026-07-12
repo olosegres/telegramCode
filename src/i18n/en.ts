@@ -360,6 +360,8 @@ export const enDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Schedules paused: {count} — the topic was unbound from its folder. /bind will bring them back.',
   'schedule.resumedRebind': '▶️ Schedules resumed: {count} (next run recomputed from now).',
+  'schedule.noAgent':
+    '⚠️ Nothing scheduled — no agent is running in this topic, so a scheduled run would have nothing to launch. Start /claude or /opencode first.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN ENGLISH what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

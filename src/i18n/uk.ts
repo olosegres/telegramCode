@@ -362,6 +362,8 @@ export const ukDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Розкладів на паузі: {count} — топік відв\'язано від папки. /bind поверне їх у роботу.',
   'schedule.resumedRebind': '▶️ Розкладів відновлено: {count} (наступний запуск перераховано від поточного моменту).',
+  'schedule.noAgent':
+    '⚠️ Нічого не заплановано — у цій темі не запущено жодного агента, тож запланованому запуску не буде чого запускати. Спочатку запустіть /claude або /opencode.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN UKRAINIAN what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

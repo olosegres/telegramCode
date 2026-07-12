@@ -356,6 +356,8 @@ export const deDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Zeitpläne pausiert: {count} — das Topic wurde vom Ordner getrennt. /bind bringt sie zurück.',
   'schedule.resumedRebind': '▶️ Zeitpläne fortgesetzt: {count} (nächster Lauf ab jetzt neu berechnet).',
+  'schedule.noAgent':
+    '⚠️ Nichts geplant — in diesem Thema läuft kein Agent, ein geplanter Lauf hätte also nichts zu starten. Starte zuerst /claude oder /opencode.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN GERMAN what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

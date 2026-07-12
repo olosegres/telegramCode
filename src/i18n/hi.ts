@@ -356,6 +356,8 @@ export const hiDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ रुके हुए शेड्यूल: {count} — टॉपिक अपने फ़ोल्डर से अनबाउंड हो गया। /bind उन्हें वापस लाएगा।',
   'schedule.resumedRebind': '▶️ शेड्यूल पुनः शुरू: {count} (अगला रन अब से पुनः गणना)।',
+  'schedule.noAgent':
+    '⚠️ कुछ भी शेड्यूल नहीं हुआ — इस टॉपिक में कोई एजेंट नहीं चल रहा, इसलिए शेड्यूल किए गए रन के पास शुरू करने के लिए कुछ नहीं होगा। पहले /claude या /opencode शुरू करें।',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN HINDI what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

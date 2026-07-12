@@ -356,6 +356,8 @@ export const esDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Programaciones en pausa: {count} — el topic se desvinculó de su carpeta. /bind las restaurará.',
   'schedule.resumedRebind': '▶️ Programaciones reanudadas: {count} (próxima recalculada desde ahora).',
+  'schedule.noAgent':
+    '⚠️ No se programó nada — no hay ningún agente activo en este tema, así que una ejecución programada no tendría nada que iniciar. Inicia primero /claude o /opencode.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN SPANISH what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

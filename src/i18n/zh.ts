@@ -356,6 +356,8 @@ export const zhDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ 已暂停的定时任务: {count} — 话题已从文件夹解绑。/bind 将恢复它们。',
   'schedule.resumedRebind': '▶️ 已恢复的定时任务: {count}（下次运行从现在重新计算）。',
+  'schedule.noAgent':
+    '⚠️ 未创建任何计划 — 此话题中没有运行中的代理，因此计划运行将无内容可启动。请先启动 /claude 或 /opencode。',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN CHINESE what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

@@ -356,6 +356,8 @@ export const frDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Planifications en pause : {count} — le topic a été détaché de son dossier. /bind les restaurera.',
   'schedule.resumedRebind': '▶️ Planifications reprises : {count} (prochain recalculé à partir de maintenant).',
+  'schedule.noAgent':
+    "⚠️ Rien de planifié — aucun agent n'est actif dans ce sujet, une exécution planifiée n'aurait donc rien à lancer. Démarre d'abord /claude ou /opencode.",
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN FRENCH what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

@@ -360,6 +360,8 @@ export const ruDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ Расписаний на паузе: {count} — топик отвязан от папки. /bind вернёт их в строй.',
   'schedule.resumedRebind': '▶️ Расписаний возобновлено: {count} (следующий запуск пересчитан от текущего момента).',
+  'schedule.noAgent':
+    '⚠️ Ничего не запланировано — в этой теме не запущен ни один агент, поэтому запланированному запуску нечего будет запустить. Сначала запустите /claude или /opencode.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN RUSSIAN what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

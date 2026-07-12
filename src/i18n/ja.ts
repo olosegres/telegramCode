@@ -356,6 +356,8 @@ export const jaDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ 一時停止中のスケジュール: {count} — トピックがフォルダからアンバインドされました。/bind で復元されます。',
   'schedule.resumedRebind': '▶️ スケジュールを再開: {count}（次回実行は現在時刻から再計算）。',
+  'schedule.noAgent':
+    '⚠️ 何もスケジュールされませんでした — このトピックで実行中のエージェントがないため、スケジュール実行で起動するものがありません。まず /claude または /opencode を開始してください。',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN JAPANESE what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

@@ -356,6 +356,8 @@ export const kaDict: Record<string, string> = {
   'schedule.pausedUnbound':
     '⏸ შეჩერებული განრიგები: {count} — თემა მოხსნილია თავის საქაღალდიდან. /bind დააბრუნებს მათ.',
   'schedule.resumedRebind': '▶️ განრიგები გაგრძელდა: {count} (შემდეგი გაშვება ხელახლა გამოითვლება ახლანდელი დროიდან).',
+  'schedule.noAgent':
+    '⚠️ არაფერი დაიგეგმა — ამ თემაში არცერთი აგენტი არ მუშაობს, ამიტომ დაგეგმილ გაშვებას გასაშვები არაფერი ექნება. ჯერ გაუშვით /claude ან /opencode.',
   'schedule.forwardPromptTemplate':
     'The user wants to schedule the following. Use the schedule_create / schedule_list / schedule_cancel MCP tools (cron for repeats, one-shot for a single run), translating any time phrasing into the right schedule, then confirm to the user IN GEORGIAN what you scheduled.\n\nRequest: {text}',
   'schedule.interviewPromptTemplate':

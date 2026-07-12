@@ -582,8 +582,11 @@ OpenCode events / bindings).
     (`schedule.forwardPromptTemplate`; bare `/schedule` →
     `schedule.interviewPromptTemplate`, agent asks what + when) and delivers it
     EXACTLY like a plain user message: `ensureAgentSession` does the
-    bind-check + start (unbound → bind-required reply), then
-    `deliverPromptOrBuffer` forwards to the live agent or buffers it
+    bind-check + start (unbound → bind-required reply; a bound topic that
+    never started an agent → `no-adapter`, surfaced as the schedule-specific
+    `schedule.noAgent` warning «start /claude or /opencode first» instead of
+    the generic `agent.no_session`, since a scheduled run needs an agent to
+    launch), then `deliverPromptOrBuffer` forwards to the live agent or buffers it
     mid-startup. The agent does all the work (parse time → cron/one-shot, call
     the `schedule_create` / `schedule_list` / `schedule_cancel` MCP tools).
     Template instructions stay English in all locales (agent-facing, not

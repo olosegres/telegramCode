@@ -5908,7 +5908,12 @@ command('schedule', async (ctx, key) => {
 
   const result = await ensureAgentSession(key);
   if (!result.ok) {
-    await replyToThread(key, result.message);
+    // A bound topic that never started an agent (`no-adapter`) gets a
+    // schedule-specific warning: a scheduled run needs an agent to launch,
+    // so there is nothing to schedule until one is started. Every other
+    // failure (e.g. `unbound`) keeps the shared reply.
+    const message = result.reason === 'no-adapter' ? t('schedule.noAgent') : result.message;
+    await replyToThread(key, message);
     return;
   }
   // Fresh-start notice (empty when the session was already active / starting).

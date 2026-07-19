@@ -147,6 +147,15 @@ test('connect provider-auth keys exist in every locale', () => {
     'connect.failed',
     'connect.success',
     'connect.cancelled',
+    'connect.pick_method',
+    'connect.no_methods',
+    'connect.oauth_device',
+    'connect.oauth_url_only',
+    'connect.oauth_paste',
+    'connect.oauth_waiting',
+    'connect.oauth_success',
+    'connect.oauth_failed',
+    'cb.connect_method_expired',
   ]) {
     assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
   }

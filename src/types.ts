@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import type { Locale } from './i18n';
+import type { OpenCodeAuthMethod } from './utils/openCodeAuthLogin';
 
 export interface AgentSession {
   id: string;
@@ -757,6 +758,13 @@ export interface AgentAdapter extends EventEmitter {
    * Claude/Terminal do not.
    */
   connectProvider?(key: ThreadKey, providerId: string, apiKey: string): Promise<string | null>;
+
+  /**
+   * Fetch a provider's auth methods from the live catalog (OAuth methods + the
+   * API-key method) for the `/connect` method picker. Optional (OpenCode only,
+   * same optional-method pattern as {@link connectProvider}).
+   */
+  fetchProviderAuthMethods?(providerId: string): Promise<OpenCodeAuthMethod[]>;
 
   /**
    * Set model override. Returns error message on failure, `null` on

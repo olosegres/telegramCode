@@ -33,3 +33,25 @@ export function resolveClaudeBinary(): string {
   }
   return path.join(process.env.HOME || '/tmp', '.npm-global', 'bin', 'claude');
 }
+
+/**
+ * @description Locate the OpenCode CLI binary. Mirrors {@link resolveClaudeBinary}:
+ * `OPENCODE_BIN` env wins (returned even if the file is absent — authoritative
+ * override), else `which opencode`, else the `.npm-global/bin/opencode` fallback.
+ * Used by the bot-driven out-of-band `/connect` OAuth flow (`opencode auth login`
+ * in a pty), so it must always return a string.
+ */
+export function resolveOpenCodeBinary(): string {
+  if (process.env.OPENCODE_BIN) return process.env.OPENCODE_BIN;
+  try {
+    const which = execFileSync('which', ['opencode'], {
+      encoding: 'utf8',
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (which) return which;
+  } catch {
+    // PATH lookup failed; fall through.
+  }
+  return path.join(process.env.HOME || '/tmp', '.npm-global', 'bin', 'opencode');
+}

@@ -36,6 +36,10 @@ import {
   getSubagentPartAction,
 } from '../utils/subagentRender';
 import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
+import {
+  parseProviderAuthMethods,
+  type OpenCodeAuthMethod,
+} from '../utils/openCodeAuthLogin';
 
 const execAsync = promisify(exec);
 
@@ -1742,6 +1746,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!await checkIsOpenCodeServerRunning()) {
       await ensureOpenCodeServer();
     }
+  }
+
+  /**
+   * @description Fetch a provider's auth methods from the live `/provider/auth`
+   * catalog (OAuth methods + the API-key method), for the `/connect` method
+   * picker. The bot drives OAuth methods out-of-band via `opencode auth login`
+   * (a pty); the API-key method reuses {@link connectProvider}. Order is
+   * catalog order. Throws on a server/transport error (the caller surfaces it).
+   */
+  async fetchProviderAuthMethods(providerId: string): Promise<OpenCodeAuthMethod[]> {
+    await this.ensureProviderAuthServerReady();
+    const raw = await this.apiRequest<unknown>('GET', '/provider/auth');
+    return parseProviderAuthMethods(raw, providerId);
   }
 
   /**

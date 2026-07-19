@@ -219,7 +219,7 @@ import { getRebindResumeAction } from './scheduler/rebindResume';
 import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/types';
 import { decideRetryAction, classifyAgentApiError } from './apiErrorRetry';
 import { spawn as spawnPty, type IPty } from 'node-pty';
-import { resolveClaudeBinary } from './utils/resolveBinary';
+import { resolveClaudeBinary, resolveOpenCodeBinary } from './utils/resolveBinary';
 import {
   parseClaudeAuthLoginUrl,
   checkIsClaudeAuthLoginCodePrompt,
@@ -227,6 +227,19 @@ import {
   checkIsAuthLoginSucceeded,
   getLoginCommandRoute,
 } from './utils/claudeAuthLogin';
+import {
+  type OpenCodeAuthMethod,
+  buildOpenCodeAuthLoginArgs,
+  parseOpenCodeOAuthUrl,
+  parseOpenCodeDeviceCode,
+  checkIsOpenCodeOAuthPastePrompt,
+  checkIsOAuthInfoReady,
+  checkIsOAuthMethod,
+  getOpenCodeAuthFilePath,
+  checkProviderAuthed,
+  checkIsOpenCodeOAuthSucceeded,
+  buildConnectMethodButtonLabel,
+} from './utils/openCodeAuthLogin';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ENV parsing & fatal validation
@@ -1550,6 +1563,205 @@ async function onAuthLoginExit(
   }
 }
 
+// ── OpenCode `/connect` OAuth (subscription) — out-of-band pty flow ───────────
+// Mirrors the Claude `/login` driver above but drives `opencode auth login
+// -p <id> -m <label>`. Two shapes, auto-detected from the pty output: a DEVICE
+// flow (relay URL + code, wait for the process to exit when the user authorises
+// in a browser) and a PASTE flow (relay URL, then the next plain text is the
+// code written into the pty). Pure parse/decision helpers live in
+// `utils/openCodeAuthLogin.ts`; success is read from the on-disk `auth.json`.
+
+interface PendingOpenCodeOAuth {
+  readonly pty: IPty;
+  readonly providerId: string;
+  readonly methodLabel: string;
+  /** Accumulated pty output (ANSI included) — re-parsed on each chunk. */
+  output: string;
+  /** The sign-in URL/code has been relayed to the topic. */
+  infoRelayed: boolean;
+  /** Paste-style flow: the next plain text is the OAuth code to type into the pty. */
+  awaitingCode: boolean;
+  /** Fires if no sign-in URL appears in the window (OAuth-init call blocked). */
+  readonly timeoutTimer: NodeJS.Timeout;
+}
+
+/** Per-thread in-flight `opencode auth login` OAuth flows, keyed by `keyToString(key)`. */
+const pendingOpenCodeOAuth = new Map<string, PendingOpenCodeOAuth>();
+
+/**
+ * @description Whether the thread's OAuth flow is a PASTE-style one that has
+ * reached the "paste the code" stage — only then is the next plain text swallowed
+ * as the code. A device flow never sets this (nothing is pasted back).
+ */
+function checkIsOpenCodeOAuthAwaitingCode(key: ThreadKey): boolean {
+  return pendingOpenCodeOAuth.get(keyToString(key))?.awaitingCode === true;
+}
+
+/** Kill + forget a thread's in-flight OAuth login (idempotent). Reports nothing. */
+function cancelOpenCodeOAuthLogin(key: ThreadKey): void {
+  const k = keyToString(key);
+  const pending = pendingOpenCodeOAuth.get(k);
+  if (!pending) return;
+  pendingOpenCodeOAuth.delete(k);
+  clearTimeout(pending.timeoutTimer);
+  try {
+    pending.pty.kill();
+  } catch {
+    /* already exited */
+  }
+}
+
+/**
+ * @description Read the provider's credential type out of OpenCode's on-disk
+ * `auth.json` after the flow exits. Returns `true` when the provider is authed
+ * as `oauth` (a fresh success — distinct from a stale `api` entry left by an
+ * earlier key-based `/connect`), `false` when it isn't, `null` when the file
+ * can't be read (caller falls back to the exit code).
+ */
+async function readOpenCodeProviderAuthed(providerId: string): Promise<boolean | null> {
+  try {
+    const authPath = getOpenCodeAuthFilePath({
+      XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+      HOME: os.homedir(),
+    });
+    const raw = await fsp.readFile(authPath, 'utf8');
+    return checkProviderAuthed(JSON.parse(raw), providerId, 'oauth');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @description Start the out-of-band OAuth flow for `/connect <provider>`: spawn
+ * `opencode auth login -p <id> -m <label>` in a pty, relay the sign-in URL (+ the
+ * device code, for a device flow) once it's fully rendered, and — for a paste
+ * flow — arm the pending-code state. Re-running restarts a pending flow.
+ */
+async function startOpenCodeOAuthLogin(
+  key: ThreadKey,
+  providerId: string,
+  methodLabel: string,
+): Promise<void> {
+  const k = keyToString(key);
+  cancelOpenCodeOAuthLogin(key); // clean restart on a repeat
+
+  let child: IPty;
+  try {
+    // Drop provider API-key envs so the login uses the subscription/account path
+    // and can't be short-circuited by an ambient key. cwd is irrelevant — login
+    // writes to OpenCode's global auth.json.
+    const env: Record<string, string | undefined> = { ...process.env };
+    delete env.OPENAI_API_KEY;
+    delete env.ANTHROPIC_API_KEY;
+    child = spawnPty(resolveOpenCodeBinary(), buildOpenCodeAuthLoginArgs(providerId, methodLabel), {
+      name: 'xterm-256color',
+      cols: authLoginPtyCols,
+      rows: authLoginPtyRows,
+      cwd: process.cwd(),
+      env,
+    });
+  } catch (e) {
+    console.warn(`[connect] ${k} opencode oauth pty spawn failed:`, e);
+    await replyToThread(key, t('connect.oauth_failed', { provider: providerId }));
+    return;
+  }
+
+  const pending: PendingOpenCodeOAuth = {
+    pty: child,
+    providerId,
+    methodLabel,
+    output: '',
+    infoRelayed: false,
+    awaitingCode: false,
+    timeoutTimer: setTimeout(() => {
+      void onOpenCodeOAuthUrlTimeout(key, child);
+    }, authLoginUrlTimeoutMs),
+  };
+  pendingOpenCodeOAuth.set(k, pending);
+
+  child.onData((chunk) => {
+    const current = pendingOpenCodeOAuth.get(k);
+    if (!current || current.pty !== child) return; // cancelled/replaced
+    current.output += chunk;
+    if (current.infoRelayed) return;
+    // Relay only once the URL block is fully rendered (a device code, the poll,
+    // or a paste prompt is present) — never a chunk-split half-URL.
+    if (!checkIsOAuthInfoReady(current.output)) return;
+    const url = parseOpenCodeOAuthUrl(current.output);
+    if (!url) return;
+    current.infoRelayed = true;
+    clearTimeout(current.timeoutTimer);
+    const deviceCode = parseOpenCodeDeviceCode(current.output);
+    const isPaste = checkIsOpenCodeOAuthPastePrompt(current.output) && !deviceCode;
+    if (deviceCode) {
+      void replyToThread(key, t('connect.oauth_device', { provider: providerId, url, code: deviceCode }));
+    } else {
+      void replyToThread(key, t('connect.oauth_url_only', { provider: providerId, url }));
+    }
+    if (isPaste) {
+      current.awaitingCode = true;
+      void replyToThread(key, t('connect.oauth_paste'));
+    } else {
+      void replyToThread(key, t('connect.oauth_waiting'));
+    }
+  });
+
+  child.onExit(({ exitCode }) => {
+    void onOpenCodeOAuthExit(key, child, exitCode);
+  });
+}
+
+/**
+ * @description Paste-style flow only: the pending flow's next plain text is the
+ * OAuth code — type it into the pty, delete the user's message (single-use
+ * secret), and post the 🔐 ack. The success/failure notice comes from
+ * {@link onOpenCodeOAuthExit}.
+ */
+async function submitOpenCodeOAuthCode(
+  key: ThreadKey,
+  code: string,
+  messageId: number,
+): Promise<void> {
+  const pending = pendingOpenCodeOAuth.get(keyToString(key));
+  if (!pending) return;
+  pending.pty.write(`${code.trim()}\r`);
+  await deleteThreadMessage(key, messageId);
+  await replyToThread(key, t('agent.login_code_relayed'));
+}
+
+/** No sign-in URL within the window → the OAuth-init call was likely blocked. */
+async function onOpenCodeOAuthUrlTimeout(key: ThreadKey, child: IPty): Promise<void> {
+  const k = keyToString(key);
+  const pending = pendingOpenCodeOAuth.get(k);
+  if (!pending || pending.pty !== child || pending.infoRelayed) return;
+  cancelOpenCodeOAuthLogin(key);
+  await replyToThread(key, t('connect.oauth_failed', { provider: pending.providerId }));
+}
+
+/**
+ * @description The `opencode auth login` process exited. If the thread's flow is
+ * still active, report the outcome: `auth.json` is authoritative (the provider's
+ * entry flips to `oauth`), exit code is the fallback. A cancelled flow already
+ * dropped its entry, so this no-ops for it.
+ */
+async function onOpenCodeOAuthExit(
+  key: ThreadKey,
+  child: IPty,
+  exitCode: number,
+): Promise<void> {
+  const k = keyToString(key);
+  const pending = pendingOpenCodeOAuth.get(k);
+  if (!pending || pending.pty !== child) return; // cancelled/replaced → no report
+  clearTimeout(pending.timeoutTimer);
+  pendingOpenCodeOAuth.delete(k);
+  const authed = await readOpenCodeProviderAuthed(pending.providerId);
+  if (checkIsOpenCodeOAuthSucceeded({ exitCode, authed })) {
+    await replyToThread(key, t('connect.oauth_success', { provider: pending.providerId }));
+  } else {
+    await replyToThread(key, t('connect.oauth_failed', { provider: pending.providerId }));
+  }
+}
+
 /**
  * @description Buffers prompts typed while an agent session is still booting so
  * they are replayed once it's ready, instead of being dropped into the
@@ -1578,6 +1790,14 @@ interface PendingProviderConnect {
  * stores it in OpenCode auth.
  */
 const pendingProviderConnects = new Map<string, PendingProviderConnect>();
+
+/**
+ * @description Per-thread snapshot of the last `/connect` method picker: the
+ * provider and its auth methods in catalog order. The `connm_<idx>` callback
+ * resolves its tapped method here (labels are long / > 64-byte callback_data, so
+ * the index is the payload — same trick as `threadSessionLists`/`resume_<idx>`).
+ */
+const connectMethodLists = new Map<string, { providerId: string; methods: OpenCodeAuthMethod[] }>();
 
 /**
  * @description Per-thread "session-pick" arming flag. A thread is added here
@@ -2073,12 +2293,14 @@ function clearInMemoryThreadState(key: ThreadKey): void {
   // API-error retry silently; there's nothing left to resume into.
   cancelApiRetry(key);
   cancelClaudeAuthLogin(key); // teardown → kill any in-flight /login pty
+  cancelOpenCodeOAuthLogin(key); // teardown → kill any in-flight /connect oauth pty
   clearAuthNotice(key); // teardown → retire any pinned logged-out notice
   threadModelLists.delete(k);
   awaitingModelSelection.delete(k);
   threadSessionLists.delete(k);
   awaitingSessionSelection.delete(k);
   pendingProviderConnects.delete(k);
+  connectMethodLists.delete(k);
   awaitingFolderName.delete(k);
   pinnedStatusTextCache.delete(k);
   statusCoalescers.delete(k);
@@ -3577,6 +3799,7 @@ async function releaseThreadSession(key: ThreadKey): Promise<ReturnType<typeof s
   // session.
   cancelApiRetry(key);
   cancelClaudeAuthLogin(key); // session released → kill any in-flight /login pty
+  cancelOpenCodeOAuthLogin(key); // session released → kill any in-flight /connect oauth pty
   clearAuthNotice(key); // session released → retire any pinned logged-out notice
   // Session is going away → no output is coming, so stop the "working" loader
   // (covers the release half of /new before its fresh start re-arms it).
@@ -5160,6 +5383,41 @@ async function handleProviderConnectKey(
   await replyToThread(key, t('connect.success', { provider: providerId }));
 }
 
+/**
+ * @description Show the `/connect <provider>` method picker: one inline button
+ * per auth method from the live catalog — OAuth (subscription/account, driven
+ * out-of-band via `opencode auth login` in a pty) and the API-key method (the
+ * existing key-paste flow). Tapping a button fires the `connm_<idx>` callback.
+ */
+async function showConnectMethodPicker(key: ThreadKey, providerId: string): Promise<void> {
+  const adapter = getAdapter('opencode');
+  if (!adapter.fetchProviderAuthMethods) {
+    await replyToThread(key, t('connect.unsupported_backend'));
+    return;
+  }
+  let methods: OpenCodeAuthMethod[];
+  try {
+    methods = await adapter.fetchProviderAuthMethods(providerId);
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    await replyToThread(key, t('connect.failed', { provider: providerId, reason }));
+    return;
+  }
+  if (methods.length === 0) {
+    await replyToThread(key, t('connect.no_methods', { provider: providerId }));
+    return;
+  }
+  connectMethodLists.set(keyToString(key), { providerId, methods });
+  const buttons = methods.map((m, i) =>
+    Markup.button.callback(buildConnectMethodButtonLabel(m), `connm_${i}`),
+  );
+  await replyToThread(
+    key,
+    t('connect.pick_method', { provider: providerId }),
+    Markup.inlineKeyboard(buttons, { columns: 1 }),
+  );
+}
+
 command('connect', async (ctx, key) => {
   const { providerId, apiKey } = getConnectCommandArgs(ctx.message.text);
   if (!checkIsValidProviderId(providerId)) {
@@ -5167,12 +5425,14 @@ command('connect', async (ctx, key) => {
     await replyToThread(key, t('connect.invalid_provider', { provider: providerId }));
     return;
   }
+  // Inline API-key fast path: `/connect <provider> sk-…` connects with the key
+  // directly (and deletes the secret message). No key → show the method picker
+  // so the user can choose OAuth (subscription) vs API key.
   if (apiKey !== null) {
     await handleProviderConnectKey(key, providerId, apiKey, ctx.message.message_id);
     return;
   }
-  armProviderConnect(key, providerId);
-  await replyToThread(key, t('connect.prompt_key', { provider: providerId }));
+  await showConnectMethodPicker(key, providerId);
 });
 
 /** Human label for a Claude backend name (the two adapters share `label`
@@ -5840,6 +6100,7 @@ command(['quit', 'q'], async (_ctx, key) => {
   // inline), so the cancel is wired here explicitly.
   cancelApiRetry(key);
   cancelClaudeAuthLogin(key); // /quit teardown → kill any in-flight /login pty
+  cancelOpenCodeOAuthLogin(key); // /quit teardown → kill any in-flight /connect oauth pty
   clearAuthNotice(key); // /quit teardown → retire any pinned logged-out notice
   const adapter = getThreadAdapter(key);
   const adapterName = getThreadAdapterNameRaw(key);
@@ -6278,6 +6539,15 @@ bot.on(message('text'), async (ctx) => {
   // pending login).
   if (checkIsAuthLoginAwaitingCode(key) && !text.startsWith('/')) {
     await submitClaudeAuthLoginCode(key, text, ctx.message.message_id);
+    return;
+  }
+
+  // A PASTE-style OpenCode `/connect` OAuth flow has reached the "paste code"
+  // stage → the next plain text is the code: type it into the pty, delete the
+  // secret, ack. (Device flows never arm this — nothing is pasted back.) A slash
+  // command falls through so /quit, /new, etc. still run + cancel the flow.
+  if (checkIsOpenCodeOAuthAwaitingCode(key) && !text.startsWith('/')) {
+    await submitOpenCodeOAuthCode(key, text, ctx.message.message_id);
     return;
   }
 
@@ -7325,6 +7595,24 @@ bot.action(/^model_(.+)$/, async (ctx) => {
   }
   await ctx.answerCbQuery(t('cb.model_set', { model: displayLabel.split('/').pop() || displayLabel }));
   await replyToThread(key, message);
+});
+
+bot.action(/^connm_(\d+)$/, async (ctx) => {
+  const key = await authoriseContext(ctx);
+  if (!key) { await ctx.answerCbQuery(t('cb.access_denied')); return; }
+  const entry = connectMethodLists.get(keyToString(key));
+  const idx = Number(ctx.match[1]);
+  const method = entry?.methods[idx];
+  if (!entry || !method) { await ctx.answerCbQuery(t('cb.connect_method_expired')); return; }
+  await ctx.answerCbQuery();
+  if (checkIsOAuthMethod(method)) {
+    // OAuth (subscription/account): drive `opencode auth login` out-of-band.
+    await startOpenCodeOAuthLogin(key, entry.providerId, method.label);
+    return;
+  }
+  // API-key method: arm the existing key-paste flow (next message is the key).
+  armProviderConnect(key, entry.providerId);
+  await replyToThread(key, t('connect.prompt_key', { provider: entry.providerId }));
 });
 
 bot.action(/^effort_(.+)$/, async (ctx) => {

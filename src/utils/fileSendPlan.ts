@@ -1,6 +1,6 @@
 /**
  * @description Pure decision layer for the agent→Telegram file/image send
- * (`send_file` MCP tool). Three concerns, all side-effect-free enough to
+ * (`send_file_to_user` MCP tool). Three concerns, all side-effect-free enough to
  * unit-test without Telegraf:
  *   1. {@link resolveSendFileWithinDir} — path-safety: resolve a caller-supplied
  *      path against the topic's bound folder and confirm (realpath + containment)

@@ -359,8 +359,16 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     assert.ok(instructions, 'server should report instructions on initialize');
     // Use-case pointer, not recipe repetition: names the tools + the fresh-session caveat.
     assert.match(instructions, /schedule_create/);
-    assert.match(instructions, /send_file/);
+    assert.match(instructions, /send_file_to_user/);
     assert.match(instructions, /fresh session/);
+  });
+
+  it('exposes the file-send tool under its agent-facing name send_file_to_user', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    const toolNames = (await client.listTools()).tools.map((tool) => tool.name);
+    assert.ok(toolNames.includes('send_file_to_user'), 'file-send tool should be listed as send_file_to_user');
+    assert.ok(!toolNames.includes('send_file'), 'the old send_file name must not be exposed anymore');
   });
 
   it('thread-scope: create (cron + once + N-times) → list → cancel → list empty', async () => {

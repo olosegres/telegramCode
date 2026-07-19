@@ -57,7 +57,7 @@ const mcpServerInstructions = `This MCP lets the agent act on its own Telegram t
 
 When to use it:
 • The user asks to run/finish a plan or task LATER ("in 2h", "tomorrow 9am", "every weekday") → schedule_create. Put the work in \`prompt\`; the future run is a fresh session with no memory of this chat.
-• You produced a file/chart/screenshot to deliver → send_file.
+• You produced a file/chart/screenshot to deliver → send_file_to_user.
 • You need to review or remove scheduled jobs → schedule_list / schedule_cancel.
 
 Each tool's own description has the exact argument recipe (one-shot vs cron vs N-times).`;
@@ -574,7 +574,7 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
 }
 
 /**
- * @description Register the agent→Telegram `send_file` tool onto a fresh
+ * @description Register the agent→Telegram `send_file_to_user` tool onto a fresh
  * {@link McpServer}. Kept separate from {@link registerSchedulerTools} so the
  * scheduler tools stay cohesive. Like every tool here it resolves the target
  * thread from `scope` first (scope isolation — the agent can never name another
@@ -582,7 +582,7 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
  */
 function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: SchedulerScope): void {
   server.registerTool(
-    'send_file',
+    'send_file_to_user',
     {
       title: 'Send a file or image to this topic',
       description:
@@ -612,7 +612,7 @@ function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: 
 
 /**
  * @description Build a fresh {@link McpServer} for one request, registering the
- * scope-bound scheduler tools plus the `send_file` tool. The SDK binds one server
+ * scope-bound scheduler tools plus the `send_file_to_user` tool. The SDK binds one server
  * per transport per connection, so a new instance is built (and closed) per
  * request in the stateless flow.
  */

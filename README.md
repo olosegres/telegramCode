@@ -508,7 +508,7 @@ HMAC bearer tokens scoped to the thread / directory. It exposes:
 
 - `schedule_create` / `schedule_list` / `schedule_cancel` — the agent-side
   scheduling API behind `/schedule`;
-- `send_file` — lets the agent push a file or image from the bound folder into
+- `send_file_to_user` — lets the agent push a file or image from the bound folder into
   the topic (photo/animation/document, albums, size caps).
 
 This server is bot-owned plumbing; if its port fails to bind, the bot still

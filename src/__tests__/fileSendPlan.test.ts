@@ -1,5 +1,5 @@
 /**
- * @description Load-bearing tests for the agent→Telegram `send_file` decision
+ * @description Load-bearing tests for the agent→Telegram `send_file_to_user` decision
  * layer (`utils/fileSendPlan.ts`). Three pure concerns: path-safety
  * (`resolveSendFileWithinDir`), extension classification (`classifyFileSendKind`),
  * and the single/album send plan (`planFileSend`). The path-safety part is

@@ -9502,7 +9502,7 @@ export function reconcileTransientFrames(
 }
 
 /**
- * @description The bot side of the agent's `send_file` MCP tool: resolve the
+ * @description The bot side of the agent's `send_file_to_user` MCP tool: resolve the
  * thread's bound folder, path-check each file against it, decide the send
  * plan (single method / album / error), and dispatch through `enqueueSend`
  * (per-thread FIFO + 429 retry + output trace). Returns a typed `{ ok }` the

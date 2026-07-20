@@ -122,6 +122,7 @@ import { splitMessage, MAX_MESSAGE_LEN } from './messageSplit';
 import { getOutputFlushPlan, appendPendingOutput, getUnsentRemainder } from './utils/outputFlushPlan';
 import { glueBacklogFrames } from './utils/outputBacklogGlue';
 import { checkShouldKeepTyping as checkShouldKeepTypingDecision } from './utils/typingActive';
+import { checkIsTypingStuckByLeak } from './utils/typingLoopBackstop';
 import { getOutputFlushTiming } from './utils/outputFlushTiming';
 import { getOutputDebounceMs as resolveOutputDebounceMs } from './utils/outputDebounce';
 import { checkIsStaleAnswerCallbackQueryError } from './utils/telegramError';
@@ -2938,10 +2939,49 @@ function startTypingLoader(key: ThreadKey): void {
       stopTypingLoader(key);
       return;
     }
+    // Loop-level backstop: `checkShouldKeepTyping` still holds, but is it a
+    // GENUINE working/streaming state, or a leaked one? A live debounce timer is
+    // always armed WITH pending text; an armed handle over an otherwise-empty,
+    // not-busy queue is the dead handle from the `isFinal` fast-path — it pins
+    // `isOutputStreaming` true forever and the indicator hangs unbounded (the
+    // hour+ hang). The pure decision (`utils/typingLoopBackstop`) fires ONLY on
+    // that provable inconsistency, never on a legit long silent-tool turn (which
+    // keeps the adapter busy). Diagnose which input kept the loop alive, repair
+    // the leaked handle, and stop — so a FUTURE unknown leak is self-recorded too.
+    if (checkIsTypingLoopStuck(key)) {
+      const q = outputQueues.get(keyToString(key));
+      console.warn(
+        `[typing] ${keyToString(key)} force-stop: kept alive by leaked output-queue state — ` +
+        `isOutputStreaming=${checkIsOutputStreaming(key)} isAdapterBusy=${checkIsAdapterBusy(key)} ` +
+        `pendingOutput=${q?.pendingOutput !== null && q?.pendingOutput !== undefined} ` +
+        `isProcessing=${q?.isProcessing === true} debounceTimer=${q?.debounceTimer !== null && q?.debounceTimer !== undefined}`,
+      );
+      if (q?.debounceTimer) { clearTimeout(q.debounceTimer); q.debounceTimer = null; }
+      stopTypingLoader(key);
+      return;
+    }
     sendThreadTypingIndicator(key).catch(() => {});
   }, typingLoaderRefreshMs);
   // Don't keep the event loop alive just for a loader (mirrors the liveness timer).
   s.typingLoaderTimer.unref?.();
+}
+
+/**
+ * @description Loop-level backstop check: is the typing loop being kept alive
+ * PURELY by a leaked output-queue state (an armed debounce handle over an empty,
+ * not-busy queue) rather than genuine work? Wraps the pure
+ * {@link checkIsTypingStuckByLeak} with the live queue + adapter readings. Only
+ * fires on a provable inconsistency, so it never truncates a legit long turn.
+ */
+function checkIsTypingLoopStuck(key: ThreadKey): boolean {
+  const q = outputQueues.get(keyToString(key));
+  return checkIsTypingStuckByLeak({
+    isAdapterBusy: checkIsAdapterBusy(key),
+    isTransportStreaming: getOutputTransport().checkIsStreaming(key),
+    hasPendingOutput: q?.pendingOutput != null,
+    isProcessing: q?.isProcessing === true,
+    hasDebounceTimer: q?.debounceTimer != null,
+  });
 }
 
 /**
@@ -3063,7 +3103,15 @@ function queueOutput(
   // `isFinal` / `isComplete` still drive the immediate-flush timing below (a
   // finished turn must not wait out the debounce) — they no longer mark the
   // buffer for redelivery (retired with the global send pacer, S4).
-  if (q.debounceTimer) clearTimeout(q.debounceTimer);
+  // NULL the handle, don't just clear it: the `timing === 'now'` branch below
+  // RETURNS without reassigning `q.debounceTimer`, so a bare `clearTimeout` left
+  // the field holding a dead-but-non-null handle. `checkIsOutputStreaming` reads
+  // `q.debounceTimer !== null`, so that stale handle pinned "output streaming"
+  // true forever after the final flush → the native typing indicator hung for
+  // an hour+ on an idle topic (live 2026-07-19, a json-stream group topic whose
+  // turn ended with a residual `isFinal` flush). Nulling here keeps the field
+  // authoritative on every path; the else-branch reassigns it a fresh timer.
+  if (q.debounceTimer) { clearTimeout(q.debounceTimer); q.debounceTimer = null; }
 
   const timing = getOutputFlushTiming({
     // A complete one-shot flushes immediately like a final frame — ready content

@@ -29,6 +29,7 @@ import * as path from 'path';
 
 import { ClaudeJsonStreamAdapter } from '../adapters/claudeJsonStreamAdapter';
 import { ClaudeStreamLineReader } from '../utils/claudeStreamJson';
+import { busyIdleWatchdogMs } from '../utils/jsonStreamBusyWatchdog';
 import {
   createStdoutTailState,
   getJsonStreamSessionPaths,
@@ -65,6 +66,8 @@ function createSessionInDir(adapter: ClaudeJsonStreamAdapter, dir: string) {
     isStopping: false,
     isRespawning: false,
     isBusy: false,
+    lastStdoutActivityAt: Date.now(),
+    outstandingToolUseIds: new Set<string>(),
     model: null,
     effort: null,
     currentResponseText: '',
@@ -182,5 +185,72 @@ describe('json-stream external transport — exit detection', () => {
     assert.equal(session.isBusy, true, 'a replayed mid-turn delta marks the session busy');
     adapter['onStdout'](session, resultLine);
     assert.equal(session.isBusy, false, 'the replayed result clears it');
+  });
+});
+
+// tool_use assistant line (a normal, non-sub-agent tool) + its tool_result.
+const toolUseLine =
+  JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }] } }) + '\n';
+const toolResultLine =
+  JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }] } }) + '\n';
+
+describe('json-stream idle watchdog — the stuck-busy / hung-typing backstop', () => {
+  let dir: string;
+  afterEach(() => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('clears a busy session gone silent with nothing in flight (a missed terminal result)', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-wd-clear-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    // A delta arrived (busy=true) but the terminal `result` never did.
+    adapter['onStdout'](session, textDeltaLine);
+    adapter['flushAnswer'](session, false); // drain the batch (no un-emitted text)
+    assert.equal(session.isBusy, true);
+    // stdout has been silent past the threshold.
+    session.lastStdoutActivityAt = Date.now() - busyIdleWatchdogMs - 1000;
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      adapter['maybeClearBusyOnIdle'](session);
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.equal(session.isBusy, false, 'the stuck busy flag is cleared → typing indicator can stop');
+    assert.ok(warnings.some((w) => w.includes('watchdog')), `the clear is logged: ${warnings}`);
+  });
+
+  it('does NOT clear while a tool is still outstanding (a long silent Bash is legitimately busy)', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-wd-tool-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    // A tool_use started but its tool_result has not come back yet.
+    adapter['onStdout'](session, toolUseLine);
+    assert.equal(session.isBusy, true);
+    assert.equal(session.outstandingToolUseIds.size, 1, 'the tool is tracked as in flight');
+    session.lastStdoutActivityAt = Date.now() - busyIdleWatchdogMs - 1000;
+
+    adapter['maybeClearBusyOnIdle'](session);
+    assert.equal(session.isBusy, true, 'an outstanding tool vetoes the idle clear');
+
+    // Once the tool returns, the outstanding set drains and the watchdog may fire.
+    adapter['onStdout'](session, toolResultLine);
+    assert.equal(session.outstandingToolUseIds.size, 0, 'the returned tool leaves the in-flight set');
+    session.lastStdoutActivityAt = Date.now() - busyIdleWatchdogMs - 1000;
+    adapter['maybeClearBusyOnIdle'](session);
+    assert.equal(session.isBusy, false, 'with no tool outstanding the stuck busy clears');
+  });
+
+  it('an explicit interrupt clears isBusy immediately (an aborted turn may emit no result)', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-wd-int-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    adapter['onStdout'](session, toolUseLine); // busy, one tool outstanding
+    assert.equal(session.isBusy, true);
+
+    adapter.sendEscape(session.key); // → sendInterrupt
+    assert.equal(session.isBusy, false, 'interrupt drops busy without waiting on a result');
+    assert.equal(session.outstandingToolUseIds.size, 0, 'interrupt clears the in-flight tool set');
   });
 });

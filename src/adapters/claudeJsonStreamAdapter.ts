@@ -49,6 +49,7 @@ import {
 } from '../utils/claudeStreamJson';
 import { execFilePromise, tmuxAsync, tmuxOrThrowAsync } from '../utils/tmuxExec';
 import { basePollIntervalMs, getNextPollDelay } from '../utils/pollBackoff';
+import { busyIdleWatchdogMs, checkShouldClearBusyOnIdle } from '../utils/jsonStreamBusyWatchdog';
 import {
   buildJsonStreamTmuxSessionName,
   buildWrapperScript,
@@ -132,6 +133,15 @@ interface StreamSession {
   isRespawning: boolean;
   /** True from a user turn sent until its `result` → drives `checkIsBusy`. */
   isBusy: boolean;
+  /** `Date.now()` of the last consumed stdout byte / turn-start kick. Feeds the
+   *  idle watchdog (`utils/jsonStreamBusyWatchdog`): stdout silence with nothing
+   *  in flight is how a stuck-busy session (a missed terminal `result`) is
+   *  detected and cleared, so the typing indicator can't hang for an hour. */
+  lastStdoutActivityAt: number;
+  /** `tool_use` ids started but whose `tool_result` hasn't returned. A non-empty
+   *  set means the agent is legitimately waiting on a tool (possibly silent, e.g.
+   *  a long Bash) → the idle watchdog must NOT clear busy. */
+  outstandingToolUseIds: Set<string>;
   model: string | null;
   effort: string | null;
   // — answer accumulation —
@@ -358,6 +368,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       isOversizeWarned: false, lastPersistedTailOffset: 0,
       reader: new ClaudeStreamLineReader(),
       isActive: true, isStopping: false, isRespawning: false, isBusy: false,
+      lastStdoutActivityAt: Date.now(), outstandingToolUseIds: new Set(),
       model: opts.model, effort: opts.effort,
       currentResponseText: '', emittedLength: 0, outputTimer: null,
       reasoningText: '', reasoningStartedAt: null, reasoningTimer: null, reasoningActive: false,
@@ -424,9 +435,41 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       this.finalizeExternalExit(session, exitCode ?? readExitCodeFile(session.paths.exitCodeFile));
       return;
     }
+    // Backstop: a busy session gone silent with nothing in flight lost its
+    // terminal `result` — clear the stuck flag so the typing indicator can't hang.
+    this.maybeClearBusyOnIdle(session);
     const next = getNextPollDelay({ isChanged, currentDelayMs: session.pollDelayMs, unchangedStreak: session.unchangedStreak });
     session.unchangedStreak = next.unchangedStreak;
     this.schedulePoll(session, next.delayMs);
+  }
+
+  /**
+   * @description Idle watchdog (bounded safety net). `isBusy` is cleared in
+   * exactly one place — a processed terminal `result` (`handleTurnEnd`) — so a
+   * single missed `result` (an aborted `interrupt`, a process gone quiet after
+   * the answer, a future CLI dropping the line) hangs the native typing
+   * indicator indefinitely. When the session is busy but stdout has been silent
+   * past {@link busyIdleWatchdogMs} and nothing is genuinely in flight, the turn
+   * has really ended: clear the flag. The pure decision + its rationale live in
+   * `utils/jsonStreamBusyWatchdog` — every in-flight signal (tool / sub-agent /
+   * question / batched answer) vetoes the clear, so a legitimately long-running
+   * turn is never truncated (a working agent never goes silent with nothing in
+   * flight — it streams deltas or waits on a tool/sub-agent/user).
+   */
+  private maybeClearBusyOnIdle(session: StreamSession): void {
+    const shouldClear = checkShouldClearBusyOnIdle({
+      isBusy: session.isBusy,
+      msSinceStdoutActivity: Date.now() - session.lastStdoutActivityAt,
+      idleTimeoutMs: busyIdleWatchdogMs,
+      outstandingToolCount: session.outstandingToolUseIds.size,
+      subagentActive: session.subagentActive,
+      hasPendingQuestion: session.pendingQuestion !== null,
+      hasUnflushedAnswer: session.currentResponseText.length !== session.emittedLength,
+    });
+    if (!shouldClear) return;
+    console.warn(`[ClaudeJson] busy-idle watchdog: ${keyToString(session.key)} idle ${busyIdleWatchdogMs}ms with nothing in flight — clearing stuck busy (missed terminal result?)`);
+    session.isBusy = false;
+    this.finishReasoning(session);
   }
 
   /**
@@ -453,7 +496,12 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     const chunk = readFileByteRange(session.paths.stdoutFile, decision.startOffset, decision.endOffset);
     if (chunk.length === 0) return false;
     const text = decodeStdoutTailChunk(session.tail, chunk);
-    if (text) this.onStdout(session, text);
+    if (text) {
+      // Any new stdout — even a `tool_progress` frame the classifier ignores —
+      // means the process is alive and working; feed the idle watchdog's clock.
+      session.lastStdoutActivityAt = Date.now();
+      this.onStdout(session, text);
+    }
     // Persist the consumption boundary ONLY when nothing sits in the answer /
     // child batchers: the offset means "everything before here has LEFT the
     // adapter", so text still waiting in a 350ms batch must hold it back —
@@ -606,6 +654,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       // isBusy=false: the replayed/live events reconstruct it (deltas/toolUse
       // set it, `result` clears it) — see `applyAction`.
       isActive: true, isStopping: false, isRespawning: false, isBusy: false,
+      lastStdoutActivityAt: Date.now(), outstandingToolUseIds: new Set(),
       model: null, effort: null,
       currentResponseText: '', emittedLength: 0, outputTimer: null,
       reasoningText: '', reasoningStartedAt: null, reasoningTimer: null, reasoningActive: false,
@@ -727,6 +776,10 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     session.emittedLength = 0;
     session.apiErrorFired = false;
     session.isBusy = true;
+    // A fresh turn resets the idle-watchdog clock: without this a session that
+    // sat idle for minutes (busy=false, clock stale) would trip the watchdog on
+    // its very next poll — before claude has a chance to emit the first token.
+    session.lastStdoutActivityAt = Date.now();
     this.writeStdin(session, { type: 'user', message: { role: 'user', content: input } });
   }
 
@@ -746,6 +799,13 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       request_id: 'interrupt_' + randomUUID(),
       request: { subtype: 'interrupt' },
     });
+    // An interrupt ABORTS the current turn. The CLI does not reliably emit a
+    // terminal `result` for an aborted turn, so clearing `isBusy` here (rather
+    // than waiting on the idle watchdog) makes the explicit stop deterministic —
+    // the typing indicator drops immediately. If output resumes, a delta re-arms
+    // busy; if a `result` does arrive, `handleTurnEnd` is a harmless no-op.
+    session.isBusy = false;
+    session.outstandingToolUseIds.clear();
   }
 
   /** Enqueue one stream-json frame onto the stdin FIFO. Fire-and-forget for
@@ -897,11 +957,18 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     if (action.tool === 'AskUserQuestion') return;
     if (action.isSubagent) { this.markSubagentActive(session); return; }
     session.toolNamesById.set(action.toolUseId, action.tool);
+    // Track it as in flight until its tool_result returns — a busy session with
+    // an outstanding tool (e.g. a long silent Bash) must NOT trip the idle
+    // watchdog even though stdout goes quiet while the tool runs.
+    session.outstandingToolUseIds.add(action.toolUseId);
     // Transient status only; the completed body arrives as a toolResult.
     this.emit('status', session.key, `🔧 ${action.tool}`);
   }
 
   private handleToolResult(session: StreamSession, action: Extract<ClaudeStreamAction, { kind: 'toolResult' }>): void {
+    // The tool returned — no longer in flight (do this before any early return so
+    // the outstanding-tool set can never leak and pin the idle watchdog open).
+    session.outstandingToolUseIds.delete(action.toolUseId);
     // Skip AskUserQuestion's internal "questions have been answered" tool_result.
     if (session.questionToolUseIds.has(action.toolUseId)) return;
     const tool = session.toolNamesById.get(action.toolUseId) ?? 'tool';
@@ -950,6 +1017,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
 
   private handleTurnEnd(session: StreamSession, action: Extract<ClaudeStreamAction, { kind: 'turnEnd' }>): void {
     session.isBusy = false;
+    session.outstandingToolUseIds.clear();
     this.finishReasoning(session);
     this.clearSubagent(session);
 
@@ -1103,6 +1171,9 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     const pending = session.pendingQuestion;
     session.pendingQuestion = null;
     this.clearQuestionSidecar(session);
+    // The turn resumes now; reset the idle-watchdog clock so the (possibly long)
+    // wait for the user's answer doesn't instantly trip it before output resumes.
+    session.lastStdoutActivityAt = Date.now();
 
     // Build the answers map: question text → selected label(s) (comma-joined for
     // multi-select), the exact shape AskUserQuestion expects.

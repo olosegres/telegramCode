@@ -181,6 +181,7 @@ import {
 } from './utils/claudeLivenessAction';
 import { getModelSetReplyDecision } from './utils/modelSetReplyDecision';
 import { formatIsoLocalOffset } from './utils/isoTimestamp';
+import { defaultEffortLevel } from './effortLevels';
 import {
   buildThreadContextPreamble,
   prependThreadContextPreamble,
@@ -4000,8 +4001,13 @@ async function switchThreadAdapter(key: ThreadKey, newName: string): Promise<voi
   // Wipe ids that don't belong to the new adapter. We persist via
   // setAgent (which merges), so build a fresh record with only the
   // surviving fields.
-  const next: { name: string; model?: string; claudeSessionId?: string; opencodeSessionId?: string } = { name: newName };
+  const next: { name: string; model?: string; claudeSessionId?: string; opencodeSessionId?: string; startedAt?: string } = { name: newName };
   if (agent.model !== undefined) next.model = agent.model;
+  // Preserve the session-start time across a same-conversation backend switch
+  // (`/claude_mode` tmux↔json-stream). A truly fresh start (the
+  // `ensureAgentSession` → switch → `startAgentSession` path) overwrites it
+  // with "now" afterwards, so carrying it here can't wrongly age a new session.
+  if (agent.startedAt !== undefined) next.startedAt = agent.startedAt;
   // Both Claude backends share the on-disk transcript, so keep the session id
   // when switching between tmux-scrape and json-stream — the new backend resumes
   // the SAME conversation (`/claude_mode` live switch).
@@ -4075,6 +4081,11 @@ async function startAgentSession(key: ThreadKey, args?: string): Promise<string>
     // Persist backend session ids so a bot restart can re-attach without
     // losing the live conversation (Claude tmux UUID; OpenCode server UUID).
     await persistAdapterSessionIds(key, adapter, state);
+    // Stamp the session-start time (surfaced by /status). A fresh start is
+    // "now"; the agent row already exists (just persisted above), so this
+    // merge-only write lands. `/new` cleared the old value via
+    // releaseThreadSession first, so this correctly resets it.
+    await state.setAgentStartedAt(key, formatIsoLocalOffset(Date.now()));
 
     // Session is active now — replay anything the user typed while it booted,
     // in arrival order, through the normal forward path. Fire-and-forget so the
@@ -4463,16 +4474,30 @@ command('status', async (_ctx, key) => {
   const adapter = getThreadAdapter(key);
   const isActive = adapter.checkIsActive(key);
   const adapterName = getThreadAdapterNameRaw(key);
-  const agentLine = adapterName ? `${adapter.label} (${adapterName})` : 'none (start /claude or /opencode)';
+  const agentLine = adapterName ? `${adapter.label} (${adapterName})` : t('status.thread_no_agent');
   const binding = state.getBinding(key);
-  const subdir = binding?.subdir ?? '(no binding — WORK_ROOT)';
-  await replyToThread(
-    key,
-    'Status:\n\n' +
-      `Agent: ${agentLine}\n` +
-      `Folder: ${subdir}\n` +
-      `Session: ${isActive ? 'running' : 'stopped'}`,
-  );
+  const subdir = binding?.subdir ?? t('status.thread_no_binding');
+  const lines = [
+    t('status.thread_report', {
+      agent: agentLine,
+      subdir,
+      session: isActive ? t('status.thread_running') : t('status.thread_stopped'),
+    }),
+  ];
+  // Model / effort / start date are session properties — only meaningful while
+  // a session is live. Resolve model + effort exactly like the pinned banner
+  // (`computePinnedStatusText`) so the two never disagree; effort additionally
+  // falls back to the default the agent actually runs when none is picked.
+  if (isActive) {
+    const agent = state.getAgent(key);
+    const model = adapter.getCurrentModel?.(key) ?? agent?.model ?? null;
+    const effort = adapter.getEffort ? (adapter.getEffort(key) ?? defaultEffortLevel) : null;
+    const startedAt = agent?.startedAt ?? null;
+    if (model) lines.push(t('status.thread_model', { model }));
+    if (effort) lines.push(t('status.thread_effort', { effort }));
+    if (startedAt) lines.push(t('status.thread_started', { started: startedAt }));
+  }
+  await replyToThread(key, lines.join('\n'));
 });
 
 function getLanguageCommandArg(text: string): string {
@@ -6171,6 +6196,10 @@ async function resumeSessionByIndex(
     // whatever id the last fresh start wrote, silently dropping the user's
     // pick (live incident 2026-06-10).
     await persistAdapterSessionIds(key, adapter, state);
+    // Stamp "now" as the start time: this is when the thread began using the
+    // picked session (the original transcript's creation time isn't cheaply
+    // recoverable). The agent row exists (persisted above), so the merge lands.
+    await state.setAgentStartedAt(key, formatIsoLocalOffset(Date.now()));
     return t('session.resumed');
   } catch (e) {
     return t('session.resume_failed', { error: e instanceof Error ? e.message : String(e) });
@@ -9590,11 +9619,14 @@ async function reattachExistingSessions(
         if (needsReconcile) {
           const recovered = await claudeAdapter.recoverSessionIdFromTmux(sessionName);
           if (recovered) {
-            const patched: { name: string; model?: string; claudeSessionId: string } = {
+            const patched: { name: string; model?: string; claudeSessionId: string; startedAt?: string } = {
               name: 'claude',
               claudeSessionId: recovered,
             };
             if (agent?.model !== undefined) patched.model = agent.model;
+            // Carry the session-start time through the reconcile rebuild so a
+            // restart doesn't reset it (a missing one is backfilled below).
+            if (agent?.startedAt !== undefined) patched.startedAt = agent.startedAt;
             // Drop the row first so a stale opencodeSessionId doesn't
             // ride along into the new shape (setAgent merges).
             await state.removeAgent(key);
@@ -9809,6 +9841,25 @@ async function reattachExistingSessions(
     } catch (e) {
       console.error('[reattach] terminal scan failed:', e);
     }
+  }
+
+  // Backfill a session-start timestamp for any reattached session whose agent
+  // row predates the `startedAt` field (older state file) or lost it through
+  // the claude reconcile rebuild above. NEVER overwrite an existing value — the
+  // displayed start date must survive a restart, not reset to boot time. Only
+  // active (reattached) threads get one; a dead/idle row is left untouched
+  // (its startedAt, if any, still round-trips for a later `/sessions` resume).
+  const backfillIso = formatIsoLocalOffset(Date.now());
+  for (const { key } of state.listBindings()) {
+    const agent = state.getAgent(key);
+    if (!agent || agent.startedAt !== undefined) continue;
+    let isActive = false;
+    try {
+      isActive = getThreadAdapter(key).checkIsActive(key);
+    } catch {
+      // Unknown adapter from a stale binding — nothing reattached, skip.
+    }
+    if (isActive) await state.setAgentStartedAt(key, backfillIso);
   }
 }
 

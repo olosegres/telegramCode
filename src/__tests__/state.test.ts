@@ -290,6 +290,71 @@ test('clearAgentSessionIds: no-op when the thread has no agent record', async ()
   assert.equal(store.getAgent(key1), null, 'must not create a dangling agent row');
 });
 
+test('clearAgentSessionIds: also drops the session-start timestamp', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgent(key1, { name: 'claude' });
+  await store.setClaudeSessionId(key1, 'claude-uuid-1');
+  await store.setAgentStartedAt(key1, '2026-06-27T19:42:10+04:00');
+  // Pre-condition: the timestamp is present, so the drop really changes state.
+  assert.equal(store.getAgent(key1)?.startedAt, '2026-06-27T19:42:10+04:00');
+
+  await store.clearAgentSessionIds(key1);
+
+  const agent = store.getAgent(key1);
+  assert.equal(agent?.name, 'claude', 'name must survive the release');
+  assert.equal(agent?.startedAt, undefined, 'startedAt must be dropped with the session');
+});
+
+// ── setAgentStartedAt (session-start timestamp for /status) ──
+
+test('setAgentStartedAt: merges onto the agent row without flipping name, coexists with session ids', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgent(key1, { name: 'claude', model: 'sonnet' });
+  await store.setClaudeSessionId(key1, 'claude-uuid-1');
+
+  await store.setAgentStartedAt(key1, '2026-06-27T19:42:10+04:00');
+
+  const agent = store.getAgent(key1);
+  assert.equal(agent?.name, 'claude', 'name must not flip');
+  assert.equal(agent?.model, 'sonnet', 'model must survive');
+  assert.equal(agent?.claudeSessionId, 'claude-uuid-1', 'session id must coexist');
+  assert.equal(agent?.startedAt, '2026-06-27T19:42:10+04:00');
+});
+
+test('setAgentStartedAt: a later setAgent (model change) does NOT wipe startedAt (merge)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgent(key1, { name: 'opencode' });
+  await store.setAgentStartedAt(key1, '2026-06-27T19:42:10+04:00');
+  // A subsequent partial update (e.g. /model) must preserve the timestamp.
+  await store.setAgent(key1, { name: 'opencode', model: 'anthropic/claude-3-5-sonnet' });
+  const agent = store.getAgent(key1);
+  assert.equal(agent?.startedAt, '2026-06-27T19:42:10+04:00', 'startedAt must survive a merge');
+  assert.equal(agent?.model, 'anthropic/claude-3-5-sonnet');
+});
+
+test('setAgentStartedAt: no-op when the thread has no agent record (needs a live agent)', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.setAgentStartedAt(key1, '2026-06-27T19:42:10+04:00');
+  assert.equal(store.getAgent(key1), null, 'must not create a dangling agent row');
+});
+
+test('setAgentStartedAt: persists to disk and survives a reload', async () => {
+  const first = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await first.init();
+  await first.setAgent(key1, { name: 'claude' });
+  await first.setClaudeSessionId(key1, 'claude-uuid-1');
+  await first.setAgentStartedAt(key1, '2026-06-27T19:42:10+04:00');
+  await first.flush();
+
+  const second = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await second.init();
+  assert.equal(second.getAgent(key1)?.startedAt, '2026-06-27T19:42:10+04:00', 'startedAt must survive a restart');
+});
+
 // ── setSeenWatermark (reattach recap watermark) ──
 
 test('setSeenWatermark: merges onto the agent row without flipping name, coexists with session ids', async () => {

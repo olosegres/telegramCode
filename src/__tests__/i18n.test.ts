@@ -235,6 +235,39 @@ test('timestamps toggle keys exist in every locale', () => {
   }
 });
 
+test('per-thread /status keys exist in every locale', () => {
+  for (const code of [
+    'status.thread_report',
+    'status.thread_model',
+    'status.thread_effort',
+    'status.thread_started',
+    'status.thread_running',
+    'status.thread_stopped',
+    'status.thread_no_agent',
+    'status.thread_no_binding',
+  ]) {
+    assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
+  }
+});
+
+test('status.thread_report substitutes agent / subdir / session placeholders', () => {
+  const out = t('status.thread_report', {
+    agent: 'Claude Code (claude)',
+    subdir: 'overview',
+    session: 'running',
+  });
+  assert.ok(out.includes('Claude Code (claude)'), `expected the agent in "${out}"`);
+  assert.ok(out.includes('overview'), `expected the subdir in "${out}"`);
+  assert.ok(out.includes('running'), `expected the session state in "${out}"`);
+  assert.ok(!out.includes('{'), `placeholders not substituted: "${out}"`);
+});
+
+test('status.thread_started substitutes the {started} timestamp', () => {
+  const out = t('status.thread_started', { started: '2026-06-27T19:42:10+04:00' });
+  assert.ok(out.includes('2026-06-27T19:42:10+04:00'), `expected the timestamp in "${out}"`);
+  assert.ok(!out.includes('{started}'), `placeholder not substituted: "${out}"`);
+});
+
 test('language command keys exist in every locale', () => {
   for (const code of [
     'language.status',

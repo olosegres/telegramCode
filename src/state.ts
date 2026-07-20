@@ -128,6 +128,19 @@ export interface AgentData {
    * Cleared together with the session ids on explicit release.
    */
   jsonStreamTail?: JsonStreamTailOffset;
+  /**
+   * When THIS thread's current agent session began, as a local-offset ISO
+   * string (`2026-06-27T19:42:10+04:00`, same shape `/timestamps` uses — never
+   * `Z`). Set to "now" on a FRESH start (`startAgentSession`) and on a
+   * `/sessions` resume PICK (when the thread began using that session — the
+   * original transcript creation time isn't cheaply recoverable). PRESERVED
+   * across a bot restart (reattach never overwrites an existing value; only
+   * backfills a missing one, e.g. an older state file) and across an adapter
+   * switch (`/claude_mode`, same conversation). Cleared together with the
+   * session ids on explicit release (`/quit`, `/new`, `/unbind`). Surfaced by
+   * `/status`. Optional so older state files stay valid.
+   */
+  startedAt?: string;
 }
 
 export interface StateV1 {
@@ -876,8 +889,26 @@ export class StateStore {
   }
 
   /**
+   * @description Persist the session-start timestamp (a local-offset ISO string;
+   * see {@link AgentData.startedAt}). Merge-only like {@link setSeenWatermark}:
+   * never flips `agent.name` and never CREATES a row — the caller records the
+   * agent row (via `setAgent` / `persistAdapterSessionIds`) first, so a write
+   * for an unknown thread is a no-op rather than a dangling agent row.
+   */
+  async setAgentStartedAt(key: ThreadKey, startedAt: string): Promise<void> {
+    const k = keyToString(key);
+    await this.withLock(key, async () => {
+      const existing = this.state.agents[k];
+      if (!existing) return;
+      this.state.agents[k] = { ...existing, startedAt };
+      this.scheduleSave();
+    });
+  }
+
+  /**
    * @description Release both persisted session ids (and the json-stream tail
-   * offset, which is meaningless without its session) for `key` while keeping
+   * offset, which is meaningless without its session; plus the session-start
+   * timestamp, which belongs to the session going away) for `key` while keeping
    * `name` / `model`. Called on explicit user stop (`/quit`, `/quit-all`,
    * `/new`, `/unbind`) so a later bot restart won't auto-reattach a session
    * the user deliberately ended. No-op when the thread has no agent record.
@@ -887,7 +918,7 @@ export class StateStore {
     await this.withLock(key, async () => {
       const existing = this.state.agents[k];
       if (!existing) return;
-      const { claudeSessionId, opencodeSessionId, jsonStreamTail, ...rest } = existing;
+      const { claudeSessionId, opencodeSessionId, jsonStreamTail, startedAt, ...rest } = existing;
       this.state.agents[k] = rest;
       this.scheduleSave();
     });

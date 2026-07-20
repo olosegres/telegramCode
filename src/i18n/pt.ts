@@ -241,6 +241,7 @@ export const ptDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Envia a API key para `{provider}` como próxima mensagem. Vou apagar a mensagem com a chave do histórico.',
   'connect.empty_key': '❌ A API key está vazia. Envia a chave como próxima mensagem.',
+  'connect.invalid_key': '❌ Isto não parece uma API key (tem espaços ou caracteres não latinos). Envia apenas a key como próxima mensagem, ou executa /connect novamente.',
   'connect.invalid_provider': '❌ ID de provider inválido `{provider}`. Exemplo: /connect openai',
   'connect.unsupported_provider': '⚠️ O provider `{provider}` não suporta um login por API key simples neste fluxo. Usa a UI/CLI do OpenCode para este provider.',
   'connect.unsupported_backend': 'A auth de provider OpenCode não está disponível neste build.',
@@ -253,6 +254,9 @@ export const ptDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 Para ligar `{provider}`: abre {url} e conclui o início de sessão. Confirmo aqui quando terminar.',
   'connect.oauth_paste': '🔑 Após autorizar, cola o código aqui como próxima mensagem — vou apagá-lo do histórico.',
   'connect.oauth_waiting': '⏳ A aguardar autorização…',
+  'connect.oauth_loopback': '🔑 Após autorizares, o teu navegador tentará abrir uma página `localhost` que não carrega — é o esperado aqui. Copia esse URL da barra de endereço e cola-o como próxima mensagem (ou apenas o valor `code`). Vou apagá-lo do histórico e concluir o início de sessão.',
+  'connect.oauth_invalid_reply': '❌ Isto não parece um URL de callback nem um código de autorização. Após autorizares, cola o URL de callback `localhost` do teu navegador (ou o valor `code`).',
+  'connect.oauth_callback_no_flow': '⚠️ Isto parece um URL de callback OAuth, mas não há nenhum início de sessão em curso aqui — apaguei-o. Executa /connect para começar de novo.',
   'connect.oauth_success': '✅ `{provider}` ligado via OAuth. O servidor OpenCode não foi reiniciado.',
   'connect.oauth_failed': '⚠️ O início de sessão OAuth para `{provider}` não foi concluído. Executa /connect novamente.',
   'quit_all.none_active': 'Sem agentes em execução — nada a parar.',

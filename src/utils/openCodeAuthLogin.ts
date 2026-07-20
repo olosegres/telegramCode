@@ -189,3 +189,190 @@ export function buildConnectMethodButtonLabel(method: OpenCodeAuthMethod): strin
   const label = method.label.length > 40 ? `${method.label.slice(0, 39)}…` : method.label;
   return `${emoji} ${label}`;
 }
+
+// ── Loopback (browser) OAuth support ─────────────────────────────────────────
+// Some providers offer a "browser" OAuth method that redirects to a loopback
+// URL (`redirect_uri=http://localhost:<port>/auth/callback`) instead of showing
+// a device code. Over Telegram the user's browser redirect hits THEIR OWN
+// localhost, not the server's, so the flow never completes on its own. The bot
+// bridges it: it relays the sign-in URL, the user pastes the resulting callback
+// URL (or the bare code) back, and the bot replays it against the CLI's local
+// callback server on the host to complete the exchange. These helpers parse the
+// pieces; the fetch + pty state live in `bot.ts`.
+
+/** Details parsed out of the CLI's `Go to: <authorize-url>` sign-in URL. */
+export interface OAuthAuthorizeDetails {
+  /** The loopback callback port from `redirect_uri` (e.g. 1455), or `null`. */
+  redirectPort: number | null;
+  /** The loopback callback path from `redirect_uri` (e.g. `/auth/callback`), or `null`. */
+  redirectPath: string | null;
+  /** Whether `redirect_uri` targets loopback (localhost / 127.0.0.1 / [::1]). */
+  isLoopback: boolean;
+  /** The `state` param the CLI generated (needed to complete a bare-code reply). */
+  state: string | null;
+}
+
+function checkIsLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+/**
+ * @description Parse the authorize URL rendered by `opencode auth login` into its
+ * loopback redirect target + `state`. Returns all-null/false when there is no
+ * URL yet or it carries no loopback `redirect_uri`. Robust to junk: a malformed
+ * URL yields the empty result rather than throwing.
+ */
+export function parseOAuthAuthorizeDetails(ptyOutput: string): OAuthAuthorizeDetails {
+  const empty: OAuthAuthorizeDetails = {
+    redirectPort: null,
+    redirectPath: null,
+    isLoopback: false,
+    state: null,
+  };
+  const authorizeUrl = parseOpenCodeOAuthUrl(ptyOutput);
+  if (!authorizeUrl) return empty;
+  let parsed: URL;
+  try {
+    parsed = new URL(authorizeUrl);
+  } catch {
+    return empty;
+  }
+  const state = parsed.searchParams.get('state');
+  const redirectUri = parsed.searchParams.get('redirect_uri');
+  if (!redirectUri) return { ...empty, state };
+  let redirect: URL;
+  try {
+    redirect = new URL(redirectUri);
+  } catch {
+    return { ...empty, state };
+  }
+  const isLoopback = checkIsLoopbackHost(redirect.hostname);
+  const port = redirect.port ? Number(redirect.port) : null;
+  return {
+    redirectPort: Number.isFinite(port) ? port : null,
+    redirectPath: redirect.pathname || null,
+    isLoopback,
+    state,
+  };
+}
+
+/**
+ * @description A loopback (browser) OAuth flow: the CLI redirects to a localhost
+ * callback and shows NO device code (so it can't be relayed as a device flow).
+ * This is the shape that can't self-complete over Telegram and needs the paste
+ * bridge.
+ */
+export function checkIsLoopbackOAuthFlow(ptyOutput: string): boolean {
+  if (parseOpenCodeDeviceCode(ptyOutput) !== null) return false;
+  return parseOAuthAuthorizeDetails(ptyOutput).isLoopback;
+}
+
+/**
+ * @description Is `text` a plausible OAuth authorization code? Deliberately
+ * strict so a stale "awaiting reply" state can never swallow an unrelated chat
+ * message (the "я перезагрузил" bug): a real code is a single token — no
+ * whitespace, ASCII only, url-safe charset (optionally `#state`), bounded
+ * length. A normal sentence (spaces / non-Latin) is rejected.
+ */
+const oauthCodeRe = /^[A-Za-z0-9._~+/=#-]{8,1024}$/;
+export function checkIsPlausibleOAuthCode(text: string): boolean {
+  return oauthCodeRe.test(text.trim());
+}
+
+/**
+ * @description Is `text` a plausible provider API key? A key is sent verbatim as
+ * an HTTP `Authorization: Bearer <key>` header, and HTTP header values are
+ * ISO-8859-1 with no whitespace/controls — so a value carrying spaces, tabs,
+ * newlines, control chars or non-Latin-1 characters (e.g. Cyrillic) can NEVER be
+ * a real key. Rejecting them up front turns a stray chat message ("я
+ * перезагрузил") captured by a stale `/connect` state into a clear error at
+ * paste time, instead of a cryptic `Header … has invalid value` on the next
+ * request (live 2026-07-20). Deliberately permissive otherwise — it
+ * only rules out the impossible, never guesses a provider's key shape.
+ */
+export function checkIsPlausibleProviderApiKey(text: string): boolean {
+  const key = text.trim();
+  if (key.length < 8 || key.length > 4096) return false;
+  // No whitespace/controls anywhere, and every char within Latin-1 (0x21–0xFF).
+  for (const ch of key) {
+    const code = ch.codePointAt(0)!;
+    if (code <= 0x20 || code === 0x7f || code > 0xff) return false;
+  }
+  return true;
+}
+
+/** A parsed OAuth callback URL the user pasted back (or one embedded in text). */
+export interface OAuthCallbackParts {
+  code: string | null;
+  state: string | null;
+  port: number | null;
+  path: string | null;
+}
+
+/**
+ * @description Extract callback parts from a pasted string IF it contains an
+ * `http(s)` URL that looks like an OAuth callback — i.e. it carries a `code`
+ * query param, or its path ends in `/callback`. Returns `null` when the text has
+ * no such URL (so the caller can fall back to bare-code parsing). Never throws.
+ */
+export function parseOAuthCallbackFromReply(text: string): OAuthCallbackParts | null {
+  const urlMatch = stripAnsiForDetection(text).match(oauthUrlRe);
+  if (!urlMatch) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(urlMatch[0]);
+  } catch {
+    return null;
+  }
+  const code = parsed.searchParams.get('code');
+  const isCallbackPath = /\/callback\/?$/i.test(parsed.pathname);
+  if (!code && !isCallbackPath) return null;
+  const port = parsed.port ? Number(parsed.port) : null;
+  return {
+    code,
+    state: parsed.searchParams.get('state'),
+    port: Number.isFinite(port) ? port : null,
+    path: parsed.pathname || null,
+  };
+}
+
+/**
+ * @name OpenCodeOAuthReply
+ * @description The classified user reply to a pending OAuth flow. URL-FIRST (a
+ * pasted callback URL wins), then a bare code, else `null` (not an OAuth reply —
+ * the caller must NOT consume it as one). This ordering is the requested
+ * behaviour: recognise a link first, otherwise recognise + validate a code.
+ */
+export type OpenCodeOAuthReply =
+  | ({ kind: 'callback' } & OAuthCallbackParts)
+  | { kind: 'code'; code: string }
+  | null;
+
+export function classifyOpenCodeOAuthReply(text: string): OpenCodeOAuthReply {
+  const callback = parseOAuthCallbackFromReply(text);
+  if (callback) return { kind: 'callback', ...callback };
+  const trimmed = text.trim();
+  if (checkIsPlausibleOAuthCode(trimmed)) return { kind: 'code', code: trimmed };
+  return null;
+}
+
+/**
+ * @description Build the loopback completion URL to replay against the CLI's
+ * local callback server on the host: `http://127.0.0.1:<port><path>?code&state`.
+ * Returns `null` unless all of port, code and state are known (state may come
+ * from the stored authorize URL when the user pasted only a bare code). Path
+ * defaults to `/auth/callback`.
+ */
+export function buildLoopbackCompletionUrl(input: {
+  port: number | null;
+  path: string | null;
+  code: string | null;
+  state: string | null;
+}): string | null {
+  const { port, code, state } = input;
+  if (port === null || !code || !state) return null;
+  const path = input.path && input.path.startsWith('/') ? input.path : '/auth/callback';
+  const params = new URLSearchParams({ code, state });
+  return `http://127.0.0.1:${port}${path}?${params.toString()}`;
+}

@@ -20,6 +20,12 @@ import {
   checkProviderAuthed,
   checkIsOpenCodeOAuthSucceeded,
   buildConnectMethodButtonLabel,
+  parseOAuthAuthorizeDetails,
+  checkIsLoopbackOAuthFlow,
+  checkIsPlausibleOAuthCode,
+  parseOAuthCallbackFromReply,
+  classifyOpenCodeOAuthReply,
+  buildLoopbackCompletionUrl,
 } from '../utils/openCodeAuthLogin';
 
 /** The real `/provider/auth` catalog shape (trimmed to the shapes that matter). */
@@ -160,6 +166,103 @@ describe('auth.json success signal', () => {
     assert.equal(checkIsOpenCodeOAuthSucceeded({ exitCode: 0, authed: false }), false);
     assert.equal(checkIsOpenCodeOAuthSucceeded({ exitCode: 0, authed: null }), true);
     assert.equal(checkIsOpenCodeOAuthSucceeded({ exitCode: 1, authed: null }), false);
+  });
+});
+
+// A REAL `opencode auth login -p openai -m "ChatGPT Pro/Plus (browser)"` capture:
+// the loopback (browser) flow — redirect_uri is localhost, NO device code, then
+// it polls "Waiting for authorization" against its own local callback server.
+// Shaped exactly like a real `-m "ChatGPT Pro/Plus (browser)"` capture, but all
+// credential-bearing values (client_id / code_challenge / state) are SYNTHETIC —
+// never commit a real OAuth code/state (public repo, privacy gate).
+const loopbackFlowRaw =
+  '\u001b[0m\r\n' +
+  '\u001b[90m┌\u001b[39m  Add credential\r\n' +
+  '\u001b[90m│\u001b[39m\r\n' +
+  '\u001b[34m●\u001b[39m  Go to: https://auth.openai.com/oauth/authorize?response_type=code' +
+  '&client_id=app_exampleClientId0000000000' +
+  '&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback' +
+  '&scope=openid+profile+email+offline_access' +
+  '&code_challenge=exampleChallenge0000000000000000000000000&code_challenge_method=S256' +
+  '&id_token_add_organizations=true&codex_cli_simplified_flow=true' +
+  '&state=exampleAuthState000000000000000000000&originator=opencode\r\n' +
+  '\u001b[90m│\u001b[39m\r\n' +
+  '\u001b[34m●\u001b[39m  Complete authorization in your browser. This window will close automatically.\r\n' +
+  '\u001b[35m◒\u001b[39m  Waiting for authorization\u001b[999D\u001b[J';
+
+// Shaped like the callback URL a user pastes back (synthetic code/state).
+const pastedCallbackUrl =
+  'http://localhost:1455/auth/callback?code=ac_exampleCode00000000000000000' +
+  '.exampleTail0000000000000000000000000' +
+  '&scope=openid+profile+email+offline_access' +
+  '&state=exampleCallbackState00000000000000';
+
+describe('loopback (browser) OAuth flow', () => {
+  test('parses redirect port/path/state out of the authorize URL', () => {
+    const d = parseOAuthAuthorizeDetails(loopbackFlowRaw);
+    assert.equal(d.isLoopback, true);
+    assert.equal(d.redirectPort, 1455);
+    assert.equal(d.redirectPath, '/auth/callback');
+    assert.equal(d.state, 'exampleAuthState000000000000000000000');
+  });
+
+  test('is detected as loopback (no device code), device flow is not', () => {
+    assert.equal(checkIsLoopbackOAuthFlow(loopbackFlowRaw), true);
+    assert.equal(checkIsLoopbackOAuthFlow(deviceFlowRaw), false);
+  });
+
+  test('the loopback flow still counts as info-ready (URL + waiting poll)', () => {
+    assert.equal(checkIsOAuthInfoReady(loopbackFlowRaw), true);
+    // …but must NOT be mistaken for a device flow.
+    assert.equal(parseOpenCodeDeviceCode(loopbackFlowRaw), null);
+  });
+});
+
+describe('OAuth reply parsing (URL-first, then validated code)', () => {
+  test('a pasted callback URL is parsed to code/state/port (URL wins)', () => {
+    const parts = parseOAuthCallbackFromReply(pastedCallbackUrl);
+    assert.ok(parts);
+    assert.equal(parts!.port, 1455);
+    assert.equal(parts!.path, '/auth/callback');
+    assert.equal(parts!.state, 'exampleCallbackState00000000000000');
+    assert.ok(parts!.code!.startsWith('ac_exampleCode00000000000000000'));
+    const reply = classifyOpenCodeOAuthReply(`  ${pastedCallbackUrl}  `);
+    assert.equal(reply?.kind, 'callback');
+  });
+
+  test('a bare plausible code classifies as code', () => {
+    assert.equal(checkIsPlausibleOAuthCode('ac_exampleCode00000000000000000.exampleTail'), true);
+    assert.equal(checkIsPlausibleOAuthCode('95J2-4U74J'), true);
+    assert.equal(checkIsPlausibleOAuthCode('abc123#state-xyz_9'), true);
+    const reply = classifyOpenCodeOAuthReply('ac_exampleCode00000000000000000.exampleTail');
+    assert.equal(reply?.kind, 'code');
+  });
+
+  test('an ordinary chat message is NOT a code (the "я перезагрузил" bug)', () => {
+    assert.equal(checkIsPlausibleOAuthCode('я перезагрузил'), false);
+    assert.equal(checkIsPlausibleOAuthCode('I restarted the bot'), false);
+    assert.equal(checkIsPlausibleOAuthCode('ok'), false); // too short
+    assert.equal(classifyOpenCodeOAuthReply('я перезагрузил'), null);
+    assert.equal(classifyOpenCodeOAuthReply('what is the status?'), null);
+  });
+
+  test('parseOAuthCallbackFromReply ignores a plain non-callback URL', () => {
+    assert.equal(parseOAuthCallbackFromReply('see https://example.com/docs'), null);
+  });
+
+  test('builds the loopback completion URL against 127.0.0.1 only when complete', () => {
+    assert.equal(
+      buildLoopbackCompletionUrl({ port: 1455, path: '/auth/callback', code: 'ac_x', state: 'st' }),
+      'http://127.0.0.1:1455/auth/callback?code=ac_x&state=st',
+    );
+    // Missing state (bare code with no stored state) → cannot complete.
+    assert.equal(buildLoopbackCompletionUrl({ port: 1455, path: '/auth/callback', code: 'ac_x', state: null }), null);
+    assert.equal(buildLoopbackCompletionUrl({ port: null, path: null, code: 'ac_x', state: 'st' }), null);
+    // Path defaults + encodes params.
+    assert.equal(
+      buildLoopbackCompletionUrl({ port: 8080, path: null, code: 'a b', state: 's/t' }),
+      'http://127.0.0.1:8080/auth/callback?code=a+b&state=s%2Ft',
+    );
   });
 });
 

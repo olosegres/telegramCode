@@ -240,6 +240,12 @@ import {
   checkProviderAuthed,
   checkIsOpenCodeOAuthSucceeded,
   buildConnectMethodButtonLabel,
+  parseOAuthAuthorizeDetails,
+  checkIsLoopbackOAuthFlow,
+  parseOAuthCallbackFromReply,
+  classifyOpenCodeOAuthReply,
+  buildLoopbackCompletionUrl,
+  checkIsPlausibleProviderApiKey,
 } from './utils/openCodeAuthLogin';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1580,8 +1586,23 @@ interface PendingOpenCodeOAuth {
   output: string;
   /** The sign-in URL/code has been relayed to the topic. */
   infoRelayed: boolean;
-  /** Paste-style flow: the next plain text is the OAuth code to type into the pty. */
-  awaitingCode: boolean;
+  /**
+   * Paste OR loopback flow: the next plain text is the OAuth reply — either a
+   * pasted callback URL or a bare code. A device flow never sets this (it
+   * self-completes when the user authorises at the URL — nothing is pasted).
+   */
+  awaitingReply: boolean;
+  /**
+   * The flow redirects to a loopback callback (`redirect_uri=localhost:<port>`)
+   * that the user's remote browser can't reach — the bot must replay the pasted
+   * callback on the host to complete it (see {@link submitOpenCodeOAuthReply}).
+   */
+  isLoopback: boolean;
+  /** Loopback completion target parsed from the authorize URL. */
+  redirectPort: number | null;
+  redirectPath: string | null;
+  /** `state` the CLI generated — needed to complete a bare-code loopback reply. */
+  oauthState: string | null;
   /** Fires if no sign-in URL appears in the window (OAuth-init call blocked). */
   readonly timeoutTimer: NodeJS.Timeout;
 }
@@ -1590,12 +1611,12 @@ interface PendingOpenCodeOAuth {
 const pendingOpenCodeOAuth = new Map<string, PendingOpenCodeOAuth>();
 
 /**
- * @description Whether the thread's OAuth flow is a PASTE-style one that has
- * reached the "paste the code" stage — only then is the next plain text swallowed
- * as the code. A device flow never sets this (nothing is pasted back).
+ * @description Whether the thread's OAuth flow has reached a stage where the next
+ * plain text is the OAuth reply (a paste-style code OR a loopback callback URL).
+ * A device flow never sets this (nothing is pasted back — it self-completes).
  */
-function checkIsOpenCodeOAuthAwaitingCode(key: ThreadKey): boolean {
-  return pendingOpenCodeOAuth.get(keyToString(key))?.awaitingCode === true;
+function checkIsOpenCodeOAuthAwaitingReply(key: ThreadKey): boolean {
+  return pendingOpenCodeOAuth.get(keyToString(key))?.awaitingReply === true;
 }
 
 /** Kill + forget a thread's in-flight OAuth login (idempotent). Reports nothing. */
@@ -1673,7 +1694,11 @@ async function startOpenCodeOAuthLogin(
     methodLabel,
     output: '',
     infoRelayed: false,
-    awaitingCode: false,
+    awaitingReply: false,
+    isLoopback: false,
+    redirectPort: null,
+    redirectPath: null,
+    oauthState: null,
     timeoutTimer: setTimeout(() => {
       void onOpenCodeOAuthUrlTimeout(key, child);
     }, authLoginUrlTimeoutMs),
@@ -1694,14 +1719,28 @@ async function startOpenCodeOAuthLogin(
     clearTimeout(current.timeoutTimer);
     const deviceCode = parseOpenCodeDeviceCode(current.output);
     const isPaste = checkIsOpenCodeOAuthPastePrompt(current.output) && !deviceCode;
+    // Loopback (browser) flow: the CLI redirects to localhost, which a REMOTE
+    // browser can't reach — so we relay the URL and bridge the callback the user
+    // pastes back (either the full callback URL or the bare code, completed with
+    // the stored state). Parse the completion target now, while the authorize
+    // URL (with state) is fully rendered.
+    const isLoopback = !deviceCode && !isPaste && checkIsLoopbackOAuthFlow(current.output);
     if (deviceCode) {
       void replyToThread(key, t('connect.oauth_device', { provider: providerId, url, code: deviceCode }));
     } else {
       void replyToThread(key, t('connect.oauth_url_only', { provider: providerId, url }));
     }
     if (isPaste) {
-      current.awaitingCode = true;
+      current.awaitingReply = true;
       void replyToThread(key, t('connect.oauth_paste'));
+    } else if (isLoopback) {
+      const details = parseOAuthAuthorizeDetails(current.output);
+      current.isLoopback = true;
+      current.redirectPort = details.redirectPort;
+      current.redirectPath = details.redirectPath;
+      current.oauthState = details.state;
+      current.awaitingReply = true;
+      void replyToThread(key, t('connect.oauth_loopback'));
     } else {
       void replyToThread(key, t('connect.oauth_waiting'));
     }
@@ -1713,21 +1752,71 @@ async function startOpenCodeOAuthLogin(
 }
 
 /**
- * @description Paste-style flow only: the pending flow's next plain text is the
- * OAuth code — type it into the pty, delete the user's message (single-use
- * secret), and post the 🔐 ack. The success/failure notice comes from
- * {@link onOpenCodeOAuthExit}.
+ * @description Handle the user's reply to a pending OAuth flow. The reply is
+ * classified URL-FIRST, then as a bare code (requested behaviour): recognise a
+ * pasted callback link first, otherwise a validated code — a value that is
+ * neither (an ordinary chat message like "я перезагрузил") is NEVER consumed as
+ * a credential, so a stale "awaiting reply" state can't swallow unrelated text.
+ *
+ *  - LOOPBACK (browser) flow: the pasted callback URL (or a bare code + the
+ *    stored `state`) is replayed against the CLI's local callback server on the
+ *    host (`127.0.0.1:<port>/auth/callback?…`) — the bot bridges what the remote
+ *    browser could not reach. The CLI then exchanges the code and exits.
+ *  - PASTE flow: the code is typed into the pty verbatim.
+ *
+ * The user's message is deleted (single-use secret); success/failure comes from
+ * {@link onOpenCodeOAuthExit} once the CLI process exits.
+ * @returns `true` when the reply was consumed as an OAuth reply, `false` when it
+ *   was not recognised (caller keeps the flow armed and hints).
  */
-async function submitOpenCodeOAuthCode(
+async function submitOpenCodeOAuthReply(
   key: ThreadKey,
-  code: string,
+  text: string,
   messageId: number,
-): Promise<void> {
+): Promise<boolean> {
   const pending = pendingOpenCodeOAuth.get(keyToString(key));
-  if (!pending) return;
-  pending.pty.write(`${code.trim()}\r`);
+  if (!pending) return false;
+  const reply = classifyOpenCodeOAuthReply(text);
+  if (reply === null) {
+    // Not a link, not a plausible code → do not consume it as a credential.
+    await replyToThread(key, t('connect.oauth_invalid_reply'));
+    return false;
+  }
+
+  if (pending.isLoopback) {
+    // Complete the loopback exchange on the host. Prefer values from the pasted
+    // callback URL; fall back to the stored port/path/state for a bare code.
+    const completionUrl = buildLoopbackCompletionUrl({
+      port: (reply.kind === 'callback' ? reply.port : null) ?? pending.redirectPort,
+      path: (reply.kind === 'callback' ? reply.path : null) ?? pending.redirectPath,
+      code: reply.code,
+      state: (reply.kind === 'callback' ? reply.state : null) ?? pending.oauthState,
+    });
+    if (!completionUrl) {
+      await replyToThread(key, t('connect.oauth_invalid_reply'));
+      return false;
+    }
+    await deleteThreadMessage(key, messageId);
+    await replyToThread(key, t('agent.login_code_relayed'));
+    try {
+      // The CLI's local callback server exchanges the code and lets the pty exit.
+      const res = await fetch(completionUrl, { signal: AbortSignal.timeout(30_000) });
+      // Drain the body so the connection closes cleanly; ignore its content.
+      await res.text().catch(() => '');
+    } catch (e) {
+      console.warn(`[connect] ${keyToString(key)} loopback callback replay failed:`, e);
+      // The pty is still waiting; onExit will report the eventual outcome, but a
+      // transport failure here means it likely won't — surface it now.
+      await replyToThread(key, t('connect.oauth_failed', { provider: pending.providerId }));
+    }
+    return true;
+  }
+
+  // Paste flow: type the code into the pty verbatim.
   await deleteThreadMessage(key, messageId);
   await replyToThread(key, t('agent.login_code_relayed'));
+  pending.pty.write(`${reply.code}\r`);
+  return true;
 }
 
 /** No sign-in URL within the window → the OAuth-init call was likely blocked. */
@@ -5415,14 +5504,25 @@ async function handleProviderConnectKey(
   apiKey: string,
   secretMessageId: number | null,
 ): Promise<void> {
-  if (secretMessageId !== null) {
-    await deleteThreadMessage(key, secretMessageId);
-  }
   const trimmedApiKey = apiKey.trim();
   if (!trimmedApiKey) {
     armProviderConnect(key, providerId);
     await replyToThread(key, t('connect.empty_key'));
     return;
+  }
+  // Reject a value that can't be a real key (spaces / non-Latin-1 / controls)
+  // BEFORE storing it — otherwise a stray chat message captured by a stale
+  // `/connect` state becomes a broken `Authorization` header that only fails
+  // (cryptically) on the next request. An implausible value is NOT a secret, so
+  // keep it visible, re-arm, and hint. (live 2026-07-20)
+  if (!checkIsPlausibleProviderApiKey(trimmedApiKey)) {
+    armProviderConnect(key, providerId);
+    await replyToThread(key, t('connect.invalid_key'));
+    return;
+  }
+  // A plausible key IS a single-use secret → delete it from history now.
+  if (secretMessageId !== null) {
+    await deleteThreadMessage(key, secretMessageId);
   }
 
   const adapter = getAdapter('opencode');
@@ -6597,12 +6697,25 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // A PASTE-style OpenCode `/connect` OAuth flow has reached the "paste code"
-  // stage → the next plain text is the code: type it into the pty, delete the
-  // secret, ack. (Device flows never arm this — nothing is pasted back.) A slash
-  // command falls through so /quit, /new, etc. still run + cancel the flow.
-  if (checkIsOpenCodeOAuthAwaitingCode(key) && !text.startsWith('/')) {
-    await submitOpenCodeOAuthCode(key, text, ctx.message.message_id);
+  // An OpenCode `/connect` OAuth flow has reached the reply stage (paste-style
+  // code OR loopback callback) → the next plain text is the OAuth reply: a
+  // pasted callback URL or a validated code. Recognised → consumed + deleted as
+  // a secret; NOT recognised → the flow stays armed and hints (never forwarded
+  // to the agent). A slash command falls through so /quit, /new, etc. still run
+  // + cancel the flow.
+  if (checkIsOpenCodeOAuthAwaitingReply(key) && !text.startsWith('/')) {
+    await submitOpenCodeOAuthReply(key, text, ctx.message.message_id);
+    return;
+  }
+
+  // Safety net: a pasted OAuth callback URL with NO flow in progress (e.g. a
+  // stale one from a browser that timed out, or a re-paste after the flow ended)
+  // must NOT be forwarded to the agent as a prompt — that both leaks the code
+  // into the transcript and produced the confusing header error (live
+  // 2026-07-20). Delete it as a secret and hint to re-run /connect.
+  if (!text.startsWith('/') && parseOAuthCallbackFromReply(text)) {
+    await deleteThreadMessage(key, ctx.message.message_id);
+    await replyToThread(key, t('connect.oauth_callback_no_flow'));
     return;
   }
 

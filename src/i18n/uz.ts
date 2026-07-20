@@ -241,6 +241,7 @@ export const uzDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Keyingi xabar sifatida `{provider}` uchun API kalitni yuboring. Kalit xabarini tarixdan o‘chiraman.',
   'connect.empty_key': '❌ API kalit bo‘sh. Keyingi xabar sifatida kalitni yuboring.',
+  'connect.invalid_key': '❌ Bu API kalitiga o‘xshamaydi (unda bo‘shliqlar yoki lotin bo‘lmagan belgilar bor). Keyingi xabar sifatida faqat kalitni yuboring yoki /connect ni qayta ishga tushiring.',
   'connect.invalid_provider': '❌ Yaroqsiz provayder id `{provider}`. Misol: /connect openai',
   'connect.unsupported_provider': '⚠️ `{provider}` provayderi ushbu oqim orqali oddiy API-kalit kirishini qo‘llab-quvvatlamaydi. Ushbu provayder uchun OpenCode UI/CLI dan foydalaning.',
   'connect.unsupported_backend': 'Ushbu build da OpenCode provayder autentifikatsiyasi mavjud emas.',
@@ -253,6 +254,9 @@ export const uzDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 `{provider}` ni ulash uchun: {url} ni oching va kirishni yakunlang. Tugagach shu yerda xabar beraman.',
   'connect.oauth_paste': '🔑 Tasdiqlagach, kodni keyingi xabar sifatida shu yerga joylang — uni tarixdan o‘chiraman.',
   'connect.oauth_waiting': '⏳ Avtorizatsiya kutilmoqda…',
+  'connect.oauth_loopback': '🔑 Tasdiqlagandan so‘ng brauzeringiz yuklanmaydigan `localhost` sahifasini ochishga urinadi — bu yerda bu normal holat. O‘sha URL manzilini manzil satridan nusxalab, keyingi xabar sifatida joylang (yoki faqat `code` qiymatini). Men uni tarixdan o‘chiraman va kirishni yakunlayman.',
+  'connect.oauth_invalid_reply': '❌ Bu na callback URL ga, na avtorizatsiya kodiga o‘xshaydi. Tasdiqlagandan so‘ng brauzeringizdan `localhost` callback URL manzilini joylang (yoki `code` qiymatini).',
+  'connect.oauth_callback_no_flow': '⚠️ Bu OAuth callback URL ga o‘xshaydi, lekin hozir bu yerda kirish jarayoni yo‘q — men uni o‘chirdim. Qaytadan boshlash uchun /connect ni ishga tushiring.',
   'connect.oauth_success': '✅ `{provider}` OAuth orqali ulandi. OpenCode server qayta ishga tushirilmadi.',
   'connect.oauth_failed': '⚠️ `{provider}` uchun OAuth kirish yakunlanmadi. /connect ni qayta ishga tushiring.',
   'quit_all.none_active': 'Ishlayotgan agentlar yo‘q — to‘xtatishga hech narsa yo‘q.',

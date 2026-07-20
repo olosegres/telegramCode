@@ -245,6 +245,7 @@ export const ruDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Пришли API key для `{provider}` следующим сообщением. Я удалю сообщение с ключом из истории.',
   'connect.empty_key': '❌ API key пустой. Пришли ключ следующим сообщением.',
+  'connect.invalid_key': '❌ Это не похоже на API-ключ (есть пробелы или не-латинские символы). Пришли следующим сообщением только сам ключ или запусти /connect заново.',
   'connect.invalid_provider': '❌ Некорректный provider id `{provider}`. Например: /connect openai',
   'connect.unsupported_provider': '⚠️ Provider `{provider}` не поддерживает простой API-key вход через этот flow. Используй OpenCode UI/CLI для этого provider.',
   'connect.unsupported_backend': 'OpenCode provider auth недоступен в этом билде.',
@@ -257,6 +258,9 @@ export const ruDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 Чтобы подключить `{provider}`: откройте {url} и завершите вход. Сообщу здесь, когда будет готово.',
   'connect.oauth_paste': '🔑 После подтверждения пришлите код следующим сообщением — я удалю его из истории.',
   'connect.oauth_waiting': '⏳ Ожидаю авторизацию…',
+  'connect.oauth_loopback': '🔑 После подтверждения браузер попробует открыть страницу `localhost`, которая не загрузится — это нормально. Скопируй этот URL из адресной строки и пришли следующим сообщением (или только значение `code`). Я удалю его из истории и завершу вход.',
+  'connect.oauth_invalid_reply': '❌ Это не похоже ни на callback-URL, ни на код авторизации. После подтверждения пришли `localhost`-callback URL из браузера (или значение `code`).',
+  'connect.oauth_callback_no_flow': '⚠️ Похоже на OAuth callback-URL, но сейчас вход не выполняется — я его удалил. Запусти /connect, чтобы начать заново.',
   'connect.oauth_success': '✅ `{provider}` подключён через OAuth. Сервер OpenCode не перезапускался.',
   'connect.oauth_failed': '⚠️ Вход через OAuth для `{provider}` не завершён. Запустите /connect ещё раз.',
   'quit_all.none_active': 'Нет активных агентов — нечего останавливать.',

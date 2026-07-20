@@ -245,6 +245,7 @@ export const enDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Send the API key for `{provider}` as the next message. I will delete the key message from history.',
   'connect.empty_key': '❌ API key is empty. Send the key as the next message.',
+  'connect.invalid_key': '❌ That does not look like an API key (it has spaces or non-Latin characters). Send just the key as the next message, or run /connect again.',
   'connect.invalid_provider': '❌ Invalid provider id `{provider}`. Example: /connect openai',
   'connect.unsupported_provider': '⚠️ Provider `{provider}` does not support a simple API-key login through this flow. Use the OpenCode UI/CLI for this provider.',
   'connect.unsupported_backend': 'OpenCode provider auth is not available in this build.',
@@ -257,6 +258,9 @@ export const enDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 To connect `{provider}`: open {url} and complete sign-in. I\'ll confirm here when it\'s done.',
   'connect.oauth_paste': '🔑 After authorizing, paste the code here as the next message — I\'ll delete it from history.',
   'connect.oauth_waiting': '⏳ Waiting for authorization…',
+  'connect.oauth_loopback': '🔑 After authorizing, your browser will try to open a `localhost` page that fails to load — that\'s expected here. Copy that URL from the address bar and paste it back as the next message (or just the `code` value). I\'ll delete it from history and finish sign-in.',
+  'connect.oauth_invalid_reply': '❌ That does not look like a callback URL or an auth code. After authorizing, paste the `localhost` callback URL from your browser (or the `code` value).',
+  'connect.oauth_callback_no_flow': '⚠️ That looks like an OAuth callback URL, but no sign-in is in progress here — I deleted it. Run /connect to start again.',
   'connect.oauth_success': '✅ `{provider}` connected via OAuth. OpenCode server was not restarted.',
   'connect.oauth_failed': '⚠️ OAuth sign-in for `{provider}` didn\'t complete. Run /connect to try again.',
 

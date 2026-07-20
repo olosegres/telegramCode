@@ -241,6 +241,7 @@ export const frDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Envoyez la clé API pour `{provider}` comme prochain message. Je supprimerai le message contenant la clé de l\'historique.',
   'connect.empty_key': '❌ La clé API est vide. Envoyez la clé comme prochain message.',
+  'connect.invalid_key': '❌ Cela ne ressemble pas à une API key (elle contient des espaces ou des caractères non latins). Envoyez uniquement la key comme prochain message, ou relancez /connect.',
   'connect.invalid_provider': '❌ ID de provider invalide `{provider}`. Exemple : /connect openai',
   'connect.unsupported_provider': '⚠️ Le provider `{provider}` ne prend pas en charge la connexion par clé API simple via ce flux. Utilisez l\'UI/CLI OpenCode pour ce provider.',
   'connect.unsupported_backend': 'L\'auth de provider OpenCode n\'est pas disponible dans ce build.',
@@ -253,6 +254,9 @@ export const frDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 Pour connecter `{provider}` : ouvre {url} et termine la connexion. Je confirmerai ici une fois terminé.',
   'connect.oauth_paste': '🔑 Après autorisation, colle le code ici comme prochain message — je le supprimerai de l\'historique.',
   'connect.oauth_waiting': '⏳ En attente d\'autorisation…',
+  'connect.oauth_loopback': '🔑 Après autorisation, votre navigateur tentera d\'ouvrir une page `localhost` qui ne se chargera pas — c\'est normal ici. Copiez cette URL depuis la barre d\'adresse et collez-la comme prochain message (ou juste la valeur `code`). Je la supprimerai de l\'historique et terminerai la connexion.',
+  'connect.oauth_invalid_reply': '❌ Cela ne ressemble ni à une URL de callback ni à un code d\'autorisation. Après autorisation, collez l\'URL de callback `localhost` depuis votre navigateur (ou la valeur `code`).',
+  'connect.oauth_callback_no_flow': '⚠️ Cela ressemble à une URL de callback OAuth, mais aucune connexion n\'est en cours ici — je l\'ai supprimée. Lancez /connect pour recommencer.',
   'connect.oauth_success': '✅ `{provider}` connecté via OAuth. Le serveur OpenCode n\'a pas été redémarré.',
   'connect.oauth_failed': '⚠️ La connexion OAuth pour `{provider}` ne s\'est pas terminée. Relance /connect.',
   'quit_all.none_active': 'Aucun agent en cours — rien à arrêter.',

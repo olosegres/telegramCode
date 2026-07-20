@@ -241,6 +241,7 @@ export const zhDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 在下一条消息中发送 `{provider}` 的 API key。我会从历史中删除包含 key 的消息。',
   'connect.empty_key': '❌ API key 为空。请在下一条消息中发送 key。',
+  'connect.invalid_key': '❌ 这看起来不像 API key（包含空格或非拉丁字符）。请在下一条消息中仅发送 key，或重新运行 /connect。',
   'connect.invalid_provider': '❌ 无效的 provider id `{provider}`。示例：/connect openai',
   'connect.unsupported_provider': '⚠️ Provider `{provider}` 不支持通过此流程的简单 API key 登录。请为此 provider 使用 OpenCode UI/CLI。',
   'connect.unsupported_backend': '此构建中不可用 OpenCode provider 认证。',
@@ -253,6 +254,9 @@ export const zhDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 连接 `{provider}`：打开 {url} 并完成登录。完成后我会在这里确认。',
   'connect.oauth_paste': '🔑 授权后，将代码作为下一条消息粘贴到这里 — 我会从历史中删除它。',
   'connect.oauth_waiting': '⏳ 等待授权…',
+  'connect.oauth_loopback': '🔑 授权后，你的浏览器会尝试打开一个无法加载的 `localhost` 页面——这在这里是正常的。请从地址栏复制该 URL 并作为下一条消息粘贴回来（或仅粘贴 `code` 值）。我会将其从历史记录中删除并完成登录。',
+  'connect.oauth_invalid_reply': '❌ 这看起来既不像回调 URL，也不像授权码。授权后，请从浏览器粘贴 `localhost` 回调 URL（或 `code` 值）。',
+  'connect.oauth_callback_no_flow': '⚠️ 这看起来像是一个 OAuth 回调 URL，但这里当前没有正在进行的登录——我已将其删除。请运行 /connect 重新开始。',
   'connect.oauth_success': '✅ `{provider}` 已通过 OAuth 连接。OpenCode 服务器未重启。',
   'connect.oauth_failed': '⚠️ `{provider}` 的 OAuth 登录未完成。请再次运行 /connect。',
   'quit_all.none_active': '没有运行中的代理 — 无需停止。',

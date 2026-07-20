@@ -241,6 +241,7 @@ export const hiDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 अगले संदेश में `{provider}` के लिए API key भेजें। मैं key संदेश को इतिहास से हटा दूँगा।',
   'connect.empty_key': '❌ API key खाली है। अगले संदेश में key भेजें।',
+  'connect.invalid_key': '❌ यह API key जैसा नहीं लगता (इसमें स्पेस या गैर-लैटिन अक्षर हैं)। अगले संदेश में केवल key भेजें, या /connect फिर से चलाएँ।',
   'connect.invalid_provider': '❌ अमान्य प्रदाता id `{provider}`। उदाहरण: /connect openai',
   'connect.unsupported_provider': '⚠️ प्रदाता `{provider}` इस प्रवाह के माध्यम से सरल API-key लॉगिन का समर्थन नहीं करता। इस प्रदाता के लिए OpenCode UI/CLI का उपयोग करें।',
   'connect.unsupported_backend': 'इस बिल्ड में OpenCode प्रदाता प्रमाणीकरण उपलब्ध नहीं।',
@@ -253,6 +254,9 @@ export const hiDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 `{provider}` कनेक्ट करने के लिए: {url} खोलें और साइन-इन पूरा करें। पूरा होने पर मैं यहाँ पुष्टि करूँगा।',
   'connect.oauth_paste': '🔑 अधिकृत करने के बाद, कोड को अगले संदेश के रूप में यहाँ पेस्ट करें — मैं इसे इतिहास से हटा दूँगा।',
   'connect.oauth_waiting': '⏳ अधिकृतिकरण की प्रतीक्षा…',
+  'connect.oauth_loopback': '🔑 अधिकृत करने के बाद, आपका ब्राउज़र एक `localhost` पेज खोलने की कोशिश करेगा जो लोड नहीं होगा — यहाँ यह अपेक्षित है। उस URL को एड्रेस बार से कॉपी करें और अगले संदेश के रूप में पेस्ट करें (या केवल `code` मान)। मैं इसे इतिहास से हटा दूँगा और साइन-इन पूरा करूँगा।',
+  'connect.oauth_invalid_reply': '❌ यह न तो callback URL जैसा लगता है और न ही auth code जैसा। अधिकृत करने के बाद, अपने ब्राउज़र से `localhost` callback URL (या `code` मान) पेस्ट करें।',
+  'connect.oauth_callback_no_flow': '⚠️ यह OAuth callback URL जैसा लगता है, लेकिन यहाँ कोई साइन-इन प्रगति में नहीं है — मैंने इसे हटा दिया। फिर से शुरू करने के लिए /connect चलाएँ।',
   'connect.oauth_success': '✅ `{provider}` OAuth के माध्यम से कनेक्ट हुआ। OpenCode सर्वर पुनः प्रारंभ नहीं हुआ।',
   'connect.oauth_failed': '⚠️ `{provider}` के लिए OAuth साइन-इन पूरा नहीं हुआ। /connect फिर से चलाएँ।',
   'quit_all.none_active': 'कोई एजेंट नहीं चल रहा — रोकने के लिए कुछ नहीं।',

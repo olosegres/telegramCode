@@ -241,6 +241,7 @@ export const deDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Sende den API-Key für `{provider}` als nächste Nachricht. Ich lösche die Key-Nachricht aus dem Verlauf.',
   'connect.empty_key': '❌ API-Key ist leer. Sende den Key als nächste Nachricht.',
+  'connect.invalid_key': '❌ Das sieht nicht wie ein API key aus (er enthält Leerzeichen oder nicht-lateinische Zeichen). Sende als nächste Nachricht nur den Key oder starte /connect erneut.',
   'connect.invalid_provider': '❌ Ungültige Provider-ID `{provider}`. Beispiel: /connect openai',
   'connect.unsupported_provider': '⚠️ Provider `{provider}` unterstützt keinen einfachen API-Key-Login über diesen Ablauf. Verwende die OpenCode-UI/CLI für diesen Provider.',
   'connect.unsupported_backend': 'OpenCode-Provider-Auth ist in diesem Build nicht verfügbar.',
@@ -253,6 +254,9 @@ export const deDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 Um `{provider}` zu verbinden: öffne {url} und schließe die Anmeldung ab. Ich melde mich hier, wenn es fertig ist.',
   'connect.oauth_paste': '🔑 Füge nach der Bestätigung den Code als nächste Nachricht hier ein — ich lösche ihn aus dem Verlauf.',
   'connect.oauth_waiting': '⏳ Warte auf Autorisierung…',
+  'connect.oauth_loopback': '🔑 Nach der Autorisierung versucht dein Browser, eine `localhost`-Seite zu öffnen, die nicht lädt — das ist hier normal. Kopiere diese URL aus der Adresszeile und sende sie als nächste Nachricht zurück (oder nur den `code`-Wert). Ich lösche sie aus dem Verlauf und schließe die Anmeldung ab.',
+  'connect.oauth_invalid_reply': '❌ Das sieht weder nach einer Callback-URL noch nach einem Auth-Code aus. Füge nach der Autorisierung die `localhost`-Callback-URL aus deinem Browser ein (oder den `code`-Wert).',
+  'connect.oauth_callback_no_flow': '⚠️ Das sieht nach einer OAuth-Callback-URL aus, aber hier läuft gerade keine Anmeldung — ich habe sie gelöscht. Starte /connect, um erneut zu beginnen.',
   'connect.oauth_success': '✅ `{provider}` per OAuth verbunden. OpenCode-Server wurde nicht neu gestartet.',
   'connect.oauth_failed': '⚠️ OAuth-Anmeldung für `{provider}` nicht abgeschlossen. Führe /connect erneut aus.',
   'quit_all.none_active': 'Keine Agenten laufen — nichts zu stoppen.',

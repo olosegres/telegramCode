@@ -247,6 +247,7 @@ export const ukDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 Надішли API key для `{provider}` наступним повідомленням. Я видалю повідомлення з ключем з історії.',
   'connect.empty_key': '❌ API key порожній. Надішли ключ наступним повідомленням.',
+  'connect.invalid_key': '❌ Це не схоже на API key (є пробіли або нелатинські символи). Надішли наступним повідомленням лише сам ключ або запусти /connect знову.',
   'connect.invalid_provider': '❌ Некоректний provider id `{provider}`. Наприклад: /connect openai',
   'connect.unsupported_provider': '⚠️ Provider `{provider}` не підтримує простий вхід через API key у цьому flow. Скористайся OpenCode UI/CLI для цього provider.',
   'connect.unsupported_backend': 'OpenCode provider auth недоступний у цій збірці.',
@@ -259,6 +260,9 @@ export const ukDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 Щоб підключити `{provider}`: відкрий {url} і заверши вхід. Повідомлю тут, коли буде готово.',
   'connect.oauth_paste': '🔑 Після авторизації встав код сюди наступним повідомленням — я видалю його з історії.',
   'connect.oauth_waiting': '⏳ Очікую авторизацію…',
+  'connect.oauth_loopback': '🔑 Після підтвердження браузер спробує відкрити сторінку `localhost`, яка не завантажиться — це нормально. Скопіюй цей URL з адресного рядка і надішли наступним повідомленням (або лише значення `code`). Я видалю його з історії та завершу вхід.',
+  'connect.oauth_invalid_reply': '❌ Це не схоже ні на callback-URL, ні на код авторизації. Після підтвердження надішли `localhost`-callback URL з браузера (або значення `code`).',
+  'connect.oauth_callback_no_flow': '⚠️ Схоже на OAuth callback-URL, але зараз вхід не виконується — я його видалив. Запусти /connect, щоб почати заново.',
   'connect.oauth_success': '✅ `{provider}` підключено через OAuth. OpenCode server не перезапускався.',
   'connect.oauth_failed': '⚠️ OAuth-вхід для `{provider}` не завершено. Запусти /connect ще раз.',
   'quit_all.none_active': 'Немає запущених агентів — нема чого зупиняти.',

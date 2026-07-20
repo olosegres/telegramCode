@@ -241,6 +241,7 @@ export const kaDict: Record<string, string> = {
 
   'connect.prompt_key': '🔑 შემდეგ შეტყობინებად გამოგვიგზავნეთ `{provider}`-ის API გასაღები. გასაღების შეტყობინებას ისტორიიდან წავშლი.',
   'connect.empty_key': '❌ API გასაღები ცარიელია. შემდეგ შეტყობინებად გამოგვიგზავნეთ გასაღები.',
+  'connect.invalid_key': '❌ ეს არ ჰგავს API key-ს (შეიცავს ჰარებს ან არა-ლათინურ სიმბოლოებს). შემდეგ შეტყობინებად გამოგზავნეთ მხოლოდ key, ან თავიდან გაუშვით /connect.',
   'connect.invalid_provider': '❌ არასწორი პროვაიდერის id `{provider}`. მაგალითი: /connect openai',
   'connect.unsupported_provider': '⚠️ პროვაიდერი `{provider}` არ უჭერს მხარს მარტივი API-გასაღებით შესვლას ამ პროცესით. გამოიყენეთ OpenCode UI/CLI ამ პროვაიდერისთვის.',
   'connect.unsupported_backend': 'ამ ბილდში OpenCode პროვაიდერის ავთენტიფიკაცია მიუწვდომელია.',
@@ -253,6 +254,9 @@ export const kaDict: Record<string, string> = {
   'connect.oauth_url_only': '🔓 `{provider}`-ის დასაკავშირებლად: გახსენით {url} და დაასრულეთ შესვლა. დასრულებისას აქ დაგიდასტურებთ.',
   'connect.oauth_paste': '🔑 დადასტურების შემდეგ ჩასვით კოდი აქ შემდეგ შეტყობინებად — ისტორიიდან წავშლი.',
   'connect.oauth_waiting': '⏳ ველოდები ავტორიზაციას…',
+  'connect.oauth_loopback': '🔑 ავტორიზაციის შემდეგ თქვენი ბრაუზერი შეეცდება გახსნას `localhost` გვერდი, რომელიც ვერ ჩაიტვირთება — აქ ეს მოსალოდნელია. დააკოპირეთ ეს URL მისამართის ზოლიდან და ჩასვით შემდეგ შეტყობინებად (ან მხოლოდ `code` მნიშვნელობა). მე წავშლი მას ისტორიიდან და დავასრულებ შესვლას.',
+  'connect.oauth_invalid_reply': '❌ ეს არც callback URL-ს ჰგავს და არც ავტორიზაციის კოდს. ავტორიზაციის შემდეგ ჩასვით `localhost` callback URL თქვენი ბრაუზერიდან (ან `code` მნიშვნელობა).',
+  'connect.oauth_callback_no_flow': '⚠️ ეს OAuth callback URL-ს ჰგავს, მაგრამ აქ ამჟამად შესვლა არ მიმდინარეობს — მე წავშალე იგი. თავიდან დასაწყებად გაუშვით /connect.',
   'connect.oauth_success': '✅ `{provider}` დაკავშირდა OAuth-ით. OpenCode სერვერი არ გადატვირთულა.',
   'connect.oauth_failed': '⚠️ `{provider}`-ის OAuth შესვლა არ დასრულდა. ხელახლა გაუშვით /connect.',
   'quit_all.none_active': 'აგენტები არ არის გაშვებული — გასაჩერებელი არაფერია.',

@@ -29,3 +29,40 @@ export function getTransientFrameIds(state: TransientFrameState): number[] {
   if (state.subagentStatusMessageId !== null) ids.push(state.subagentStatusMessageId);
   return ids;
 }
+
+/**
+ * The frame-generation guards a shutdown sweep must bump. Both are captured by
+ * an in-flight `sendStatusFrame` / thinking-frame create BEFORE its `await` and
+ * re-checked after (`getStatusFrameStoreDecision`) to decide store-vs-discard.
+ */
+export interface ShutdownFrameState extends TransientFrameState {
+  statusFrameGeneration: number;
+  thinkingFrameGeneration: number;
+}
+
+/**
+ * @description Graceful-shutdown clear of a thread's transient frames: returns the
+ * ids currently on screen (for the caller to delete), then bumps BOTH frame
+ * generations and nulls all three ids.
+ *
+ * The generation bump is the load-bearing part, and the reason this must run for
+ * EVERY tracked thread — including one whose ids are all null right now. A
+ * `sendStatusFrame` / thinking-frame create that is mid-`await` when the sweep
+ * runs has NOT yet stored its id (so {@link getTransientFrameIds} is empty here),
+ * but it captured the pre-bump generation and re-checks it after the await
+ * (`getStatusFrameStoreDecision`). Bumping makes that racing create DISCARD
+ * (delete) its just-sent message instead of storing an orphan that outlives the
+ * restart — the leftover "🔧 <tool>…" / "✽ working…" frame stranded as a topic's
+ * last message. Mirrors the bump `deleteStatusMessage` already does for the
+ * mid-session delete; the shutdown path previously nulled the ids WITHOUT bumping,
+ * so it sat outside that race protection.
+ */
+export function clearTransientFramesForShutdown(state: ShutdownFrameState): number[] {
+  const ids = getTransientFrameIds(state);
+  state.statusFrameGeneration += 1;
+  state.thinkingFrameGeneration += 1;
+  state.statusMessageId = null;
+  state.thinkingMessageId = null;
+  state.subagentStatusMessageId = null;
+  return ids;
+}

@@ -148,7 +148,7 @@ import {
 } from './utils/fileSendPlan';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
-import { getTransientFrameIds } from './utils/transientFrames';
+import { getTransientFrameIds, clearTransientFramesForShutdown } from './utils/transientFrames';
 import {
   getThinkingEventAction,
   getThinkingAnswerStartAction,
@@ -3396,10 +3396,19 @@ const shutdownFrameSweepMs = 1500;
  * thinking indicator, and the dedicated sub-agent status. Their ids live ONLY in
  * volatile in-memory {@link ThreadMessageState}, so a restart that doesn't clean
  * them up orphans the messages forever in the topic (the reported incident:
- * ~25 hot reloads left "✽ работаю…" frames stuck). Iterates every tracked
- * thread, collects its non-null frame ids ({@link getTransientFrameIds}), fires
- * the deletes in parallel, and nulls the in-memory ids so a racing per-thread
- * tick can't re-edit a just-deleted message.
+ * ~25 hot reloads left "✽ работаю…" frames stuck; and a 🔧 tool status stranded
+ * as a topic's last message when a hot reload landed mid-tool). Iterates every
+ * tracked thread, and for each {@link clearTransientFramesForShutdown} BUMPS both
+ * frame generations (so a `sendStatusFrame`/thinking create still mid-`await`
+ * discards its just-sent message instead of orphaning it — see that helper) and
+ * nulls the in-memory ids so a racing per-thread tick can't re-edit a just-deleted
+ * message; the returned on-screen ids are deleted in parallel.
+ *
+ * The generation bump MUST run for every thread, including one whose ids are
+ * already null (its racing create hasn't stored an id yet) — that is exactly the
+ * case the old `if (ids.length === 0) continue` skipped, letting the create store
+ * an orphan after the sweep. Threads that had nothing on screen still skip the
+ * (fire-and-forget) persist + delete work.
  *
  * Wired into {@link gracefulShutdown} as `clearTransientFrames`: runs AFTER
  * `cleanupTimers()` (no interval re-creates a frame mid-sweep) and BEFORE
@@ -3409,22 +3418,20 @@ const shutdownFrameSweepMs = 1500;
 async function sweepTransientFramesOnShutdown(): Promise<void> {
   const deletes: Promise<unknown>[] = [];
   for (const [keyStr, msgState] of threadMessageStates) {
-    const ids = getTransientFrameIds(msgState);
-    if (ids.length === 0) continue;
     let key: ThreadKey;
     try {
       key = keyFromString(keyStr);
     } catch {
       continue;
     }
+    // Bump generations + null ids for EVERY tracked thread (fixes the racing
+    // create that resolves after the sweep). Only threads that HAD a frame on
+    // screen need the persist + delete.
+    const ids = clearTransientFramesForShutdown(msgState);
+    if (ids.length === 0) continue;
     for (const id of ids) {
       deletes.push(bot.telegram.deleteMessage(key.chatId, id).catch(() => {}));
     }
-    // Null the in-memory ids so a racing unref'd liveness/sub-agent tick can't
-    // re-edit (or re-track) a message we're deleting.
-    msgState.statusMessageId = null;
-    msgState.thinkingMessageId = null;
-    msgState.subagentStatusMessageId = null;
     // Clear the S2 persisted set too, so the next boot's reconciliation finds
     // nothing to redo after a graceful exit.
     state.setTransientFrames(key, []).catch(() => {});

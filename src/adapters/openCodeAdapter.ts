@@ -6,7 +6,7 @@ import * as path from 'path';
 import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ThreadLocaleReader, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
-import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit } from '../installManager';
+import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit, restartOpenCodeServer } from '../installManager';
 import { resolveDataDir } from '../state';
 import { appendDiagLog } from '../diagLog';
 import {
@@ -1228,7 +1228,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * Prevents concurrent restart attempts. If restart is already in progress,
    * waits for it to complete and returns its result.
    */
-  private async restartServer(): Promise<boolean> {
+  private async restartServer(force = false): Promise<boolean> {
     if (this.isServerRestarting) {
       console.log(`[OpenCode] Server restart already in progress, waiting...`);
       // Wait for the in-progress restart to complete
@@ -1242,7 +1242,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     this.isServerRestarting = true;
     try {
       console.log(`[OpenCode] Attempting server restart...`);
-      await ensureOpenCodeServer();
+      if (force) await restartOpenCodeServer();
+      else await ensureOpenCodeServer();
       console.log(`[OpenCode] Server restarted successfully`);
 
       // Close the global stream up front: its reader points at the crashed
@@ -1307,6 +1308,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     } finally {
       this.isServerRestarting = false;
     }
+  }
+
+  /**
+   * @description Reload credentials written by the out-of-band `opencode auth
+   * login` CLI. The CLI updates auth.json directly, but a running OpenCode
+   * server retains its prior provider credential in memory until restarted.
+   * Reuses the normal restart + active-session restoration path.
+   */
+  async reloadProviderAuth(): Promise<boolean> {
+    return this.restartServer(true);
   }
 
   private getHeaders(): Record<string, string> {

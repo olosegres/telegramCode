@@ -767,6 +767,14 @@ export interface AgentAdapter extends EventEmitter {
   fetchProviderAuthMethods?(providerId: string): Promise<OpenCodeAuthMethod[]>;
 
   /**
+   * Reload provider credentials after an out-of-band OAuth login. OpenCode
+   * caches auth in its live server process, so its adapter performs a
+   * controlled restart and restores its active sessions before resolving.
+   * Optional (OpenCode only, same optional-method pattern as provider auth).
+   */
+  reloadProviderAuth?(): Promise<boolean>;
+
+  /**
    * Set model override. Returns error message on failure, `null` on
    * success. Audit S10 / #39: unified to `Promise<string | null>` —
    * callers used to branch on `void` vs `Promise<string | null>`.

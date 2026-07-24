@@ -336,6 +336,19 @@ export async function ensureOpenCodeServer(): Promise<void> {
   throw new Error('OpenCode server did not become ready within 15 seconds');
 }
 
+/**
+ * @description Force the current OpenCode server generation to stop and start
+ * again. Unlike {@link ensureOpenCodeServer}, this NEVER adopts a healthy
+ * process: provider OAuth performed by `opencode auth login` writes auth.json
+ * out-of-band, while a live server keeps the old credential in memory. The
+ * caller owns restoring active sessions after this controlled restart.
+ */
+export async function restartOpenCodeServer(): Promise<void> {
+  const port = new URL(process.env.OPENCODE_URL || 'http://localhost:4096').port || '4096';
+  await stopAdoptedOpenCodeServer(port);
+  await ensureOpenCodeServer();
+}
+
 export function stopOpenCodeServer(): void {
   const child = openCodeProcess;
   if (child && !child.killed) {

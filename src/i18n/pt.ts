@@ -265,7 +265,7 @@ export const ptDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 Após autorizares, o teu navegador tentará abrir uma página `localhost` que não carrega — é o esperado aqui. Copia esse URL da barra de endereço e cola-o como próxima mensagem (ou apenas o valor `code`). Vou apagá-lo do histórico e concluir o início de sessão.',
   'connect.oauth_invalid_reply': '❌ Isto não parece um URL de callback nem um código de autorização. Após autorizares, cola o URL de callback `localhost` do teu navegador (ou o valor `code`).',
   'connect.oauth_callback_no_flow': '⚠️ Isto parece um URL de callback OAuth, mas não há nenhum início de sessão em curso aqui — apaguei-o. Executa /connect para começar de novo.',
-  'connect.oauth_success': '✅ `{provider}` ligado via OAuth. O servidor OpenCode não foi reiniciado.',
+  'connect.oauth_success': '✅ `{provider}` ligado via OAuth. As credenciais do servidor OpenCode foram atualizadas.',
   'connect.oauth_failed': '⚠️ O início de sessão OAuth para `{provider}` não foi concluído. Executa /connect novamente.',
   'quit_all.none_active': 'Sem agentes em execução — nada a parar.',
   'quit_all.summary': '🚪 Parados {stopped} de {total} agentes ativos.',

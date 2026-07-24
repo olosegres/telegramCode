@@ -269,7 +269,7 @@ export const enDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 After authorizing, your browser will try to open a `localhost` page that fails to load — that\'s expected here. Copy that URL from the address bar and paste it back as the next message (or just the `code` value). I\'ll delete it from history and finish sign-in.',
   'connect.oauth_invalid_reply': '❌ That does not look like a callback URL or an auth code. After authorizing, paste the `localhost` callback URL from your browser (or the `code` value).',
   'connect.oauth_callback_no_flow': '⚠️ That looks like an OAuth callback URL, but no sign-in is in progress here — I deleted it. Run /connect to start again.',
-  'connect.oauth_success': '✅ `{provider}` connected via OAuth. OpenCode server was not restarted.',
+  'connect.oauth_success': '✅ `{provider}` connected via OAuth. OpenCode server credentials were reloaded.',
   'connect.oauth_failed': '⚠️ OAuth sign-in for `{provider}` didn\'t complete. Run /connect to try again.',
 
   'quit_all.none_active': 'No agents running — nothing to stop.',

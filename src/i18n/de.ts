@@ -265,7 +265,7 @@ export const deDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 Nach der Autorisierung versucht dein Browser, eine `localhost`-Seite zu öffnen, die nicht lädt — das ist hier normal. Kopiere diese URL aus der Adresszeile und sende sie als nächste Nachricht zurück (oder nur den `code`-Wert). Ich lösche sie aus dem Verlauf und schließe die Anmeldung ab.',
   'connect.oauth_invalid_reply': '❌ Das sieht weder nach einer Callback-URL noch nach einem Auth-Code aus. Füge nach der Autorisierung die `localhost`-Callback-URL aus deinem Browser ein (oder den `code`-Wert).',
   'connect.oauth_callback_no_flow': '⚠️ Das sieht nach einer OAuth-Callback-URL aus, aber hier läuft gerade keine Anmeldung — ich habe sie gelöscht. Starte /connect, um erneut zu beginnen.',
-  'connect.oauth_success': '✅ `{provider}` per OAuth verbunden. OpenCode-Server wurde nicht neu gestartet.',
+  'connect.oauth_success': '✅ `{provider}` per OAuth verbunden. Die Zugangsdaten des OpenCode-Servers wurden aktualisiert.',
   'connect.oauth_failed': '⚠️ OAuth-Anmeldung für `{provider}` nicht abgeschlossen. Führe /connect erneut aus.',
   'quit_all.none_active': 'Keine Agenten laufen — nichts zu stoppen.',
   'quit_all.summary': '🚪 {stopped} von {total} aktiven Agenten beendet.',

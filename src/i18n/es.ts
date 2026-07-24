@@ -265,7 +265,7 @@ export const esDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 Tras autorizar, tu navegador intentará abrir una página `localhost` que no cargará — es lo esperado aquí. Copia esa URL de la barra de direcciones y pégala como próximo mensaje (o solo el valor `code`). La eliminaré del historial y completaré el inicio de sesión.',
   'connect.oauth_invalid_reply': '❌ Eso no parece una URL de callback ni un código de autorización. Tras autorizar, pega la URL de callback `localhost` de tu navegador (o el valor `code`).',
   'connect.oauth_callback_no_flow': '⚠️ Eso parece una URL de callback de OAuth, pero aquí no hay ningún inicio de sesión en curso — la eliminé. Ejecuta /connect para empezar de nuevo.',
-  'connect.oauth_success': '✅ `{provider}` conectado vía OAuth. El servidor OpenCode no fue reiniciado.',
+  'connect.oauth_success': '✅ `{provider}` conectado vía OAuth. Las credenciales del servidor OpenCode se actualizaron.',
   'connect.oauth_failed': '⚠️ El inicio de sesión OAuth para `{provider}` no se completó. Ejecuta /connect de nuevo.',
   'quit_all.none_active': 'No hay agentes en ejecución — nada que detener.',
   'quit_all.summary': '🚪 Detenidos {stopped} de {total} agentes activos.',

@@ -265,7 +265,7 @@ export const jaDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 承認後、ブラウザは読み込みに失敗する `localhost` ページを開こうとします — ここではそれが正常です。そのURLをアドレスバーからコピーして、次のメッセージとして貼り付けてください（または `code` の値だけでも構いません）。履歴から削除してサインインを完了します。',
   'connect.oauth_invalid_reply': '❌ これはコールバックURLにも認証コードにも見えません。承認後、ブラウザから `localhost` のコールバックURL（または `code` の値）を貼り付けてください。',
   'connect.oauth_callback_no_flow': '⚠️ これは OAuth コールバックURLのようですが、ここでは現在サインインが進行していません — 削除しました。/connect を実行してもう一度始めてください。',
-  'connect.oauth_success': '✅ `{provider}` を OAuth で接続しました。OpenCode サーバーは再起動されませんでした。',
+  'connect.oauth_success': '✅ `{provider}` を OAuth で接続しました。OpenCode サーバーの認証情報を再読み込みしました。',
   'connect.oauth_failed': '⚠️ `{provider}` の OAuth サインインが完了しませんでした。/connect をもう一度実行してください。',
   'quit_all.none_active': '実行中のエージェントがいません — 停止するものはありません。',
   'quit_all.summary': '🚪 アクティブなエージェント {total} 件中 {stopped} 件を終了しました。',

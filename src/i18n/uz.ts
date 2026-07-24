@@ -265,7 +265,7 @@ export const uzDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 Tasdiqlagandan so‘ng brauzeringiz yuklanmaydigan `localhost` sahifasini ochishga urinadi — bu yerda bu normal holat. O‘sha URL manzilini manzil satridan nusxalab, keyingi xabar sifatida joylang (yoki faqat `code` qiymatini). Men uni tarixdan o‘chiraman va kirishni yakunlayman.',
   'connect.oauth_invalid_reply': '❌ Bu na callback URL ga, na avtorizatsiya kodiga o‘xshaydi. Tasdiqlagandan so‘ng brauzeringizdan `localhost` callback URL manzilini joylang (yoki `code` qiymatini).',
   'connect.oauth_callback_no_flow': '⚠️ Bu OAuth callback URL ga o‘xshaydi, lekin hozir bu yerda kirish jarayoni yo‘q — men uni o‘chirdim. Qaytadan boshlash uchun /connect ni ishga tushiring.',
-  'connect.oauth_success': '✅ `{provider}` OAuth orqali ulandi. OpenCode server qayta ishga tushirilmadi.',
+  'connect.oauth_success': '✅ `{provider}` OAuth orqali ulandi. OpenCode server credentiallari yangilandi.',
   'connect.oauth_failed': '⚠️ `{provider}` uchun OAuth kirish yakunlanmadi. /connect ni qayta ishga tushiring.',
   'quit_all.none_active': 'Ishlayotgan agentlar yo‘q — to‘xtatishga hech narsa yo‘q.',
   'quit_all.summary': '🚪 {total} faol agentdan {stopped} to‘xtatildi.',

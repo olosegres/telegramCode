@@ -265,7 +265,7 @@ export const frDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 Après autorisation, votre navigateur tentera d\'ouvrir une page `localhost` qui ne se chargera pas — c\'est normal ici. Copiez cette URL depuis la barre d\'adresse et collez-la comme prochain message (ou juste la valeur `code`). Je la supprimerai de l\'historique et terminerai la connexion.',
   'connect.oauth_invalid_reply': '❌ Cela ne ressemble ni à une URL de callback ni à un code d\'autorisation. Après autorisation, collez l\'URL de callback `localhost` depuis votre navigateur (ou la valeur `code`).',
   'connect.oauth_callback_no_flow': '⚠️ Cela ressemble à une URL de callback OAuth, mais aucune connexion n\'est en cours ici — je l\'ai supprimée. Lancez /connect pour recommencer.',
-  'connect.oauth_success': '✅ `{provider}` connecté via OAuth. Le serveur OpenCode n\'a pas été redémarré.',
+  'connect.oauth_success': '✅ `{provider}` connecté via OAuth. Les identifiants du serveur OpenCode ont été actualisés.',
   'connect.oauth_failed': '⚠️ La connexion OAuth pour `{provider}` ne s\'est pas terminée. Relance /connect.',
   'quit_all.none_active': 'Aucun agent en cours — rien à arrêter.',
   'quit_all.summary': '🚪 {stopped} sur {total} agents actifs arrêtés.',

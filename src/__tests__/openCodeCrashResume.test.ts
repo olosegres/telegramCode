@@ -142,6 +142,20 @@ function createAdapter(sessionExists: boolean): {
 }
 
 describe('OpenCode crash-resume in restartServer', () => {
+  it('reloadProviderAuth forces a controlled restart so a live server reloads its credential', async () => {
+    const adapter = new OpenCodeAdapter();
+    let isForcedRestart = false;
+    adapter['restartServer'] = async (force = false) => {
+      isForcedRestart = force;
+      return true;
+    };
+
+    const result = await adapter.reloadProviderAuth();
+
+    assert.equal(result, true);
+    assert.equal(isForcedRestart, true, 'OAuth credential reload must stop a healthy server generation');
+  });
+
   it('crash → restart OK → GET /session/:id issued, session stays active with the SAME id, restored notice, NO closed', async () => {
     const { adapter, outputs, closedKeys, getSessionRequests } = createAdapter(true);
 

@@ -1847,7 +1847,15 @@ async function onOpenCodeOAuthExit(
   pendingOpenCodeOAuth.delete(k);
   const authed = await readOpenCodeProviderAuthed(pending.providerId);
   if (checkIsOpenCodeOAuthSucceeded({ exitCode, authed })) {
-    await replyToThread(key, t('connect.oauth_success', { provider: pending.providerId }));
+    const adapter = getAdapter('opencode');
+    const isProviderAuthReloaded = adapter.reloadProviderAuth
+      ? await adapter.reloadProviderAuth()
+      : false;
+    if (isProviderAuthReloaded) {
+      await replyToThread(key, t('connect.oauth_success', { provider: pending.providerId }));
+    } else {
+      await replyToThread(key, t('connect.oauth_failed', { provider: pending.providerId }));
+    }
   } else {
     await replyToThread(key, t('connect.oauth_failed', { provider: pending.providerId }));
   }

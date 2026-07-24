@@ -269,7 +269,7 @@ export const ruDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 После подтверждения браузер попробует открыть страницу `localhost`, которая не загрузится — это нормально. Скопируй этот URL из адресной строки и пришли следующим сообщением (или только значение `code`). Я удалю его из истории и завершу вход.',
   'connect.oauth_invalid_reply': '❌ Это не похоже ни на callback-URL, ни на код авторизации. После подтверждения пришли `localhost`-callback URL из браузера (или значение `code`).',
   'connect.oauth_callback_no_flow': '⚠️ Похоже на OAuth callback-URL, но сейчас вход не выполняется — я его удалил. Запусти /connect, чтобы начать заново.',
-  'connect.oauth_success': '✅ `{provider}` подключён через OAuth. Сервер OpenCode не перезапускался.',
+  'connect.oauth_success': '✅ `{provider}` подключён через OAuth. Учётные данные сервера OpenCode обновлены.',
   'connect.oauth_failed': '⚠️ Вход через OAuth для `{provider}` не завершён. Запустите /connect ещё раз.',
   'quit_all.none_active': 'Нет активных агентов — нечего останавливать.',
   'quit_all.summary': '🚪 Завершено {stopped} из {total} активных агентов.',

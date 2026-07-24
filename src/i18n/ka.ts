@@ -265,7 +265,7 @@ export const kaDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 ავტორიზაციის შემდეგ თქვენი ბრაუზერი შეეცდება გახსნას `localhost` გვერდი, რომელიც ვერ ჩაიტვირთება — აქ ეს მოსალოდნელია. დააკოპირეთ ეს URL მისამართის ზოლიდან და ჩასვით შემდეგ შეტყობინებად (ან მხოლოდ `code` მნიშვნელობა). მე წავშლი მას ისტორიიდან და დავასრულებ შესვლას.',
   'connect.oauth_invalid_reply': '❌ ეს არც callback URL-ს ჰგავს და არც ავტორიზაციის კოდს. ავტორიზაციის შემდეგ ჩასვით `localhost` callback URL თქვენი ბრაუზერიდან (ან `code` მნიშვნელობა).',
   'connect.oauth_callback_no_flow': '⚠️ ეს OAuth callback URL-ს ჰგავს, მაგრამ აქ ამჟამად შესვლა არ მიმდინარეობს — მე წავშალე იგი. თავიდან დასაწყებად გაუშვით /connect.',
-  'connect.oauth_success': '✅ `{provider}` დაკავშირდა OAuth-ით. OpenCode სერვერი არ გადატვირთულა.',
+  'connect.oauth_success': '✅ `{provider}` დაკავშირდა OAuth-ით. OpenCode სერვერის რწმუნებათა მონაცემები განახლდა.',
   'connect.oauth_failed': '⚠️ `{provider}`-ის OAuth შესვლა არ დასრულდა. ხელახლა გაუშვით /connect.',
   'quit_all.none_active': 'აგენტები არ არის გაშვებული — გასაჩერებელი არაფერია.',
   'quit_all.summary': '🚪 გაჩერდა {stopped} / {total} აქტიური აგენტი.',

@@ -265,7 +265,7 @@ export const hiDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 अधिकृत करने के बाद, आपका ब्राउज़र एक `localhost` पेज खोलने की कोशिश करेगा जो लोड नहीं होगा — यहाँ यह अपेक्षित है। उस URL को एड्रेस बार से कॉपी करें और अगले संदेश के रूप में पेस्ट करें (या केवल `code` मान)। मैं इसे इतिहास से हटा दूँगा और साइन-इन पूरा करूँगा।',
   'connect.oauth_invalid_reply': '❌ यह न तो callback URL जैसा लगता है और न ही auth code जैसा। अधिकृत करने के बाद, अपने ब्राउज़र से `localhost` callback URL (या `code` मान) पेस्ट करें।',
   'connect.oauth_callback_no_flow': '⚠️ यह OAuth callback URL जैसा लगता है, लेकिन यहाँ कोई साइन-इन प्रगति में नहीं है — मैंने इसे हटा दिया। फिर से शुरू करने के लिए /connect चलाएँ।',
-  'connect.oauth_success': '✅ `{provider}` OAuth के माध्यम से कनेक्ट हुआ। OpenCode सर्वर पुनः प्रारंभ नहीं हुआ।',
+  'connect.oauth_success': '✅ `{provider}` OAuth के माध्यम से कनेक्ट हुआ। OpenCode सर्वर के क्रेडेंशियल फिर से लोड किए गए।',
   'connect.oauth_failed': '⚠️ `{provider}` के लिए OAuth साइन-इन पूरा नहीं हुआ। /connect फिर से चलाएँ।',
   'quit_all.none_active': 'कोई एजेंट नहीं चल रहा — रोकने के लिए कुछ नहीं।',
   'quit_all.summary': '🚪 {total} में से {stopped} सक्रिय एजेंट बंद किए।',

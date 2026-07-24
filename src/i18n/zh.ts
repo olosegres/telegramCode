@@ -265,7 +265,7 @@ export const zhDict: Record<string, string> = {
   'connect.oauth_loopback': '🔑 授权后，你的浏览器会尝试打开一个无法加载的 `localhost` 页面——这在这里是正常的。请从地址栏复制该 URL 并作为下一条消息粘贴回来（或仅粘贴 `code` 值）。我会将其从历史记录中删除并完成登录。',
   'connect.oauth_invalid_reply': '❌ 这看起来既不像回调 URL，也不像授权码。授权后，请从浏览器粘贴 `localhost` 回调 URL（或 `code` 值）。',
   'connect.oauth_callback_no_flow': '⚠️ 这看起来像是一个 OAuth 回调 URL，但这里当前没有正在进行的登录——我已将其删除。请运行 /connect 重新开始。',
-  'connect.oauth_success': '✅ `{provider}` 已通过 OAuth 连接。OpenCode 服务器未重启。',
+  'connect.oauth_success': '✅ `{provider}` 已通过 OAuth 连接。OpenCode 服务器凭据已重新加载。',
   'connect.oauth_failed': '⚠️ `{provider}` 的 OAuth 登录未完成。请再次运行 /connect。',
   'quit_all.none_active': '没有运行中的代理 — 无需停止。',
   'quit_all.summary': '🚪 已停止 {stopped}/{total} 个活跃代理。',

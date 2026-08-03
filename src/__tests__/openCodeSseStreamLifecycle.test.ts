@@ -281,6 +281,27 @@ describe('scheduler MCP registration per directory on session start (plan 2026-0
     assert.equal(calls.length, 1, 'idempotent — the dir Set prevents a re-POST');
   });
 
+  it('registers reattached sessions after scheduler injection becomes available', async () => {
+    const adapter = createAdapter();
+    const keyA: ThreadKey = { chatId: -100, threadId: 1 };
+    adapter['sessions'].set(keyToString(keyA), makeSession(keyA, 'ses_A', sharedDir));
+    const calls: string[] = [];
+    adapter['apiRequest'] = (async (_method: string, url: string) => {
+      calls.push(url);
+    }) as OpenCodeAdapter['apiRequest'];
+
+    // A bot restart restores sessions before its scheduler listener is started.
+    adapter['connectSse'](keyA);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 0, 'inert injection cannot register during reattach');
+
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    adapter.registerSchedulerMcpForActiveSessions();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(calls, [`/mcp?directory=${encodeURIComponent(sharedDir)}`]);
+  });
+
   it('clearing the dir Set (what restartServer does) makes the next connect re-register (S4)', async () => {
     configureSchedulerMcpInjection({ getSecret: async () => secret, port });
     const adapter = createAdapter();

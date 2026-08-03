@@ -2326,6 +2326,18 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
+   * Re-register active directories once the bot scheduler listener is ready.
+   * Reattached sessions connect before that listener starts during bot boot.
+   */
+  registerSchedulerMcpForActiveSessions(): void {
+    for (const session of this.sessions.values()) {
+      if (session.isActive) {
+        void this.registerSchedulerMcpForDirectory(session.workDir);
+      }
+    }
+  }
+
+  /**
    * @description Mark a session inactive and tear down the global SSE stream IFF
    * it was the LAST active session anywhere. The stream is reference-counted by
    * the TOTAL active-session count (recomputed from `this.sessions` so it can

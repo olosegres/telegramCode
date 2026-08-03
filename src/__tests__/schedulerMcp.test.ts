@@ -117,11 +117,13 @@ describe('getSchedulerMcpPort', () => {
     if (original === undefined) delete process.env.SCHEDULER_MCP_PORT;
     else process.env.SCHEDULER_MCP_PORT = original;
   });
-  it('defaults when unset / invalid, reads a valid value', () => {
+  it('uses an ephemeral port when unset / invalid, and accepts explicit ports', () => {
     delete process.env.SCHEDULER_MCP_PORT;
     assert.equal(getSchedulerMcpPort(), defaultSchedulerMcpPort);
     process.env.SCHEDULER_MCP_PORT = 'nope';
     assert.equal(getSchedulerMcpPort(), defaultSchedulerMcpPort);
+    process.env.SCHEDULER_MCP_PORT = '0';
+    assert.equal(getSchedulerMcpPort(), 0);
     process.env.SCHEDULER_MCP_PORT = '5099';
     assert.equal(getSchedulerMcpPort(), 5099);
   });

@@ -10501,6 +10501,7 @@ export async function startBot(): Promise<void> {
       getSecret: () => state.getSchedulerMcpSecret(),
       port: boundPort,
     });
+    getAdapter('opencode').registerSchedulerMcpForActiveSessions?.();
     console.log(`[scheduler] MCP server listening on 127.0.0.1:${boundPort}`);
   } catch (e) {
     // Port busy / bind failure: keep booting WITHOUT the scheduler MCP server.

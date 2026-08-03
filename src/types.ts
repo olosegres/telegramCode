@@ -669,6 +669,13 @@ export interface AgentAdapter extends EventEmitter {
    */
   checkIsBusy?(key: ThreadKey): boolean;
 
+  /**
+   * Re-register the bot-owned scheduler MCP for active OpenCode directories.
+   * This is needed after the scheduler listener becomes available following a
+   * bot restart, because session reattachment happens earlier in boot.
+   */
+  registerSchedulerMcpForActiveSessions?(): void;
+
   // — Input —
 
   sendInput(key: ThreadKey, input: string, options?: SendInputOptions): void;

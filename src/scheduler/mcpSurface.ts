@@ -36,8 +36,11 @@ import type { ScheduleRecord, ScheduleSpec } from './types';
  * {@link resolveTargetThreadKey}) and can only touch that thread's jobs.
  */
 
-/** Default loopback port for the scheduler MCP server; overridable via `SCHEDULER_MCP_PORT`. */
-export const defaultSchedulerMcpPort = 4097;
+/**
+ * Default loopback port for the scheduler MCP server. Zero asks the OS for a
+ * free ephemeral port, so independent bot instances never compete for 4097.
+ */
+export const defaultSchedulerMcpPort = 0;
 
 /** HTTP path the streamable transport is served on (matches the injected `--mcp-config` url, S6). */
 export const schedulerMcpPath = '/mcp';
@@ -83,7 +86,9 @@ export function getSchedulerMcpPort(): number {
   const raw = process.env.SCHEDULER_MCP_PORT;
   if (!raw) return defaultSchedulerMcpPort;
   const parsed = Number(raw);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : defaultSchedulerMcpPort;
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 65535
+    ? parsed
+    : defaultSchedulerMcpPort;
 }
 
 /** Serialise a scope to its canonical cleartext form (the string the HMAC signs). */

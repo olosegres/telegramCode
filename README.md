@@ -492,7 +492,7 @@ before launch if your chosen providers need them.
 | `OPENAI_API_KEY` | — | You intentionally use OpenAI Whisper as the voice fallback instead of Groq |
 | `ANTHROPIC_API_KEY` | — | A custom MCP/OpenCode plugin/auth resolver explicitly reads it; not needed for normal Claude CLI auth. The json-stream Claude backend strips it from the agent's env (subscription billing) |
 | `SHELL` | `/bin/bash` | You want `/terminal` to open a different shell than your login shell (host env var, not set by the bot) |
-| `SCHEDULER_MCP_PORT` | `4097` | The default collides with another local port, including this instance's `OPENCODE_URL` port |
+| `SCHEDULER_MCP_PORT` | an OS-chosen free loopback port | You need a stable, explicitly chosen port; it must differ from this instance's `OPENCODE_URL` port |
 | `CLAUDE_SCRAPE_DEBUG` | off | You are debugging Claude tmux scraping and need full RAW/FILTERED chunks |
 
 > `WORK_DIR` (1.x) is retired. Use the wrapper from the desired parent folder
@@ -502,8 +502,8 @@ before launch if your chosen providers need them.
 
 The bot injects its own `telegramBot` MCP server into every bot-started session
 — for Claude via a generated `--mcp-config`, for OpenCode via runtime
-registration. It is loopback-only (`127.0.0.1`, port `SCHEDULER_MCP_PORT`,
-default `4097` — that is all this env var is) and authenticated with per-session
+registration. It is loopback-only (`127.0.0.1`, on an OS-chosen free port unless
+`SCHEDULER_MCP_PORT` explicitly pins one) and authenticated with per-session
 HMAC bearer tokens scoped to the thread / directory. It exposes:
 
 - `schedule_create` / `schedule_list` / `schedule_cancel` — the agent-side
@@ -515,6 +515,10 @@ This server is bot-owned plumbing; if its port fails to bind, the bot still
 boots — only these agent-facing tools go inert. (Your own MCP servers still work
 independently: Claude auto-loads them from `~/.claude/settings.json` and a
 project's `.mcp.json`; inspect what's active in a thread with `/mcp`.)
+
+Third-party OpenCode MCP servers, including a separate `telegram-mcp`, belong to
+the OpenCode configuration of the Linux user that runs the bot. They are not
+injected by TelegramCode; run `opencode mcp list` as that user to verify them.
 
 ## Two instances on one host
 
@@ -528,7 +532,7 @@ Each pair of variables below must differ to avoid silent corruption:
 | `WORK_ROOT` | Each instance manages its subtree; sharing → tmux name collisions |
 | `DATA_DIR` | `state.json` / `mcp.json` / `threads/` per instance; sharing → corrupted JSON |
 | `OPENCODE_URL` port | OpenCode server binds the port; second start fails with `EADDRINUSE` and you'd silently share sessions |
-| `SCHEDULER_MCP_PORT` | Scheduler MCP binds a local port inside the same bot process; it must differ from that instance's `OPENCODE_URL` port |
+| `SCHEDULER_MCP_PORT` | Optional stable scheduler-MCP port; if set, it must differ from that instance's `OPENCODE_URL` port |
 
 The shipped compose uses OpenCode ports `4096` (pet) and `4097` (work),
 with scheduler MCP on `4097` (pet) and `4107` (work). If you run

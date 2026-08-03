@@ -2933,7 +2933,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         break;
 
       case 'session.error':
-        this.handleSessionError(key, event.properties);
+        this.handleSessionError(key, eventSessionId, event.properties);
         break;
 
       case 'permission.asked':
@@ -3757,10 +3757,23 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     session.isCompacting = value;
   }
 
-  private handleSessionError(key: ThreadKey, properties: Record<string, unknown>): void {
+  private handleSessionError(key: ThreadKey, eventSessionId: string | null, properties: Record<string, unknown>): void {
     const errorMsg = this.extractErrorMessage(properties.error);
     console.error(`[OpenCode] Session error:`, errorMsg);
     this.emit('output', key, `OpenCode error: ${errorMsg}`);
+
+    // A PARENT-session error aborts the current turn/generation, so the
+    // delegation the dedicated sub-agent status describes is no longer running:
+    // close it defensively (mirrors the parent-idle / parent-finish closes) so
+    // an error that never reaches a clean idle can't leave the "working" frame
+    // and its self-re-arming tick wedged, flooding the topic (live 2026-08-03).
+    // A CHILD (sub-agent) error must NOT close it — the parent delegation is
+    // still in flight (guarded the same way as `handleSessionIdle`). If an
+    // auto-retry re-delegates, a fresh `subagentStatus{active:true}` re-opens it.
+    const session = this.sessions.get(keyToString(key));
+    if (session?.isActive && (!eventSessionId || eventSessionId === session.sessionId)) {
+      this.closeSubagentStatusOnParentTurnEnd(key);
+    }
 
     // Provider-side API error at the proxy boundary → emit `apiError`. transient
     // / usageLimit arm the auto-retry (the session stays active after

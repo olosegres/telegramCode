@@ -163,6 +163,8 @@ import { buildSubagentOutputPrefix } from './utils/subagentRender';
 import {
   buildSubagentElapsedText,
   getSubagentStatusAction,
+  checkShouldSendSubagentStatus,
+  checkShouldExpireSubagentStatus,
 } from './utils/subagentStatusRender';
 import {
   displayVerbosityModeOptions,
@@ -677,6 +679,18 @@ const claudeBusyOnsetGraceMs = 8_000;
 const subagentTickMs = 10_000;
 
 /**
+ * Hard upper bound on how long a dedicated sub-agent status message may stay
+ * open. A session that dies SERVER-SIDE emits no clean `session.idle` / parent
+ * `message.finish`, so the adapter's defensive close never fires and the
+ * self-re-arming {@link subagentTickMs} timer would otherwise churn the frame
+ * forever, tripping the per-group 429 flood limit and starving the topic (live
+ * incident 2026-08-03). Sub-agent delegations here run ~3 min; 30 min is
+ * generously above any realistic length, so this only ever fires on a genuinely
+ * abandoned frame — never on a healthy in-flight delegation.
+ */
+const subagentStatusMaxAgeMs = 30 * 60 * 1000;
+
+/**
  * Re-fire cadence of the native typing-indicator loader. Telegram's `typing`
  * chat action self-expires after ~5 s, so the sustained loader re-sends it on
  * this interval (comfortably under the expiry) to keep the dots visible for as
@@ -861,6 +875,16 @@ interface ThreadMessageState {
    * armed (no message open). Mirrors {@link livenessTimer}'s lifecycle.
    */
   subagentTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Last text actually pushed to the open sub-agent status message (S1 dedup).
+   * `refreshSubagentStatus` skips the `editMessageText` when the freshly
+   * rendered line equals this — re-editing identical text only earns a
+   * `400 "message is not modified"`, and a stuck/frozen elapsed counter would
+   * otherwise churn that 400 every tick until the per-group 429 flood limit
+   * starves the whole topic (live incident 2026-08-03). `null` on open /
+   * post-clear so the first real edit always lands.
+   */
+  lastSubagentText: string | null;
 }
 
 interface OutputQueueState {
@@ -1972,7 +1996,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, busyOnsetArmedUntil: 0, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, busyOnsetArmedUntil: 0, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null, lastSubagentText: null };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -9071,12 +9095,19 @@ async function refreshSubagentStatus(key: ThreadKey): Promise<void> {
   if (state.subagentStatusMessageId === null) return;
   const elapsedMs = Date.now() - (state.subagentStartedAt ?? Date.now());
   const text = buildSubagentElapsedText(state.subagentTitle, elapsedMs);
-  await editThreadMessage(
+  // S1: never re-send an unchanged edit — an identical elapsed/title only earns
+  // a `400 "message is not modified"` and, when the counter is stuck, floods
+  // the group's send budget into a 429 storm that starves the topic.
+  if (!checkShouldSendSubagentStatus(text, state.lastSubagentText)) return;
+  const sent = await editThreadMessage(
     key,
     state.subagentStatusMessageId,
     renderAgentHtml(text),
     { parse_mode: 'HTML' },
   );
+  // Record only what actually reached Telegram, so a failed edit re-tries the
+  // same text next tick instead of being suppressed by a stale record.
+  if (sent) state.lastSubagentText = text;
 }
 
 /**
@@ -9091,6 +9122,22 @@ function armSubagentTimer(key: ThreadKey, state: ThreadMessageState): void {
   state.subagentTimer = setTimeout(() => {
     state.subagentTimer = null;
     if (state.subagentStatusMessageId === null) return;
+    // S2 safety net: a frame whose owning session is no longer active, or that
+    // has outlived any realistic delegation, is CLOSED instead of re-armed — a
+    // server-side session death emits no clean idle/finish, so without this the
+    // timer would churn the frame forever (live incident 2026-08-03). A silent
+    // death leaves `checkIsActive` true, so the age cap is the load-bearing net.
+    if (
+      checkShouldExpireSubagentStatus({
+        startedAtMs: state.subagentStartedAt,
+        nowMs: Date.now(),
+        maxAgeMs: subagentStatusMaxAgeMs,
+        isOwningSessionActive: getThreadAdapter(key).checkIsActive(key),
+      })
+    ) {
+      clearSubagentStatus(key);
+      return;
+    }
     void withThreadLocale(key, () => refreshSubagentStatus(key).finally(() => {
       // Re-arm only while the message is still open — a close that landed during
       // the edit nulls the id, so we stop instead of resurrecting the loop.
@@ -9118,6 +9165,7 @@ function clearSubagentStatus(key: ThreadKey): void {
   setSubagentFrameId(key, null);
   state.subagentStartedAt = null;
   state.subagentTitle = null;
+  state.lastSubagentText = null;
   if (id !== null) deleteThreadMessage(key, id).catch(() => {});
 }
 
@@ -9155,6 +9203,9 @@ function handleSubagentStatus(key: ThreadKey, payload: SubagentStatusEvent): voi
       if (action === 'open') {
         state.subagentStartedAt = Date.now();
         state.subagentTitle = payload.title;
+        // Fresh frame — clear the dedup record so the first tick's edit lands
+        // even if it happens to render the same text as a prior (cleared) frame.
+        state.lastSubagentText = null;
         const text = buildSubagentElapsedText(state.subagentTitle, 0);
         const id = await replyToThread(key, renderAgentHtml(text), { parse_mode: 'HTML' });
         if (id === null) return;

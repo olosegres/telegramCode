@@ -80,3 +80,38 @@ export function getSubagentStatusAction(input: {
   if (input.eventActive) return input.hasMessage ? 'refresh' : 'open';
   return input.hasMessage ? 'close' : 'noop';
 }
+
+/**
+ * @description S1 dedup gate for the dedicated sub-agent status edit: should the
+ * freshly rendered line actually be re-sent, given the last text that reached
+ * Telegram? `false` when the text is unchanged — re-editing identical text only
+ * earns a `400 "message is not modified"`, and a stuck/frozen elapsed counter
+ * would otherwise churn that 400 on every refresh until the per-group 429 flood
+ * limit starves the whole topic (live incident 2026-08-03). A `null` last text
+ * (fresh open / post-clear) always sends.
+ */
+export function checkShouldSendSubagentStatus(nextText: string, lastText: string | null): boolean {
+  return nextText !== lastText;
+}
+
+/**
+ * @description S2 hard safety net for the dedicated sub-agent status tick:
+ * should the frame be CLOSED (instead of re-arming the elapsed-tick timer)?
+ * `true` when the owning session is no longer active, OR the frame has outlived
+ * any realistic delegation (`maxAgeMs`). A session that dies server-side emits
+ * no clean idle/finish, so the adapter's defensive close never fires and the
+ * self-re-arming timer would otherwise live forever churning the topic (live
+ * 2026-08-03). A `null` `startedAtMs` (should never happen while a message is
+ * open) is treated as "just started", so a transient race can never force-close
+ * an otherwise healthy frame on the age branch.
+ */
+export function checkShouldExpireSubagentStatus(input: {
+  startedAtMs: number | null;
+  nowMs: number;
+  maxAgeMs: number;
+  isOwningSessionActive: boolean;
+}): boolean {
+  if (!input.isOwningSessionActive) return true;
+  const startedAt = input.startedAtMs ?? input.nowMs;
+  return input.nowMs - startedAt > input.maxAgeMs;
+}

@@ -13,6 +13,8 @@ import {
   formatElapsed,
   buildSubagentElapsedText,
   getSubagentStatusAction,
+  checkShouldSendSubagentStatus,
+  checkShouldExpireSubagentStatus,
 } from '../utils/subagentStatusRender';
 
 describe('formatElapsed — m:ss with two-digit seconds', () => {
@@ -72,5 +74,69 @@ describe('getSubagentStatusAction — lifecycle truth table', () => {
 
   it('inactive + no message → noop (defensive close is idempotent)', () => {
     assert.equal(getSubagentStatusAction({ hasMessage: false, eventActive: false }), 'noop');
+  });
+});
+
+describe('checkShouldSendSubagentStatus — S1 dedup gate', () => {
+  it('identical text → false (skip the edit, no 400 "not modified" churn)', () => {
+    assert.equal(checkShouldSendSubagentStatus('🤖 sub-agent: X · 3:21', '🤖 sub-agent: X · 3:21'), false);
+  });
+
+  it('changed elapsed → true (a real m:ss tick still lands)', () => {
+    assert.equal(checkShouldSendSubagentStatus('🤖 sub-agent: X · 3:31', '🤖 sub-agent: X · 3:21'), true);
+  });
+
+  it('changed title → true (a title upgrade still lands)', () => {
+    assert.equal(checkShouldSendSubagentStatus('🤖 sub-agent: Y · 0:10', '🤖 sub-agent: X · 0:10'), true);
+  });
+
+  it('null last text (fresh open / post-clear) → true (always send the first edit)', () => {
+    assert.equal(checkShouldSendSubagentStatus('🤖 sub-agent: X · 0:10', null), true);
+  });
+});
+
+describe('checkShouldExpireSubagentStatus — S2 close-instead-of-rearm gate', () => {
+  const maxAgeMs = 30 * 60 * 1000;
+
+  it('owning session inactive → true (close even when young)', () => {
+    assert.equal(
+      checkShouldExpireSubagentStatus({ startedAtMs: 1000, nowMs: 2000, maxAgeMs, isOwningSessionActive: false }),
+      true,
+    );
+  });
+
+  it('active + within the age cap → false (keep ticking)', () => {
+    assert.equal(
+      checkShouldExpireSubagentStatus({ startedAtMs: 0, nowMs: maxAgeMs - 1, maxAgeMs, isOwningSessionActive: true }),
+      false,
+    );
+  });
+
+  it('active + exactly at the age cap → false (strict `>` boundary)', () => {
+    assert.equal(
+      checkShouldExpireSubagentStatus({ startedAtMs: 0, nowMs: maxAgeMs, maxAgeMs, isOwningSessionActive: true }),
+      false,
+    );
+  });
+
+  it('active + past the age cap → true (bounds a silent server-side death)', () => {
+    assert.equal(
+      checkShouldExpireSubagentStatus({ startedAtMs: 0, nowMs: maxAgeMs + 1, maxAgeMs, isOwningSessionActive: true }),
+      true,
+    );
+  });
+
+  it('null startedAt + active → false (treated as just-started, never force-closes a healthy frame)', () => {
+    assert.equal(
+      checkShouldExpireSubagentStatus({ startedAtMs: null, nowMs: 5_000_000, maxAgeMs, isOwningSessionActive: true }),
+      false,
+    );
+  });
+
+  it('null startedAt + inactive → true (the inactive check wins before the age branch)', () => {
+    assert.equal(
+      checkShouldExpireSubagentStatus({ startedAtMs: null, nowMs: 5_000_000, maxAgeMs, isOwningSessionActive: false }),
+      true,
+    );
   });
 });

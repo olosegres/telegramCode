@@ -279,7 +279,14 @@ config/variants, not a per-message API field).
   per-session thread/dir-scoped HMAC tokens) into EVERY bot-started session —
   Claude via a bot-generated `--mcp-config` file (thread-scoped), OpenCode via
   runtime `POST /mcp?directory=` (dir-scoped, re-registered after a server
-  restart). This server exposes the `schedule_*` tools plus `send_file_to_user`
+  restart AND self-healed on every BOT boot: `reconcileSchedulerMcpForActiveSessions`
+  reads the live `GET /mcp` per active dir and force re-registers any `telegramBot`
+  that is missing or not `connected` — opencode does NOT auto-reconnect a remote
+  MCP dropped during the bot-restart gap, which otherwise stranded every dir's
+  tools; fire-and-forget so boot never blocks on opencode). The scheduler MCP
+  listen port is OS-ephemeral by default but PERSISTED in `state.json`
+  (`schedulerMcpPort`) and reused across restarts so injected URLs stay valid
+  (env `SCHEDULER_MCP_PORT` pins it and wins). This server exposes the `schedule_*` tools plus `send_file_to_user`
   (agent→user file/image send into the topic, dir/thread-scoped exactly like the
   `schedule_*` tools — no new server/port/token/injection) and is bot-owned
   plumbing; it is NOT part of the user-editable `/mcp` hierarchy and never

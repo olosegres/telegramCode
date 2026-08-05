@@ -23,7 +23,7 @@ import { t, runWithLocale, defaultLocale } from '../i18n';
 import { formatResumeContext, resumeContextTurnLimit } from '../resumeContext';
 import { stripThreadContextPreamble } from '../threadContextPreamble';
 import { getOpenQuestionForSession } from '../openCodeOpenQuestion';
-import { buildOpenCodeSchedulerMcpRegistration } from '../scheduler/injection';
+import { buildOpenCodeSchedulerMcpRegistration, schedulerMcpServerName } from '../scheduler/injection';
 import {
   buildSessionTitleSnippet,
   checkIsMeaningfulPrompt,
@@ -879,6 +879,23 @@ export function checkIsValidProviderId(providerId: string): boolean {
 
 export function buildProviderAuthPath(providerId: string): string {
   return `/auth/${encodeURIComponent(providerId)}`;
+}
+
+/**
+ * @description Pure decision for the boot self-heal: given opencode's live
+ * `GET /mcp` status map (`{ <serverName>: { status, error? }, … }`), does the
+ * bot-owned `telegramBot` server need a (re)registration? True when the entry is
+ * ABSENT (never registered on this server generation) or its `status` is
+ * anything other than `connected` (e.g. `failed` — a stale registration to a
+ * dead port left by a previous bot generation). A malformed/empty response is
+ * treated as "needs register": a redundant POST is a harmless overwrite on the
+ * server, whereas skipping a real failure would leave agents without the tools.
+ */
+export function checkNeedsSchedulerMcpReregister(mcpStatus: unknown): boolean {
+  if (!mcpStatus || typeof mcpStatus !== 'object') return true;
+  const entry = (mcpStatus as Record<string, unknown>)[schedulerMcpServerName];
+  if (!entry || typeof entry !== 'object') return true;
+  return (entry as Record<string, unknown>).status !== 'connected';
 }
 
 export function buildProviderApiAuthPayload(apiKey: string): Record<string, string> {
@@ -2334,6 +2351,59 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       if (session.isActive) {
         void this.registerSchedulerMcpForDirectory(session.workDir);
       }
+    }
+  }
+
+  /**
+   * @description Boot self-heal for the adopt path. When the bot restarts and
+   * ADOPTS an already-running opencode (the server outlived the bot), that
+   * server still holds the PREVIOUS bot generation's `telegramBot` registration
+   * pointing at a now-dead ephemeral port — so every session in the directory
+   * reports the MCP `failed` and loses its scheduling / file-send tools. For
+   * each active session's directory (de-duped — a folder can host several
+   * threads), read the LIVE `GET /mcp` status and, when the `telegramBot` entry
+   * is missing or not `connected`, drop the Set gate and force a fresh POST (the
+   * server overwrites a same-name registration with the current port). A dir
+   * already `connected` is left untouched. Best-effort per directory: a read /
+   * registration error is logged and swallowed — it must never throw out of
+   * boot. Supersedes {@link registerSchedulerMcpForActiveSessions} at the boot
+   * call site (a not-yet-registered dir has no entry → treated as needing one).
+   */
+  async reconcileSchedulerMcpForActiveSessions(): Promise<void> {
+    const directories = new Set<string>();
+    for (const session of this.sessions.values()) {
+      if (session.isActive) directories.add(session.workDir);
+    }
+    // Reconcile every directory concurrently so one slow/unresponsive dir can't
+    // delay the others; each is best-effort (never rejects), so allSettled is
+    // just a join point.
+    await Promise.allSettled(
+      Array.from(directories, (directory) => this.reconcileSchedulerMcpForDirectory(directory)),
+    );
+  }
+
+  /**
+   * @description Reconcile ONE directory: read the live `GET /mcp` status and,
+   * when `telegramBot` is missing or not `connected`, drop the Set gate and
+   * force a fresh POST. Best-effort — a read/registration error is logged and
+   * swallowed so it never rejects out of {@link reconcileSchedulerMcpForActiveSessions}.
+   */
+  private async reconcileSchedulerMcpForDirectory(directory: string): Promise<void> {
+    try {
+      const mcpStatus = await this.apiRequest<unknown>(
+        'GET',
+        buildDirectoryScopedPath('/mcp', directory),
+      );
+      if (!checkNeedsSchedulerMcpReregister(mcpStatus)) return;
+      // The live server contradicts the Set gate (stale entry from a prior
+      // generation): clear it so the re-POST actually fires.
+      this.registeredSchedulerMcpDirs.delete(directory);
+      await this.registerSchedulerMcpForDirectory(directory);
+    } catch (e) {
+      console.warn(
+        `[OpenCode] scheduler MCP reconcile failed for ${directory}:`,
+        e instanceof Error ? e.message : e,
+      );
     }
   }
 

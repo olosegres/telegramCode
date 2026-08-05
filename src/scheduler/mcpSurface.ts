@@ -91,6 +91,24 @@ export function getSchedulerMcpPort(): number {
     : defaultSchedulerMcpPort;
 }
 
+/**
+ * @description Resolve the scheduler MCP listen port with a fixed precedence:
+ * an explicit env port (`SCHEDULER_MCP_PORT`, a non-zero {@link getSchedulerMcpPort})
+ * WINS; else the port persisted from a prior boot (so an ephemeral port, once
+ * chosen, is reused — the registrations injected into agent sessions point at
+ * it, and an ephemeral port changing every restart would orphan them); else `0`
+ * (ask the OS for a fresh ephemeral port). A persisted `0` / non-positive value
+ * is ignored (nothing worth reusing).
+ */
+export function resolveSchedulerMcpPort(
+  envPort: number,
+  persistedPort: number | undefined,
+): number {
+  if (envPort !== defaultSchedulerMcpPort) return envPort;
+  if (persistedPort !== undefined && persistedPort > 0) return persistedPort;
+  return defaultSchedulerMcpPort;
+}
+
 /** Serialise a scope to its canonical cleartext form (the string the HMAC signs). */
 export function serializeSchedulerScope(scope: SchedulerScope): string {
   return scope.kind === 'thread' ? `thread:${scope.threadKey}` : `dir:${scope.directory}`;
@@ -707,14 +725,39 @@ export function createSchedulerMcpServer(deps: SchedulerMcpDeps): SchedulerMcpHa
         }
         writeJsonRpcError(res, 404, -32601, 'Not found');
       });
-      server.on('error', reject);
-      server.listen(requestedPort, '127.0.0.1', () => {
+
+      let retriedEphemeral = false;
+
+      const handleListening = (): void => {
         const address = server.address();
         if (address && typeof address === 'object') boundPort = address.port;
         httpServer = server;
-        server.off('error', reject);
+        server.off('error', handleError);
         resolve();
-      });
+      };
+
+      const handleError = (error: NodeJS.ErrnoException): void => {
+        // A non-zero requested port already in use (a persisted port a prior
+        // generation still holds, or a sibling instance) must not wedge boot:
+        // retry ONCE on an ephemeral port. Port 0 can never hit EADDRINUSE.
+        if (error.code === 'EADDRINUSE' && requestedPort !== 0 && !retriedEphemeral) {
+          retriedEphemeral = true;
+          // Track the server before the retry so a stop() in the retry window
+          // still closes the eventually-bound listener (no orphan).
+          httpServer = server;
+          console.warn(
+            `[scheduler-mcp] requested port ${requestedPort} is in use; falling back to an ephemeral port`,
+          );
+          server.listen(0, '127.0.0.1');
+          return;
+        }
+        server.off('listening', handleListening);
+        reject(error);
+      };
+
+      server.on('listening', handleListening);
+      server.on('error', handleError);
+      server.listen(requestedPort, '127.0.0.1');
     });
   }
 

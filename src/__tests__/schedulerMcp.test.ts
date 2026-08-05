@@ -37,17 +37,65 @@ import {
   serializeSchedulerScope,
   parseSchedulerScope,
   getSchedulerMcpPort,
+  resolveSchedulerMcpPort,
   defaultSchedulerMcpPort,
   type SchedulerScope,
   type SchedulerMcpHandle,
   type SchedulerMcpDeps,
 } from '../scheduler/mcpSurface';
+import { createServer } from 'node:http';
 import type { ScheduleRecord } from '../scheduler/types';
 
 const secret = 'a'.repeat(64);
 const threadAKey = keyToString({ chatId: -1001234567890, threadId: 11 });
 const threadBKey = keyToString({ chatId: -1001234567890, threadId: 22 });
 const nowMs = new Date(2026, 5, 6, 10, 0, 0).getTime();
+
+// ─── port resolution + reuse ─────────────────────────────────────────
+
+describe('resolveSchedulerMcpPort', () => {
+  it('an explicit env port wins over a persisted one', () => {
+    assert.equal(resolveSchedulerMcpPort(4107, 5555), 4107);
+  });
+  it('reuses the persisted port when no env override is set', () => {
+    assert.equal(resolveSchedulerMcpPort(defaultSchedulerMcpPort, 5555), 5555);
+  });
+  it('falls back to ephemeral (0) when neither env nor a persisted port exist', () => {
+    assert.equal(resolveSchedulerMcpPort(defaultSchedulerMcpPort, undefined), defaultSchedulerMcpPort);
+  });
+  it('ignores a non-positive persisted port', () => {
+    assert.equal(resolveSchedulerMcpPort(defaultSchedulerMcpPort, 0), defaultSchedulerMcpPort);
+  });
+});
+
+describe('createSchedulerMcpServer port binding', () => {
+  it('falls back to an ephemeral port when the requested port is already in use', async () => {
+    // Occupy a port with a throwaway server, then ask the scheduler server for
+    // that same port: it must NOT reject boot — it retries on an ephemeral one.
+    const blocker = createServer(() => {});
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', () => resolve()));
+    const takenPort = (blocker.address() as { port: number }).port;
+
+    const deps: SchedulerMcpDeps = {
+      store: {} as SchedulerMcpDeps['store'],
+      armJob: () => {},
+      disarmJob: () => {},
+      getThreadsForDirectory: () => [],
+      getThreadAdapterName: () => 'claude',
+      getSecret: async () => secret,
+      port: takenPort,
+    };
+    const handle = createSchedulerMcpServer(deps);
+    try {
+      await handle.start();
+      assert.ok(handle.port > 0, 'a port was bound');
+      assert.notEqual(handle.port, takenPort, 'did not bind the occupied port');
+    } finally {
+      await handle.stop();
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+});
 
 // ─── token helpers ───────────────────────────────────────────────────
 

@@ -216,7 +216,12 @@ import { resolveJsonStreamRoot, sweepOrphanJsonStreamDirs } from './utils/jsonSt
 import { RunLedger } from './scheduler/runLedger';
 import { createScheduleDelivery, unboundDeliveryError } from './scheduler/delivery';
 import { createSchedulerEngine, maxTimeoutMs, type SchedulerEngine } from './scheduler/engine';
-import { createSchedulerMcpServer, type SchedulerMcpHandle } from './scheduler/mcpSurface';
+import {
+  createSchedulerMcpServer,
+  getSchedulerMcpPort,
+  resolveSchedulerMcpPort,
+  type SchedulerMcpHandle,
+} from './scheduler/mcpSurface';
 import { configureSchedulerMcpInjection } from './scheduler/injection';
 import { getThreadKeysForDirectory } from './scheduler/directoryThreads';
 import { getRebindResumeAction } from './scheduler/rebindResume';
@@ -10225,6 +10230,10 @@ function wireScheduler(): SchedulerMcpHandle {
     },
     sendFilesToThread,
     getSecret: () => state.getSchedulerMcpSecret(),
+    // Reuse the port persisted from a prior boot (env override wins) so the
+    // `telegramBot` registrations injected into agent sessions keep pointing at
+    // a live port across restarts instead of orphaning on a fresh ephemeral one.
+    port: resolveSchedulerMcpPort(getSchedulerMcpPort(), state.getPersistedSchedulerMcpPort()),
   });
 }
 
@@ -10548,11 +10557,25 @@ export async function startBot(): Promise<void> {
     await schedulerMcpHandle.start();
     schedulerMcpStarted = true;
     const boundPort = schedulerMcpHandle.port;
+    // Persist the actually-bound port so the next boot reuses it (registrations
+    // stay valid). Skip when the operator fixed the port via env (nothing to
+    // reuse) or when it is unchanged (avoid a needless flush).
+    if (getSchedulerMcpPort() === 0 && state.getPersistedSchedulerMcpPort() !== boundPort) {
+      await state.setSchedulerMcpPort(boundPort);
+    }
     configureSchedulerMcpInjection({
       getSecret: () => state.getSchedulerMcpSecret(),
       port: boundPort,
     });
-    getAdapter('opencode').registerSchedulerMcpForActiveSessions?.();
+    // Self-heal: when this boot ADOPTED an already-running opencode, that server
+    // may still hold a `telegramBot` registration from the previous bot
+    // generation pointing at a now-dead port. Reconcile against the live MCP
+    // status and force-refresh any directory that is not `connected`.
+    // Fire-and-forget (like the register call it replaced): boot must not block
+    // on opencode HTTP round-trips before `bot.launch()` (self-heal runs async).
+    getAdapter('opencode').reconcileSchedulerMcpForActiveSessions?.()?.catch((e) =>
+      console.warn('[scheduler] MCP reconcile failed:', e instanceof Error ? e.message : e),
+    );
     console.log(`[scheduler] MCP server listening on 127.0.0.1:${boundPort}`);
   } catch (e) {
     // Port busy / bind failure: keep booting WITHOUT the scheduler MCP server.

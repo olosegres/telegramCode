@@ -23,7 +23,7 @@
 
 import { describe, it, afterEach, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { OpenCodeAdapter } from '../adapters/openCodeAdapter';
+import { OpenCodeAdapter, checkNeedsSchedulerMcpReregister } from '../adapters/openCodeAdapter';
 import { keyToString, type ThreadKey } from '../types';
 import {
   configureSchedulerMcpInjection,
@@ -343,6 +343,70 @@ describe('scheduler MCP registration per directory on session start (plan 2026-0
       false,
       'a failed registration leaves the dir unlatched so a later connect retries',
     );
+  });
+
+  it('reconcile: force re-registers a directory whose telegramBot is not connected (adopt path)', async () => {
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    const adapter = createAdapter();
+    const keyA: ThreadKey = { chatId: -100, threadId: 1 };
+    adapter['sessions'].set(keyToString(keyA), makeSession(keyA, 'ses_A', sharedDir));
+    // A stale Set entry from a prior generation makes the dir LOOK registered;
+    // the live server says otherwise, so reconcile must override the gate.
+    adapter['registeredSchedulerMcpDirs'].add(sharedDir);
+    const posts: string[] = [];
+    adapter['apiRequest'] = (async (method: string, url: string) => {
+      if (method === 'GET') return { telegramBot: { status: 'failed', error: 'Unable to connect' } };
+      if (method === 'POST') posts.push(url);
+      return undefined;
+    }) as OpenCodeAdapter['apiRequest'];
+
+    await adapter.reconcileSchedulerMcpForActiveSessions();
+
+    assert.deepEqual(
+      posts,
+      [`/mcp?directory=${encodeURIComponent(sharedDir)}`],
+      're-POSTed the registration despite the stale Set entry',
+    );
+    assert.equal(adapter['registeredSchedulerMcpDirs'].has(sharedDir), true, 're-latched after re-register');
+  });
+
+  it('reconcile: leaves a connected directory untouched (no POST) and de-dupes shared folders', async () => {
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    const adapter = createAdapter();
+    // Two threads bound to the SAME folder — the reconcile must GET/POST it once.
+    const keyA: ThreadKey = { chatId: -100, threadId: 1 };
+    const keyB: ThreadKey = { chatId: -100, threadId: 2 };
+    adapter['sessions'].set(keyToString(keyA), makeSession(keyA, 'ses_A', sharedDir));
+    adapter['sessions'].set(keyToString(keyB), makeSession(keyB, 'ses_B', sharedDir));
+    const gets: string[] = [];
+    const posts: string[] = [];
+    adapter['apiRequest'] = (async (method: string, url: string) => {
+      if (method === 'GET') { gets.push(url); return { telegramBot: { status: 'connected' } }; }
+      if (method === 'POST') posts.push(url);
+      return undefined;
+    }) as OpenCodeAdapter['apiRequest'];
+
+    await adapter.reconcileSchedulerMcpForActiveSessions();
+
+    assert.equal(gets.length, 1, 'a shared folder is reconciled once, not once per thread');
+    assert.equal(posts.length, 0, 'a connected dir is not re-registered');
+  });
+});
+
+describe('checkNeedsSchedulerMcpReregister', () => {
+  it('needs a register when telegramBot is absent from the status map', () => {
+    assert.equal(checkNeedsSchedulerMcpReregister({ 'telegram-mcp': { status: 'connected' } }), true);
+  });
+  it('needs a register when telegramBot is failed', () => {
+    assert.equal(checkNeedsSchedulerMcpReregister({ telegramBot: { status: 'failed', error: 'x' } }), true);
+  });
+  it('does NOT need a register when telegramBot is connected', () => {
+    assert.equal(checkNeedsSchedulerMcpReregister({ telegramBot: { status: 'connected' } }), false);
+  });
+  it('treats a malformed/empty response as needing a register', () => {
+    assert.equal(checkNeedsSchedulerMcpReregister(null), true);
+    assert.equal(checkNeedsSchedulerMcpReregister('nope'), true);
+    assert.equal(checkNeedsSchedulerMcpReregister({}), true);
   });
 });
 

@@ -222,6 +222,17 @@ export interface StateV1 {
    */
   schedulerMcpSecret?: string;
   /**
+   * The loopback port the bot's scheduler MCP server bound on a prior boot (see
+   * `scheduler/mcpSurface.ts`). The listen port is EPHEMERAL by default (`0` →
+   * an OS-assigned port), which changes on every restart; persisting the bound
+   * port lets a later boot reuse it so the `telegramBot` registrations injected
+   * into agent sessions (which embed `http://127.0.0.1:<port>/mcp`) stay valid
+   * across restarts instead of pointing at a dead port. Not written when the
+   * operator fixes the port via `SCHEDULER_MCP_PORT`. Optional so older state
+   * files stay valid — a missing value means "no port to reuse, pick fresh".
+   */
+  schedulerMcpPort?: number;
+  /**
    * In-flight interactive agent questions, keyed by {@link ThreadKey} string.
    * Persisted so a pending question survives a bot restart / hot reload: the
    * in-memory `pendingQuestions` map (see `bot.ts`) is otherwise lost, leaving
@@ -1271,6 +1282,30 @@ export class StateStore {
     this.state.schedulerMcpSecret = secret;
     await this.flush();
     return secret;
+  }
+
+  // ── scheduler MCP port (reuse across restarts) ──
+
+  /**
+   * @description The scheduler MCP listen port persisted from a prior boot, or
+   * `undefined` if never persisted (fresh / pre-feature state file). Reused so an
+   * ephemeral port keeps its value across restarts (see
+   * {@link StateV1.schedulerMcpPort}).
+   */
+  getPersistedSchedulerMcpPort(): number | undefined {
+    return this.state.schedulerMcpPort;
+  }
+
+  /**
+   * @description Persist the actually-bound scheduler MCP port and flush eagerly.
+   * Eager (not debounced) mirrors {@link getSchedulerMcpSecret}: the injected
+   * registrations point at this port, so a crash right after binding must not lose
+   * it and hand the next boot a stale port. Called once at boot, only when the
+   * value changed and the operator did not fix the port via env.
+   */
+  async setSchedulerMcpPort(port: number): Promise<void> {
+    this.state.schedulerMcpPort = port;
+    await this.flush();
   }
 
   // ── pending interactive questions (restart survival) ──

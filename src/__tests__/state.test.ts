@@ -102,6 +102,21 @@ test('R5: concurrent setBinding on DIFFERENT keys both land', async () => {
   assert.equal(store.getBinding(key2)?.subdir, 'beta');
 });
 
+test('scheduler MCP port: undefined by default, persisted + reloaded across restarts', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  assert.equal(store.getPersistedSchedulerMcpPort(), undefined, 'no port persisted on a fresh store');
+
+  await store.setSchedulerMcpPort(41234);
+  assert.equal(store.getPersistedSchedulerMcpPort(), 41234, 'in-memory value updated');
+
+  // A fresh store over the same dataDir must reload the persisted port (the
+  // whole point: the next boot reuses it so registrations stay valid).
+  const reloaded = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await reloaded.init();
+  assert.equal(reloaded.getPersistedSchedulerMcpPort(), 41234, 'reloaded from disk');
+});
+
 test('R6: corrupted state.json is archived and store starts fresh', async () => {
   const statePath = path.join(dataDir, 'state.json');
   fs.writeFileSync(statePath, '{ this is not valid json');

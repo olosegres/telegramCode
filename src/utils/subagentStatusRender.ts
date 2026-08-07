@@ -95,6 +95,35 @@ export function checkShouldSendSubagentStatus(nextText: string, lastText: string
 }
 
 /**
+ * @description S1' COALESCING gate for the dedicated sub-agent status edit:
+ * should a fresh refresh actually ENQUEUE an edit right now? Combines the text
+ * dedup ({@link checkShouldSendSubagentStatus}) with an in-flight guard so that,
+ * under a per-thread send backlog (the global pacer drains ~1 send / 2s), a
+ * burst of same-second refreshes can enqueue AT MOST ONE edit instead of
+ * stacking hundreds of identical closures.
+ *
+ * The bug this closes (live 2026-08-07, topic 61130): OpenCode streams frequent
+ * `message.part.updated` events for a live parent `task` part, so the bot got a
+ * high-frequency run of `subagentStatus{active:true}` refreshes. The plain S1
+ * dedup compared against the last text that REACHED Telegram, which only updates
+ * after the pacer-delayed send resolves — so during that window every same-text
+ * refresh passed the gate and enqueued another identical `editMessageText`.
+ * Hundreds piled into the thread's FIFO, drained one every 2s, and
+ * head-of-line-blocked the agent's OWN answer behind them — the topic looked
+ * hung. Fix: dedup against the last text we DECIDED to enqueue (recorded
+ * synchronously at decision time) AND never enqueue while one edit is still in
+ * flight.
+ */
+export function checkShouldEnqueueSubagentStatus(input: {
+  nextText: string;
+  lastEnqueuedText: string | null;
+  isEditInFlight: boolean;
+}): boolean {
+  if (input.isEditInFlight) return false;
+  return checkShouldSendSubagentStatus(input.nextText, input.lastEnqueuedText);
+}
+
+/**
  * @description S2 hard safety net for the dedicated sub-agent status tick:
  * should the frame be CLOSED (instead of re-arming the elapsed-tick timer)?
  * `true` when the owning session is no longer active, OR the frame has outlived

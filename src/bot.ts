@@ -163,7 +163,7 @@ import { buildSubagentOutputPrefix } from './utils/subagentRender';
 import {
   buildSubagentElapsedText,
   getSubagentStatusAction,
-  checkShouldSendSubagentStatus,
+  checkShouldEnqueueSubagentStatus,
   checkShouldExpireSubagentStatus,
 } from './utils/subagentStatusRender';
 import {
@@ -881,15 +881,26 @@ interface ThreadMessageState {
    */
   subagentTimer: ReturnType<typeof setTimeout> | null;
   /**
-   * Last text actually pushed to the open sub-agent status message (S1 dedup).
-   * `refreshSubagentStatus` skips the `editMessageText` when the freshly
-   * rendered line equals this — re-editing identical text only earns a
-   * `400 "message is not modified"`, and a stuck/frozen elapsed counter would
-   * otherwise churn that 400 every tick until the per-group 429 flood limit
-   * starves the whole topic (live incident 2026-08-03). `null` on open /
-   * post-clear so the first real edit always lands.
+   * Last text the sub-agent status refresh DECIDED to enqueue — recorded
+   * synchronously at decision time, not after the send resolves (S1' coalescing
+   * dedup, see {@link checkShouldEnqueueSubagentStatus}). `refreshSubagentStatus`
+   * skips the edit when the freshly rendered line equals this. Recording it at
+   * decision time (rather than the old "last delivered" semantics) is what stops
+   * a burst of same-second refreshes from stacking identical `editMessageText`
+   * closures into the per-thread FIFO while the pacer drains them one every 2s —
+   * that backlog head-of-line-blocked the agent's own answer and hung the topic
+   * (live 2026-08-07, topic 61130; earlier 400-churn variant 2026-08-03). `null`
+   * on open / post-clear so the first real edit always lands.
    */
   lastSubagentText: string | null;
+  /**
+   * Whether a sub-agent status `editMessageText` is currently in flight (from
+   * {@link refreshSubagentStatus} enqueue to resolve). Guards against enqueuing a
+   * second edit while one is still draining the pacer — the coalescing half of
+   * the fix above; at most ONE status edit rides the FIFO at a time. `false` when
+   * idle / no message open.
+   */
+  subagentEditInFlight: boolean;
 }
 
 interface OutputQueueState {
@@ -2001,7 +2012,7 @@ function getThreadMessageState(key: ThreadKey): ThreadMessageState {
   const k = keyToString(key);
   let s = threadMessageStates.get(k);
   if (!s) {
-    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, busyOnsetArmedUntil: 0, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null, lastSubagentText: null };
+    s = { lastMessageId: null, lastMessageText: null, needsNewMessage: true, typingLoaderTimer: null, statusMessageId: null, thinkingMessageId: null, thinkingFrameGeneration: 0, statusFrameGeneration: 0, livenessTimer: null, lastActivityText: null, livenessGlyphIndex: 0, wasBusy: false, workingSince: null, lastLivenessSentAt: 0, statusIdleSuppressed: false, busyOnsetArmedUntil: 0, subagentStatusMessageId: null, subagentStartedAt: null, subagentTitle: null, subagentTimer: null, lastSubagentText: null, subagentEditInFlight: false };
     threadMessageStates.set(k, s);
   }
   return s;
@@ -9097,22 +9108,47 @@ function stopClaudeLiveness(key: ThreadKey): void {
  */
 async function refreshSubagentStatus(key: ThreadKey): Promise<void> {
   const state = getThreadMessageState(key);
-  if (state.subagentStatusMessageId === null) return;
+  const messageId = state.subagentStatusMessageId;
+  if (messageId === null) return;
   const elapsedMs = Date.now() - (state.subagentStartedAt ?? Date.now());
   const text = buildSubagentElapsedText(state.subagentTitle, elapsedMs);
-  // S1: never re-send an unchanged edit — an identical elapsed/title only earns
-  // a `400 "message is not modified"` and, when the counter is stuck, floods
-  // the group's send budget into a 429 storm that starves the topic.
-  if (!checkShouldSendSubagentStatus(text, state.lastSubagentText)) return;
-  const sent = await editThreadMessage(
-    key,
-    state.subagentStatusMessageId,
-    renderAgentHtml(text),
-    { parse_mode: 'HTML' },
-  );
-  // Record only what actually reached Telegram, so a failed edit re-tries the
-  // same text next tick instead of being suppressed by a stale record.
-  if (sent) state.lastSubagentText = text;
+  // S1' coalescing: skip when an edit is already draining the pacer, or when the
+  // text is unchanged from the last edit we DECIDED to enqueue. Both guards, and
+  // recording the decision synchronously BELOW (not after the send resolves), are
+  // what keep a burst of same-second `subagentStatus{active:true}` refreshes from
+  // stacking hundreds of identical `editMessageText` closures into the per-thread
+  // FIFO — that backlog drained one every 2s and head-of-line-blocked the agent's
+  // own answer, hanging the topic (live 2026-08-07, topic 61130).
+  if (!checkShouldEnqueueSubagentStatus({
+    nextText: text,
+    lastEnqueuedText: state.lastSubagentText,
+    isEditInFlight: state.subagentEditInFlight,
+  })) return;
+  state.subagentEditInFlight = true;
+  // Record the DECISION synchronously (before the pacer-delayed await) so
+  // concurrent same-text refreshes are suppressed immediately, not only once the
+  // send finally lands.
+  state.lastSubagentText = text;
+  try {
+    const sent = await editThreadMessage(
+      key,
+      messageId,
+      renderAgentHtml(text),
+      { parse_mode: 'HTML' },
+    );
+    // Guard the post-await mutations against a close+reopen that swapped the
+    // frame WHILE this edit was draining the pacer: `lastSubagentText` /
+    // `subagentEditInFlight` now belong to a DIFFERENT frame that owns its own
+    // state (reset on its open), so clobbering them here would drop its dedup or
+    // permit a duplicate edit. Only touch them while THIS frame is still open.
+    if (state.subagentStatusMessageId !== messageId) return;
+    // A GENUINE (non-benign) failure clears the decision record so the next tick
+    // retries — `editThreadMessage` already treats "message is not modified" as
+    // success, so a benign 400 keeps the dedup and never churns.
+    if (!sent) state.lastSubagentText = null;
+  } finally {
+    if (state.subagentStatusMessageId === messageId) state.subagentEditInFlight = false;
+  }
 }
 
 /**
@@ -9171,6 +9207,10 @@ function clearSubagentStatus(key: ThreadKey): void {
   state.subagentStartedAt = null;
   state.subagentTitle = null;
   state.lastSubagentText = null;
+  // Reset the coalescing flag so a later frame is never wedged silent by a
+  // teardown that landed mid-edit (an in-flight edit's own `finally` also
+  // clears it; this covers the close-before-resolve race).
+  state.subagentEditInFlight = false;
   if (id !== null) deleteThreadMessage(key, id).catch(() => {});
 }
 
@@ -9208,9 +9248,11 @@ function handleSubagentStatus(key: ThreadKey, payload: SubagentStatusEvent): voi
       if (action === 'open') {
         state.subagentStartedAt = Date.now();
         state.subagentTitle = payload.title;
-        // Fresh frame — clear the dedup record so the first tick's edit lands
-        // even if it happens to render the same text as a prior (cleared) frame.
+        // Fresh frame — clear the dedup record + coalescing flag so the first
+        // tick's edit lands even if it renders the same text as a prior (cleared)
+        // frame, and a stale in-flight flag can't wedge the new frame silent.
         state.lastSubagentText = null;
+        state.subagentEditInFlight = false;
         const text = buildSubagentElapsedText(state.subagentTitle, 0);
         const id = await replyToThread(key, renderAgentHtml(text), { parse_mode: 'HTML' });
         if (id === null) return;

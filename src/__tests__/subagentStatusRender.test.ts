@@ -14,6 +14,7 @@ import {
   buildSubagentElapsedText,
   getSubagentStatusAction,
   checkShouldSendSubagentStatus,
+  checkShouldEnqueueSubagentStatus,
   checkShouldExpireSubagentStatus,
 } from '../utils/subagentStatusRender';
 
@@ -92,6 +93,73 @@ describe('checkShouldSendSubagentStatus — S1 dedup gate', () => {
 
   it('null last text (fresh open / post-clear) → true (always send the first edit)', () => {
     assert.equal(checkShouldSendSubagentStatus('🤖 sub-agent: X · 0:10', null), true);
+  });
+});
+
+describe('checkShouldEnqueueSubagentStatus — coalescing gate (live 2026-08-07, topic 61130)', () => {
+  const text = '🤖 sub-agent: X · 3:54';
+
+  it('an edit already in flight → false (never stack a second onto the FIFO)', () => {
+    assert.equal(
+      checkShouldEnqueueSubagentStatus({ nextText: text, lastEnqueuedText: '🤖 sub-agent: X · 3:53', isEditInFlight: true }),
+      false,
+    );
+  });
+
+  it('same text as last ENQUEUED, nothing in flight → false (dedup at decision time)', () => {
+    assert.equal(
+      checkShouldEnqueueSubagentStatus({ nextText: text, lastEnqueuedText: text, isEditInFlight: false }),
+      false,
+    );
+  });
+
+  it('changed text, nothing in flight → true (a real m:ss tick still lands)', () => {
+    assert.equal(
+      checkShouldEnqueueSubagentStatus({ nextText: '🤖 sub-agent: X · 3:55', lastEnqueuedText: text, isEditInFlight: false }),
+      true,
+    );
+  });
+
+  it('first edit (null last, nothing in flight) → true', () => {
+    assert.equal(
+      checkShouldEnqueueSubagentStatus({ nextText: '🤖 sub-agent: X · 0:00', lastEnqueuedText: null, isEditInFlight: false }),
+      true,
+    );
+  });
+
+  // THE regression: a burst of same-second refreshes arriving while the first
+  // (pacer-delayed) edit is still draining must enqueue AT MOST ONE edit — not
+  // the hundreds of identical closures that head-of-line-blocked the agent's
+  // answer in the same per-thread FIFO. Dedup MUST be against the last DECIDED
+  // text (recorded synchronously), not the last delivered one.
+  it('burst of identical refreshes with one edit in flight → exactly one enqueue', () => {
+    let decided = 0;
+    let lastEnqueuedText: string | null = null;
+    let isEditInFlight = false;
+    for (let i = 0; i < 200; i++) {
+      if (checkShouldEnqueueSubagentStatus({ nextText: text, lastEnqueuedText, isEditInFlight })) {
+        decided += 1;
+        lastEnqueuedText = text; // synchronous decision record
+        isEditInFlight = true;   // the edit stays in flight for the whole burst
+      }
+    }
+    assert.equal(decided, 1, 'exactly one edit enqueued for the whole burst');
+  });
+
+  // After the in-flight edit resolves, a genuinely NEW elapsed still lands
+  // (coalescing must not wedge the counter permanently).
+  it('one tick per resolve cycle: enqueue → in-flight blocks → resolve → next distinct text enqueues', () => {
+    let lastEnqueuedText: string | null = null;
+    let isEditInFlight = false;
+    const enqueue = (next: string): boolean => {
+      const go = checkShouldEnqueueSubagentStatus({ nextText: next, lastEnqueuedText, isEditInFlight });
+      if (go) { lastEnqueuedText = next; isEditInFlight = true; }
+      return go;
+    };
+    assert.equal(enqueue('🤖 sub-agent: X · 0:10'), true);   // first lands
+    assert.equal(enqueue('🤖 sub-agent: X · 0:11'), false);  // blocked in flight
+    isEditInFlight = false;                                   // prior edit resolved
+    assert.equal(enqueue('🤖 sub-agent: X · 0:12'), true);   // next distinct tick lands
   });
 });
 

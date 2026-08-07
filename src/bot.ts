@@ -4283,10 +4283,12 @@ async function replayBufferedPrompts(key: ThreadKey): Promise<void> {
  * turn and wait until it is actually idle before handing over the text. Only
  * Claude implements it (Escape + a TUI poll) — its TUI ignores typed input for
  * a long stretch of a running turn, so interrupting is what makes it read the
- * new message promptly. OpenCode deliberately does NOT: `prompt_async` queues
- * the prompt and the agent picks it up quickly, so aborting the live turn cost
- * work for nothing (user decision 2026-06-06). An adapter without the method
- * forwards directly.
+ * new message promptly. OpenCode deliberately does NOT interrupt a HEALTHY busy
+ * turn: `prompt_async` queues the prompt and the agent picks it up quickly, so
+ * aborting would lose work. Its adapter handles the one exception internally:
+ * `session.status=retry` will not read queued prompts until the provider retry
+ * time, so a new prompt aborts that stale wait before using the current model.
+ * An adapter without the method forwards directly.
  */
 async function forwardPromptToAgent(
   key: ThreadKey,

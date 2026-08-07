@@ -159,6 +159,13 @@ interface OpenCodeModelOverride {
   modelID: string;
 }
 
+interface OpenCodeSessionStatus {
+  type?: string;
+  attempt?: number;
+  message?: string;
+  next?: number;
+}
+
 interface OpenCodeSession {
   key: ThreadKey;
   sessionId: string;
@@ -252,10 +259,22 @@ interface OpenCodeSession {
    * Whether this session is mid-generation. Tracked from SSE `session.status`
    * (and cleared on `session.idle`); set optimistically when a prompt is sent.
    * Drives {@link checkIsOpenCodeSessionBusy} (the scheduler's wait-for-idle
-   * probe). A new prompt never aborts a busy turn — `prompt_async` queues it
-   * and OpenCode picks it up quickly (user decision 2026-06-06).
+   * probe). A normal busy turn queues new prompts, but a provider-managed
+   * `retry` is different: OpenCode will not read the queue until its retry time,
+   * so the next user prompt aborts that stale turn before using the current
+   * model override.
    */
   isBusy: boolean;
+  /**
+   * Signature of the current provider-managed `session.status=retry`, or null.
+   * Doubles as the one-notice-per-retry dedup key and the signal that the next
+   * user prompt must interrupt the wait instead of queueing behind it.
+   */
+  providerRetrySignature: string | null;
+  /** Ignore stale model updates until the post-abort selected-model turn starts. */
+  isAwaitingModelAfterProviderRetryAbort: boolean;
+  /** Shared abort request so concurrent prompts cannot race abort-after-prompt. */
+  providerRetryAbortPromise: Promise<void> | null;
   /**
    * Whether context compaction is in flight (between
    * `session.next.compaction.started` and `…ended` / `session.compacted`).
@@ -698,6 +717,8 @@ const ignoredSseEventTypes = new Set<string>(['sync', 'session.diff']);
  * genuinely failed — it must never overwrite a real LLM name with a raw snippet.
  */
 const fallbackRenameGraceMs = 8000;
+/** Milliseconds per minute for rendering OpenCode's provider-retry notice. */
+const providerRetryMsPerMinute = 60_000;
 
 /**
  * @description Live busy-relevant state of an OpenCode session, derived from
@@ -1502,6 +1523,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           pendingQuestion: null,
           effortLevel: loadSavedEffort(key),
           isBusy: false,
+          providerRetrySignature: null,
+          isAwaitingModelAfterProviderRetryAbort: false,
+          providerRetryAbortPromise: null,
           isCompacting: false,
           busyChildSessionIds: new Set(),
           // No assistant turn has finished yet — the seen-watermark anchor is
@@ -1622,6 +1646,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * @description Send message via async endpoint (returns 204, response streams via SSE).
    * Fire-and-forget — errors are logged but don't block.
    *
+   * A normal busy turn is preserved and receives the prompt through OpenCode's
+   * queue. A provider-managed retry is interrupted first: otherwise a model
+   * switch plus "continue" is accepted into the transcript but remains unread
+   * behind the old provider's retry window.
+   *
    * **Per-prompt effort apply:** if the thread has a stored effort level
    * (a model variant), it's sent as `body.variant` alongside `body.model`
    * — the same per-prompt override the prompt endpoint already uses for the
@@ -1663,17 +1692,50 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     void (async () => {
       try {
+        const retryAbortPromise = this.getProviderRetryAbortPromise(session);
+        if (retryAbortPromise) await retryAbortPromise;
         await this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body);
       } catch (e) {
         // The optimistic `isBusy = true` above never gets a `session.status`
         // idle to clear it if the POST failed — clear it so the next prompt
         // doesn't eat a spurious abort + wait.
         const current = this.sessions.get(keyToString(key));
-        if (current) current.isBusy = false;
+        if (current && !current.providerRetrySignature) current.isBusy = false;
         console.error(`[OpenCode] Failed to send message:`, e);
         this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
       }
     })();
+  }
+
+  /**
+   * @description Return the one shared abort request for a provider-managed
+   * retry. Concurrent prompts await the same request, preventing a later abort
+   * from cancelling a prompt that an earlier caller already posted.
+   */
+  private getProviderRetryAbortPromise(session: OpenCodeSession): Promise<void> | null {
+    if (session.providerRetryAbortPromise) return session.providerRetryAbortPromise;
+    if (!session.providerRetrySignature) return null;
+
+    console.log(`[OpenCode] Aborting provider retry before new prompt`);
+    session.isAwaitingModelAfterProviderRetryAbort = true;
+    const abortPromise = this.apiRequest('POST', `/session/${session.sessionId}/abort`).then(() => undefined);
+    session.providerRetryAbortPromise = abortPromise;
+    void abortPromise.then(
+      () => {
+        const current = this.sessions.get(keyToString(session.key));
+        if (current !== session || current.providerRetryAbortPromise !== abortPromise) return;
+        current.providerRetrySignature = null;
+        current.providerRetryAbortPromise = null;
+      },
+      () => {
+        const current = this.sessions.get(keyToString(session.key));
+        if (current === session && current.providerRetryAbortPromise === abortPromise) {
+          current.isAwaitingModelAfterProviderRetryAbort = false;
+          current.providerRetryAbortPromise = null;
+        }
+      },
+    );
+    return abortPromise;
   }
 
   /**
@@ -2262,6 +2324,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         pendingQuestion: null,
         effortLevel: loadSavedEffort(key),
         isBusy: false,
+        providerRetrySignature: null,
+        isAwaitingModelAfterProviderRetryAbort: false,
+        providerRetryAbortPromise: null,
         isCompacting: false,
         busyChildSessionIds: new Set(),
         // The watermark anchor is re-learned from the next finished turn; the
@@ -3664,12 +3729,27 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       const modelLabel = info.providerID
         ? `${info.providerID}/${info.modelID}`
         : info.modelID;
-      session.currentModelLabel = modelLabel;
+      const selectedModelLabel = session.modelOverride
+        ? `${session.modelOverride.providerID}/${session.modelOverride.modelID}`
+        : null;
+      const isAbortedRetryModel = session.isAwaitingModelAfterProviderRetryAbort
+        && selectedModelLabel !== null
+        && modelLabel !== selectedModelLabel;
 
-      if (!session.isModelInfoShown) {
-        session.isModelInfoShown = true;
-        console.log(`[OpenCode] Using model: ${modelLabel}`);
-        this.emit('output', key, `Model: ${modelLabel}`);
+      // Aborting a provider retry finalises its old assistant message before the
+      // replacement prompt starts. That stale update must not overwrite the
+      // newly-selected /model or announce the old provider as the new turn.
+      if (isAbortedRetryModel) {
+        console.log(`[OpenCode] Ignoring model from aborted provider retry: ${modelLabel}`);
+      } else {
+        if (selectedModelLabel === modelLabel) session.isAwaitingModelAfterProviderRetryAbort = false;
+        session.currentModelLabel = modelLabel;
+
+        if (!session.isModelInfoShown) {
+          session.isModelInfoShown = true;
+          console.log(`[OpenCode] Using model: ${modelLabel}`);
+          this.emit('output', key, `Model: ${modelLabel}`);
+        }
       }
     }
 
@@ -3720,7 +3800,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // `session.status` idle was missed. Own idle also ends any compaction
     // (the `.ended` / `session.compacted` event may be lost) — without this the
     // latched flag would force every later prompt down the queue path.
-    if (!sessionId || sessionId === session.sessionId) session.isCompacting = false;
+    if (!sessionId || sessionId === session.sessionId) {
+      session.isCompacting = false;
+      session.providerRetrySignature = null;
+    }
     applyOpenCodeStatusEvent(
       session,
       session.sessionId,
@@ -3754,8 +3837,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   /**
-   * @description Track live busy/idle from `session.status`. The own session's
-   * status drives {@link OpenCodeSession.isBusy}; a lineage-verified child
+   * @description Track live busy/idle/retry from `session.status`. The own
+   * session's status drives {@link OpenCodeSession.isBusy}; provider-managed
+   * retry remains busy and is surfaced once, because OpenCode otherwise accepts
+   * later prompts into an unread queue with no user-visible explanation. A
+   * lineage-verified child
    * (sub-agent) status maintains {@link OpenCodeSession.busyChildSessionIds}
    * so a new prompt never aborts a running sub-agent. A foreign non-descendant
    * session's busy=true (dir-fallback-routed wedged sibling) is ignored —
@@ -3769,17 +3855,43 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
-    const status = properties.status as { type?: string } | undefined;
+    const status = properties.status as OpenCodeSessionStatus | undefined;
+    const isProviderRetry = status?.type === 'retry';
     const wasForeignBusyIgnored = applyOpenCodeStatusEvent(
       session,
       session.sessionId,
       eventSessionId,
-      status?.type === 'busy',
+      status?.type === 'busy' || isProviderRetry,
       this.checkIsVerifiedDescendant(eventSessionId, session.sessionId),
     );
     if (wasForeignBusyIgnored && eventSessionId) {
       this.logForeignBusyIgnoredOncePerWindow(eventSessionId, session.sessionId);
     }
+
+    const isOwnSession = !eventSessionId || eventSessionId === session.sessionId;
+    if (!isOwnSession) return;
+    if (!isProviderRetry) {
+      if (!session.providerRetryAbortPromise) {
+        session.providerRetrySignature = null;
+      }
+      return;
+    }
+
+    const retryAttempt = typeof status.attempt === 'number' ? status.attempt : 1;
+    const retryAt = typeof status.next === 'number' ? status.next : Date.now();
+    const retryMessage = typeof status.message === 'string' ? status.message : '';
+    const retrySignature = `${retryAttempt}:${retryAt}:${retryMessage}`;
+    if (session.providerRetrySignature === retrySignature) return;
+
+    session.providerRetrySignature = retrySignature;
+    const retryMinutes = Math.max(1, Math.ceil((retryAt - Date.now()) / providerRetryMsPerMinute));
+    console.warn(`[OpenCode] Provider retry attempt=${retryAttempt} in=${retryMinutes}m: ${retryMessage}`);
+    this.emit(
+      'output',
+      key,
+      this.tl(key, () => t('apiRetry.transientNotice', { minutes: retryMinutes, attempt: retryAttempt })),
+      { isComplete: true } satisfies OutputEventMeta,
+    );
   }
 
   /**

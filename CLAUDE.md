@@ -39,6 +39,11 @@ to the agent rather than handled locally:
   to the owning session (plan
   `agent/tasks/actual/2026-06-17-opencode-global-event-stream.md`). The single
   stream opens with the FIRST active session anywhere and closes with the LAST.
+  Healthy busy turns keep new `prompt_async` messages queued. A provider-managed
+  `session.status=retry` is the exception: it stays visibly busy and posts one
+  retry notice; the next user prompt aborts the old provider wait before posting
+  with the current `/model`, otherwise a model switch + `continue` sits unread
+  behind the old provider's retry deadline.
   (Why not `/event?directory=<workDir>` — the old per-folder model: on opencode
   1.14.41 that endpoint goes silent for an aged sole subscriber, keeping only
   `server.heartbeat` flowing so the stall watchdog never trips → the topic

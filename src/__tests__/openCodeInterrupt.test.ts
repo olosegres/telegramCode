@@ -1,11 +1,11 @@
 /**
- * @description OpenCode never interrupts a running turn for a new prompt:
- * `prompt_async` queues the message and the agent reads it promptly, so unlike
- * the Claude TUI (which ignores typed input mid-turn and needs Escape first)
- * aborting would only lose live work (user decision 2026-06-06). The contract
- * tests lock that asymmetry on the adapter prototypes; the tracking tests cover
- * `applyOpenCodeStatusEvent`, the SSE-driven busy state behind
- * `checkIsOpenCodeSessionBusy` (the scheduler's wait-for-idle probe).
+ * @description OpenCode preserves a healthy running turn for a new prompt:
+ * `prompt_async` queues the message and the agent reads it promptly. The one
+ * exception is provider-managed retry: the queue is unread until the retry
+ * deadline, so a fresh prompt aborts that stale turn and starts with the current
+ * model. The contract tests lock that asymmetry on the adapter prototypes; the
+ * tracking tests cover `applyOpenCodeStatusEvent`, the SSE-driven busy state
+ * behind `checkIsOpenCodeSessionBusy` (the scheduler's wait-for-idle probe).
  */
 
 import { test } from 'node:test';
@@ -20,7 +20,95 @@ import { ClaudeCliAdapter } from '../adapters/claudeCliAdapter';
 const own = 'ses_own';
 const child = 'ses_child';
 const foreign = 'ses_foreign_sibling';
+const providerRetryDelayMs = 60 * 60_000;
 const freshTracking = (): OpenCodeBusyTracking => ({ isBusy: false, busyChildSessionIds: new Set() });
+
+function createRetryingAdapter(): {
+  adapter: OpenCodeAdapter;
+  outputs: string[];
+  requests: { method: string; path: string; body: Record<string, unknown> | undefined }[];
+} {
+  const key = { chatId: -100123, threadId: 42 };
+  const adapter = new OpenCodeAdapter();
+  adapter['sessions'].set('-100123:42', {
+    key,
+    sessionId: own,
+    workDir: '/tmp/work',
+    isActive: true,
+    currentResponseText: '',
+    lastEmittedLength: 0,
+    outputTimer: null,
+    childResponseText: '',
+    childLastEmittedLength: 0,
+    childOutputTimer: null,
+    activeSubagentTitle: null,
+    isModelInfoShown: true,
+    modelOverride: { providerID: 'anthropic', modelID: 'claude-opus-5' },
+    currentModelLabel: 'anthropic/claude-opus-5',
+    partTypes: new Map(),
+    statusDebounceTimer: null,
+    pendingStatus: null,
+    reasoningText: '',
+    reasoningStartedAt: null,
+    reasoningTimer: null,
+    emittedToolResultPartIds: new Set(),
+    pendingQuestion: null,
+    effortLevel: 'xhigh',
+    isBusy: true,
+    isCompacting: false,
+    busyChildSessionIds: new Set(),
+    isAutoNamePending: false,
+  });
+
+  const outputs: string[] = [];
+  adapter.on('output', (_key, output: string) => outputs.push(output));
+  const requests: { method: string; path: string; body: Record<string, unknown> | undefined }[] = [];
+  adapter['apiRequest'] = (async (
+    method: string,
+    path: string,
+    body?: Record<string, unknown>,
+  ) => {
+    requests.push({ method, path, body });
+  }) as OpenCodeAdapter['apiRequest'];
+
+  const retryAt = Date.now() + providerRetryDelayMs;
+  const retryEvent = JSON.stringify({
+    directory: '/tmp/work',
+    payload: {
+      type: 'session.status',
+      properties: {
+        sessionID: own,
+        status: {
+          type: 'retry',
+          attempt: 1,
+          message: "This request would exceed your account's rate limit. Please try again later.",
+          next: retryAt,
+        },
+      },
+    },
+  });
+  adapter['routeSseData'](retryEvent);
+  adapter['routeSseData'](retryEvent);
+
+  const session = adapter['sessions'].get('-100123:42');
+  session.modelOverride = { providerID: 'openai', modelID: 'gpt-test' };
+  session.currentModelLabel = 'openai/gpt-test';
+  session.isModelInfoShown = false;
+
+  return { adapter, outputs, requests };
+}
+
+function feedAssistantModel(adapter: OpenCodeAdapter, providerID: string, modelID: string): void {
+  adapter['routeSseData'](JSON.stringify({
+    directory: '/tmp/work',
+    payload: {
+      type: 'message.updated',
+      properties: {
+        info: { sessionID: own, role: 'assistant', providerID, modelID },
+      },
+    },
+  }));
+}
 
 // ── interrupt-before-prompt contract ──
 
@@ -91,4 +179,107 @@ test('applied transitions (own / verified descendant) report not-ignored', () =>
   const t = freshTracking();
   assert.equal(applyOpenCodeStatusEvent(t, own, own, true, false), false);
   assert.equal(applyOpenCodeStatusEvent(t, own, child, true, true), false);
+});
+
+test('provider retry stays busy and is surfaced once instead of looking silently idle', () => {
+  const { adapter, outputs } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+
+  assert.equal(adapter.checkIsBusy(key), true, 'a provider-managed retry is still an in-flight turn');
+  assert.equal(outputs.length, 1, 'duplicate retry status frames must not repeat the user notice');
+  assert.match(outputs[0], /API rate-limited.*auto-retrying in 60 min.*attempt 1/);
+});
+
+test('a prompt during provider retry aborts the old turn before using the current model', async () => {
+  const { adapter, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+
+  adapter.sendInput(key, 'continue on the selected model');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(
+    requests.map(request => [request.method, request.path]),
+    [
+      ['POST', `/session/${own}/abort`],
+      ['POST', `/session/${own}/prompt_async`],
+    ],
+    'a new prompt must not queue behind a provider retry',
+  );
+  assert.deepEqual(requests[1].body, {
+    parts: [{ type: 'text', text: 'continue on the selected model' }],
+    model: { providerID: 'openai', modelID: 'gpt-test' },
+    variant: 'xhigh',
+  });
+});
+
+test('concurrent prompts share one provider-retry abort before both are posted', async () => {
+  const { adapter, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+
+  adapter.sendInput(key, 'first');
+  adapter.sendInput(key, 'second');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(
+    requests.map(request => [request.method, request.path]),
+    [
+      ['POST', `/session/${own}/abort`],
+      ['POST', `/session/${own}/prompt_async`],
+      ['POST', `/session/${own}/prompt_async`],
+    ],
+    'a second abort after the first prompt would cancel newly-started work',
+  );
+  assert.deepEqual(
+    requests.slice(1).map(request => request.body?.parts),
+    [
+      [{ type: 'text', text: 'first' }],
+      [{ type: 'text', text: 'second' }],
+    ],
+  );
+});
+
+test('a failed provider-retry abort posts no prompt and keeps the session busy for another attempt', async () => {
+  const { adapter, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  const errors: Error[] = [];
+  adapter.on('error', (_key, error: Error) => errors.push(error));
+  adapter['apiRequest'] = (async (method: string, path: string, body?: Record<string, unknown>) => {
+    requests.push({ method, path, body });
+    throw new Error('abort failed');
+  }) as OpenCodeAdapter['apiRequest'];
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(requests.map(request => request.path), [`/session/${own}/abort`]);
+  assert.equal(adapter.checkIsBusy(key), true, 'the provider retry still owns the turn after a failed abort');
+  assert.deepEqual(errors.map(error => error.message), ['abort failed']);
+});
+
+test('the aborted retry cannot overwrite the selected model after the abort request has resolved', async () => {
+  const { adapter, outputs, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let resolveAbort: (() => void) | null = null;
+  const abortResult = new Promise<void>(resolve => {
+    resolveAbort = resolve;
+  });
+  adapter['apiRequest'] = (async (method: string, path: string, body?: Record<string, unknown>) => {
+    requests.push({ method, path, body });
+    if (path.endsWith('/abort')) await abortResult;
+  }) as OpenCodeAdapter['apiRequest'];
+
+  adapter.sendInput(key, 'continue');
+  resolveAbort?.();
+  await new Promise(resolve => setImmediate(resolve));
+  feedAssistantModel(adapter, 'anthropic', 'claude-opus-5');
+
+  assert.deepEqual(
+    outputs.filter(output => output.startsWith('Model:')),
+    [],
+    'the assistant update finalising the aborted retry is not the model for the new prompt',
+  );
+
+  feedAssistantModel(adapter, 'openai', 'gpt-test');
+
+  assert.deepEqual(outputs.filter(output => output.startsWith('Model:')), ['Model: openai/gpt-test']);
 });

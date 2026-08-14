@@ -721,6 +721,20 @@ const fallbackRenameGraceMs = 8000;
 const providerRetryMsPerMinute = 60_000;
 
 /**
+ * @description Whether a `session.error` message is the bot-issued abort of a
+ * running generation (`POST /session/:id/abort`) — the ONLY source of an
+ * "Aborted" error in OpenCode (the user has no other abort trigger). It fires
+ * on the question-cancel SIGINT, `/esc`, and the provider-retry interrupt, and
+ * must be SWALLOWED rather than surfaced as "OpenCode error: Aborted" — that
+ * bogus line was the third message on the question-cancel path (parity with the
+ * json-stream "Claude error: API error" swallow). Matched as the exact bare
+ * word so a real provider error that merely quotes "aborted" still surfaces.
+ */
+export function checkIsOpenCodeAbortError(errorMsg: string): boolean {
+  return errorMsg.trim().toLowerCase() === 'aborted';
+}
+
+/**
  * @description Live busy-relevant state of an OpenCode session, derived from
  * SSE events (not an HTTP poll — the stream catches sub-100 ms busy/idle
  * transitions an HTTP poll races past).
@@ -3777,11 +3791,18 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.flushOutput(key);
     }
 
-    // Surface errors to the user
+    // Surface errors to the user — except a bot-issued abort ("Aborted"), which
+    // the aborted turn's assistant message also carries in `info.error`. It is
+    // swallowed for the same reason as the `session.error` twin above (the
+    // question-cancel / `/esc` / provider-retry interrupt is ours, not a fault).
     if (info.error) {
       const errorMsg = this.extractErrorMessage(info.error);
-      console.error(`[OpenCode] Message error:`, errorMsg);
-      this.emit('output', key, `Error: ${errorMsg}`);
+      if (checkIsOpenCodeAbortError(errorMsg)) {
+        console.log(`[OpenCode] Swallowed bot-issued abort (message.error "Aborted") for ${keyToString(key)}`);
+      } else {
+        console.error(`[OpenCode] Message error:`, errorMsg);
+        this.emit('output', key, `Error: ${errorMsg}`);
+      }
     }
   }
 
@@ -3941,6 +3962,19 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
   private handleSessionError(key: ThreadKey, eventSessionId: string | null, properties: Record<string, unknown>): void {
     const errorMsg = this.extractErrorMessage(properties.error);
+    const session = this.sessions.get(keyToString(key));
+    const isOwnSession = !eventSessionId || (session !== undefined && eventSessionId === session.sessionId);
+
+    // A bare "Aborted" error is ALWAYS a bot-issued abort (question-cancel SIGINT
+    // / `/esc` / provider-retry interrupt) — never surface it as "OpenCode error:
+    // Aborted" (the reported third bogus message on the question-cancel path).
+    // The turn DID end, so still close the sub-agent status for the own session.
+    if (checkIsOpenCodeAbortError(errorMsg)) {
+      console.log(`[OpenCode] Swallowed bot-issued abort (session.error "Aborted") for ${keyToString(key)}`);
+      if (session?.isActive && isOwnSession) this.closeSubagentStatusOnParentTurnEnd(key);
+      return;
+    }
+
     console.error(`[OpenCode] Session error:`, errorMsg);
     this.emit('output', key, `OpenCode error: ${errorMsg}`);
 
@@ -3952,8 +3986,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // A CHILD (sub-agent) error must NOT close it — the parent delegation is
     // still in flight (guarded the same way as `handleSessionIdle`). If an
     // auto-retry re-delegates, a fresh `subagentStatus{active:true}` re-opens it.
-    const session = this.sessions.get(keyToString(key));
-    if (session?.isActive && (!eventSessionId || eventSessionId === session.sessionId)) {
+    if (session?.isActive && isOwnSession) {
       this.closeSubagentStatusOnParentTurnEnd(key);
     }
 

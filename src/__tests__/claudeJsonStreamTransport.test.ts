@@ -87,6 +87,7 @@ function createSessionInDir(adapter: ClaudeJsonStreamAdapter, dir: string) {
     initRequestId: null,
     pendingQuestion: null,
     apiErrorFired: false,
+    swallowNextAbortError: false,
     lastWatermarkOffset: -1,
   };
   adapter['sessions'].set(keyToString(key), session);
@@ -97,6 +98,12 @@ const resultLine =
   JSON.stringify({ type: 'result', is_error: false, result: 'final answer' }) + '\n';
 const textDeltaLine =
   JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } } }) + '\n';
+// A terminal error result carrying NO `api_error_status`/`result` text — the
+// shape the CLI emits for an interrupt-aborted turn. `claudeStreamJson` falls
+// back to the literal `'API error'`, which `classifyAgentApiError` does NOT
+// recognise (so it can only surface as the generic "Claude error:" line).
+const abortErrorResultLine =
+  JSON.stringify({ type: 'result', is_error: true }) + '\n';
 
 describe('json-stream external transport — exit detection', () => {
   let dir: string;
@@ -252,5 +259,54 @@ describe('json-stream idle watchdog — the stuck-busy / hung-typing backstop', 
     adapter.sendEscape(session.key); // → sendInterrupt
     assert.equal(session.isBusy, false, 'interrupt drops busy without waiting on a result');
     assert.equal(session.outstandingToolUseIds.size, 0, 'interrupt clears the in-flight tool set');
+  });
+});
+
+describe('json-stream interrupt-aborted turn — no bogus "Claude error" surfaces', () => {
+  let dir: string;
+  afterEach(() => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('swallows the abort error result that an interrupt WE issued produced', () => {
+    // Repro (live thread 15812): cancelling a pending question sends a SIGINT,
+    // whose aborted-turn `result{is_error}` used to relay "Claude error: API
+    // error" as a third bogus message on top of the two cancel notices.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-abort-swallow-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    const outputs: string[] = [];
+    adapter.on('output', (_k: ThreadKey, text: string) => outputs.push(text));
+
+    adapter.sendSignal(session.key, 'SIGINT'); // arms swallowNextAbortError
+    assert.equal(session.swallowNextAbortError, true, 'the interrupt arms the one-shot');
+    adapter['onStdout'](session, abortErrorResultLine);
+
+    assert.deepEqual(outputs, [], 'the abort result must not reach the topic as an error');
+    assert.equal(session.swallowNextAbortError, false, 'the one-shot is consumed');
+  });
+
+  it('a genuine error result WITHOUT a preceding interrupt still surfaces', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-abort-real-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    const outputs: string[] = [];
+    adapter.on('output', (_k: ThreadKey, text: string) => outputs.push(text));
+
+    adapter['onStdout'](session, abortErrorResultLine);
+
+    assert.deepEqual(outputs, ['Claude error: API error'], 'a real error must still reach the topic');
+  });
+
+  it('the swallow is one-shot: a SECOND error result after the swallowed one surfaces', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonstream-abort-oneshot-'));
+    const adapter = new ClaudeJsonStreamAdapter();
+    const session = createSessionInDir(adapter, dir);
+    const outputs: string[] = [];
+    adapter.on('output', (_k: ThreadKey, text: string) => outputs.push(text));
+
+    adapter.sendSignal(session.key, 'SIGINT');
+    adapter['onStdout'](session, abortErrorResultLine); // swallowed
+    adapter['onStdout'](session, abortErrorResultLine); // a later, unrelated error surfaces
+
+    assert.deepEqual(outputs, ['Claude error: API error'], 'only the post-interrupt result is swallowed');
   });
 });

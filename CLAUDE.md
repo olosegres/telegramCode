@@ -624,10 +624,17 @@ OpenCode events / bindings).
     shared `deliverActivePrompt` choke point (used by BOTH the text and voice
     handlers): a bare in-range digit ANSWERS that option (a button tap too), any
     other free-form text OR voice CANCELS the question (clear pending state →
-    neutralize the buttons message → **reject the question server-side**
+    relabel the buttons message to «❌ … cancelled» — that IS the single
+    cancellation notice; the standalone `agent.question_cancelled_for_prompt`
+    line fires ONLY when there was no bubble to relabel, since posting both was
+    the reported duplicate → **reject the question server-side**
     (`adapter.rejectQuestion` → `POST /question/:id/reject`) → `SIGINT` abort of
-    the wedged turn → `agent.question_cancelled_for_prompt` notice) and is
-    delivered as a fresh prompt. Pre-fix the voice handler had NO question
+    the wedged turn — the abort's OWN error result is SWALLOWED, never surfaced
+    as a bogus `OpenCode error: Aborted` / `Error: Aborted`
+    (`checkIsOpenCodeAbortError`, both the `session.error` and message `info.error`
+    channels) or json-stream `Claude error: API error` (the contentless
+    `is_error` result of an interrupt we issued; `swallowNextAbortError` one-shot
+    armed in `sendInterrupt`)) and is delivered as a fresh prompt. Pre-fix the voice handler had NO question
     handling, so a voice note queued behind the blocked question-turn and the
     user got no reply (live 2026-06-25, topic «ProjectB app 1»). Route decision:
     `getQuestionReplyRoute`. **Abandoning a question ALSO rejects it on the

@@ -170,6 +170,16 @@ interface StreamSession {
   pendingQuestion: PendingStreamQuestion | null;
   // — api error one-shot guard (re-armed on recovery) —
   apiErrorFired: boolean;
+  /**
+   * One-shot: swallow the NEXT terminal `result{is_error}` because it is the
+   * direct consequence of an interrupt WE issued (`sendInterrupt`), not a real
+   * provider error. Without it a user-initiated abort — a `/esc`, or the
+   * question-cancel path's SIGINT — surfaces the CLI's contentless error result
+   * as a bogus "Claude error: API error" line (`claudeStreamJson` falls back to
+   * the literal `'API error'` for an `is_error` result carrying no text).
+   * Consumed by the first `handleTurnEnd` after the interrupt.
+   */
+  swallowNextAbortError: boolean;
   /** Last transcript byte offset persisted as the seen-watermark (S7 monotonic
    *  guard). `-1` until the first advance so a never-advanced session writes on
    *  its first relayed message. */
@@ -375,7 +385,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       toolNamesById: new Map(), questionToolUseIds: new Set(),
       subagentActive: false, childResponseText: '', childEmittedLength: 0, childOutputTimer: null,
       pendingInitResolve: null, initRequestId: null,
-      pendingQuestion: null, apiErrorFired: false,
+      pendingQuestion: null, apiErrorFired: false, swallowNextAbortError: false,
       lastWatermarkOffset: -1,
     };
     this.sessions.set(keyToString(key), session);
@@ -662,7 +672,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       subagentActive: false, childResponseText: '', childEmittedLength: 0, childOutputTimer: null,
       pendingInitResolve: null, initRequestId: null,
       pendingQuestion: this.readQuestionSidecar(paths),
-      apiErrorFired: false,
+      apiErrorFired: false, swallowNextAbortError: false,
       lastWatermarkOffset: -1,
     };
     if (session.pendingQuestion) {
@@ -806,6 +816,12 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     // busy; if a `result` does arrive, `handleTurnEnd` is a harmless no-op.
     session.isBusy = false;
     session.outstandingToolUseIds.clear();
+    // When the CLI DOES emit a terminal `result{is_error}` for this abort, it
+    // carries no text → `claudeStreamJson` labels it the literal `'API error'`.
+    // Arm the one-shot so `handleTurnEnd` swallows it instead of relaying a bogus
+    // "Claude error: API error" (the reported triple-message on question-cancel,
+    // and any bare `/esc` mid-turn). Consumed by the next `handleTurnEnd`.
+    session.swallowNextAbortError = true;
   }
 
   /** Enqueue one stream-json frame onto the stdin FIFO. Fire-and-forget for
@@ -1020,8 +1036,19 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     session.outstandingToolUseIds.clear();
     this.finishReasoning(session);
     this.clearSubagent(session);
+    // One-shot: consume the interrupt's swallow flag for THIS terminal result
+    // (read-and-clear so it can never leak onto a later, unrelated turn).
+    const swallowAbortError = session.swallowNextAbortError;
+    session.swallowNextAbortError = false;
 
     if (action.isError && action.errorText) {
+      // Our own interrupt produced this error result — relay nothing (no bogus
+      // "Claude error", no spurious retry). A REAL provider error arriving
+      // WITHOUT a preceding interrupt still classifies / surfaces normally.
+      if (swallowAbortError) {
+        console.log(`[ClaudeJson] swallowed interrupt-aborted turn error for ${keyToString(session.key)}: ${action.errorText}`);
+        return;
+      }
       const emitted = this.maybeEmitApiError(session, action.errorText);
       if (!emitted) this.emit('output', session.key, `Claude error: ${action.errorText}`, { isFinal: true });
       return;

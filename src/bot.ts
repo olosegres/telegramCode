@@ -8224,6 +8224,11 @@ async function cancelPendingQuestionAndForward(
   const pending = pendingQuestions.get(keyToString(key));
   const cancelledMessageId = pending?.messageId ?? null;
   const cancelledQuestion = pending?.data.questions[pending.currentIndex];
+  // Whether we relabel the on-screen question bubble itself to "❌ … cancelled"
+  // below. When we do, that IS the cancellation notice — a second standalone
+  // "previous question cancelled" line is pure noise (the reported triple
+  // message). The standalone notice is kept only for the no-bubble case.
+  const didLabelQuestionMessage = cancelledMessageId !== null && cancelledQuestion !== undefined;
 
   clearPendingQuestion(key);
 
@@ -8242,7 +8247,11 @@ async function cancelPendingQuestionAndForward(
   // question (the adapter guards both).
   adapter.rejectQuestion?.(key);
   adapter.sendSignal(key, 'SIGINT');
-  await replyToThread(key, t('agent.question_cancelled_for_prompt'));
+  // Exactly ONE cancellation notice: skip the standalone line when the question
+  // bubble was already relabelled to cancelled above.
+  if (!didLabelQuestionMessage) {
+    await replyToThread(key, t('agent.question_cancelled_for_prompt'));
+  }
   await forwardPromptToAgent(key, adapter, text, sentAtMs);
 }
 

@@ -8496,6 +8496,22 @@ function handleAdapterStatus(key: ThreadKey, status: string): void {
  */
 async function handleAgentStatus(key: ThreadKey, status: string): Promise<void> {
   if (!status.trim()) return;
+  // While an OpenCode question is pending the agent is BLOCKED waiting for the
+  // user, so a status frame ("🔧 question…", tool spinner) shows no forward
+  // progress — and it actively harms the layout: a new status message lands
+  // below the question, the repost-to-bottom then moves the QUESTION below it,
+  // trapping the frame ABOVE the (multi-)question stack. Its id becomes
+  // `statusMessageId`, so every post-answer frame edits that stranded message far
+  // above the answers instead of a fresh one at the bottom (live 2026-08-14,
+  // topic 218). Drop the frame + clear any parked text; a fresh status resumes
+  // below the answered questions once the question resolves (`statusMessageId`
+  // was nulled by `handleAgentQuestion`'s `deleteStatusMessage`, so the first
+  // post-clear frame creates a new bottom-most message). No-op for Claude/
+  // terminal — they hold no `pendingQuestions` entry.
+  if (pendingQuestions.has(keyToString(key))) {
+    getStatusCoalesceState(key).pendingText = null;
+    return;
+  }
   console.log(`[Bot] status ${keyToString(key)}: ${status.slice(0, 100)}`);
   traceAgentEmit('status', key, status);
 

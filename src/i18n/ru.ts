@@ -183,6 +183,7 @@ export const ruDict: Record<string, string> = {
   'agent.queued_starting': '⏳ {label} ещё запускается — сообщение в очереди, отправлю как только будет готов.',
   'agent.question_hint': 'ℹ️ Ответь цифрой варианта (например 1) или y/n. Также: /up /down — выбор, /enter — подтвердить, /c — отмена.',
   'agent.start_failed': 'Не удалось запустить {label}: {error}',
+  'agent.no_response': '⚠️ Агент принял запрос, но так и не начал отвечать — возможно, сессия зависла. Отправьте ещё раз или /new для новой сессии.',
   'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
   'agent.question_cancelled_msg_label': '❌ Вопрос отменён: {header}',
   'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',

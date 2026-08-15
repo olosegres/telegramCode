@@ -179,6 +179,7 @@ export const esDict: Record<string, string> = {
   'agent.queued_starting': '⏳ {label} aún está iniciando — tu mensaje está en cola y se enviará cuando esté listo.',
   'agent.question_hint': 'ℹ️ Responde con el número de opción (ej. 1) o y/n. También: /up /down para mover, /enter para confirmar, /c para cancelar.',
   'agent.start_failed': 'Error al iniciar {label}: {error}',
+  'agent.no_response': '⚠️ El agente aceptó tu solicitud pero no empezó a responder: puede que la sesión esté bloqueada. Vuelve a enviarla o usa /new para una sesión nueva.',
   'agent.question_cancelled_for_prompt': '⚠️ Pregunta anterior cancelada — ejecutando tu nueva solicitud.',
   'agent.question_cancelled_msg_label': '❌ Pregunta cancelada: {header}',
   'agent.login_code_relayed': '🔐 Código de inicio de sesión enviado a Claude — el mensaje con el token se eliminó del historial.',

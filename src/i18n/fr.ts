@@ -179,6 +179,7 @@ export const frDict: Record<string, string> = {
   'agent.queued_starting': '⏳ {label} démarre encore — votre message est en file d\'attente et sera envoyé dès qu\'il sera prêt.',
   'agent.question_hint': 'ℹ️ Répondez avec le numéro d\'option (ex. 1) ou y/n. Aussi : /up /down pour naviguer, /enter pour confirmer, /c pour annuler.',
   'agent.start_failed': 'Échec du démarrage de {label} : {error}',
+  'agent.no_response': '⚠️ L’agent a accepté votre demande mais n’a jamais commencé à répondre — la session est peut-être bloquée. Renvoyez-la, ou /new pour une nouvelle session.',
   'agent.question_cancelled_for_prompt': '⚠️ Question précédente annulée — exécution de votre nouvelle requête.',
   'agent.question_cancelled_msg_label': '❌ Question annulée : {header}',
   'agent.login_code_relayed': '🔐 Code de connexion transmis à Claude — le message avec le jeton a été supprimé de l\'historique.',

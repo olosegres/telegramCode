@@ -185,6 +185,7 @@ export const ukDict: Record<string, string> = {
   'agent.queued_starting': '⏳ {label} ще запускається — твоє повідомлення в черзі й буде надіслане, щойно він буде готовий.',
   'agent.question_hint': 'ℹ️ Відповідай номером варіанта (наприклад 1) або y/n. Також: /up /down — рух, /enter — підтвердити, /c — скасувати.',
   'agent.start_failed': 'Не вдалося запустити {label}: {error}',
+  'agent.no_response': '⚠️ Агент прийняв запит, але так і не почав відповідати — можливо, сесія зависла. Надішліть ще раз або /new для нової сесії.',
   'agent.question_cancelled_for_prompt': '⚠️ Попереднє питання скасовано — виконую твій новий запит.',
   'agent.question_cancelled_msg_label': '❌ Питання скасовано: {header}',
   'agent.login_code_relayed': '🔐 Код входу передано в Claude — повідомлення з токеном видалено з історії.',

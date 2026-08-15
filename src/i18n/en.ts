@@ -183,6 +183,7 @@ export const enDict: Record<string, string> = {
   'agent.queued_starting': '⏳ {label} is still starting — your message is queued and will be sent once it is ready.',
   'agent.question_hint': 'ℹ️ Reply with the option number (e.g. 1) or y/n. Also: /up /down to move, /enter to confirm, /c to cancel.',
   'agent.start_failed': 'Failed to start {label}: {error}',
+  'agent.no_response': '⚠️ The agent accepted your request but never started responding — the session may be stuck. Send it again, or /new to start a fresh session.',
   'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
   'agent.question_cancelled_msg_label': '❌ Question cancelled: {header}',
   'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',

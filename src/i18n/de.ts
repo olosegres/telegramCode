@@ -180,6 +180,7 @@ export const deDict: Record<string, string> = {
   'agent.question_hint': 'ℹ️ Antworte mit der Optionsnummer (z.B. 1) oder y/n. Auch: /up /down zum Bewegen, /enter zum Bestätigen, /c zum Abbrechen.',
   'agent.start_failed': '{label} konnte nicht gestartet werden: {error}',
   'agent.no_response': '⚠️ Der Agent hat deine Anfrage angenommen, aber nicht begonnen zu antworten – die Sitzung hängt möglicherweise. Sende sie erneut oder /new für eine neue Sitzung.',
+  'agent.session_restarting': '⚠️ Der Agent hat nicht geantwortet – die Sitzung hängt. Ich starte sie neu und wiederhole deine Anfrage…',
   'agent.question_cancelled_for_prompt': '⚠️ Vorherige Frage abgebrochen — führe deine neue Anfrage aus.',
   'agent.question_cancelled_msg_label': '❌ Frage abgebrochen: {header}',
   'agent.login_code_relayed': '🔐 Login-Code an Claude weitergeleitet — die Token-Nachricht wurde aus dem Verlauf gelöscht.',

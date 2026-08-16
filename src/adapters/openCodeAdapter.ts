@@ -3331,10 +3331,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session?.isActive) return;
 
-    // Any part (own or sub-agent child) means the turn genuinely started —
-    // clears the wedged-turn suspicion for the pending prompt.
-    session.sawTurnActivity = true;
-
     const part = properties.part as OpenCodePart | undefined;
     const delta = properties.delta as string | undefined;
     const field = properties.field as string | undefined;
@@ -3769,7 +3765,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!info) return;
 
     // An assistant message (own or sub-agent child) means the turn genuinely
-    // started — clears the wedged-turn suspicion for the pending prompt.
+    // started — the SOLE wedged-turn activity signal. Must be assistant-only:
+    // `prompt_async` also emits message/part events for the ECHOED USER PROMPT,
+    // and counting those (the old unconditional set in handlePartUpdate) marked
+    // every wedge as "active" and masked it (live miss 2026-08-16).
     if (info.role === 'assistant') session.sawTurnActivity = true;
 
     // Track and show model info on first assistant message (or after model change)
@@ -3855,8 +3854,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Snapshot the wedged-turn guards BEFORE the own-idle clears below reset
     // them: a legitimate compaction cycle and a still-pending provider retry
     // both idle without assistant text and must NOT be flagged as wedged.
+    // `Boolean(...)` (not `!== null`) so a reattached session whose field is
+    // `undefined` — never set by the resume path — reads as "no retry" instead
+    // of silently suppressing the wedge notice (live miss 2026-08-16).
     const wasCompacting = session.isCompacting;
-    const hadPendingProviderRetry = session.providerRetrySignature !== null;
+    const hadPendingProviderRetry = Boolean(session.providerRetrySignature);
 
     // Idle = busy/idle transition to idle; also a defensive clear if a
     // `session.status` idle was missed. Own idle also ends any compaction
@@ -3899,9 +3901,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     // Wedged-turn detection: a delivered prompt that produced NO assistant
     // activity before idling means OpenCode accepted it but never ran a turn
-    // (a bloated / stuck session — live 2026-08-15). Surface a notice so the
-    // topic doesn't look silently hung. Resolved once per prompt: the pending
-    // flag is cleared on this own idle regardless of the outcome.
+    // (a bloated / stuck session — live 2026-08-15/16). Emit `noResponse` so the
+    // bot can auto-recover (fresh session + replay); the session is
+    // unrecoverable in place, so a notice alone leaves the topic dead. Resolved
+    // once per prompt: the pending flag is cleared on this own idle regardless.
     if (isOwnIdle && session.awaitingTurnResponse) {
       const isWedged = checkIsWedgedTurn({
         awaitingResponse: true,
@@ -3913,12 +3916,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       if (isWedged) {
         console.warn(`[OpenCode] Prompt produced no turn (wedged session) for ${keyToString(key)}`);
         appendDiagLog(`prompt NO-RESPONSE wedged key=${keyToString(key)} session=${session.sessionId}`);
-        this.emit(
-          'output',
-          key,
-          this.tl(key, () => t('agent.no_response')),
-          { isComplete: true } satisfies OutputEventMeta,
-        );
+        this.emit('noResponse', key);
       }
     }
   }

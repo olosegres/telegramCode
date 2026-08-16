@@ -180,6 +180,7 @@ export const zhDict: Record<string, string> = {
   'agent.question_hint': 'ℹ️ 回复选项编号（如 1）或 y/n。还有：/up /down 移动，/enter 确认，/c 取消。',
   'agent.start_failed': '启动 {label} 失败：{error}',
   'agent.no_response': '⚠️ 智能体已接收你的请求但一直没有开始回复——会话可能已卡住。请重新发送，或用 /new 开启新会话。',
+  'agent.session_restarting': '⚠️ 智能体没有响应——会话似乎卡住了。正在重启并重新执行你的请求…',
   'agent.question_cancelled_for_prompt': '⚠️ 上一个问题已取消 — 正在执行你的新请求。',
   'agent.question_cancelled_msg_label': '❌ 问题已取消：{header}',
   'agent.login_code_relayed': '🔐 登录码已转发给 Claude — 包含 token 的消息已从历史中删除。',

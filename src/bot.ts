@@ -227,6 +227,7 @@ import { getThreadKeysForDirectory } from './scheduler/directoryThreads';
 import { getRebindResumeAction } from './scheduler/rebindResume';
 import type { DeliveryOutcome, FireContext, ScheduleRecord } from './scheduler/types';
 import { decideRetryAction, classifyAgentApiError } from './apiErrorRetry';
+import { decideWedgeRecovery } from './utils/wedgeRecovery';
 import { spawn as spawnPty, type IPty } from 'node-pty';
 import { resolveClaudeBinary, resolveOpenCodeBinary } from './utils/resolveBinary';
 import {
@@ -1237,6 +1238,21 @@ interface ApiRetryTimerEntry {
 const apiRetryTimers = new Map<string, ApiRetryTimerEntry>();
 
 /**
+ * Last RAW prompt forwarded to each thread (pre-preamble), kept so a wedged
+ * OpenCode session (accepted a prompt but ran no turn) can be recovered by
+ * restarting fresh and replaying it. Slash commands and recovery replays are
+ * not cached (see {@link forwardPromptToAgent}).
+ */
+const lastForwardedPrompt = new Map<string, string>();
+/**
+ * Threads currently in the middle of a wedge-recovery restart (one fresh-session
+ * attempt per prompt episode). Present ⇒ a restart was already tried for the
+ * current prompt, so a second wedge gives up instead of looping. Cleared when a
+ * genuine new prompt is forwarded.
+ */
+const wedgeRecoveringThreads = new Set<string>();
+
+/**
  * @description `apiError` from the adapter — arm (or escalate) an auto-retry, or
  * give up. The pure decision lives in {@link decideRetryAction}; this handler is
  * the I/O shell: it posts the class-specific notice, persists the armed record,
@@ -1364,6 +1380,57 @@ function cancelApiRetry(key: ThreadKey): void {
   // message" bug. The notice is retired only on genuine teardown (the explicit
   // `clearAuthNotice` calls at session-end sites) and on recovery (first real
   // output, in `handleAgentOutput`).
+}
+
+/**
+ * @description `noResponse` from the OpenCode adapter — the prompt was accepted
+ * (HTTP 204) but the agent ran no turn at all (a WEDGED session: its loop exits
+ * at step 0 with no output). The session is unrecoverable in place — even a
+ * server-side summarize hits the same dead loop (verified live 2026-08-15/16 on
+ * the my-news digest) — so the ONLY fix is a FRESH session, then replaying the
+ * prompt. Safe because a wedge only fires on a genuinely dead session (a healthy
+ * turn always produces assistant activity) and the restart mirrors `/new`.
+ *
+ * Loop-guarded (pure {@link decideWedgeRecovery}): recover at most once per
+ * prompt episode. If the fresh session ALSO wedges, or there is nothing cached
+ * to replay, surface the actionable notice instead of restarting forever.
+ */
+function handleNoResponse(key: ThreadKey): void {
+  void withThreadLocale(key, () => handleNoResponseWithLocale(key));
+}
+
+async function handleNoResponseWithLocale(key: ThreadKey): Promise<void> {
+  const k = keyToString(key);
+  const replayPrompt = lastForwardedPrompt.get(k);
+  const action = decideWedgeRecovery({
+    hasReplayPrompt: replayPrompt !== undefined,
+    alreadyRecovering: wedgeRecoveringThreads.has(k),
+  });
+
+  if (action === 'giveUp') {
+    wedgeRecoveringThreads.delete(k);
+    await replyToThread(key, t('agent.no_response'));
+    return;
+  }
+
+  // action === 'restart': mark the episode BEFORE the replay so a second wedge
+  // (the replay forward keeps this flag) resolves to giveUp, never a loop.
+  wedgeRecoveringThreads.add(k);
+  await replyToThread(key, t('agent.session_restarting'));
+  try {
+    await releaseThreadSession(key);
+    const startMsg = await startAgentSession(key);
+    if (startMsg) await replyToThread(key, startMsg);
+    // Replay the original prompt into the FRESH session. `isRecoveryReplay`
+    // keeps the once-per-episode guard set (no re-cache, no guard reset).
+    await forwardPromptToAgent(key, getThreadAdapter(key), replayPrompt!, undefined, {
+      isRecoveryReplay: true,
+    });
+  } catch (e) {
+    console.error('[wedgeRecovery] restart failed:', e instanceof Error ? e.message : e);
+    wedgeRecoveringThreads.delete(k);
+    await replyToThread(key, t('agent.no_response'));
+  }
 }
 
 /**
@@ -4295,7 +4362,16 @@ async function forwardPromptToAgent(
   adapter: AgentAdapter,
   text: string,
   sentAtMs?: number,
+  options: { isRecoveryReplay?: boolean } = {},
 ): Promise<void> {
+  // Cache the RAW prompt so a wedged OpenCode session can be recovered by
+  // restarting fresh and replaying it. Skip slash commands (not worth replaying)
+  // and the recovery replay itself (keeps the once-per-episode guard intact). A
+  // genuine new prompt also opens a fresh recovery episode (clears the guard).
+  if (!options.isRecoveryReplay && !checkShouldSkipPreambleForText(text)) {
+    lastForwardedPrompt.set(keyToString(key), text);
+    wedgeRecoveringThreads.delete(keyToString(key));
+  }
   // Glue the thread-context preamble (topic / group / thread / folder) ahead
   // of the prompt so the agent knows WHERE it works. Slash commands forwarded
   // to the agent (`/clear`, `/compact`, …) are skipped — a preamble would
@@ -10515,6 +10591,7 @@ export async function startBot(): Promise<void> {
     onToolResult: (key, payload) => withThreadLocale(key, () => handleAgentToolResult(key, payload)),
     onSubagentStatus: (key, payload) => withThreadLocale(key, () => handleSubagentStatus(key, payload)),
     onApiError: (key, error) => withThreadLocale(key, () => handleApiError(key, error)),
+    onNoResponse: (key) => handleNoResponse(key),
     onQuestionGone: (key) => withThreadLocale(key, () => handleQuestionGone(key)),
     onClosed: (key) => withThreadLocale(key, () => handleAgentClosed(key)),
     onStarted: (key) => withThreadLocale(key, () => handleAgentStarted(key)),

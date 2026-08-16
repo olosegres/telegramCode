@@ -180,6 +180,7 @@ export const ptDict: Record<string, string> = {
   'agent.question_hint': 'ℹ️ Responde com o número da opção (ex. 1) ou y/n. Também: /up /down para mover, /enter para confirmar, /c para cancelar.',
   'agent.start_failed': 'Falha ao iniciar {label}: {error}',
   'agent.no_response': '⚠️ O agente aceitou seu pedido mas não começou a responder — a sessão pode estar travada. Envie novamente ou use /new para uma sessão nova.',
+  'agent.session_restarting': '⚠️ O agente não respondeu — a sessão parece travada. Reiniciando e repetindo seu pedido…',
   'agent.question_cancelled_for_prompt': '⚠️ Pergunta anterior cancelada — a executar o teu novo pedido.',
   'agent.question_cancelled_msg_label': '❌ Pergunta cancelada: {header}',
   'agent.login_code_relayed': '🔐 Código de login retransmitido para o Claude — a mensagem com o token foi apagada do histórico.',

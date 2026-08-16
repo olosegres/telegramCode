@@ -187,6 +187,7 @@ export const ukDict: Record<string, string> = {
   'agent.start_failed': 'Не вдалося запустити {label}: {error}',
   'agent.no_response': '⚠️ Агент прийняв запит, але так і не почав відповідати — можливо, сесія зависла. Надішліть ще раз або /new для нової сесії.',
   'agent.session_restarting': '⚠️ Агент не відповів — сесія зависла. Перезапускаю її та повторюю запит…',
+  'agent.session_recovering': '⚠️ Агент не відповів — відновлюю (діалог збережено) і повторюю запит…',
   'agent.question_cancelled_for_prompt': '⚠️ Попереднє питання скасовано — виконую твій новий запит.',
   'agent.question_cancelled_msg_label': '❌ Питання скасовано: {header}',
   'agent.login_code_relayed': '🔐 Код входу передано в Claude — повідомлення з токеном видалено з історії.',

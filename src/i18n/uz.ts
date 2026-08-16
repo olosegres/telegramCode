@@ -181,6 +181,7 @@ export const uzDict: Record<string, string> = {
   'agent.start_failed': '{label} ni boshlab bo‘lmadi: {error}',
   'agent.no_response': '⚠️ Agent so‘rovingizni qabul qildi, lekin javob berishni boshlamadi — sessiya qotib qolgan bo‘lishi mumkin. Qayta yuboring yoki yangi sessiya uchun /new.',
   'agent.session_restarting': '⚠️ Agent javob bermadi — sessiya qotib qolganga o‘xshaydi. Uni qayta ishga tushirib, so‘rovingizni qayta bajaraman…',
+  'agent.session_recovering': '⚠️ Agent javob bermadi — tiklayapman (suhbatingiz saqlanadi) va so‘rovingizni qayta bajaraman…',
   'agent.question_cancelled_for_prompt': '⚠️ Oldingi savol bekor qilindi — yangi so‘rovingiz bajarilmoqda.',
   'agent.question_cancelled_msg_label': '❌ Savol bekor qilindi: {header}',
   'agent.login_code_relayed': '🔐 Kirish kodi Claude ga yuborildi — token xabari tarixdan o‘chirildi.',

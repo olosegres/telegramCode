@@ -1245,12 +1245,13 @@ const apiRetryTimers = new Map<string, ApiRetryTimerEntry>();
  */
 const lastForwardedPrompt = new Map<string, string>();
 /**
- * Threads currently in the middle of a wedge-recovery restart (one fresh-session
- * attempt per prompt episode). Present ⇒ a restart was already tried for the
- * current prompt, so a second wedge gives up instead of looping. Cleared when a
- * genuine new prompt is forwarded.
+ * Per-thread wedge-recovery tier: how many recovery attempts were already made
+ * for the CURRENT prompt episode. Escalates resend(0) → fork(1) → restart(2) →
+ * give-up, one attempt each, so the last dialog is preserved when possible and a
+ * persistently-wedging session can't loop. Reset (deleted) when a genuine new
+ * prompt is forwarded. See {@link decideWedgeRecovery}.
  */
-const wedgeRecoveringThreads = new Set<string>();
+const wedgeRecoveryTier = new Map<string, number>();
 
 /**
  * @description `apiError` from the adapter — arm (or escalate) an auto-retry, or
@@ -1385,15 +1386,22 @@ function cancelApiRetry(key: ThreadKey): void {
 /**
  * @description `noResponse` from the OpenCode adapter — the prompt was accepted
  * (HTTP 204) but the agent ran no turn at all (a WEDGED session: its loop exits
- * at step 0 with no output). The session is unrecoverable in place — even a
- * server-side summarize hits the same dead loop (verified live 2026-08-15/16 on
- * the my-news digest) — so the ONLY fix is a FRESH session, then replaying the
- * prompt. Safe because a wedge only fires on a genuinely dead session (a healthy
- * turn always produces assistant activity) and the restart mirrors `/new`.
+ * at step 0 with no output; verified live 2026-08-15/16 on the my-news digest).
+ * The topic would otherwise look dead, so the bot auto-recovers AND restores the
+ * last dialog where possible, escalating one tier per repeat (pure
+ * {@link decideWedgeRecovery}):
  *
- * Loop-guarded (pure {@link decideWedgeRecovery}): recover at most once per
- * prompt episode. If the fresh session ALSO wedges, or there is nothing cached
- * to replay, surface the actionable notice instead of restarting forever.
+ *   resend  — replay into the SAME session (a transient stall recovers, dialog intact);
+ *   fork    — fork the session into a fresh one carrying the full conversation, then replay
+ *             (recovers an instance-level wedge while KEEPING the dialog);
+ *   restart — blank fresh session + replay (the conversation itself is the poison,
+ *             e.g. a bloated session — dialog dropped, but the trigger still runs);
+ *   giveUp  — surface the actionable notice instead of looping.
+ *
+ * The tier is bumped BEFORE the replay (which rides `isRecoveryReplay` so it does
+ * not reset it), so each repeat escalates and a persistent wedge ends at giveUp.
+ * A wedge only fires on a genuinely stuck session (a healthy turn always produces
+ * assistant activity), so this never disturbs a working thread.
  */
 function handleNoResponse(key: ThreadKey): void {
   void withThreadLocale(key, () => handleNoResponseWithLocale(key));
@@ -1402,33 +1410,53 @@ function handleNoResponse(key: ThreadKey): void {
 async function handleNoResponseWithLocale(key: ThreadKey): Promise<void> {
   const k = keyToString(key);
   const replayPrompt = lastForwardedPrompt.get(k);
+  const adapter = getThreadAdapter(key);
+  const tier = wedgeRecoveryTier.get(k) ?? 0;
   const action = decideWedgeRecovery({
+    tier,
     hasReplayPrompt: replayPrompt !== undefined,
-    alreadyRecovering: wedgeRecoveringThreads.has(k),
+    canFork: typeof adapter.forkSession === 'function',
   });
 
   if (action === 'giveUp') {
-    wedgeRecoveringThreads.delete(k);
+    wedgeRecoveryTier.delete(k);
     await replyToThread(key, t('agent.no_response'));
     return;
   }
 
-  // action === 'restart': mark the episode BEFORE the replay so a second wedge
-  // (the replay forward keeps this flag) resolves to giveUp, never a loop.
-  wedgeRecoveringThreads.add(k);
-  await replyToThread(key, t('agent.session_restarting'));
+  // Record this attempt BEFORE the replay so a repeat escalates to the next tier
+  // (the replay forward rides `isRecoveryReplay`, which does NOT reset the tier).
+  wedgeRecoveryTier.set(k, tier + 1);
   try {
-    await releaseThreadSession(key);
-    const startMsg = await startAgentSession(key);
-    if (startMsg) await replyToThread(key, startMsg);
-    // Replay the original prompt into the FRESH session. `isRecoveryReplay`
-    // keeps the once-per-episode guard set (no re-cache, no guard reset).
+    if (action === 'resend') {
+      // Transient-stall retry: same session, dialog fully intact.
+      await replyToThread(key, t('agent.session_recovering'));
+    } else if (action === 'fork') {
+      // Restore the last dialog into a fresh, unwedged session.
+      await replyToThread(key, t('agent.session_recovering'));
+      const forkedId = await adapter.forkSession!(key);
+      if (forkedId) {
+        await persistAdapterSessionIds(key, adapter, state);
+      } else {
+        // Fork failed → fall back immediately to a blank restart this tier.
+        await releaseThreadSession(key);
+        const startMsg = await startAgentSession(key);
+        if (startMsg) await replyToThread(key, startMsg);
+      }
+    } else {
+      // action === 'restart': blank fresh session (dialog dropped).
+      await replyToThread(key, t('agent.session_restarting'));
+      await releaseThreadSession(key);
+      const startMsg = await startAgentSession(key);
+      if (startMsg) await replyToThread(key, startMsg);
+    }
+    // Re-trigger the original prompt into the (same / forked / fresh) session.
     await forwardPromptToAgent(key, getThreadAdapter(key), replayPrompt!, undefined, {
       isRecoveryReplay: true,
     });
   } catch (e) {
-    console.error('[wedgeRecovery] restart failed:', e instanceof Error ? e.message : e);
-    wedgeRecoveringThreads.delete(k);
+    console.error(`[wedgeRecovery] ${action} failed:`, e instanceof Error ? e.message : e);
+    wedgeRecoveryTier.delete(k);
     await replyToThread(key, t('agent.no_response'));
   }
 }
@@ -4370,7 +4398,7 @@ async function forwardPromptToAgent(
   // genuine new prompt also opens a fresh recovery episode (clears the guard).
   if (!options.isRecoveryReplay && !checkShouldSkipPreambleForText(text)) {
     lastForwardedPrompt.set(keyToString(key), text);
-    wedgeRecoveringThreads.delete(keyToString(key));
+    wedgeRecoveryTier.delete(keyToString(key));
   }
   // Glue the thread-context preamble (topic / group / thread / folder) ahead
   // of the prompt so the agent knows WHERE it works. Slash commands forwarded

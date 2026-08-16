@@ -185,6 +185,7 @@ export const enDict: Record<string, string> = {
   'agent.start_failed': 'Failed to start {label}: {error}',
   'agent.no_response': '⚠️ The agent accepted your request but never started responding — the session may be stuck. Send it again, or /new to start a fresh session.',
   'agent.session_restarting': '⚠️ The agent didn\'t respond — the session looks stuck. Restarting it and re-running your request…',
+  'agent.session_recovering': '⚠️ The agent didn\'t respond — recovering (your conversation is kept) and re-running your request…',
   'agent.question_cancelled_for_prompt': '⚠️ Previous question cancelled — running your new request.',
   'agent.question_cancelled_msg_label': '❌ Question cancelled: {header}',
   'agent.login_code_relayed': '🔐 Login code relayed to Claude — the token message was deleted from history.',

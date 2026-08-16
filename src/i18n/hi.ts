@@ -181,6 +181,7 @@ export const hiDict: Record<string, string> = {
   'agent.start_failed': '{label} शुरू करने में विफल: {error}',
   'agent.no_response': '⚠️ एजेंट ने आपका अनुरोध स्वीकार किया पर जवाब देना शुरू नहीं किया — सत्र अटका हो सकता है। इसे फिर भेजें, या नए सत्र के लिए /new करें।',
   'agent.session_restarting': '⚠️ एजेंट ने जवाब नहीं दिया — सत्र अटका लगता है। इसे पुनः आरंभ कर आपका अनुरोध दोबारा चला रहा हूँ…',
+  'agent.session_recovering': '⚠️ एजेंट ने जवाब नहीं दिया — पुनर्प्राप्त कर रहा हूँ (आपकी बातचीत सुरक्षित है) और आपका अनुरोध दोबारा चला रहा हूँ…',
   'agent.question_cancelled_for_prompt': '⚠️ पिछला प्रश्न रद्द — आपका नया अनुरोध चल रहा है।',
   'agent.question_cancelled_msg_label': '❌ प्रश्न रद्द: {header}',
   'agent.login_code_relayed': '🔐 लॉगिन कोड Claude को भेजा गया — टोकन संदेश इतिहास से हटाया गया।',

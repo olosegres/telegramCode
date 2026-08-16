@@ -181,6 +181,7 @@ export const frDict: Record<string, string> = {
   'agent.start_failed': 'Échec du démarrage de {label} : {error}',
   'agent.no_response': '⚠️ L’agent a accepté votre demande mais n’a jamais commencé à répondre — la session est peut-être bloquée. Renvoyez-la, ou /new pour une nouvelle session.',
   'agent.session_restarting': '⚠️ L’agent n’a pas répondu — la session semble bloquée. Je la redémarre et relance votre demande…',
+  'agent.session_recovering': '⚠️ L’agent n’a pas répondu — récupération (votre conversation est conservée) et relance de votre demande…',
   'agent.question_cancelled_for_prompt': '⚠️ Question précédente annulée — exécution de votre nouvelle requête.',
   'agent.question_cancelled_msg_label': '❌ Question annulée : {header}',
   'agent.login_code_relayed': '🔐 Code de connexion transmis à Claude — le message avec le jeton a été supprimé de l\'historique.',

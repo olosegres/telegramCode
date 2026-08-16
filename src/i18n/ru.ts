@@ -185,6 +185,7 @@ export const ruDict: Record<string, string> = {
   'agent.start_failed': 'Не удалось запустить {label}: {error}',
   'agent.no_response': '⚠️ Агент принял запрос, но так и не начал отвечать — возможно, сессия зависла. Отправьте ещё раз или /new для новой сессии.',
   'agent.session_restarting': '⚠️ Агент не ответил — сессия зависла. Перезапускаю её и повторяю запрос…',
+  'agent.session_recovering': '⚠️ Агент не ответил — восстанавливаю (диалог сохранён) и повторяю запрос…',
   'agent.question_cancelled_for_prompt': '⚠️ Предыдущий вопрос отменён — выполняю новый запрос.',
   'agent.question_cancelled_msg_label': '❌ Вопрос отменён: {header}',
   'agent.login_code_relayed': '🔐 Код входа передан в Claude — сообщение с токеном удалено из истории.',

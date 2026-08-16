@@ -734,6 +734,17 @@ export interface AgentAdapter extends EventEmitter {
   resumeSession(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void>;
 
   /**
+   * @description Fork the thread's CURRENT session into a new one that carries
+   * the full conversation, and attach to it; returns the new session id (or null
+   * if inactive / failed). Optional (optional-method pattern like {@link setModel}):
+   * OpenCode implements it via `POST /session/:id/fork`; the bot's wedged-turn
+   * recovery uses it to restore the last dialog into a fresh, unwedged session
+   * before replaying. Adapters that can't fork omit it (recovery falls back to a
+   * blank restart).
+   */
+  forkSession?(key: ThreadKey): Promise<string | null>;
+
+  /**
    * @description Read the last `limit` conversational turns (user/assistant
    * messages with renderable text, oldest→newest) of `sessionId` from the
    * backend's own transcript — Claude reads its `.jsonl`, OpenCode calls

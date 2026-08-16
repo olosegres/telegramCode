@@ -2316,6 +2316,34 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return this.withLifecycleLock(k, () => this.resumeSessionInner(key, workDir, sessionId, options));
   }
 
+  /**
+   * @description Fork the thread's CURRENT session into a new one that carries
+   * the full conversation, and attach to it. Used by the bot's wedged-turn
+   * recovery (tier 2) to restore the last dialog into a fresh, unwedged session
+   * before replaying the prompt — so a stuck session doesn't lose context. The
+   * new session's id is exposed via {@link getOpenCodeSessionId}, so the bot
+   * persists it with the shared `persistAdapterSessionIds`. Returns the new
+   * session id, or null when there is no active session or the fork failed.
+   */
+  async forkSession(key: ThreadKey): Promise<string | null> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) return null;
+    const { workDir, sessionId } = session;
+    try {
+      const forked = await this.apiRequest<OpenCodeApiSession>('POST', `/session/${sessionId}/fork`);
+      if (!forked?.id) return null;
+      // resumeSession (locked) stops the wedged session and attaches to the fork
+      // — same machinery as a /sessions pick, so SSE routing + watermarking are
+      // re-seeded for the new id.
+      await this.resumeSession(key, workDir, forked.id);
+      console.log(`[OpenCode] Forked ${sessionId} -> ${forked.id} for ${keyToString(key)} (dialog preserved)`);
+      return forked.id;
+    } catch (e) {
+      console.error(`[OpenCode] forkSession failed:`, e instanceof Error ? e.message : e);
+      return null;
+    }
+  }
+
   private async resumeSessionInner(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {
     this.stopSessionInner(key);
 

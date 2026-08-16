@@ -181,6 +181,7 @@ export const jaDict: Record<string, string> = {
   'agent.start_failed': '{label} の起動に失敗: {error}',
   'agent.no_response': '⚠️ エージェントはリクエストを受け付けましたが、応答を開始しませんでした。セッションが停止している可能性があります。もう一度送信するか、/new で新しいセッションを開始してください。',
   'agent.session_restarting': '⚠️ エージェントが応答しませんでした。セッションが停止しているようです。再起動してリクエストを再実行します…',
+  'agent.session_recovering': '⚠️ エージェントが応答しませんでした。会話を保持したまま復旧し、リクエストを再実行します…',
   'agent.question_cancelled_for_prompt': '⚠️ 前の質問をキャンセル — 新しいリクエストを実行中。',
   'agent.question_cancelled_msg_label': '❌ 質問キャンセル: {header}',
   'agent.login_code_relayed': '🔐 ログインコードを Claude に中継 — トークンを含むメッセージを履歴から削除しました。',

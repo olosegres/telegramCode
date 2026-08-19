@@ -293,7 +293,17 @@ export async function ensureOpenCodeServer(): Promise<void> {
   console.log(`[OpenCode] Starting server on port ${port}... (${opencodeCmd})`);
 
   const child = spawn(opencodeCmd, ['serve', '--hostname', '127.0.0.1', '--port', port], {
-    env: { ...process.env, PATH: `${npmPrefix}/bin:${process.env.PATH}` },
+    env: {
+      ...process.env,
+      PATH: `${npmPrefix}/bin:${process.env.PATH}`,
+      // Enable OpenCode's background-subagents (experimental in 1.17.11): lets the
+      // bot detach a synchronous sub-agent that is blocking a session via
+      // `POST /experimental/session/:id/background` so a new message can be
+      // answered while the sub-agent keeps running (its result is auto-injected
+      // back when it finishes). Without this the whole session is locked for the
+      // entire sub-agent run and the topic looks hung.
+      OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: 'true',
+    },
     detached: process.platform !== 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
   });

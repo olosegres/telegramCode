@@ -4435,6 +4435,14 @@ async function forwardPromptToAgent(
   if (adapter.interruptAndWaitIdle) {
     await adapter.interruptAndWaitIdle(key);
   }
+  // OpenCode: if a sub-agent is synchronously blocking this session, detach it to
+  // the background so this prompt is answered promptly instead of queuing behind
+  // the whole (possibly long) sub-agent run — the sub-agent keeps working and its
+  // result is injected back when it finishes. No-op for other adapters and when
+  // no sub-agent is running. Best-effort; never blocks the forward on failure.
+  if (adapter.detachRunningSubagents) {
+    await adapter.detachRunningSubagents(key);
+  }
   adapter.sendInput(key, promptText);
   // S2 busy-onset arm: start the Claude liveness loop the moment the prompt is
   // forwarded — driven by `checkIsBusy`, not by waiting for an opportunistic

@@ -2344,6 +2344,32 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
   }
 
+  /**
+   * @description Detach any RUNNING sub-agent that is synchronously blocking the
+   * thread's session, so a new prompt can be answered while the sub-agent keeps
+   * working in the background (OpenCode injects its result back when it finishes).
+   * No-op (returns false) when the session is inactive or has no busy sub-agent.
+   * Needs the server started with `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true`
+   * (the bot always sets it); if not enabled the endpoint 400s and we swallow it.
+   * Best-effort — a failure must never block the prompt that follows it.
+   */
+  async detachRunningSubagents(key: ThreadKey): Promise<boolean> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive || session.busyChildSessionIds.size === 0) return false;
+    try {
+      const dir = encodeURIComponent(session.workDir);
+      const result = await this.apiRequest<boolean>(
+        'POST',
+        `/experimental/session/${session.sessionId}/background?directory=${dir}`,
+      );
+      if (result) console.log(`[OpenCode] Backgrounded sub-agent(s) for ${keyToString(key)} to unblock the session`);
+      return result === true;
+    } catch (e) {
+      console.warn(`[OpenCode] detachRunningSubagents failed:`, e instanceof Error ? e.message : e);
+      return false;
+    }
+  }
+
   private async resumeSessionInner(key: ThreadKey, workDir: string, sessionId: string, options?: ResumeSessionOptions): Promise<void> {
     this.stopSessionInner(key);
 

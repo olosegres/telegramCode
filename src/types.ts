@@ -745,6 +745,16 @@ export interface AgentAdapter extends EventEmitter {
   forkSession?(key: ThreadKey): Promise<string | null>;
 
   /**
+   * @description Detach any RUNNING sub-agent synchronously blocking the thread's
+   * session, so a new prompt is answered promptly while the sub-agent keeps
+   * working in the background (its result is injected back when it finishes).
+   * Returns whether anything was backgrounded. Optional (optional-method pattern):
+   * OpenCode implements it via `POST /experimental/session/:id/background`; other
+   * adapters omit it. Best-effort — never blocks the prompt that follows.
+   */
+  detachRunningSubagents?(key: ThreadKey): Promise<boolean>;
+
+  /**
    * @description Read the last `limit` conversational turns (user/assistant
    * messages with renderable text, oldest→newest) of `sessionId` from the
    * backend's own transcript — Claude reads its `.jsonl`, OpenCode calls

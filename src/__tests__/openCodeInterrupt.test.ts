@@ -8,11 +8,12 @@
  * behind `checkIsOpenCodeSessionBusy` (the scheduler's wait-for-idle probe).
  */
 
-import { test } from 'node:test';
+import { afterEach, beforeEach, describe, it, mock, test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   OpenCodeAdapter,
   applyOpenCodeStatusEvent,
+  providerRetryReplacementStartTimeoutMs,
   type OpenCodeBusyTracking,
 } from '../adapters/openCodeAdapter';
 import { ClaudeCliAdapter } from '../adapters/claudeCliAdapter';
@@ -21,6 +22,11 @@ const own = 'ses_own';
 const child = 'ses_child';
 const foreign = 'ses_foreign_sibling';
 const providerRetryDelayMs = 60 * 60_000;
+/**
+ * The adapter's own bound, imported rather than mirrored: a hand-copied value
+ * that drifted DOWN would leave every "nothing fired" assertion below vacuous.
+ */
+const replacementStartTimeoutMs = providerRetryReplacementStartTimeoutMs;
 const freshTracking = (): OpenCodeBusyTracking => ({ isBusy: false, busyChildSessionIds: new Set() });
 
 function createRetryingAdapter(): {
@@ -66,6 +72,7 @@ function createRetryingAdapter(): {
     busyChildSessionIds: new Set(),
     isAutoNamePending: false,
     isAwaitingProviderRetryReplacementStart: false,
+    providerRetryReplacementStartTimer: null,
   });
 
   const outputs: string[] = [];
@@ -485,6 +492,176 @@ test('a stale retry after the old idle cannot suppress wedge recovery for the re
   assert.equal(session.providerRetrySignature, null, 'the old retry must remain cleared after its idle');
   assert.equal(noResponseCount, 1, 'a wedged replacement still triggers recovery');
   assert.equal(outputs.length, 1, 'the stale retry must not post another retry notice');
+});
+
+/**
+ * @description The replacement boundary must be BOUNDED — a post-abort
+ * replacement prompt that never starts a turn has to hand the thread to wedge
+ * recovery instead of hanging it forever.
+ *
+ * Bug: the boundary (`isAwaitingProviderRetryReplacementStart`) is armed just
+ * before the replacement prompt is posted and released only by an observed
+ * `busy`. A wedged session accepts the prompt (HTTP 204) and its agent loop
+ * exits at step 0, so that `busy` never arrives: the boundary latched forever,
+ * `handleSessionIdle` swallowed every later own idle through it, the optimistic
+ * `isBusy` never cleared (so the topic — and the scheduler's wait-for-idle probe
+ * — saw a permanently busy session), and the wedged-turn detector stayed
+ * disarmed because this path defers arming it to that same `busy`. Nothing
+ * recovered the topic.
+ *
+ * Load-bearing in these tests:
+ * - the bound must fire ONCE and release the busy state (the reported hang);
+ * - it must be cancelled by a genuine `busy`, leaving the normal idle-time wedge
+ *   detection as the only reporter (a bound firing on a live turn would restart
+ *   a healthy conversation, and a double report would run the bot's escalation
+ *   twice for one prompt);
+ * - teardown must drop it, so nothing fires against a dead session.
+ *
+ * Time is advanced with `node:test` mock timers, the same way the SSE stall
+ * watchdog and the output-debounce tests drive their timers.
+ *
+ * Test case: N/A — TelegramCode has no Jira tracker.
+ */
+describe('the post-provider-retry replacement start is bounded', () => {
+  beforeEach(() => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+  });
+  afterEach(() => {
+    mock.timers.reset();
+  });
+
+  it('a replacement turn that never reports busy stops pinning the topic busy and recovers exactly once', async () => {
+    const { adapter } = createRetryingAdapter();
+    const key = { chatId: -100123, threadId: 42 };
+    let noResponseCount = 0;
+    adapter.on('noResponse', () => {
+      noResponseCount += 1;
+    });
+
+    adapter.sendInput(key, 'continue');
+    await new Promise(resolve => setImmediate(resolve));
+    const session = adapter['sessions'].get('-100123:42');
+    assert.equal(session.isAwaitingProviderRetryReplacementStart, true, 'the replacement awaits its busy boundary');
+    assert.equal(adapter.checkIsBusy(key), true, 'the turn may still start while the bound runs');
+
+    mock.timers.tick(replacementStartTimeoutMs + 1);
+
+    assert.equal(noResponseCount, 1, 'the never-started replacement must reach wedge recovery');
+    assert.equal(adapter.checkIsBusy(key), false, 'the optimistic busy state must not outlive the bound');
+    assert.equal(session.isAwaitingProviderRetryReplacementStart, false, 'the latched boundary is released');
+    // The aborted retry's OWN idle is exactly the event that arrives late here,
+    // so its one-shot guard stays armed: it must be consumed once more rather
+    // than counting as the idle of the recovery prompt that follows.
+    assert.equal(session.isAwaitingProviderRetryAbortIdle, true, 'the late abort idle is still owed one consumption');
+
+    adapter['handleSessionIdle'](key, { sessionID: own });
+    assert.equal(noResponseCount, 1, 'the late abort idle must not report the same prompt twice');
+    assert.equal(session.isAwaitingProviderRetryAbortIdle, false, 'consuming that idle ends the abort episode');
+  });
+
+  it('the recovery prompt that follows the bound keeps its own idle', async () => {
+    const { adapter } = createRetryingAdapter();
+    const key = { chatId: -100123, threadId: 42 };
+    let noResponseCount = 0;
+    adapter.on('noResponse', () => {
+      noResponseCount += 1;
+    });
+
+    adapter.sendInput(key, 'continue');
+    await new Promise(resolve => setImmediate(resolve));
+    const session = adapter['sessions'].get('-100123:42');
+    mock.timers.tick(replacementStartTimeoutMs + 1);
+    assert.equal(noResponseCount, 1, 'the never-started replacement reaches recovery');
+    // The aborted retry's idle never arrived, so its one-shot guard is still
+    // armed. The bot now replays the prompt (wedge recovery tier 0) into the
+    // SAME session: that prompt must not have ITS idle eaten by the leftover
+    // guard, or the topic hangs again one prompt later and the escalation
+    // stalls instead of advancing to a fork.
+    assert.equal(session.isAwaitingProviderRetryAbortIdle, true, 'the stale guard outlives the bound');
+
+    adapter.sendInput(key, 'continue');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(session.awaitingTurnResponse, true, 'the recovery prompt arms its own wedge detection');
+
+    adapter['handleSessionIdle'](key, { sessionID: own });
+
+    assert.equal(noResponseCount, 2, 'a silent recovery prompt must still escalate');
+  });
+
+  it('a replacement turn that does report busy cancels the bound and keeps its own wedge detection', async () => {
+    const { adapter } = createRetryingAdapter();
+    const key = { chatId: -100123, threadId: 42 };
+    let noResponseCount = 0;
+    adapter.on('noResponse', () => {
+      noResponseCount += 1;
+    });
+
+    adapter.sendInput(key, 'continue');
+    await new Promise(resolve => setImmediate(resolve));
+    const session = adapter['sessions'].get('-100123:42');
+    assert.notEqual(session.providerRetryReplacementStartTimer, null, 'the boundary is armed together with its bound');
+
+    adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+
+    assert.equal(session.providerRetryReplacementStartTimer, null, 'the observed busy drops the bound');
+    assert.equal(session.awaitingTurnResponse, true, 'the started turn keeps the idle-time wedge detector armed');
+
+    mock.timers.tick(replacementStartTimeoutMs + 1);
+
+    assert.equal(noResponseCount, 0, 'a cancelled bound must never fire against a running turn');
+    assert.equal(adapter.checkIsBusy(key), true, 'the running replacement turn is still busy');
+
+    adapter['handleSessionIdle'](key, { sessionID: own });
+    assert.equal(noResponseCount, 1, 'a started-but-silent turn is still caught by the idle wedge check, exactly once');
+  });
+
+  it('releases the boundary even when the bound decides the turn did start', async () => {
+    const { adapter } = createRetryingAdapter();
+    const key = { chatId: -100123, threadId: 42 };
+    let noResponseCount = 0;
+    adapter.on('noResponse', () => {
+      noResponseCount += 1;
+    });
+
+    adapter.sendInput(key, 'continue');
+    await new Promise(resolve => setImmediate(resolve));
+    const session = adapter['sessions'].get('-100123:42');
+    // Activity from a CHILD (sub-agent) session marks the turn as alive, but only
+    // a PARENT message releases the boundary on the normal path — so the bound
+    // can expire while the turn is genuinely running.
+    session.sawTurnActivity = true;
+
+    mock.timers.tick(replacementStartTimeoutMs + 1);
+
+    assert.equal(noResponseCount, 0, 'a turn with observed activity must not be handed to recovery');
+    // The load-bearing half: an early return here would leave the flag armed with
+    // no bound behind it, and the idle guard would swallow every own idle for the
+    // rest of the session — the exact hang the bound exists to prevent.
+    assert.equal(session.isAwaitingProviderRetryReplacementStart, false, 'the boundary is released regardless of the verdict');
+    assert.equal(session.providerRetryReplacementStartTimer, null, 'no bound is left pending behind the released boundary');
+  });
+
+  it('tearing the session down before the bound elapses fires nothing', async () => {
+    const { adapter } = createRetryingAdapter();
+    const key = { chatId: -100123, threadId: 42 };
+    let noResponseCount = 0;
+    adapter.on('noResponse', () => {
+      noResponseCount += 1;
+    });
+
+    adapter.sendInput(key, 'continue');
+    await new Promise(resolve => setImmediate(resolve));
+    const session = adapter['sessions'].get('-100123:42');
+    assert.equal(session.isAwaitingProviderRetryReplacementStart, true);
+    assert.notEqual(session.providerRetryReplacementStartTimer, null, 'the boundary is armed together with its bound');
+
+    adapter['stopSessionInner'](key);
+    assert.equal(session.providerRetryReplacementStartTimer, null, 'teardown drops the pending bound');
+
+    mock.timers.tick(replacementStartTimeoutMs + 1);
+
+    assert.equal(noResponseCount, 0, 'a stopped thread must never be handed to wedge recovery');
+  });
 });
 
 test('a replacement idle still recovers when the aborted retry never emits idle', async () => {

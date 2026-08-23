@@ -12,7 +12,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  checkIsReplacementTurnMissing,
   checkIsWedgedTurn,
+  type OpenCodeReplacementTurnState,
   type OpenCodeTurnActivityState,
 } from '../utils/openCodeTurnActivity';
 
@@ -21,6 +23,12 @@ const base: OpenCodeTurnActivityState = {
   sawActivity: false,
   wasCompacting: false,
   hadPendingProviderRetry: false,
+};
+
+const replacementBase: OpenCodeReplacementTurnState = {
+  isSessionActive: true,
+  isAwaitingReplacementStart: true,
+  sawActivity: false,
 };
 
 describe('checkIsWedgedTurn', () => {
@@ -47,6 +55,49 @@ describe('checkIsWedgedTurn', () => {
   it('activity wins even if a prompt was awaited (sub-agent-only delegation still counts)', () => {
     assert.equal(
       checkIsWedgedTurn({ ...base, sawActivity: true, awaitingResponse: true }),
+      false,
+    );
+  });
+});
+
+/**
+ * @description Unit tests for `checkIsReplacementTurnMissing` — the bound on how
+ * long a post-provider-retry REPLACEMENT prompt may take to start its turn.
+ *
+ * `session.status` carries no turn identifier, so after aborting a stale
+ * provider-managed retry the adapter waits for the next `busy` to mark the
+ * replacement turn's start. A wedged session accepts the replacement (HTTP 204)
+ * and never runs it, so that `busy` never arrives — the boundary latched
+ * forever, the topic reported busy indefinitely, every later idle was swallowed,
+ * and the wedged-turn detector stayed disarmed because this path defers arming
+ * it to that same `busy`. Each guard is load-bearing: reporting when the turn
+ * DID start restarts a healthy conversation, and not reporting restores the
+ * permanent hang.
+ *
+ * Test case: N/A — TelegramCode has no Jira tracker.
+ */
+describe('checkIsReplacementTurnMissing', () => {
+  it('flags a replacement prompt whose turn never started (the permanent hang)', () => {
+    assert.equal(checkIsReplacementTurnMissing(replacementBase), true);
+  });
+
+  it('does not flag once the boundary was released by an observed busy', () => {
+    assert.equal(
+      checkIsReplacementTurnMissing({ ...replacementBase, isAwaitingReplacementStart: false }),
+      false,
+    );
+  });
+
+  it('does not flag a torn-down session (its thread was stopped, not hung)', () => {
+    assert.equal(
+      checkIsReplacementTurnMissing({ ...replacementBase, isSessionActive: false }),
+      false,
+    );
+  });
+
+  it('does not flag when assistant activity proves the turn ran despite a missed busy', () => {
+    assert.equal(
+      checkIsReplacementTurnMissing({ ...replacementBase, sawActivity: true }),
       false,
     );
   });

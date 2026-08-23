@@ -36,7 +36,7 @@ import {
   getSubagentPartAction,
 } from '../utils/subagentRender';
 import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
-import { checkIsWedgedTurn } from '../utils/openCodeTurnActivity';
+import { checkIsReplacementTurnMissing, checkIsWedgedTurn } from '../utils/openCodeTurnActivity';
 import {
   parseProviderAuthMethods,
   type OpenCodeAuthMethod,
@@ -294,8 +294,22 @@ interface OpenCodeSession {
   isAwaitingModelAfterProviderRetryAbort: boolean;
   /** Consume the idle emitted by an aborted provider-retry turn before handling the replacement turn. */
   isAwaitingProviderRetryAbortIdle: boolean;
-  /** Wait for the post-abort replacement's own `busy` status before arming wedge detection. */
+  /**
+   * Wait for the post-abort replacement's own `busy` status before arming wedge
+   * detection. Never open-ended — {@link providerRetryReplacementStartTimer}
+   * bounds it, because while this is set the idle handler swallows every own idle.
+   */
   isAwaitingProviderRetryReplacementStart: boolean;
+  /**
+   * Bound on that wait, or `null` when no replacement boundary is armed. A
+   * wedged session accepts the replacement prompt and never runs it, so its
+   * `busy` never arrives and the boundary would latch forever — swallowing every
+   * later idle, pinning {@link isBusy}, and disarming wedge detection. On expiry
+   * the adapter ends the episode and emits `noResponse` so the bot's recovery
+   * escalation runs. Cleared whenever the boundary resolves or the session is
+   * torn down; `unref`ed so it can never hold the process open.
+   */
+  providerRetryReplacementStartTimer: NodeJS.Timeout | null;
   /** Shared abort request so concurrent prompts cannot race abort-after-prompt. */
   providerRetryAbortPromise: Promise<void> | null;
   /**
@@ -761,6 +775,40 @@ const ignoredSseEventTypes = new Set<string>(['sync', 'session.diff']);
 const fallbackRenameGraceMs = 8000;
 /** Milliseconds per minute for rendering OpenCode's provider-retry notice. */
 const providerRetryMsPerMinute = 60_000;
+/**
+ * @description Headroom on top of the worst-case event-stream gap before a
+ * replacement prompt is declared never-started.
+ */
+const providerRetryReplacementStartHeadroomMs = 20_000;
+/**
+ * @description How long a post-provider-retry replacement prompt may take to
+ * produce its first `busy` status before the adapter declares that it never
+ * started a turn. Derived from the SSE bounds rather than a flat number: the
+ * `busy` arrives sub-second on the happy path, but it is DELIVERED over the
+ * event stream, so a stall detected at {@link sseStallTimeoutMs} followed by a
+ * fully backed-off reconnect ({@link maxSseReconnectDelayMs}) can hide it for
+ * their sum. A flat 60s sat inside that window, so a stream hiccup would have
+ * been read as a dead turn and forked/restarted a session that was answering.
+ * Waiting only delays recovery; firing early discards live work.
+ */
+export const providerRetryReplacementStartTimeoutMs =
+  sseStallTimeoutMs + maxSseReconnectDelayMs + providerRetryReplacementStartHeadroomMs;
+
+/**
+ * @description Console / diag labels per cause of a "prompt delivered but no
+ * turn ran" report, kept as data so the single emit choke point stays free of
+ * branchy string building. The `wedged` diag label is unchanged from before the
+ * bound existed, so log greps for it keep matching.
+ */
+const noTurnResponseCauseLabels = {
+  wedgedIdle: { console: 'wedged session', diag: 'wedged' },
+  replacementNeverStarted: {
+    console: 'post-retry replacement never started',
+    diag: 'replacement-never-started',
+  },
+} as const;
+
+type NoTurnResponseCause = keyof typeof noTurnResponseCauseLabels;
 
 /**
  * @description Whether a `session.error` message is the bot-issued abort of a
@@ -1597,6 +1645,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           this.emit('output', session.key, `Failed to restart OpenCode server: ${e instanceof Error ? e.message : String(e)}`);
           // Mark session as inactive — no point keeping it alive
           session.isActive = false;
+          // This teardown bypasses stopSessionInner, so the replacement bound
+          // has to be dropped here or it outlives the session it belonged to.
+          this.clearProviderRetryReplacementStartTimer(session);
           this.sessions.delete(k);
           this.emit('stopped', session.key);
         }
@@ -1790,6 +1841,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           isAwaitingModelAfterProviderRetryAbort: false,
           isAwaitingProviderRetryAbortIdle: false,
           isAwaitingProviderRetryReplacementStart: false,
+          providerRetryReplacementStartTimer: null,
           providerRetryAbortPromise: null,
           isCompacting: false,
           busyChildSessionIds: new Set(),
@@ -1873,6 +1925,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.reasoningTimer);
       session.reasoningTimer = null;
     }
+    // Same rationale, higher stakes: a fired replacement bound would emit
+    // `noResponse` against a session that no longer exists, kicking wedge
+    // recovery for a thread that was deliberately stopped.
+    this.clearProviderRetryReplacementStartTimer(session);
 
     // Tear down the global SSE stream if this was the last active session
     // anywhere (also clears that stream's reconnect + stall timers).
@@ -1979,7 +2035,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           if (current !== session || !current.isActive) return;
           // SSE can report busy before prompt_async resolves. Arm the boundary
           // before sending so that busy unambiguously belongs to this prompt.
-          current.isAwaitingProviderRetryReplacementStart = true;
+          this.armProviderRetryReplacementStart(current);
         }
         await this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body);
       } catch (e) {
@@ -1990,7 +2046,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         if (current && !current.providerRetrySignature) {
           current.isBusy = false;
           current.awaitingTurnResponse = false;
-          current.isAwaitingProviderRetryReplacementStart = false;
+          this.clearProviderRetryReplacementBoundary(current);
         }
         console.error(`[OpenCode] Failed to send message:`, e);
         this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
@@ -2026,12 +2082,92 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         if (current === session && current.providerRetryAbortPromise === abortPromise) {
           current.isAwaitingModelAfterProviderRetryAbort = false;
           current.isAwaitingProviderRetryAbortIdle = false;
-          current.isAwaitingProviderRetryReplacementStart = false;
+          this.clearProviderRetryReplacementBoundary(current);
           current.providerRetryAbortPromise = null;
         }
       },
     );
     return abortPromise;
+  }
+
+  /**
+   * @description Arm the post-abort replacement boundary together with the bound
+   * on how long that boundary may stay armed.
+   *
+   * The boundary exists because `session.status` carries no turn identifier: the
+   * first observed `busy` is taken as the replacement turn's start. A wedged
+   * session never produces that `busy`, so without a bound the boundary latches
+   * forever and the topic hangs with nothing able to recover it.
+   */
+  private armProviderRetryReplacementStart(session: OpenCodeSession): void {
+    // A second concurrent replacement prompt re-arms: drop the previous bound so
+    // at most one timer per session is ever pending.
+    this.clearProviderRetryReplacementStartTimer(session);
+    session.isAwaitingProviderRetryReplacementStart = true;
+    const timer = setTimeout(() => {
+      const current = this.sessions.get(keyToString(session.key));
+      // A restart / resume swapped the session object: the new session owns its
+      // own bound, so this expired one has nothing left to report.
+      if (current !== session) return;
+      const isReplacementMissing = checkIsReplacementTurnMissing({
+        isSessionActive: current.isActive,
+        isAwaitingReplacementStart: current.isAwaitingProviderRetryReplacementStart,
+        sawActivity: current.sawTurnActivity,
+      });
+      // Release the boundary UNCONDITIONALLY, before deciding whether to report.
+      // Returning early while the flag is still armed would leave it with no
+      // bound behind it — the exact latch this bound exists to prevent (the idle
+      // guard swallows every own idle while it is set). It is reachable: activity
+      // from a CHILD session satisfies the predicate, while only a PARENT message
+      // releases the boundary on the normal path.
+      this.clearProviderRetryReplacementBoundary(current);
+      if (!isReplacementMissing) return;
+      // End the abort episode here: the optimistic busy flag waits on a `busy`
+      // that is never coming, and the wedged-turn detector stays disarmed because
+      // this path defers arming it to that same `busy`. `isAwaitingProviderRetryAbortIdle`
+      // is deliberately LEFT armed — the aborted retry's own idle is exactly the
+      // event that arrives late here, and it must still be consumed once rather
+      // than counting as the recovery prompt's idle.
+      current.isBusy = false;
+      this.reportNoTurnResponse(current.key, current, 'replacementNeverStarted');
+    }, providerRetryReplacementStartTimeoutMs);
+    // A pending boundary bound must never keep the process alive on shutdown.
+    timer.unref();
+    session.providerRetryReplacementStartTimer = timer;
+  }
+
+  /** Drop a pending replacement-start bound (teardown, or before re-arming). */
+  private clearProviderRetryReplacementStartTimer(session: OpenCodeSession): void {
+    if (!session.providerRetryReplacementStartTimer) return;
+    clearTimeout(session.providerRetryReplacementStartTimer);
+    session.providerRetryReplacementStartTimer = null;
+  }
+
+  /**
+   * @description Resolve the replacement boundary: the flag and its bound are
+   * cleared together so the invariant "boundary disarmed ⇒ no pending timer"
+   * holds at every site, and a resolved boundary can never fire a late
+   * `noResponse` against a turn that did start.
+   */
+  private clearProviderRetryReplacementBoundary(session: OpenCodeSession): void {
+    session.isAwaitingProviderRetryReplacementStart = false;
+    this.clearProviderRetryReplacementStartTimer(session);
+  }
+
+  /**
+   * @description The single emit point for "the delivered prompt produced no
+   * turn". Both detectors watch the SAME prompt from different angles — the
+   * idle-time wedge check and the replacement-start bound — so every trigger is
+   * disarmed here before emitting, and one prompt can never reach the bot's
+   * recovery escalation twice.
+   */
+  private reportNoTurnResponse(key: ThreadKey, session: OpenCodeSession, cause: NoTurnResponseCause): void {
+    session.awaitingTurnResponse = false;
+    this.clearProviderRetryReplacementBoundary(session);
+    const labels = noTurnResponseCauseLabels[cause];
+    console.warn(`[OpenCode] Prompt produced no turn (${labels.console}) for ${keyToString(key)}`);
+    appendDiagLog(`prompt NO-RESPONSE ${labels.diag} key=${keyToString(key)} session=${session.sessionId}`);
+    this.emit('noResponse', key);
   }
 
   /**
@@ -2710,6 +2846,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         isAwaitingModelAfterProviderRetryAbort: false,
         isAwaitingProviderRetryAbortIdle: false,
         isAwaitingProviderRetryReplacementStart: false,
+        providerRetryReplacementStartTimer: null,
         providerRetryAbortPromise: null,
         isCompacting: false,
         busyChildSessionIds: new Set(),
@@ -3638,6 +3775,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       clearTimeout(session.statusDebounceTimer);
       session.statusDebounceTimer = null;
     }
+    // The adopting thread owns this server session now; a bound left running
+    // here would report a missing turn on behalf of the detached owner.
+    this.clearProviderRetryReplacementStartTimer(session);
     // Tear down the directory's SSE stream if this was its last active session.
     this.disconnectSse(key);
     this.sessions.delete(k);
@@ -4210,7 +4350,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // The first non-stale parent assistant event marks the replacement turn's
       // boundary, even when it lacks the optional runtime token tuple.
       session.isAwaitingModelAfterProviderRetryAbort = false;
-      session.isAwaitingProviderRetryReplacementStart = false;
+      this.clearProviderRetryReplacementBoundary(session);
       session.isAwaitingProviderRetryAbortIdle = false;
       const contextUsedTokens = getOpenCodeContextUsedTokens(info.tokens);
       if (typeof info.id === 'string' && info.id.trim() && contextUsedTokens !== null) {
@@ -4288,10 +4428,22 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const isOwnIdle = !sessionId || sessionId === session.sessionId;
     if (
       isOwnIdle &&
+      // A turn we are actively waiting on owns its idle: the abort guard may
+      // still be armed when the replacement bound expired without the aborted
+      // retry's idle ever arriving, and the recovery prompt that follows would
+      // otherwise have ITS idle swallowed — hanging the topic one prompt later
+      // and stalling the escalation. During the legitimate swallow window this
+      // flag is false by construction (a retry replacement defers arming it to
+      // its own `busy`, which clears the guards as it arms).
+      !session.awaitingTurnResponse &&
       (session.isAwaitingProviderRetryAbortIdle || session.isAwaitingProviderRetryReplacementStart)
     ) {
       // The abort completes the old retry turn asynchronously. Its idle must not
       // settle or recover the replacement prompt that was posted after the abort.
+      // Swallowing is bounded on both flags: this one is a one-shot cleared right
+      // here, and the replacement boundary is released by its own `busy` or, if
+      // that never comes, by `providerRetryReplacementStartTimer`. Neither can
+      // latch idle handling off for the rest of the session.
       session.isAwaitingProviderRetryAbortIdle = false;
       console.log(`[OpenCode] Ignoring idle from aborted provider retry`);
       return;
@@ -4358,11 +4510,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         hadPendingProviderRetry,
       });
       session.awaitingTurnResponse = false;
-      if (isWedged) {
-        console.warn(`[OpenCode] Prompt produced no turn (wedged session) for ${keyToString(key)}`);
-        appendDiagLog(`prompt NO-RESPONSE wedged key=${keyToString(key)} session=${session.sessionId}`);
-        this.emit('noResponse', key);
-      }
+      if (isWedged) this.reportNoTurnResponse(key, session, 'wedgedIdle');
     }
   }
 
@@ -4418,8 +4566,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!isOwnSession) return;
     if (status?.type === 'busy' && session.isAwaitingProviderRetryReplacementStart) {
       // `busy` is the observable boundary for the replacement request. Older
-      // retry termination events can no longer consume this new turn's idle.
-      session.isAwaitingProviderRetryReplacementStart = false;
+      // retry termination events can no longer consume this new turn's idle, and
+      // the bound on this wait is released with the boundary it guarded.
+      this.clearProviderRetryReplacementBoundary(session);
       session.isAwaitingProviderRetryAbortIdle = false;
       session.awaitingTurnResponse = true;
       session.sawTurnActivity = false;

@@ -42,3 +42,37 @@ export function checkIsWedgedTurn(state: OpenCodeTurnActivityState): boolean {
     !state.hadPendingProviderRetry
   );
 }
+
+/**
+ * @description State read when the bound on a post-provider-retry REPLACEMENT
+ * prompt's turn start elapses.
+ *
+ * `session.status` events carry no turn identifier, so after aborting a stale
+ * provider-managed retry the adapter marks a boundary and treats the next
+ * observed `busy` as the replacement turn's start. A WEDGED session accepts the
+ * replacement (HTTP 204) and never runs it, so that `busy` never arrives: the
+ * boundary would stay armed forever, swallowing every later idle, pinning the
+ * optimistic busy state, and leaving wedge detection disarmed — a permanently
+ * hung topic that nothing recovers.
+ */
+export interface OpenCodeReplacementTurnState {
+  /** The session is still live (not stopped / detached / replaced by a resume). */
+  isSessionActive: boolean;
+  /** The replacement boundary is still armed — no `busy` was ever observed. */
+  isAwaitingReplacementStart: boolean;
+  /** Any assistant activity was observed since the replacement prompt was sent. */
+  sawActivity: boolean;
+}
+
+/**
+ * @description `true` when the elapsed bound proves the replacement prompt never
+ * became a turn — the caller must end the abort episode and hand the thread to
+ * wedge recovery instead of waiting for a `busy` that will never come.
+ *
+ * Assistant activity releases the bound the same way {@link checkIsWedgedTurn}
+ * treats it: a turn that produced output genuinely started, even if its `busy`
+ * status was dropped, so reporting it would fire recovery on a working thread.
+ */
+export function checkIsReplacementTurnMissing(state: OpenCodeReplacementTurnState): boolean {
+  return state.isSessionActive && state.isAwaitingReplacementStart && !state.sawActivity;
+}

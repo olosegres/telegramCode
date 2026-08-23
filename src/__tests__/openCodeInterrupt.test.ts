@@ -45,6 +45,8 @@ function createRetryingAdapter(): {
     isModelInfoShown: true,
     modelOverride: { providerID: 'anthropic', modelID: 'claude-opus-5' },
     currentModelLabel: 'anthropic/claude-opus-5',
+    latestParentRuntimeContext: null,
+    parentAssistantObservationVersion: 0,
     partTypes: new Map(),
     statusDebounceTimer: null,
     pendingStatus: null,
@@ -55,9 +57,15 @@ function createRetryingAdapter(): {
     pendingQuestion: null,
     effortLevel: 'xhigh',
     isBusy: true,
+    awaitingTurnResponse: false,
+    sawTurnActivity: false,
+    providerRetrySignature: null,
+    isAwaitingModelAfterProviderRetryAbort: false,
+    isAwaitingProviderRetryAbortIdle: false,
     isCompacting: false,
     busyChildSessionIds: new Set(),
     isAutoNamePending: false,
+    isAwaitingProviderRetryReplacementStart: false,
   });
 
   const outputs: string[] = [];
@@ -98,13 +106,19 @@ function createRetryingAdapter(): {
   return { adapter, outputs, requests };
 }
 
-function feedAssistantModel(adapter: OpenCodeAdapter, providerID: string, modelID: string): void {
+function feedAssistantModel(adapter: OpenCodeAdapter, providerID: string | undefined, modelID: string, finish?: string): void {
   adapter['routeSseData'](JSON.stringify({
     directory: '/tmp/work',
     payload: {
       type: 'message.updated',
       properties: {
-        info: { sessionID: own, role: 'assistant', providerID, modelID },
+        info: {
+          sessionID: own,
+          role: 'assistant',
+          modelID,
+          ...(providerID ? { providerID } : {}),
+          ...(finish ? { finish } : {}),
+        },
       },
     },
   }));
@@ -282,4 +296,210 @@ test('the aborted retry cannot overwrite the selected model after the abort requ
   feedAssistantModel(adapter, 'openai', 'gpt-test');
 
   assert.deepEqual(outputs.filter(output => output.startsWith('Model:')), ['Model: openai/gpt-test']);
+});
+
+test('an aborted retry completion cannot mask a newly submitted prompt as active', async () => {
+  const { adapter } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+  session.sawTurnActivity = false;
+  session.lastMessageId = 'new-turn-message';
+
+  feedAssistantModel(adapter, 'anthropic', 'claude-opus-5', 'stop');
+
+  assert.equal(session.sawTurnActivity, false, 'the stale completion must not count as activity for the replacement prompt');
+  assert.equal(session.lastMessageId, 'new-turn-message', 'the stale completion must not advance the persisted parent watermark');
+});
+
+test('a partial current model reference is not mistaken for an aborted retry', async () => {
+  const { adapter, outputs } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  feedAssistantModel(adapter, undefined, 'gpt-test');
+
+  assert.deepEqual(outputs.filter(output => output.startsWith('Model:')), ['Model: gpt-test']);
+});
+
+test('the idle from an aborted provider retry cannot recover the replacement prompt', async () => {
+  const { adapter } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let noResponseCount = 0;
+  adapter.on('noResponse', () => {
+    noResponseCount += 1;
+  });
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+  assert.equal(session.isAwaitingProviderRetryAbortIdle, true);
+
+  adapter['handleSessionIdle'](key, { sessionID: own });
+
+  assert.equal(noResponseCount, 0, 'the abort idle must not trigger recovery for the replacement prompt');
+  assert.equal(session.awaitingTurnResponse, false, 'the replacement turn is not armed until its own busy status');
+  assert.equal(session.isAwaitingProviderRetryAbortIdle, false, 'only the old idle is consumed');
+
+  adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+  assert.equal(session.awaitingTurnResponse, true, 'the replacement busy transition arms its wedge detector');
+});
+
+test('an early abort idle is consumed before the abort response and never re-armed', async () => {
+  const { adapter, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let resolveAbort: (() => void) | null = null;
+  const abortResult = new Promise<void>(resolve => {
+    resolveAbort = resolve;
+  });
+  adapter['apiRequest'] = (async (method: string, path: string, body?: Record<string, unknown>) => {
+    requests.push({ method, path, body });
+    if (path.endsWith('/abort')) await abortResult;
+  }) as OpenCodeAdapter['apiRequest'];
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+  assert.equal(session.isAwaitingProviderRetryAbortIdle, true);
+
+  adapter['handleSessionIdle'](key, { sessionID: own });
+  assert.equal(session.isAwaitingProviderRetryAbortIdle, false, 'the early idle is consumed while abort is pending');
+  assert.equal(session.awaitingTurnResponse, false, 'the replacement turn has not started before abort resolves');
+
+  resolveAbort?.();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(session.isAwaitingProviderRetryAbortIdle, false, 'abort completion must not re-arm an already-consumed idle');
+  assert.equal(session.isAwaitingProviderRetryReplacementStart, true, 'the posted replacement awaits its own busy boundary');
+});
+
+test('replacement busy arms its wedge detector before prompt_async resolves', async () => {
+  const { adapter, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let resolvePrompt: (() => void) | null = null;
+  const promptResult = new Promise<void>((resolve) => {
+    resolvePrompt = resolve;
+  });
+  adapter['apiRequest'] = (async (method: string, path: string, body?: Record<string, unknown>) => {
+    requests.push({ method, path, body });
+    if (path.endsWith('/prompt_async')) await promptResult;
+  }) as OpenCodeAdapter['apiRequest'];
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+  assert.equal(session.isAwaitingProviderRetryReplacementStart, true, 'the boundary is armed before the prompt request settles');
+
+  adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+
+  assert.equal(session.isAwaitingProviderRetryReplacementStart, false, 'the early busy transition belongs to the replacement');
+  assert.equal(session.awaitingTurnResponse, true, 'the early busy transition arms wedge detection');
+  resolvePrompt?.();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(session.awaitingTurnResponse, true, 'the delayed HTTP response cannot reset the armed detector');
+});
+
+test('a replacement retry after busy remains interruptible', async () => {
+  const { adapter, outputs, requests } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+  adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+  adapter['handleSessionStatus'](key, own, {
+    status: { type: 'retry', attempt: 2, message: 'replacement retry', next: Date.now() + providerRetryDelayMs },
+  });
+
+  assert.notEqual(session.providerRetrySignature, null, 'the replacement retry is tracked rather than dismissed as stale');
+  assert.equal(outputs.length, 2, 'the replacement retry gets its own notice after the original retry');
+
+  adapter.sendInput(key, 'retry replacement');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(
+    requests.filter((request) => request.path.endsWith('/abort')).length,
+    2,
+    'the next prompt aborts the replacement retry instead of joining its unread queue',
+  );
+});
+
+test('an abort error followed by its idle cannot settle the replacement before busy', async () => {
+  const { adapter } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let noResponseCount = 0;
+  adapter.on('noResponse', () => {
+    noResponseCount += 1;
+  });
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+  adapter['handleSessionError'](key, own, { error: 'Aborted' });
+  adapter['handleSessionIdle'](key, { sessionID: own });
+
+  assert.equal(noResponseCount, 0, 'the old idle remains shielded after the abort error');
+  assert.equal(session.isBusy, true, 'the old idle cannot make the pending replacement appear idle');
+  assert.equal(session.isAwaitingProviderRetryReplacementStart, true, 'the replacement still awaits its own busy boundary');
+  adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+  adapter['handleSessionIdle'](key, { sessionID: own });
+  assert.equal(noResponseCount, 1, 'the later replacement idle still reaches wedge recovery');
+});
+
+test('a late retry status from the aborted turn cannot restore provider-retry state', async () => {
+  const { adapter, outputs } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+
+  adapter['handleSessionStatus'](key, own, {
+    status: { type: 'retry', attempt: 2, message: 'stale retry', next: Date.now() + providerRetryDelayMs },
+  });
+
+  assert.equal(session.providerRetrySignature, null, 'the replacement turn must not inherit the cancelled retry');
+  assert.equal(outputs.length, 1, 'the stale retry must not post another retry notice');
+});
+
+test('a stale retry after the old idle cannot suppress wedge recovery for the replacement turn', async () => {
+  const { adapter, outputs } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let noResponseCount = 0;
+  adapter.on('noResponse', () => {
+    noResponseCount += 1;
+  });
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  const session = adapter['sessions'].get('-100123:42');
+
+  adapter['handleSessionIdle'](key, { sessionID: own });
+  adapter['handleSessionStatus'](key, own, {
+    status: { type: 'retry', attempt: 2, message: 'stale retry', next: Date.now() + providerRetryDelayMs },
+  });
+  adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+  adapter['handleSessionIdle'](key, { sessionID: own });
+
+  assert.equal(session.providerRetrySignature, null, 'the old retry must remain cleared after its idle');
+  assert.equal(noResponseCount, 1, 'a wedged replacement still triggers recovery');
+  assert.equal(outputs.length, 1, 'the stale retry must not post another retry notice');
+});
+
+test('a replacement idle still recovers when the aborted retry never emits idle', async () => {
+  const { adapter } = createRetryingAdapter();
+  const key = { chatId: -100123, threadId: 42 };
+  let noResponseCount = 0;
+  adapter.on('noResponse', () => {
+    noResponseCount += 1;
+  });
+
+  adapter.sendInput(key, 'continue');
+  await new Promise(resolve => setImmediate(resolve));
+  adapter['handleSessionError'](key, own, { error: 'Aborted' });
+  adapter['handleSessionStatus'](key, own, { status: { type: 'busy' } });
+  adapter['handleSessionIdle'](key, { sessionID: own });
+
+  assert.equal(noResponseCount, 1, 'the replacement idle must not be consumed as the absent old idle');
 });

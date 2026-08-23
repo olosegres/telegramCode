@@ -119,7 +119,7 @@ export async function checkIsOpenCodeServerRunning(): Promise<boolean> {
   return (await getOpenCodeServerHealth()).healthy;
 }
 
-interface OpenCodeServerHealth {
+export interface OpenCodeServerHealth {
   healthy: boolean;
   /** Version the running server reports, or null if unreachable / field absent. */
   version: string | null;
@@ -147,7 +147,7 @@ export function extractOpenCodeVersion(raw: string | null | undefined): string |
  * can migrate the shared opencode.db underneath the old server — which then
  * dies on every prompt (e.g. `no such column: replacement_seq`).
  */
-async function getOpenCodeServerHealth(): Promise<OpenCodeServerHealth> {
+export async function getOpenCodeServerHealth(): Promise<OpenCodeServerHealth> {
   const url = process.env.OPENCODE_URL || 'http://localhost:4096';
   try {
     const response = await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(2000) });

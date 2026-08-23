@@ -3,10 +3,10 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { AgentAdapter, AgentApiErrorClass, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ThreadLocaleReader, ToolResultEvent, ThreadKey } from '../types';
+import type { AgentAdapter, AgentApiErrorClass, AgentRuntimeInfo, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ThreadLocaleReader, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
-import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getToolCommand, onOpenCodeServerExit, restartOpenCodeServer } from '../installManager';
+import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getOpenCodeServerHealth, getToolCommand, onOpenCodeServerExit, restartOpenCodeServer } from '../installManager';
 import { resolveDataDir } from '../state';
 import { appendDiagLog } from '../diagLog';
 import {
@@ -214,6 +214,10 @@ interface OpenCodeSession {
   modelOverride: OpenCodeModelOverride | null;
   /** Last known model label from SSE events */
   currentModelLabel: string | null;
+  /** Latest valid parent-assistant context observation, kept as an atomic tuple. */
+  latestParentRuntimeContext: OpenCodeParentAssistantContext | null;
+  /** Increments for each live parent-assistant observation from SSE. */
+  parentAssistantObservationVersion: number;
   /** Map partID -> part type for resolving delta events */
   partTypes: Map<string, string>;
   /** Timer for debouncing status (tool/reasoning) updates */
@@ -288,6 +292,10 @@ interface OpenCodeSession {
   providerRetrySignature: string | null;
   /** Ignore stale model updates until the post-abort selected-model turn starts. */
   isAwaitingModelAfterProviderRetryAbort: boolean;
+  /** Consume the idle emitted by an aborted provider-retry turn before handling the replacement turn. */
+  isAwaitingProviderRetryAbortIdle: boolean;
+  /** Wait for the post-abort replacement's own `busy` status before arming wedge detection. */
+  isAwaitingProviderRetryReplacementStart: boolean;
   /** Shared abort request so concurrent prompts cannot race abort-after-prompt. */
   providerRetryAbortPromise: Promise<void> | null;
   /**
@@ -472,6 +480,21 @@ export type {
   OpenCodePendingQuestion,
 } from '../types';
 
+export interface OpenCodeParentAssistantContext {
+  messageId: string;
+  /** Omitted when OpenCode did not report a usable provider/model reference. */
+  model?: OpenCodeModelOverride;
+  contextUsedTokens: number;
+}
+
+interface OpenCodeContextUsage {
+  input?: number;
+  cache?: {
+    read?: number;
+    write?: number;
+  };
+}
+
 interface OpenCodeMessageInfo {
   id?: string;
   sessionID?: string;
@@ -480,6 +503,7 @@ interface OpenCodeMessageInfo {
   error?: unknown;
   modelID?: string;
   providerID?: string;
+  tokens?: OpenCodeContextUsage;
 }
 
 /**
@@ -682,6 +706,9 @@ const sseStallTimeoutMs = sseHeartbeatIntervalMs * 4;
 /** Cap on tracked child→parent session links (subagent lineage). */
 const maxTrackedSessionLineageEntries = 1000;
 
+/** Bound silent-restart metadata reads so many active sessions do not overload OpenCode. */
+export const openCodeRuntimeContextHydrationConcurrency = 3;
+
 /**
  * Minimum gap between diag-logged "sse drop" lines for the SAME
  * (eventType, eventSessionId). A truly orphaned session streams hundreds of
@@ -747,6 +774,116 @@ const providerRetryMsPerMinute = 60_000;
  */
 export function checkIsOpenCodeAbortError(errorMsg: string): boolean {
   return errorMsg.trim().toLowerCase() === 'aborted';
+}
+
+const genericOpenCodeErrorMessage = 'OpenCode request failed';
+/** Placeholder written over every redacted credential. */
+const openCodeErrorRedactedMarker = '[redacted]';
+/**
+ * Cap for a surfaced error string. A provider can attach a whole
+ * request/response dump; the head carries the readable reason, the tail is
+ * noise that would flood the topic.
+ */
+export const openCodeErrorMessageMaxLength = 500;
+
+const openCodeErrorAuthSchemeRe = /\b(Bearer|Basic)\s+\S+/gi;
+/**
+ * Redaction is BEST-EFFORT and exists for the STRING path only — a provider's
+ * prose message or an HTTP error-response body, which must be surfaced for the
+ * user to act on. Being name-based it cannot promise to catch a credential a
+ * provider ships under a field name (or in a shape) nobody has seen yet.
+ *
+ * That is precisely why an unrecognised STRUCTURED payload is deliberately NOT
+ * rendered: it collapses to {@link genericOpenCodeErrorMessage} instead of
+ * being serialised through these rules. Escaped nested JSON, header-pair
+ * arrays (`[["x-api-key","…"]]`), unlisted field names and bare values all slip
+ * past a name-based rule, and the rendered text goes straight into a Telegram
+ * topic and the console log.
+ *
+ * The value branch stops at a JSON/prose separator instead of running to the
+ * next whitespace: a greedy `\S+` swallowed the rest of the object, taking the
+ * later fields with it — including the `429` / "rate limited" markers
+ * {@link classifyAgentApiError} needs to arm the auto-retry.
+ */
+const openCodeErrorSecretAssignmentRe =
+  /\b((?:api|auth|access|refresh|id|app|client|private|session|user|x)?[_ -]?(?:api[_ -]?key|key|token|secret|password|passwd|pwd|authorization|credential|cookie|signature)s?)\b("?\s*[:=]\s*)(?:(?:Bearer|Basic)\s+)?(?:"[^"]*"|'[^']*'|[^\s,{}\]"']+)/gi;
+/**
+ * Credential VALUE shapes, redacted whatever carries them: a provider echoes a
+ * rejected key in prose with no field name at all ("401 invalid credential
+ * sk-ant-…"), inside a header-pair array, or in a URL query string — none of
+ * which the name-based rule above can see.
+ */
+const openCodeErrorCredentialValueRe = /\bsk-[A-Za-z0-9_-]+|\bghp_[A-Za-z0-9]+|\bAIza[A-Za-z0-9_-]+|\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/g;
+/**
+ * URL userinfo (`https://user:password@host`). The password half is not
+ * required: a bare `https://<token>@host` is just as much a credential.
+ */
+const openCodeErrorUrlUserInfoRe = /(\w+:\/\/)[^\s/@]+@/g;
+
+/**
+ * @description Redact the credentials a surfaced error string is known to carry
+ * and cap it. Redaction runs BEFORE the cap: capping first could cut a secret
+ * assignment in half and leave the head of the credential visible.
+ */
+function redactOpenCodeErrorMessage(message: string): string {
+  return message
+    .replace(openCodeErrorSecretAssignmentRe, `$1$2${openCodeErrorRedactedMarker}`)
+    .replace(openCodeErrorAuthSchemeRe, `$1 ${openCodeErrorRedactedMarker}`)
+    .replace(openCodeErrorCredentialValueRe, openCodeErrorRedactedMarker)
+    .replace(openCodeErrorUrlUserInfoRe, `$1${openCodeErrorRedactedMarker}@`)
+    .slice(0, openCodeErrorMessageMaxLength);
+}
+
+/**
+ * @description Extract the readable, SAFE-TO-SURFACE error form from OpenCode's
+ * persisted and SSE payload shapes. Every return value of this function reaches
+ * a Telegram topic and the console log, so a payload whose shape carries no
+ * known message field yields the fixed {@link genericOpenCodeErrorMessage}: such
+ * a payload is an arbitrary provider dump (a rejected request body, a header
+ * list, a response echo) and `/connect` PUTs the user's provider key, so
+ * rendering it is a credential-leak path that name-based redaction cannot close.
+ * The retry classifier reads {@link getOpenCodeErrorClassificationText} instead.
+ */
+export function getOpenCodeErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return redactOpenCodeErrorMessage(error);
+  if (!error || typeof error !== 'object') return genericOpenCodeErrorMessage;
+
+  const errorRecord = error as Record<string, unknown>;
+  if (errorRecord.data && typeof errorRecord.data === 'object') {
+    const errorData = errorRecord.data as Record<string, unknown>;
+    if (typeof errorData.message === 'string') return redactOpenCodeErrorMessage(errorData.message);
+  }
+  if (typeof errorRecord.message === 'string') return redactOpenCodeErrorMessage(errorRecord.message);
+
+  return genericOpenCodeErrorMessage;
+}
+
+/**
+ * @description Serialise an error payload FOR CLASSIFICATION ONLY. The result
+ * is UNREDACTED and may contain the user's provider key verbatim: it must never
+ * be emitted to a topic, never logged, and never returned to a caller that
+ * surfaces text — the single legal consumer is
+ * {@link classifyAgentApiError}, which only runs regexes over it and returns an
+ * error CLASS.
+ *
+ * It exists because the safe user-facing text collapses an unrecognised payload
+ * shape to a constant, and the classifier reads text to decide whether an error
+ * is an auto-retryable rate-limit / usage-limit. Feeding it that constant
+ * silently cancelled the retry of a real rate limit, so the two paths are split:
+ * the user gets the constant, the classifier gets the full payload.
+ */
+function getOpenCodeErrorClassificationText(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  if (!error || typeof error !== 'object') return '';
+  try {
+    // A payload whose `toJSON` opts out yields undefined rather than text.
+    const serialized: string | undefined = JSON.stringify(error);
+    return serialized ?? '';
+  } catch {
+    // Circular / non-serialisable payload (e.g. a self-referencing error object).
+    return '';
+  }
 }
 
 /**
@@ -861,10 +998,6 @@ const modelsCacheTtlMs = 5 * 60 * 1000; // 5 minutes
  * @description Cache for `GET /config/providers` (OpenCode 1.15.x). Same
  * 5-minute TTL as the models cache — variant maps change about as often as
  * the model list (operator edits `opencode.json`, restarts server).
- *
- * Plan 2026-05-30-effort-command, R2: log the raw shape ONCE before
- * relying on it; the docs aren't 100% authoritative across server versions.
- *
  * Shape (observed against opencode 1.15.12):
  *   { providers: [ { id, name, models: { <modelId>: { variants?: {...} } } } ] }
  * but newer versions may key by provider id directly. The parser below
@@ -873,7 +1006,6 @@ const modelsCacheTtlMs = 5 * 60 * 1000; // 5 minutes
 let cachedProviders: ParsedProvidersConfig | null = null;
 let providersCacheTime = 0;
 const providersCacheTtlMs = 5 * 60 * 1000;
-let isProvidersShapeLogged = false;
 
 const providerIdRe = /^[a-z0-9][a-z0-9-_]*$/;
 
@@ -883,14 +1015,19 @@ interface OpenCodeProviderAuthMethod {
 }
 
 /**
- * @description Provider → model → variant-names map. Keys are provider ids
+ * @description Provider → model configuration map. Keys are provider ids
  * (e.g. `"anthropic"`, `"openai"`), values are model ids (e.g.
- * `"claude-3-5-sonnet"`) mapping to the list of variant names declared
- * on that model. A model with no `variants` entry maps to `[]`, which
- * the picker treats as "this model has no effort concept".
+ * `"claude-3-5-sonnet"`) mapping to its variants and context limit. A model
+ * with no `variants` entry maps to `[]`, which the picker treats as "this model
+ * has no effort concept".
  */
 export interface ParsedProvidersConfig {
-  providers: Map<string, Map<string, string[]>>;
+  providers: Map<string, Map<string, OpenCodeProviderModel>>;
+}
+
+export interface OpenCodeProviderModel {
+  variants: string[];
+  contextWindowTokens: number | null;
 }
 
 /**
@@ -925,6 +1062,88 @@ export function buildPromptBody(
 
 export function checkIsValidProviderId(providerId: string): boolean {
   return providerIdRe.test(providerId);
+}
+
+function checkIsOpenCodeRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function checkIsOpenCodeTokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0;
+}
+
+function getOpenCodeContextUsedTokens(usage: unknown): number | null {
+  if (!checkIsOpenCodeRecord(usage) || !checkIsOpenCodeTokenCount(usage.input)) return null;
+  const outputTokens = usage.output;
+  const cache = usage.cache;
+  if (
+    (outputTokens !== undefined && !checkIsOpenCodeTokenCount(outputTokens)) ||
+    (cache !== undefined && !checkIsOpenCodeRecord(cache))
+  ) {
+    return null;
+  }
+  const cacheReadTokens = cache?.read;
+  const cacheWriteTokens = cache?.write;
+  if (
+    (cacheReadTokens !== undefined && !checkIsOpenCodeTokenCount(cacheReadTokens)) ||
+    (cacheWriteTokens !== undefined && !checkIsOpenCodeTokenCount(cacheWriteTokens))
+  ) {
+    return null;
+  }
+  return usage.input + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) + (outputTokens ?? 0);
+}
+
+function getOpenCodeRuntimeModel(providerID: unknown, modelID: unknown): OpenCodeModelOverride | null {
+  if (
+    typeof providerID !== 'string' ||
+    !providerID.trim() ||
+    typeof modelID !== 'string' ||
+    !modelID.trim()
+  ) {
+    return null;
+  }
+  return { providerID, modelID };
+}
+
+/**
+ * @description Return the newest parent assistant message with a valid complete
+ * input-context usage total from a session-history payload. A malformed or
+ * foreign record is ignored rather than making a previous valid observation
+ * unusable.
+ */
+export function getLatestOpenCodeParentAssistantContext(
+  records: unknown,
+  sessionId: string,
+): OpenCodeParentAssistantContext | null {
+  if (!Array.isArray(records)) return null;
+  let latestContext: OpenCodeParentAssistantContext | null = null;
+  for (const record of records) {
+    if (!checkIsOpenCodeRecord(record) || !checkIsOpenCodeRecord(record.info)) continue;
+    const info = record.info;
+    if (info.role !== 'assistant' || typeof info.id !== 'string' || !info.id.trim()) continue;
+    if (info.sessionID !== undefined && info.sessionID !== sessionId) continue;
+    if (info.error !== undefined && checkIsOpenCodeAbortError(getOpenCodeErrorMessage(info.error))) continue;
+    const contextUsedTokens = getOpenCodeContextUsedTokens(info.tokens);
+    if (contextUsedTokens === null) continue;
+    const model = getOpenCodeRuntimeModel(info.providerID, info.modelID);
+    latestContext = {
+      messageId: info.id,
+      ...(model ? { model } : {}),
+      contextUsedTokens,
+    };
+  }
+  return latestContext;
+}
+
+function getOpenCodeModelVariants(model: Record<string, unknown>): string[] {
+  const variants = model.variants;
+  return checkIsOpenCodeRecord(variants) ? Object.keys(variants) : [];
+}
+
+function getOpenCodeModelContextWindowTokens(model: Record<string, unknown>): number | null {
+  const limit = model.limit;
+  if (!checkIsOpenCodeRecord(limit) || !checkIsOpenCodeTokenCount(limit.context)) return null;
+  return limit.context;
 }
 
 export function buildProviderAuthPath(providerId: string): string {
@@ -964,50 +1183,55 @@ export function checkProviderSupportsSimpleApiAuth(raw: unknown, providerId: str
   });
 }
 
-function resetOpenCodeProviderCaches(): void {
+/**
+ * @description Drop the cached model list + provider config so the next read
+ * re-fetches. Called after a credential change (`/connect`), which can change
+ * which providers/models the server exposes; also the isolation seam tests use
+ * to keep the module-level cache from leaking between cases.
+ */
+export function resetOpenCodeProviderCaches(): void {
   cachedModels = null;
   modelsCacheTime = 0;
   cachedProviders = null;
   providersCacheTime = 0;
 }
 
+function getFreshProvidersConfig(now = Date.now()): ParsedProvidersConfig | null {
+  if (!cachedProviders || now - providersCacheTime >= providersCacheTtlMs) return null;
+  return cachedProviders;
+}
+
 export function parseProvidersResponse(raw: unknown): ParsedProvidersConfig {
   const out: ParsedProvidersConfig = { providers: new Map() };
-  if (!raw || typeof raw !== 'object') return out;
-  const root = raw as Record<string, unknown>;
+  if (!checkIsOpenCodeRecord(raw)) return out;
 
   // Two shapes seen in the wild: `{ providers: [...] }` (array, opencode
   // 1.15.x) and `{ providers: { <id>: {...} } }` (older bundles). Parse
-  // both into the same flat (providerId → modelId → variantNames) map so
+  // both into the same flat (providerId → modelId → model config) map so
   // the rest of the code doesn't care which shape the server sent.
   const collect = (providerId: string, providerObj: unknown): void => {
-    if (!providerObj || typeof providerObj !== 'object') return;
-    const models = (providerObj as Record<string, unknown>).models;
-    if (!models || typeof models !== 'object') return;
-    const modelMap = new Map<string, string[]>();
-    for (const [modelId, modelObj] of Object.entries(models as Record<string, unknown>)) {
-      const variants = modelObj && typeof modelObj === 'object'
-        ? (modelObj as Record<string, unknown>).variants
-        : undefined;
-      if (variants && typeof variants === 'object' && !Array.isArray(variants)) {
-        modelMap.set(modelId, Object.keys(variants as Record<string, unknown>));
-      } else {
-        modelMap.set(modelId, []);
+    if (!checkIsOpenCodeRecord(providerObj) || !checkIsOpenCodeRecord(providerObj.models)) return;
+    const modelMap = new Map<string, OpenCodeProviderModel>();
+    for (const [modelId, modelObj] of Object.entries(providerObj.models)) {
+      if (!checkIsOpenCodeRecord(modelObj)) {
+        modelMap.set(modelId, { variants: [], contextWindowTokens: null });
+        continue;
       }
+      modelMap.set(modelId, {
+        variants: getOpenCodeModelVariants(modelObj),
+        contextWindowTokens: getOpenCodeModelContextWindowTokens(modelObj),
+      });
     }
     out.providers.set(providerId, modelMap);
   };
 
-  const providersField = root.providers;
+  const providersField = raw.providers;
   if (Array.isArray(providersField)) {
     for (const item of providersField) {
-      if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).id === 'string') {
-        const id = (item as Record<string, unknown>).id as string;
-        collect(id, item);
-      }
+      if (checkIsOpenCodeRecord(item) && typeof item.id === 'string') collect(item.id, item);
     }
-  } else if (providersField && typeof providersField === 'object') {
-    for (const [id, value] of Object.entries(providersField as Record<string, unknown>)) {
+  } else if (checkIsOpenCodeRecord(providersField)) {
+    for (const [id, value] of Object.entries(providersField)) {
       collect(id, value);
     }
   }
@@ -1166,6 +1390,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
    * session id with no owner.
    */
   private lifecycleChains: Map<string, Promise<unknown>> = new Map();
+
+  /** Number of in-flight optional history reads used to hydrate `/status` metadata. */
+  private runtimeContextHydrationCount = 0;
+
+  /** Callers waiting for one of the bounded runtime-context hydration slots. */
+  private runtimeContextHydrationWaiters: (() => void)[] = [];
 
   /** Whether a server restart is already in progress (prevents concurrent restart attempts) */
   private isServerRestarting = false;
@@ -1445,7 +1675,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       if (cause?.code === 'ECONNREFUSED') {
         throw new Error(`OpenCode server not available at ${this.baseUrl}. Is "opencode serve" running?`);
       }
-      throw new Error(`OpenCode server connection failed (${this.baseUrl}): ${e instanceof Error ? e.message : String(e)}`);
+      throw new Error(`OpenCode server connection failed (${this.baseUrl}): ${getOpenCodeErrorMessage(e)}`);
     }
 
     // prompt_async returns 204 with no body
@@ -1455,7 +1685,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
-      throw new Error(`OpenCode API ${method} ${urlPath} failed: ${response.status} ${errorText}`);
+      throw new Error(`OpenCode API ${method} ${urlPath} failed: ${response.status} ${getOpenCodeErrorMessage(errorText)}`);
     }
 
     const contentType = response.headers.get('content-type') || '';
@@ -1542,6 +1772,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           isModelInfoShown: false,
           modelOverride: null,
           currentModelLabel: null,
+          latestParentRuntimeContext: null,
+          parentAssistantObservationVersion: 0,
           partTypes: new Map(),
           statusDebounceTimer: null,
           pendingStatus: null,
@@ -1556,6 +1788,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
           sawTurnActivity: false,
           providerRetrySignature: null,
           isAwaitingModelAfterProviderRetryAbort: false,
+          isAwaitingProviderRetryAbortIdle: false,
+          isAwaitingProviderRetryReplacementStart: false,
           providerRetryAbortPromise: null,
           isCompacting: false,
           busyChildSessionIds: new Set(),
@@ -1717,13 +1951,21 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // Mark busy optimistically so an immediately-following message correctly
     // sees a turn in flight; the `session.status` stream corrects/confirms it.
     session.isBusy = true;
-    // Arm the wedged-turn detector: a healthy turn sets `sawTurnActivity` from
-    // its first assistant message/part; if the next own-session idle arrives
-    // with none, the prompt produced no turn (a wedged session accepts prompts
-    // but its agent loop exits at once) and we surface a notice instead of
-    // hanging silently.
-    session.awaitingTurnResponse = true;
-    session.sawTurnActivity = false;
+    const isReplacingProviderRetry = session.providerRetrySignature !== null || session.providerRetryAbortPromise !== null;
+    if (!isReplacingProviderRetry) {
+      // Arm the wedged-turn detector: a healthy turn sets `sawTurnActivity` from
+      // its first assistant message/part; if the next own-session idle arrives
+      // with none, the prompt produced no turn (a wedged session accepts prompts
+      // but its agent loop exits at once) and we surface a notice instead of
+      // hanging silently.
+      session.awaitingTurnResponse = true;
+      session.sawTurnActivity = false;
+    } else {
+      // The prior retry's pending detector belongs to the turn being aborted.
+      // The replacement is armed only at its own observed busy transition.
+      session.awaitingTurnResponse = false;
+      session.sawTurnActivity = false;
+    }
 
     // Model + reasoning-effort overrides ride the prompt body (see buildPromptBody).
     const body = buildPromptBody(input, session.modelOverride, session.effortLevel);
@@ -1732,13 +1974,24 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       try {
         const retryAbortPromise = this.getProviderRetryAbortPromise(session);
         if (retryAbortPromise) await retryAbortPromise;
+        if (isReplacingProviderRetry) {
+          const current = this.sessions.get(keyToString(key));
+          if (current !== session || !current.isActive) return;
+          // SSE can report busy before prompt_async resolves. Arm the boundary
+          // before sending so that busy unambiguously belongs to this prompt.
+          current.isAwaitingProviderRetryReplacementStart = true;
+        }
         await this.apiRequest('POST', `/session/${session.sessionId}/prompt_async`, body);
       } catch (e) {
         // The optimistic `isBusy = true` above never gets a `session.status`
         // idle to clear it if the POST failed — clear it so the next prompt
         // doesn't eat a spurious abort + wait.
         const current = this.sessions.get(keyToString(key));
-        if (current && !current.providerRetrySignature) current.isBusy = false;
+        if (current && !current.providerRetrySignature) {
+          current.isBusy = false;
+          current.awaitingTurnResponse = false;
+          current.isAwaitingProviderRetryReplacementStart = false;
+        }
         console.error(`[OpenCode] Failed to send message:`, e);
         this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
       }
@@ -1756,6 +2009,9 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
 
     console.log(`[OpenCode] Aborting provider retry before new prompt`);
     session.isAwaitingModelAfterProviderRetryAbort = true;
+    // The abort's idle may arrive before this request resolves, so arm its
+    // one-shot consumer before dispatching rather than in the success handler.
+    session.isAwaitingProviderRetryAbortIdle = true;
     const abortPromise = this.apiRequest('POST', `/session/${session.sessionId}/abort`).then(() => undefined);
     session.providerRetryAbortPromise = abortPromise;
     void abortPromise.then(
@@ -1769,6 +2025,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         const current = this.sessions.get(keyToString(session.key));
         if (current === session && current.providerRetryAbortPromise === abortPromise) {
           current.isAwaitingModelAfterProviderRetryAbort = false;
+          current.isAwaitingProviderRetryAbortIdle = false;
+          current.isAwaitingProviderRetryReplacementStart = false;
           current.providerRetryAbortPromise = null;
         }
       },
@@ -1974,26 +2232,54 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     return saved ? `${saved.providerID}/${saved.modelID}` : null;
   }
 
+  async getRuntimeInfo(key: ThreadKey): Promise<AgentRuntimeInfo> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) {
+      return { version: null, model: null, contextWindowTokens: null, contextUsedTokens: null };
+    }
+
+    const runtimeContext = session.latestParentRuntimeContext;
+    const runtimeModel = runtimeContext?.model ?? null;
+    // Fetch (not cache-peek) the provider config: a cache-only read reported
+    // "context limit unavailable" for the whole TTL window after a server
+    // restart. A failed lookup degrades to an unknown limit — `/status` must
+    // never throw. Skipped entirely without an observed model, since there is
+    // then no model to look a limit up for; the two independent HTTP reads run
+    // concurrently so `/status` waits for the slower one, not for their sum.
+    const [health, providers] = await Promise.all([
+      getOpenCodeServerHealth(),
+      runtimeModel
+        ? this.getProvidersConfig().catch((error) => {
+          console.warn('[OpenCode] getRuntimeInfo providers lookup failed:', error instanceof Error ? error.message : error);
+          return null;
+        })
+        : null,
+    ]);
+    const contextWindowTokens = runtimeModel && providers
+      ? providers.providers.get(runtimeModel.providerID)?.get(runtimeModel.modelID)?.contextWindowTokens ?? null
+      : null;
+
+    return {
+      version: health.version,
+      model: runtimeModel ? `${runtimeModel.providerID}/${runtimeModel.modelID}` : null,
+      contextWindowTokens,
+      contextUsedTokens: runtimeContext?.contextUsedTokens ?? null,
+    };
+  }
+
   // ── Reasoning effort (variants) ───────────────────────────────────────────
 
   /**
    * @description Fetch + cache the provider/variant config
    * (`GET /config/providers`). 5-minute TTL — variant maps change about as
-   * often as the model list. Plan R2: log the raw shape ONCE before trusting
-   * the parser, since the response shape varies across server versions.
+   * often as the model list. The response is not logged because provider
+   * configuration can contain credentials.
    */
   private async getProvidersConfig(): Promise<ParsedProvidersConfig> {
     const now = Date.now();
-    if (cachedProviders && now - providersCacheTime < providersCacheTtlMs) {
-      return cachedProviders;
-    }
+    const freshConfig = getFreshProvidersConfig(now);
+    if (freshConfig) return freshConfig;
     const raw = await this.apiRequest<unknown>('GET', '/config/providers');
-    if (!isProvidersShapeLogged) {
-      isProvidersShapeLogged = true;
-      try {
-        console.log(`[OpenCode] /config/providers raw shape:`, JSON.stringify(raw).slice(0, 2000));
-      } catch { /* non-serialisable — skip the one-time log */ }
-    }
     const parsed = parseProvidersResponse(raw);
     cachedProviders = parsed;
     providersCacheTime = now;
@@ -2014,7 +2300,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (!providerID || !modelID) return [];
     try {
       const config = await this.getProvidersConfig();
-      return config.providers.get(providerID)?.get(modelID) ?? [];
+      return config.providers.get(providerID)?.get(modelID)?.variants ?? [];
     } catch (e) {
       console.warn(`[OpenCode] getProvidersConfig failed:`, e instanceof Error ? e.message : e);
       return [];
@@ -2406,6 +2692,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         isModelInfoShown: false,
         modelOverride: null,
         currentModelLabel: null,
+        latestParentRuntimeContext: null,
+        parentAssistantObservationVersion: 0,
         partTypes: new Map(),
         statusDebounceTimer: null,
         pendingStatus: null,
@@ -2420,6 +2708,8 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
         sawTurnActivity: false,
         providerRetrySignature: null,
         isAwaitingModelAfterProviderRetryAbort: false,
+        isAwaitingProviderRetryAbortIdle: false,
+        isAwaitingProviderRetryReplacementStart: false,
         providerRetryAbortPromise: null,
         isCompacting: false,
         busyChildSessionIds: new Set(),
@@ -2438,6 +2728,10 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       // for tens of seconds; the topic must not wait on it for the reattach
       // notice. Session + SSE are live here.
       this.emit('started', key);
+
+      // History is only a fallback for context that predates this attachment.
+      // It must not hold up the resumed session's ready signal or post a recap.
+      void this.hydrateLatestParentAssistantContext(key, session);
 
       // Re-surface a question still open on the server (G1): this method runs on
       // BOTH silent restart re-attach AND explicit /sessions resume, so an
@@ -2482,6 +2776,67 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.error(`[OpenCode] Failed to resume session:`, e);
       throw e;
     }
+  }
+
+  /**
+   * @description Best-effort hydration for an idle resumed session's context
+   * usage. A live SSE observation wins over this historical read even when the
+   * history request resolves later.
+   */
+  private async hydrateLatestParentAssistantContext(key: ThreadKey, session: OpenCodeSession): Promise<void> {
+    // Snapshot before waiting: a queued read must never overwrite an SSE tuple
+    // that arrives while the semaphore is occupied by other resumed sessions.
+    const observationVersion = session.parentAssistantObservationVersion;
+    await this.acquireRuntimeContextHydrationSlot();
+    try {
+      const currentSession = this.sessions.get(keyToString(key));
+      if (
+        currentSession !== session ||
+        !currentSession.isActive ||
+        currentSession.parentAssistantObservationVersion !== observationVersion
+      ) {
+        return;
+      }
+
+      const records = await this.apiRequest<unknown>('GET', `/session/${session.sessionId}/message`);
+      const latestContext = getLatestOpenCodeParentAssistantContext(records, session.sessionId);
+      if (!latestContext) return;
+
+      const currentSessionAfterRead = this.sessions.get(keyToString(key));
+      if (
+        currentSessionAfterRead !== session ||
+        !currentSessionAfterRead.isActive ||
+        currentSessionAfterRead.parentAssistantObservationVersion !== observationVersion
+      ) {
+        return;
+      }
+      currentSessionAfterRead.latestParentRuntimeContext = latestContext;
+    } catch (error) {
+      console.warn(`[OpenCode] context hydration failed for ${keyToString(key)}:`, error instanceof Error ? error.message : error);
+    } finally {
+      this.releaseRuntimeContextHydrationSlot();
+    }
+  }
+
+  /** @description Wait for a bounded slot before fetching optional history metadata. */
+  private async acquireRuntimeContextHydrationSlot(): Promise<void> {
+    if (this.runtimeContextHydrationCount < openCodeRuntimeContextHydrationConcurrency) {
+      this.runtimeContextHydrationCount += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.runtimeContextHydrationWaiters.push(resolve);
+    });
+  }
+
+  /** @description Hand a completed metadata-read slot to the next queued session. */
+  private releaseRuntimeContextHydrationSlot(): void {
+    const nextWaiter = this.runtimeContextHydrationWaiters.shift();
+    if (nextWaiter) {
+      nextWaiter();
+      return;
+    }
+    this.runtimeContextHydrationCount -= 1;
   }
 
   /**
@@ -3818,39 +4173,65 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     const info = properties.info as OpenCodeMessageInfo | undefined;
     if (!info) return;
 
+    const isParentAssistantMessage = info.role === 'assistant' && (!info.sessionID || info.sessionID === session.sessionId);
+    const modelLabel = info.modelID
+      ? (info.providerID ? `${info.providerID}/${info.modelID}` : info.modelID)
+      : null;
+    const selectedModelLabel = session.modelOverride
+      ? `${session.modelOverride.providerID}/${session.modelOverride.modelID}`
+      : null;
+    const isCompleteConflictingModel = Boolean(
+      selectedModelLabel !== null
+      && info.providerID
+      && info.modelID
+      && modelLabel !== selectedModelLabel,
+    );
+    const isAbortedRetryMessage = isParentAssistantMessage
+      && session.isAwaitingModelAfterProviderRetryAbort
+      && (
+        (info.error !== undefined && checkIsOpenCodeAbortError(getOpenCodeErrorMessage(info.error)))
+        || isCompleteConflictingModel
+      );
+    if (isAbortedRetryMessage) {
+      // The event is stale for this turn, but newer than any reattach history.
+      // Record that ordering without retaining the aborted runtime tuple.
+      session.parentAssistantObservationVersion += 1;
+      console.log(`[OpenCode] Ignoring model from aborted provider retry: ${modelLabel ?? 'unknown'}`);
+      return;
+    }
+
     // An assistant message (own or sub-agent child) means the turn genuinely
     // started — the SOLE wedged-turn activity signal. Must be assistant-only:
     // `prompt_async` also emits message/part events for the ECHOED USER PROMPT,
     // and counting those (the old unconditional set in handlePartUpdate) marked
     // every wedge as "active" and masked it (live miss 2026-08-16).
     if (info.role === 'assistant') session.sawTurnActivity = true;
+    if (isParentAssistantMessage) {
+      // The first non-stale parent assistant event marks the replacement turn's
+      // boundary, even when it lacks the optional runtime token tuple.
+      session.isAwaitingModelAfterProviderRetryAbort = false;
+      session.isAwaitingProviderRetryReplacementStart = false;
+      session.isAwaitingProviderRetryAbortIdle = false;
+      const contextUsedTokens = getOpenCodeContextUsedTokens(info.tokens);
+      if (typeof info.id === 'string' && info.id.trim() && contextUsedTokens !== null) {
+        session.parentAssistantObservationVersion += 1;
+        const model = getOpenCodeRuntimeModel(info.providerID, info.modelID);
+        session.latestParentRuntimeContext = {
+          messageId: info.id,
+          ...(model ? { model } : {}),
+          contextUsedTokens,
+        };
+      }
+    }
 
     // Track and show model info on first assistant message (or after model change)
-    if (info.role === 'assistant' && info.modelID) {
-      const modelLabel = info.providerID
-        ? `${info.providerID}/${info.modelID}`
-        : info.modelID;
-      const selectedModelLabel = session.modelOverride
-        ? `${session.modelOverride.providerID}/${session.modelOverride.modelID}`
-        : null;
-      const isAbortedRetryModel = session.isAwaitingModelAfterProviderRetryAbort
-        && selectedModelLabel !== null
-        && modelLabel !== selectedModelLabel;
+    if (info.role === 'assistant' && modelLabel !== null) {
+      session.currentModelLabel = modelLabel;
 
-      // Aborting a provider retry finalises its old assistant message before the
-      // replacement prompt starts. That stale update must not overwrite the
-      // newly-selected /model or announce the old provider as the new turn.
-      if (isAbortedRetryModel) {
-        console.log(`[OpenCode] Ignoring model from aborted provider retry: ${modelLabel}`);
-      } else {
-        if (selectedModelLabel === modelLabel) session.isAwaitingModelAfterProviderRetryAbort = false;
-        session.currentModelLabel = modelLabel;
-
-        if (!session.isModelInfoShown) {
-          session.isModelInfoShown = true;
-          console.log(`[OpenCode] Using model: ${modelLabel}`);
-          this.emit('output', key, `Model: ${modelLabel}`);
-        }
+      if (!session.isModelInfoShown) {
+        session.isModelInfoShown = true;
+        console.log(`[OpenCode] Using model: ${modelLabel}`);
+        this.emit('output', key, `Model: ${modelLabel}`);
       }
     }
 
@@ -3883,7 +4264,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // swallowed for the same reason as the `session.error` twin above (the
     // question-cancel / `/esc` / provider-retry interrupt is ours, not a fault).
     if (info.error) {
-      const errorMsg = this.extractErrorMessage(info.error);
+      const errorMsg = getOpenCodeErrorMessage(info.error);
       if (checkIsOpenCodeAbortError(errorMsg)) {
         console.log(`[OpenCode] Swallowed bot-issued abort (message.error "Aborted") for ${keyToString(key)}`);
       } else {
@@ -3905,6 +4286,16 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     if (sessionId && !checkIsEventForSession(sessionId, session.sessionId, this.sessionLineage)) return;
 
     const isOwnIdle = !sessionId || sessionId === session.sessionId;
+    if (
+      isOwnIdle &&
+      (session.isAwaitingProviderRetryAbortIdle || session.isAwaitingProviderRetryReplacementStart)
+    ) {
+      // The abort completes the old retry turn asynchronously. Its idle must not
+      // settle or recover the replacement prompt that was posted after the abort.
+      session.isAwaitingProviderRetryAbortIdle = false;
+      console.log(`[OpenCode] Ignoring idle from aborted provider retry`);
+      return;
+    }
     // Snapshot the wedged-turn guards BEFORE the own-idle clears below reset
     // them: a legitimate compaction cycle and a still-pending provider retry
     // both idle without assistant text and must NOT be flagged as wedged.
@@ -4008,7 +4399,31 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     }
 
     const isOwnSession = !eventSessionId || eventSessionId === session.sessionId;
+    if (
+      isOwnSession
+      && isProviderRetry
+      && (
+        session.providerRetryAbortPromise
+        || (
+          session.isAwaitingProviderRetryReplacementStart
+          && (session.isAwaitingProviderRetryAbortIdle || session.isAwaitingModelAfterProviderRetryAbort)
+        )
+      )
+    ) {
+      // A retry status that races the abort belongs to the cancelled turn. It
+      // must not restore the retry guard for the prompt we are about to send.
+      console.log(`[OpenCode] Ignoring retry status from aborted provider retry`);
+      return;
+    }
     if (!isOwnSession) return;
+    if (status?.type === 'busy' && session.isAwaitingProviderRetryReplacementStart) {
+      // `busy` is the observable boundary for the replacement request. Older
+      // retry termination events can no longer consume this new turn's idle.
+      session.isAwaitingProviderRetryReplacementStart = false;
+      session.isAwaitingProviderRetryAbortIdle = false;
+      session.awaitingTurnResponse = true;
+      session.sawTurnActivity = false;
+    }
     if (!isProviderRetry) {
       if (!session.providerRetryAbortPromise) {
         session.providerRetrySignature = null;
@@ -4079,7 +4494,7 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
   }
 
   private handleSessionError(key: ThreadKey, eventSessionId: string | null, properties: Record<string, unknown>): void {
-    const errorMsg = this.extractErrorMessage(properties.error);
+    const errorMsg = getOpenCodeErrorMessage(properties.error);
     const session = this.sessions.get(keyToString(key));
     const isOwnSession = !eventSessionId || (session !== undefined && eventSessionId === session.sessionId);
 
@@ -4089,7 +4504,11 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // The turn DID end, so still close the sub-agent status for the own session.
     if (checkIsOpenCodeAbortError(errorMsg)) {
       console.log(`[OpenCode] Swallowed bot-issued abort (session.error "Aborted") for ${keyToString(key)}`);
-      if (session?.isActive && isOwnSession) this.closeSubagentStatusOnParentTurnEnd(key);
+      if (session?.isActive && isOwnSession) {
+        // OpenCode may emit the terminal idle after this error. Keep its
+        // one-shot shield armed until idle or the replacement's busy boundary.
+        this.closeSubagentStatusOnParentTurnEnd(key);
+      }
       return;
     }
 
@@ -4113,7 +4532,14 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
     // `session.error`, so the kick reuses it); `auth` (logged out / bad
     // credentials) is SURFACED as a pinned notice by the bot, never retried.
     // Unrecognised errors classify to `null` and emit nothing.
-    const apiError: AgentApiErrorClass | null = classifyAgentApiError(errorMsg, Date.now());
+    //
+    // Classified from the RAW payload, not from `errorMsg`: the surfaced text
+    // collapses an unrecognised shape to a constant that carries no marker to
+    // classify. The raw text stops here — the classifier returns only a class.
+    const apiError: AgentApiErrorClass | null = classifyAgentApiError(
+      getOpenCodeErrorClassificationText(properties.error),
+      Date.now(),
+    );
     if (apiError) {
       this.emit('apiError', key, apiError);
     }
@@ -4287,28 +4713,6 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       console.error(`[OpenCode] Failed to reject question:`, e);
       this.emit('error', key, e instanceof Error ? e : new Error(String(e)));
     });
-  }
-
-  /**
-   * @description Extract human-readable message from OpenCode error objects.
-   * Handles { name, data: { message } } and { message } shapes.
-   */
-  private extractErrorMessage(error: unknown): string {
-    if (typeof error === 'string') return error;
-    if (!error || typeof error !== 'object') return String(error);
-
-    const err = error as Record<string, unknown>;
-
-    // Shape: { name: "APIError", data: { message: "..." } }
-    if (err.data && typeof err.data === 'object') {
-      const data = err.data as Record<string, unknown>;
-      if (typeof data.message === 'string') return data.message;
-    }
-
-    // Shape: { message: "..." }
-    if (typeof err.message === 'string') return err.message;
-
-    return JSON.stringify(error);
   }
 
   private flushOutput(key: ThreadKey, isFinal = false): void {

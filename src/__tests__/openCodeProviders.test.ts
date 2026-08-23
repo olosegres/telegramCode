@@ -3,7 +3,7 @@
  * is the source of truth for which reasoning-effort *variants* a model exposes,
  * but its JSON shape varies across OpenCode server versions (array of providers
  * vs. an object keyed by provider id). `parseProvidersResponse` must flatten
- * BOTH into the same `provider → model → variantNames` map, and degrade to an
+ * BOTH into the same `provider → model → config` map, and degrade to an
  * empty map (never throw) on garbage — a parse crash here would take down the
  * whole prompt path.
  */
@@ -18,7 +18,7 @@ test('parses the ARRAY shape ({ providers: [{ id, models }] })', () => {
       {
         id: 'anthropic',
         models: {
-          'claude-opus-4-8': { variants: { high: {}, max: {} } },
+          'claude-opus-4-8': { variants: { high: {}, max: {} }, limit: { context: 1_000_000 } },
           'claude-haiku': {}, // no variants → []
         },
       },
@@ -31,11 +31,15 @@ test('parses the ARRAY shape ({ providers: [{ id, models }] })', () => {
     ],
   };
   const cfg = parseProvidersResponse(raw);
-  assert.deepEqual(cfg.providers.get('anthropic')?.get('claude-opus-4-8'), ['high', 'max']);
-  assert.deepEqual(cfg.providers.get('anthropic')?.get('claude-haiku'), []);
+  assert.deepEqual(cfg.providers.get('anthropic')?.get('claude-opus-4-8'), {
+    variants: ['high', 'max'], contextWindowTokens: 1_000_000,
+  });
+  assert.deepEqual(cfg.providers.get('anthropic')?.get('claude-haiku'), {
+    variants: [], contextWindowTokens: null,
+  });
   assert.deepEqual(
     cfg.providers.get('openai')?.get('gpt-5'),
-    ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+    { variants: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'], contextWindowTokens: null },
   );
 });
 
@@ -50,7 +54,9 @@ test('parses the OBJECT shape ({ providers: { <id>: { models } } })', () => {
     },
   };
   const cfg = parseProvidersResponse(raw);
-  assert.deepEqual(cfg.providers.get('anthropic')?.get('claude-sonnet-4-6'), ['high', 'max']);
+  assert.deepEqual(cfg.providers.get('anthropic')?.get('claude-sonnet-4-6'), {
+    variants: ['high', 'max'], contextWindowTokens: null,
+  });
 });
 
 test('a model whose variants is not an object maps to [] (defensive)', () => {
@@ -61,8 +67,8 @@ test('a model whose variants is not an object maps to [] (defensive)', () => {
   };
   // `variants` as an array or null is malformed → treated as "no variants".
   const cfg = parseProvidersResponse(raw);
-  assert.deepEqual(cfg.providers.get('x')?.get('m1'), []);
-  assert.deepEqual(cfg.providers.get('x')?.get('m2'), []);
+  assert.deepEqual(cfg.providers.get('x')?.get('m1'), { variants: [], contextWindowTokens: null });
+  assert.deepEqual(cfg.providers.get('x')?.get('m2'), { variants: [], contextWindowTokens: null });
 });
 
 test('garbage / missing fields yield an empty map, never throw', () => {

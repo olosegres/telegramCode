@@ -16,7 +16,11 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { OpenCodeAdapter, mapOpenCodeMessagesToTurns } from '../adapters/openCodeAdapter';
+import {
+  getLatestOpenCodeParentAssistantContext,
+  OpenCodeAdapter,
+  mapOpenCodeMessagesToTurns,
+} from '../adapters/openCodeAdapter';
 import type { ThreadKey } from '../types';
 
 const limit = 3;
@@ -66,6 +70,92 @@ describe('mapOpenCodeMessagesToTurns', () => {
       { info: { role: 'user' }, parts: [{ type: 'text', text: 'real user' }] },
     ];
     assert.deepEqual(mapOpenCodeMessagesToTurns(records, limit), [{ role: 'user', text: 'real user' }]);
+  });
+});
+
+describe('getLatestOpenCodeParentAssistantContext', () => {
+  it('selects the newest valid parent assistant context and ignores foreign or malformed entries', () => {
+    const records = [
+      {
+        info: {
+          id: 'msg_foreign',
+          sessionID: 'ses_child',
+          role: 'assistant',
+          tokens: { input: 900, cache: { read: 50, write: 25 } },
+        },
+      },
+      {
+        info: {
+          id: 'msg_previous',
+          sessionID: sessionId,
+          role: 'assistant',
+          tokens: { input: 120, cache: { read: 30, write: 5 } },
+        },
+      },
+      {
+        info: {
+          id: 'msg_malformed',
+          sessionID: sessionId,
+          role: 'assistant',
+          tokens: { input: 200, cache: { read: 'wrong', write: 5 } },
+        },
+      },
+      {
+        info: {
+          id: 'msg_latest',
+          sessionID: sessionId,
+          role: 'assistant',
+          tokens: { input: 400, cache: { read: 50, write: 25 } },
+        },
+      },
+    ];
+
+    assert.deepEqual(getLatestOpenCodeParentAssistantContext(records, sessionId), {
+      messageId: 'msg_latest',
+      contextUsedTokens: 475,
+    });
+  });
+
+  it('returns null when no parent assistant entry has a complete valid token total', () => {
+    const records = [
+      { info: { id: 'msg_missing_input', sessionID: sessionId, role: 'assistant', tokens: { cache: { read: 1 } } } },
+      { info: { id: 'msg_fraction', sessionID: sessionId, role: 'assistant', tokens: { input: 1.5 } } },
+      { info: { id: 'msg_negative', sessionID: sessionId, role: 'assistant', tokens: { input: 3, cache: { write: -1 } } } },
+    ];
+
+    assert.equal(getLatestOpenCodeParentAssistantContext(records, sessionId), null);
+  });
+
+  it('keeps the valid parent context when a later record is an aborted turn', () => {
+    const records = [
+      {
+        info: {
+          id: 'msg_valid',
+          sessionID: sessionId,
+          role: 'assistant',
+          providerID: 'provider',
+          modelID: 'model',
+          tokens: { input: 120, cache: { read: 30, write: 5 } },
+        },
+      },
+      {
+        info: {
+          id: 'msg_aborted',
+          sessionID: sessionId,
+          role: 'assistant',
+          providerID: 'stale-provider',
+          modelID: 'stale-model',
+          tokens: { input: 900, cache: { read: 50, write: 25 } },
+          error: { data: { message: 'Aborted' } },
+        },
+      },
+    ];
+
+    assert.deepEqual(getLatestOpenCodeParentAssistantContext(records, sessionId), {
+      messageId: 'msg_valid',
+      model: { providerID: 'provider', modelID: 'model' },
+      contextUsedTokens: 155,
+    });
   });
 });
 

@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Socket } from 'node:net';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
@@ -677,6 +678,7 @@ export function createSchedulerMcpServer(deps: SchedulerMcpDeps): SchedulerMcpHa
   const requestedPort = deps.port ?? getSchedulerMcpPort();
   let boundPort = requestedPort;
   let httpServer: Server | null = null;
+  const sockets = new Set<Socket>();
 
   async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const secret = await deps.getSecret();
@@ -725,6 +727,10 @@ export function createSchedulerMcpServer(deps: SchedulerMcpDeps): SchedulerMcpHa
         }
         writeJsonRpcError(res, 404, -32601, 'Not found');
       });
+      server.on('connection', (socket) => {
+        sockets.add(socket);
+        socket.once('close', () => sockets.delete(socket));
+      });
 
       let retriedEphemeral = false;
 
@@ -771,6 +777,9 @@ export function createSchedulerMcpServer(deps: SchedulerMcpDeps): SchedulerMcpHa
         httpServer = null;
         resolve();
       });
+      // Streamable HTTP clients may retain an idle keep-alive connection after
+      // their request completes; server.close() otherwise waits for it forever.
+      for (const socket of sockets) socket.destroy();
     });
   }
 

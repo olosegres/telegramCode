@@ -4,15 +4,28 @@
  * for jobs paused by an /unbind.
  */
 
-import { test, describe, it } from 'node:test';
+import { test, describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { getThreadKeysForDirectory } from '../scheduler/directoryThreads';
 import { getRebindResumeAction } from '../scheduler/rebindResume';
 import { createScheduleRecord } from '../scheduler/store';
 import type { ThreadKey } from '../types';
 import type { BindingData } from '../state';
 
-const workRoot = '/work/root';
+let workRoot = '';
+
+before(() => {
+  workRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcode-scheduler-work-root-'));
+  fs.mkdirSync(path.join(workRoot, 'projectA'));
+  fs.mkdirSync(path.join(workRoot, 'projectB'));
+});
+
+after(() => {
+  fs.rmSync(workRoot, { recursive: true, force: true });
+});
 
 function buildBinding(chatId: number, threadId: number, subdir: string): { key: ThreadKey; data: BindingData } {
   return { key: { chatId, threadId }, data: { subdir, createdAt: '2026-06-06T00:00:00.000Z' } };
@@ -26,24 +39,45 @@ describe('getThreadKeysForDirectory', () => {
   ];
 
   it('returns every thread bound to the directory (shared folders share scope)', () => {
-    assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, '/work/root/projectA'), [
+    assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, path.join(workRoot, 'projectA')), [
       '-100:11',
       '-100:22',
     ]);
   });
 
   it('a single-thread directory resolves to exactly that thread', () => {
-    assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, '/work/root/projectB'), ['-100:33']);
+    assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, path.join(workRoot, 'projectB')), ['-100:33']);
   });
 
   it('an unknown directory resolves to no threads', () => {
-    assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, '/work/root/other'), []);
+    assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, path.join(workRoot, 'other')), []);
   });
 
   it('matches the RESOLVED workDir, not the raw subdir', () => {
     // The dir-scope token carries the absolute instance directory; comparing
     // against the relative subdir would miss every match.
     assert.deepEqual(getThreadKeysForDirectory(bindings, workRoot, 'projectA'), []);
+  });
+
+  it('matches the canonical directory when WORK_ROOT is a symlink', (t) => {
+    const physicalWorkRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcode-scheduler-root-'));
+    const symlinkedWorkRoot = `${physicalWorkRoot}-link`;
+    fs.mkdirSync(path.join(physicalWorkRoot, 'projectA'));
+    try {
+      fs.symlinkSync(physicalWorkRoot, symlinkedWorkRoot);
+    } catch {
+      fs.rmSync(physicalWorkRoot, { recursive: true, force: true });
+      return t.skip('host fs refused symlink creation');
+    }
+    try {
+      assert.deepEqual(
+        getThreadKeysForDirectory([buildBinding(-100, 11, 'projectA')], symlinkedWorkRoot, fs.realpathSync(path.join(physicalWorkRoot, 'projectA'))),
+        ['-100:11'],
+      );
+    } finally {
+      fs.unlinkSync(symlinkedWorkRoot);
+      fs.rmSync(physicalWorkRoot, { recursive: true, force: true });
+    }
   });
 });
 

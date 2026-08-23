@@ -136,7 +136,7 @@ export function resolveBoundWorkDir(
   if (!binding) return { kind: 'refuse' };
   try {
     const subdir = validateSubdir(workRoot, binding.subdir);
-    return { kind: 'proceed', subdir, workDir: path.join(workRoot, subdir) };
+    return { kind: 'proceed', subdir, workDir: fs.realpathSync(path.resolve(workRoot, subdir)) };
   } catch (e) {
     if (e instanceof BindError) return { kind: 'invalid', error: e };
     throw e;

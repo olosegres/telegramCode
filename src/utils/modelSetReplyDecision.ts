@@ -4,7 +4,7 @@
  * pick, and the `model_<id>` button callback). All four asked the adapter to
  * set the model and now must build the SAME user-facing reply — so the branchy
  * decision lives here, unit-testable without the Telegraf machinery (same
- * pattern as `statusFlushDecision.ts` / `bindGateDecision.ts`).
+ * pattern as `statusFlushDecision.ts`).
  *
  * The no-session decision itself now lives in the adapters (OpenCode persists
  * the pref and returns success; Claude refuses with a notice), so this helper

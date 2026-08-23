@@ -77,8 +77,38 @@ test('resolveBoundWorkDir validates a persisted binding before returning workDir
   assert.deepEqual(resolveBoundWorkDir(workRoot, { subdir: 'alpha' }), {
     kind: 'proceed',
     subdir: 'alpha',
-    workDir: path.join(workRoot, 'alpha'),
+    workDir: fs.realpathSync(path.join(workRoot, 'alpha')),
   });
+});
+
+test('resolveBoundWorkDir returns an absolute canonical path for a relative root', () => {
+  const relativeWorkRoot = path.relative(process.cwd(), workRoot);
+  const decision = resolveBoundWorkDir(relativeWorkRoot, { subdir: 'alpha' });
+
+  assert.deepEqual(decision, {
+    kind: 'proceed',
+    subdir: 'alpha',
+    workDir: fs.realpathSync(path.join(workRoot, 'alpha')),
+  });
+});
+
+test('resolveBoundWorkDir resolves a symlinked root to its physical directory', (t) => {
+  const symlinkedWorkRoot = `${workRoot}-link`;
+  try {
+    fs.symlinkSync(workRoot, symlinkedWorkRoot);
+  } catch {
+    return t.skip('host fs refused symlink creation');
+  }
+  try {
+    const decision = resolveBoundWorkDir(symlinkedWorkRoot, { subdir: 'alpha' });
+    assert.deepEqual(decision, {
+      kind: 'proceed',
+      subdir: 'alpha',
+      workDir: fs.realpathSync(path.join(workRoot, 'alpha')),
+    });
+  } finally {
+    fs.unlinkSync(symlinkedWorkRoot);
+  }
 });
 
 test('resolveBoundWorkDir rejects a deleted persisted binding target', () => {

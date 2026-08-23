@@ -43,13 +43,60 @@ import {
   type SchedulerMcpHandle,
   type SchedulerMcpDeps,
 } from '../scheduler/mcpSurface';
-import { createServer } from 'node:http';
+import { createServer, request, type ClientRequest } from 'node:http';
 import type { ScheduleRecord } from '../scheduler/types';
 
 const secret = 'a'.repeat(64);
 const threadAKey = keyToString({ chatId: -1001234567890, threadId: 11 });
 const threadBKey = keyToString({ chatId: -1001234567890, threadId: 22 });
 const nowMs = new Date(2026, 5, 6, 10, 0, 0).getTime();
+const schedulerMcpStopTimeoutMs = 1_000;
+const incompleteRequestBody = '{"jsonrpc":"2.0"';
+
+interface IncompleteHttpRequest {
+  request: ClientRequest;
+  connected: Promise<void>;
+}
+
+function checkPromiseResolvesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    promise.then(
+      () => {
+        clearTimeout(timeout);
+        resolve(true);
+      },
+      (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
+function createIncompleteHttpRequest(port: number, token: string): IncompleteHttpRequest {
+  const activeRequest = request({
+    host: '127.0.0.1',
+    port,
+    path: '/mcp',
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'Content-Length': (incompleteRequestBody.length + 1).toString(),
+    },
+  });
+  // Destroying the request during test cleanup reports ECONNRESET asynchronously.
+  activeRequest.on('error', () => {});
+  const connected = new Promise<void>((resolve) => {
+    activeRequest.once('socket', (socket) => {
+      if (socket.connecting) socket.once('connect', resolve);
+      else resolve();
+    });
+  });
+  activeRequest.write(incompleteRequestBody);
+  return { request: activeRequest, connected };
+}
 
 // ─── port resolution + reuse ─────────────────────────────────────────
 
@@ -394,6 +441,27 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     assert.ok(fixture.handle.port > 0);
   });
 
+  it('destroys active sockets while an initialized client remains connected', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    const activeRequest = createIncompleteHttpRequest(fixture.handle.port, token);
+    let stopPromise: Promise<void> | null = null;
+    try {
+      await activeRequest.connected;
+      stopPromise = fixture.handle.stop();
+      assert.equal(
+        await checkPromiseResolvesWithin(stopPromise, schedulerMcpStopTimeoutMs),
+        true,
+        'stop must destroy the active request socket instead of waiting for its unfinished body',
+      );
+    } finally {
+      if (stopPromise === null) stopPromise = fixture.handle.stop();
+      activeRequest.request.destroy();
+      await client.close();
+      await stopPromise;
+    }
+  });
+
   it('rejects a connection with no token', async () => {
     await assert.rejects(buildClient(fixture.handle.port, null));
   });
@@ -405,12 +473,16 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
   it('reports connect-time server instructions on initialize', async () => {
     const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
     const client = await buildClient(fixture.handle.port, token);
-    const instructions = client.getInstructions();
-    assert.ok(instructions, 'server should report instructions on initialize');
-    // Use-case pointer, not recipe repetition: names the tools + the fresh-session caveat.
-    assert.match(instructions, /schedule_create/);
-    assert.match(instructions, /send_file_to_user/);
-    assert.match(instructions, /fresh session/);
+    try {
+      const instructions = client.getInstructions();
+      assert.ok(instructions, 'server should report instructions on initialize');
+      // Use-case pointer, not recipe repetition: names the tools + the fresh-session caveat.
+      assert.match(instructions, /schedule_create/);
+      assert.match(instructions, /send_file_to_user/);
+      assert.match(instructions, /fresh session/);
+    } finally {
+      await client.close();
+    }
   });
 
   it('exposes the file-send tool under its agent-facing name send_file_to_user', async () => {

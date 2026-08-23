@@ -245,6 +245,9 @@ test('per-thread /status keys exist in every locale', () => {
     'status.thread_stopped',
     'status.thread_no_agent',
     'status.thread_no_binding',
+    'status.thread_workdir',
+    'status.thread_runtime_version',
+    'status.thread_context',
   ]) {
     assert.ok(checkKeyInAllLangs(code), `${code} missing in some locale`);
   }
@@ -266,6 +269,17 @@ test('status.thread_started substitutes the {started} timestamp', () => {
   const out = t('status.thread_started', { started: '2026-06-27T19:42:10+04:00' });
   assert.ok(out.includes('2026-06-27T19:42:10+04:00'), `expected the timestamp in "${out}"`);
   assert.ok(!out.includes('{started}'), `placeholder not substituted: "${out}"`);
+});
+
+test('status runtime keys substitute their values', () => {
+  const workDir = t('status.thread_workdir', { workDir: '/home/user/projects/example' });
+  const version = t('status.thread_runtime_version', { version: '1.2.3' });
+  const context = t('status.thread_context', { used: 12_000, limit: 200_000 });
+  assert.ok(workDir.includes('/home/user/projects/example'));
+  assert.ok(version.includes('1.2.3'));
+  assert.ok(context.includes('12000'));
+  assert.ok(context.includes('200000'));
+  assert.ok(!`${workDir}${version}${context}`.includes('{'));
 });
 
 test('language command keys exist in every locale', () => {

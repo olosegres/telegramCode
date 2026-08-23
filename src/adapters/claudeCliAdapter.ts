@@ -7,6 +7,7 @@ import { sleep } from '../utils';
 import type {
   AgentAdapter,
   AgentApiErrorClass,
+  AgentRuntimeInfo,
   AgentSession,
   ClaudeSurveyOption,
   DisplayPrefsReader,
@@ -69,6 +70,7 @@ import {
   parseTmuxSessionName as parseTmuxSessionNameWithPrefix,
 } from '../utils/tmuxSessionName';
 import { getEffortStartupKeystroke } from '../utils/effortStartupKeystroke';
+import { readClaudeRuntimeInfo } from '../utils/claudeRuntimeInfo';
 import { defaultDisplayVerbosityMode } from '../utils/displayVerbosity';
 import {
   checkIsSubagentTranscriptName,
@@ -2023,6 +2025,19 @@ export function getClaudeProjectsRoot(): string {
 }
 
 /**
+ * @description Absolute path of ONE session's transcript
+ * (`<projectsRoot>/<slug>/<sessionId>.jsonl`).
+ *
+ * Single source for the layout: both Claude backends resolve it for the
+ * watermark advance, the runtime-info read, the resume-context turns, and the
+ * reattach recap — a hand-built copy in any of them would silently read nothing
+ * if the layout ever drifts.
+ */
+export function getClaudeTranscriptPath(workDir: string, sessionId: string): string {
+  return path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+}
+
+/**
  * @description Read the byte range `[startOffset..endOffset)` of a file as
  * UTF-8. The sub-agent transcript tail uses it to fetch only the bytes
  * appended since the previous poll instead of re-reading whole files. A short
@@ -2971,11 +2986,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     isReady: boolean,
   ): void {
     if (!isReady) return; // skip the fs stat before the input box is up (not a relay)
-    const transcriptPath = path.join(
-      getClaudeProjectsRoot(),
-      getClaudeProjectSlug(session.workDir),
-      `${session.claudeSessionId}.jsonl`,
-    );
+    const transcriptPath = getClaudeTranscriptPath(session.workDir, session.claudeSessionId);
     let eof: number;
     try {
       eof = fs.statSync(transcriptPath).size;
@@ -3403,6 +3414,19 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     const session = this.sessions.get(keyToString(key));
     if (!session) return false;
     return checkIsClaudeSessionBusy({ isActive: session.isActive, lastContent: session.lastContent });
+  }
+
+  async getRuntimeInfo(key: ThreadKey): Promise<AgentRuntimeInfo> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) {
+      return { version: null, model: null, contextWindowTokens: null, contextUsedTokens: null };
+    }
+    const filePath = getClaudeTranscriptPath(session.workDir, session.claudeSessionId);
+    try {
+      return await readClaudeRuntimeInfo(filePath);
+    } catch {
+      return { version: null, model: null, contextWindowTokens: null, contextUsedTokens: null };
+    }
   }
 
   /**
@@ -3861,7 +3885,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
    * (unknown / pruned UUID) yields `[]`, so the caller posts no context block.
    */
   async getRecentTurns(_key: ThreadKey, workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]> {
-    const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    const filePath = getClaudeTranscriptPath(workDir, sessionId);
     return readRecentClaudeTurns(filePath, limit);
   }
 
@@ -3885,7 +3909,7 @@ export class ClaudeCliAdapter extends EventEmitter implements AgentAdapter {
     sessionId: string,
     watermark: SeenWatermark | null,
   ): Promise<ReattachRecap> {
-    const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    const filePath = getClaudeTranscriptPath(workDir, sessionId);
     const offset = watermark?.claudeTranscriptOffset;
     const isWatermarkKnown = typeof offset === 'number' && watermark?.sessionId === sessionId;
     // ONE read serves both the count and the body. When the watermark is unknown

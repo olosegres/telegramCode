@@ -593,6 +593,25 @@ export interface SendInputOptions {
 }
 
 /**
+ * @description Read-only metadata from a live agent runtime. Null means the
+ * backend could not determine that value and callers must render it as unknown.
+ */
+export interface AgentRuntimeInfo {
+  version: string | null;
+  /**
+   * The model the runtime ACTUALLY ran last, as the backend itself reports it
+   * (Claude: the newest main-session assistant record; OpenCode: the live
+   * `provider/model` of the last parent turn). This is the fallback `/status`
+   * needs for a backend whose sync {@link AgentAdapter.getCurrentModel} cannot
+   * know the answer — the Claude tmux backend never can (its model lives inside
+   * the TUI), so before this field `/status` named no model at all there.
+   */
+  model: string | null;
+  contextWindowTokens: number | null;
+  contextUsedTokens: number | null;
+}
+
+/**
  * @description Unified interface for AI agent backends (Claude CLI, OpenCode, etc.).
  * Each adapter manages sessions keyed by `ThreadKey` and communicates via EventEmitter.
  *
@@ -648,6 +667,13 @@ export interface AgentAdapter extends EventEmitter {
   startSession(key: ThreadKey, workDir: string, args?: string, sessionId?: string): Promise<void>;
   stopSession(key: ThreadKey): void;
   checkIsActive(key: ThreadKey): boolean;
+
+  /**
+   * @description Read runtime metadata for the live session without sending the
+   * agent a prompt or command. Backends that cannot expose trustworthy model or
+   * context data (such as Terminal) omit this method.
+   */
+  getRuntimeInfo?(key: ThreadKey): Promise<AgentRuntimeInfo>;
 
   /**
    * @description Whether the session bound to `key` is mid-turn (an in-progress

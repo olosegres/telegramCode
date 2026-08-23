@@ -286,7 +286,7 @@ actually start an agent or terminal in the folder.
 | `/rename_session` | Rename the current live session (OpenCode; Claude transcripts have no title) |
 | `/quit`, `/q` | End the session — Claude: graceful double Ctrl+C; OpenCode/terminal: `stopSession`. Releases the persisted session id, so a bot restart won't auto-reattach it (resume later via `/sessions`) |
 | `/new`, `/clear_session` | End the current session and start a fresh one (same adapter) |
-| `/status` | This thread's status |
+| `/status` | This thread's status: agent, bound folder and resolved workdir; a live session also shows the model it is actually running, effort, start time, runtime version and context use (anything the backend cannot report renders as unknown) |
 | `/output` | Last 500 lines of agent output (sent as at most 5 chunks; the overflow is reported as omitted) |
 | `/c`, `/y`, `/n` | Ctrl+C / "y" / "n" |
 | `/enter`, `/up`, `/down`, `/tab` | tmux key passthrough |
@@ -306,7 +306,7 @@ actually start an agent or terminal in the folder.
 | `/help` | Context-aware help |
 | `/ls` | List the project subfolders of the folder the bot was launched from |
 | `/list` | List existing topics and their bindings |
-| `/status` | This thread's status; in General — a global view of all topics + active agents |
+| `/status` | This topic's status; in General — a global view of all topics + active agents. A live non-General topic also reports the resolved workdir, the model actually running, runtime version and context use (unknown when the backend cannot report it) |
 | `/doctor` | Self-diagnose: admin rights, privacy mode, paths, CLIs |
 | `/version` | Versions: bot, claude, opencode, node, tmux |
 | `/whoami` | Show userId, chatId, threadId, isAllowed, binding |

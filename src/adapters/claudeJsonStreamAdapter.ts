@@ -1,10 +1,10 @@
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
-import * as path from 'path';
 import type {
   AgentAdapter,
   AgentSession,
+  AgentRuntimeInfo,
   DisplayPrefsReader,
   JsonStreamTailOffset,
   JsonStreamTailWriter,
@@ -31,7 +31,7 @@ import { getClaudeAvailableLevels, checkIsClaudeEffortLevel, defaultEffortLevel 
 import {
   checkIsValidUuid,
   getClaudeProjectsRoot,
-  getClaudeProjectSlug,
+  getClaudeTranscriptPath,
   listClaudeSessionsForWorkDir,
   readRecentClaudeTurns,
   readClaudeReattachTranscript,
@@ -49,6 +49,7 @@ import {
 } from '../utils/claudeStreamJson';
 import { execFilePromise, tmuxAsync, tmuxOrThrowAsync } from '../utils/tmuxExec';
 import { basePollIntervalMs, getNextPollDelay } from '../utils/pollBackoff';
+import { readClaudeRuntimeInfo } from '../utils/claudeRuntimeInfo';
 import { busyIdleWatchdogMs, checkShouldClearBusyOnIdle } from '../utils/jsonStreamBusyWatchdog';
 import {
   buildJsonStreamTmuxSessionName,
@@ -142,7 +143,17 @@ interface StreamSession {
    *  set means the agent is legitimately waiting on a tool (possibly silent, e.g.
    *  a long Bash) → the idle watchdog must NOT clear busy. */
   outstandingToolUseIds: Set<string>;
+  /** The model PINNED by an explicit `/model` pick — the `--model` spawn flag,
+   *  replayed verbatim on every effort/model re-spawn. `null` means "no pick,
+   *  claude runs its own default", so it must NOT be overwritten with the
+   *  resolved live id (that would silently pin the session to one snapshot). */
   model: string | null;
+  /** The model claude itself reports in `system/init` (the resolved id, e.g.
+   *  `claude-opus-4-5-20251101`) — the only source of the LIVE model when no
+   *  explicit pick was made, which is every default start, every resume, and
+   *  every boot-time adopt. Read by {@link ClaudeJsonStreamAdapter.getCurrentModel}
+   *  so `/status` and the pinned banner can name the running model at all. */
+  reportedModel: string | null;
   effort: string | null;
   // — answer accumulation —
   currentResponseText: string;
@@ -379,7 +390,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       reader: new ClaudeStreamLineReader(),
       isActive: true, isStopping: false, isRespawning: false, isBusy: false,
       lastStdoutActivityAt: Date.now(), outstandingToolUseIds: new Set(),
-      model: opts.model, effort: opts.effort,
+      model: opts.model, reportedModel: null, effort: opts.effort,
       currentResponseText: '', emittedLength: 0, outputTimer: null,
       reasoningText: '', reasoningStartedAt: null, reasoningTimer: null, reasoningActive: false,
       toolNamesById: new Map(), questionToolUseIds: new Set(),
@@ -665,7 +676,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
       // set it, `result` clears it) — see `applyAction`.
       isActive: true, isStopping: false, isRespawning: false, isBusy: false,
       lastStdoutActivityAt: Date.now(), outstandingToolUseIds: new Set(),
-      model: null, effort: null,
+      model: null, reportedModel: null, effort: null,
       currentResponseText: '', emittedLength: 0, outputTimer: null,
       reasoningText: '', reasoningStartedAt: null, reasoningTimer: null, reasoningActive: false,
       toolNamesById: new Map(), questionToolUseIds: new Set(),
@@ -764,6 +775,19 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
 
   checkIsBusy(key: ThreadKey): boolean {
     return this.sessions.get(keyToString(key))?.isBusy === true;
+  }
+
+  async getRuntimeInfo(key: ThreadKey): Promise<AgentRuntimeInfo> {
+    const session = this.sessions.get(keyToString(key));
+    if (!session?.isActive) {
+      return { version: null, model: null, contextWindowTokens: null, contextUsedTokens: null };
+    }
+    const filePath = getClaudeTranscriptPath(session.workDir, session.sessionId);
+    try {
+      return await readClaudeRuntimeInfo(filePath);
+    } catch {
+      return { version: null, model: null, contextWindowTokens: null, contextUsedTokens: null };
+    }
   }
 
   getClaudeSessionId(key: ThreadKey): string | null {
@@ -876,8 +900,12 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
   private applyAction(session: StreamSession, action: ClaudeStreamAction): void {
     switch (action.kind) {
       case 'init':
-        // Per-turn `init` re-emits; the id is fixed by our `--session-id`. Nothing
-        // to do besides confirm liveness.
+        // Per-turn `init` re-emits; the id is fixed by our `--session-id`, so the
+        // id itself is nothing to act on. The MODEL it carries is load-bearing:
+        // it is the only report of what claude actually runs. Without capturing
+        // it `/status` and the pinned banner showed no model at all on a default
+        // start / resume / adopt (nothing ever set the `--model` pick).
+        if (action.model) session.reportedModel = action.model;
         return;
       case 'textDelta':
         // Mid-turn activity marks the session busy: `sendInput` normally set it,
@@ -1080,7 +1108,7 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
    */
   private advanceWatermarkFromTranscript(session: StreamSession): void {
     try {
-      const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(session.workDir), `${session.sessionId}.jsonl`);
+      const filePath = getClaudeTranscriptPath(session.workDir, session.sessionId);
       const eof = fs.statSync(filePath).size;
       if (eof <= session.lastWatermarkOffset) return; // monotonic: only real growth writes
       session.lastWatermarkOffset = eof;
@@ -1234,12 +1262,12 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
   }
 
   async getRecentTurns(_key: ThreadKey, workDir: string, sessionId: string, limit: number): Promise<RecentTurn[]> {
-    const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    const filePath = getClaudeTranscriptPath(workDir, sessionId);
     return readRecentClaudeTurns(filePath, limit);
   }
 
   async getReattachRecap(key: ThreadKey, workDir: string, sessionId: string, watermark: SeenWatermark | null): Promise<ReattachRecap> {
-    const filePath = path.join(getClaudeProjectsRoot(), getClaudeProjectSlug(workDir), `${sessionId}.jsonl`);
+    const filePath = getClaudeTranscriptPath(workDir, sessionId);
     const offset = watermark?.claudeTranscriptOffset;
     const isWatermarkKnown = typeof offset === 'number' && watermark?.sessionId === sessionId;
     const { missedCount, turns, headOffset } = readClaudeReattachTranscript(filePath, offset ?? 0, resumeContextTurnLimit);
@@ -1259,8 +1287,17 @@ export class ClaudeJsonStreamAdapter extends EventEmitter implements AgentAdapte
     return null;
   }
 
+  /**
+   * @description The model the session is RUNNING. Claude's own `system/init`
+   * report wins over the pinned `--model` pick: it is the resolved id (an alias
+   * like `opus` resolves to its snapshot) and it is the only value present when
+   * no pick was ever made. The pick is the fallback for the window between a
+   * `/model` re-spawn and its first `init`, so the label never blanks out
+   * mid-switch.
+   */
   getCurrentModel(key: ThreadKey): string | null {
-    return this.sessions.get(keyToString(key))?.model ?? null;
+    const session = this.sessions.get(keyToString(key));
+    return session?.reportedModel ?? session?.model ?? null;
   }
 
   async getAvailableModels(): Promise<string[]> {

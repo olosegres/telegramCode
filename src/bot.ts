@@ -37,7 +37,7 @@ import {
 } from './adapters/createAdapter';
 import { ClaudeJsonStreamAdapter, claudeJsonStreamAdapterName } from './adapters/claudeJsonStreamAdapter';
 import { checkShouldPostReattachRecap, formatReattachRecap } from './resumeContext';
-import type { ThreadKey, AgentAdapter, AgentSession, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
+import type { ThreadKey, AgentAdapter, AgentRuntimeInfo, AgentSession, DisplayVerbosityMode, OutputEventMeta, OutputTransport, PendingQuestionState, AgentApiErrorClass, ResolvedThreadDisplayPrefs, SeenWatermark, SubagentStatusEvent, ThinkingEvent, ToolResultEvent } from './types';
 import { createOutputTransport } from './output/createOutputTransport';
 import { keyToString, keyFromString } from './types';
 // Pure parser lives in `./agentTrigger` so it can be unit-tested without
@@ -147,6 +147,7 @@ import {
   type FileSendItem,
 } from './utils/fileSendPlan';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
+import { getThreadStatusModel, getThreadStatusReport } from './utils/threadStatusReport';
 import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
 import { getTransientFrameIds, clearTransientFramesForShutdown } from './utils/transientFrames';
 import {
@@ -4639,27 +4640,48 @@ command('status', async (_ctx, key) => {
   const agentLine = adapterName ? `${adapter.label} (${adapterName})` : t('status.thread_no_agent');
   const binding = state.getBinding(key);
   const subdir = binding?.subdir ?? t('status.thread_no_binding');
-  const lines = [
-    t('status.thread_report', {
-      agent: agentLine,
-      subdir,
-      session: isActive ? t('status.thread_running') : t('status.thread_stopped'),
-    }),
-  ];
+  let workDir: string | null = null;
+  if (binding) {
+    workDir = t('version.unknown');
+    try {
+      const resolved = resolveBoundWorkDir(ENV.workRoot, binding);
+      if (resolved.kind === 'proceed') workDir = resolved.workDir;
+    } catch (error) {
+      console.warn(`[Status] failed to resolve work directory for ${keyToString(key)}:`, error instanceof Error ? error.message : error);
+    }
+  }
   // Model / effort / start date are session properties — only meaningful while
-  // a session is live. Resolve model + effort exactly like the pinned banner
-  // (`computePinnedStatusText`) so the two never disagree; effort additionally
-  // falls back to the default the agent actually runs when none is picked.
+  // a session is live. Effort resolves exactly like the pinned banner
+  // (`computePinnedStatusText`), plus a fallback to the default the agent
+  // actually runs when none is picked. Model resolution is DELIBERATELY wider
+  // than the banner's: it adds the runtime's self-reported model, which the
+  // banner cannot share because `computePinnedStatusText` is synchronous while
+  // reading runtime info is an async transcript/HTTP read. So on the Claude tmux
+  // backend `/status` can name a model the banner still leaves blank.
+  let model: string | null = null;
+  let effort: string | null = null;
+  let startedAt: string | null = null;
+  let runtime: AgentRuntimeInfo | null = null;
   if (isActive) {
     const agent = state.getAgent(key);
-    const model = adapter.getCurrentModel?.(key) ?? agent?.model ?? null;
-    const effort = adapter.getEffort ? (adapter.getEffort(key) ?? defaultEffortLevel) : null;
-    const startedAt = agent?.startedAt ?? null;
-    if (model) lines.push(t('status.thread_model', { model }));
-    if (effort) lines.push(t('status.thread_effort', { effort }));
-    if (startedAt) lines.push(t('status.thread_started', { started: startedAt }));
+    effort = adapter.getEffort ? (adapter.getEffort(key) ?? defaultEffortLevel) : null;
+    startedAt = agent?.startedAt ?? null;
+
+    if (adapter.getRuntimeInfo) {
+      runtime = await adapter.getRuntimeInfo(key).catch((error) => {
+        console.warn(`[Status] failed to read runtime info for ${keyToString(key)}:`, error instanceof Error ? error.message : error);
+        return null;
+      });
+    }
+    // The runtime is read BEFORE the label is resolved so its self-reported
+    // model can serve as the middle fallback (see `getThreadStatusModel`).
+    model = getThreadStatusModel({
+      adapterModel: adapter.getCurrentModel?.(key) ?? null,
+      runtimeModel: runtime?.model ?? null,
+      persistedModel: agent?.model ?? null,
+    });
   }
-  await replyToThread(key, lines.join('\n'));
+  await replyToThread(key, getThreadStatusReport({ agentLine, subdir, isActive, workDir, model, effort, startedAt, runtime }));
 });
 
 function getLanguageCommandArg(text: string): string {

@@ -71,6 +71,7 @@ import {
   stopOpenCodeServer,
   ensureOpenCodeServer,
   checkIsInstalled,
+  getOpenCodeChildEnv,
 } from './installManager';
 import {
   buildReadinessReport,
@@ -1809,7 +1810,7 @@ async function startOpenCodeOAuthLogin(
     // Drop provider API-key envs so the login uses the subscription/account path
     // and can't be short-circuited by an ambient key. cwd is irrelevant — login
     // writes to OpenCode's global auth.json.
-    const env: Record<string, string | undefined> = { ...process.env };
+    const env: Record<string, string | undefined> = getOpenCodeChildEnv();
     delete env.OPENAI_API_KEY;
     delete env.ANTHROPIC_API_KEY;
     child = spawnPty(resolveOpenCodeBinary(), buildOpenCodeAuthLoginArgs(providerId, methodLabel), {

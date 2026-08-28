@@ -11,8 +11,12 @@
  *     globals are loaded with `override: false`) but lose to a local .env
  *   - Neither file present → no throw, `loaded: []`
  *   - The `loaded` array reflects actual load order (global first, local last)
+ *   - A caller can load the local file from an explicit project directory
+ *     without changing the process cwd
  *   - Global config dir resolution: `~/.config/telegramcode` preferred, the
  *     legacy `~/.config/telegram-code` read as a fallback (first existing wins)
+ *
+ * Test case: N/A — TelegramCode has no Jira tracker.
  */
 
 import { test, beforeEach, afterEach } from 'node:test';
@@ -106,6 +110,22 @@ test('loads local .env when only local exists', () => {
   assert.equal(loaded.length, 1);
   assert.equal(loaded[0], getExpectedLocalEnvPath());
   assert.equal(process.env.ENV_LOADER_TEST_LOCAL_ONLY, 'from-local');
+});
+
+test('loads local .env from an explicit project directory without changing cwd', () => {
+  const alternateProjectDir = path.join(tmpRoot, 'alternate-project');
+  fs.mkdirSync(alternateProjectDir);
+  fs.writeFileSync(
+    path.join(alternateProjectDir, '.env'),
+    'ENV_LOADER_TEST_LOCAL_ONLY=from-explicit-project\n',
+  );
+  const launchCwd = process.cwd();
+
+  const { loaded } = loadEnvFiles(alternateProjectDir);
+
+  assert.deepEqual(loaded, [path.join(alternateProjectDir, '.env')]);
+  assert.equal(process.env.ENV_LOADER_TEST_LOCAL_ONLY, 'from-explicit-project');
+  assert.equal(process.cwd(), launchCwd);
 });
 
 test('local .env overrides global on per-key basis, leaves global-only keys intact', () => {

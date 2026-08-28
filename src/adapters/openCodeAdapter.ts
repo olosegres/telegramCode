@@ -6,7 +6,7 @@ import * as path from 'path';
 import type { AgentAdapter, AgentApiErrorClass, AgentRuntimeInfo, AgentSession, DisplayPrefsReader, DisplayVerbosityMode, OpenCodePendingQuestion, OpenCodeQuestion, OutputEventMeta, ReattachRecap, RecentTurn, ResolvedThreadDisplayPrefs, ResumeSessionOptions, SeenWatermark, SeenWatermarkWriter, ThinkingEvent, ThreadLocaleReader, ToolResultEvent, ThreadKey } from '../types';
 import { keyToString } from '../types';
 import { classifyAgentApiError } from '../apiErrorRetry';
-import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getOpenCodeServerHealth, getToolCommand, onOpenCodeServerExit, restartOpenCodeServer } from '../installManager';
+import { checkIsInstalled, installTool, checkIsOpenCodeServerRunning, ensureOpenCodeServer, getOpenCodeChildEnv, getOpenCodeServerHealth, getToolCommand, onOpenCodeServerExit, restartOpenCodeServer } from '../installManager';
 import { resolveDataDir } from '../state';
 import { appendDiagLog } from '../diagLog';
 import {
@@ -1298,7 +1298,10 @@ async function fetchAvailableModels(): Promise<string[]> {
   
   try {
     const opencodeCmd = getToolCommand('opencode');
-    const { stdout } = await execAsync(`${opencodeCmd} models`, { timeout: 10000 });
+    const { stdout } = await execAsync(`${opencodeCmd} models`, {
+      timeout: 10000,
+      env: getOpenCodeChildEnv(),
+    });
     const models = stdout.trim().split('\n').filter(line => line.includes('/'));
     if (models.length > 0) {
       cachedModels = models;

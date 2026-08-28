@@ -46,8 +46,10 @@ yarn build        # tsc → dist/
 yarn test         # unit/integration (node test runner + tsx); build first —
                   # some tests exercise the built dist/cli.js
 yarn hot          # hot-reload mode: tsc -w + nodemon on dist/ (also
-                  # `telegramcode hot` from anywhere) — a broken edit can't
-                  # take the bot down, agents survive the reload
+                   # `telegramcode hot` from anywhere) — a broken edit can't
+                   # take the bot down; OpenCode generations stay outside the
+                   # worker tree, so agent turns survive worker reloads
+                   # (Linux/macOS; Windows hot mode is intentionally refused)
 ```
 
 The Docker dev loop (never `docker compose restart` — it ignores

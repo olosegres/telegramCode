@@ -33,17 +33,19 @@ export function globalEnvPath(): string {
   return canonicalPath;
 }
 
-/** @description Path to the local `$PWD/.env`. */
-export function localEnvPath(): string {
-  return path.join(process.cwd(), '.env');
+/** @description Path to the local `.env` for a supplied directory (defaults to `$PWD`). */
+export function localEnvPath(localDirectory = process.cwd()): string {
+  return path.join(localDirectory, '.env');
 }
 
 /**
  * @description Load environment from the wrapper's two well-known locations.
  *
  * Order is **global first, local second** so that `dotenv.config({ override: true })`
- * on the local file gives `$PWD/.env` last-write-wins semantics over the global.
- * Both files are optional; if neither exists this is a no-op.
+ * on the local file gives `<localDirectory>/.env` last-write-wins semantics over
+ * the global. Both files are optional; if neither exists this is a no-op. The
+ * explicit directory lets a supervisor load its worker's project config without
+ * changing the operator-facing process cwd.
  *
  * The first load uses `override: false` so that variables already in
  * `process.env` (set by the user's shell, systemd, etc.) win against the
@@ -53,7 +55,7 @@ export function localEnvPath(): string {
  * Returns the list of paths actually read, in load order. Useful for the
  * `telegramcode` startup banner and for test assertions.
  */
-export function loadEnvFiles(): { loaded: string[] } {
+export function loadEnvFiles(localDirectory = process.cwd()): { loaded: string[] } {
   const loaded: string[] = [];
 
   const globalPath = globalEnvPath();
@@ -68,7 +70,7 @@ export function loadEnvFiles(): { loaded: string[] } {
     }
   }
 
-  const localPath = localEnvPath();
+  const localPath = localEnvPath(localDirectory);
   if (fs.existsSync(localPath)) {
     dotenv.config({ path: localPath, override: true });
     loaded.push(localPath);

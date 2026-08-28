@@ -1,6 +1,25 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
+import { loadEnvFiles } from './envLoader';
+import {
+  checkIsInstalled,
+  ensureOpenCodeServer,
+  getDefaultOpenCodeOwnershipFilePath,
+  openCodeExternalHostEnvName,
+  openCodeExternalHostEnvValue,
+  openCodeOwnershipFileEnvName,
+  stopOpenCodeServer,
+} from '../installManager';
+
+interface HotOpenCodeDeps {
+  checkIsInstalled: (toolName: string) => boolean;
+  ensureOpenCodeServer: () => Promise<void>;
+  stopOpenCodeServer: () => void;
+  writeWarning: (message: string) => void;
+}
+
+type HotChildName = 'tsc' | 'nodemon';
 
 /**
  * @description Wrapper-entry for `telegramcode hot` — hot-reload mode for
@@ -10,8 +29,10 @@ import { spawn, spawnSync, type ChildProcess } from 'child_process';
  * project root, so editing any `src/**` file rebuilds `dist/` and nodemon
  * restarts `node dist/cli.js bot` on the new artifact. The bot's own
  * graceful-shutdown sequence (state flush → lock release → exit) makes the
- * old → new handoff clean enough that mid-work tmux/SSE agent sessions
- * outlive the reload and are re-attached on the next boot.
+ * old → new handoff clean enough that mid-work agent sessions are re-attached
+ * on the next boot. OpenCode is pre-started by this long-lived supervisor;
+ * later generations use a one-shot external host, so none remain inside
+ * nodemon's worker subtree and in-flight turns survive reloads.
  *
  * **Why it lives in the bin** (not only as `yarn hot`): the user runs
  * `telegramcode` as a globally-installed `npm link` symlink, so they don't
@@ -25,12 +46,11 @@ import { spawn, spawnSync, type ChildProcess } from 'child_process';
  *     so nodemon has something to launch;
  *   - broken intermediate TS edit → `tsc -w` doesn't emit, so nodemon
  *     never sees a new artifact and the running bot keeps serving;
- *   - SIGINT/SIGTERM in the wrapper → propagated to both children, then
- *     we wait for them to exit before our own `process.exit`.
+ *   - wrapper termination → tsc receives the original signal, while nodemon
+ *     receives its graceful `SIGINT`; we wait for both before exiting.
  *
- * **Independent of the runner from `yarn hot`** — that script uses
- * `concurrently` for terseness; this entry point spawns directly so the
- * installed bin doesn't need any devDep but `nodemon` + `typescript`
+ * `yarn hot` reaches this same wrapper. It spawns directly so the installed
+ * bin doesn't need any devDep but `nodemon` + `typescript`
  * (always present in this project because the consumer of the bin IS this
  * project — `npm link` exposes the same `node_modules/.bin`).
  */
@@ -40,6 +60,20 @@ export async function runHot(): Promise<void> {
   // can't derive it later, because nodemon runs it with cwd = projectRoot.
   const launchCwd = process.cwd();
   const projectRoot = resolveProjectRoot();
+  if (!checkIsHotModeSupported(process.platform)) {
+    process.stderr.write(
+      'telegramcode hot: Windows is not supported because nodemon cannot gracefully drain its worker tree.\n',
+    );
+    process.exit(1);
+    return;
+  }
+  // Match the worker's env sources without changing the launch cwd that owns
+  // WORK_ROOT. This is load-bearing when the repo .env selects a custom port.
+  loadEnvFiles(projectRoot);
+  // Only nodemon's replaceable worker externalizes later server generations.
+  // The long-lived supervisor owns the initial server directly.
+  delete process.env[openCodeExternalHostEnvName];
+  process.env[openCodeOwnershipFileEnvName] = getDefaultOpenCodeOwnershipFilePath(projectRoot);
   const distEntry = path.join(projectRoot, 'dist', 'cli.js');
   const tscBin = localBin(projectRoot, 'tsc');
   const nodemonBin = localBin(projectRoot, 'nodemon');
@@ -75,6 +109,11 @@ export async function runHot(): Promise<void> {
     }
   }
 
+  // nodemon kills the worker's complete descendant tree on every rebuild.
+  // Own OpenCode here, as a sibling of nodemon, so an agent turn survives the
+  // relay worker being replaced. The worker's normal ensure call adopts it.
+  await prepareHotOpenCodeServer();
+
   process.stderr.write(
     `telegramcode hot: project=${projectRoot}\n` +
       `telegramcode hot: spawning \`tsc -w\` and \`nodemon\` — Ctrl-C to stop both.\n`,
@@ -105,8 +144,10 @@ export async function runHot(): Promise<void> {
   const forwardSignal = (sig: NodeJS.Signals) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    for (const c of children) {
-      if (!c.killed && c.exitCode === null) c.kill(sig);
+    for (const child of children) {
+      if (child.killed || child.exitCode !== null) continue;
+      const childName: HotChildName = child === nodemonChild ? 'nodemon' : 'tsc';
+      child.kill(getHotChildShutdownSignal(childName, sig));
     }
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
@@ -153,6 +194,52 @@ export async function runHot(): Promise<void> {
 }
 
 /**
+ * @description Select the signal used to stop each hot-mode watcher. Nodemon's
+ * SIGTERM handler can terminate its shell before the asynchronous process-tree
+ * sweep reaches the bot worker, leaving that worker alive with the instance
+ * lock. SIGINT follows nodemon's graceful quit path and waits for the tree.
+ */
+export function getHotChildShutdownSignal(
+  childName: HotChildName,
+  wrapperSignal: NodeJS.Signals,
+): NodeJS.Signals {
+  return childName === 'nodemon' ? 'SIGINT' : wrapperSignal;
+}
+
+export function checkIsHotModeSupported(platform: typeof process.platform): boolean {
+  return platform !== 'win32';
+}
+
+/**
+ * @description Pre-start OpenCode in the long-lived hot supervisor, outside
+ * nodemon's worker subtree. A missing binary or failed start stays non-fatal:
+ * hot mode must still serve Claude/terminal and the worker can retry OpenCode
+ * through the externally hosted startup path.
+ */
+export async function prepareHotOpenCodeServer(
+  deps: HotOpenCodeDeps = {
+    checkIsInstalled,
+    ensureOpenCodeServer,
+    stopOpenCodeServer,
+    writeWarning: (message) => process.stderr.write(message),
+  },
+): Promise<boolean> {
+  if (!deps.checkIsInstalled('opencode')) return false;
+  try {
+    await deps.ensureOpenCodeServer();
+    return true;
+  } catch (error) {
+    // `ensureOpenCodeServer` confirms cleanup for generations it started. This
+    // extra stop also covers failures outside that startup window.
+    deps.stopOpenCodeServer();
+    const message =
+      error instanceof Error ? error.message : error?.toString() ?? 'unknown error';
+    deps.writeWarning(`telegramcode hot: OpenCode pre-start failed: ${message}\n`);
+    return false;
+  }
+}
+
+/**
  * @description Build the env handed to the hot-mode worker (nodemon → bot).
  *
  * In hot mode the supervisor runs `nodemon` with cwd = projectRoot (it must,
@@ -173,6 +260,7 @@ export function buildHotWorkerEnv(
   return {
     ...baseEnv,
     WORK_ROOT: baseEnv.WORK_ROOT || launchCwd,
+    [openCodeExternalHostEnvName]: openCodeExternalHostEnvValue,
   };
 }
 

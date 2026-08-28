@@ -446,7 +446,7 @@ config/variants, not a per-message API field).
 | `utils/recvPreviewRedaction.ts` | Pure security decision for the recv-trace preview (`getRecvTracePreview`): while a thread is in the pending `/connect` state (same `pendingProviderConnects` state the text handler consumes), the next non-command text IS a pasted provider API key → the preview is redacted at record time; an inline `/connect <key>` records only a fixed command marker. Also owns the shared `checkIsConnectCommandText` |
 | `utils/rotatingLogFile.ts` | Shared hourly time-bucket helper for the observability logs: `getHourBucketPath(dir,base,ext,nowMs)` (`<base>-YYYYMMDDHH.<ext>`, host-local hour) + `pruneExpiredBuckets(...)` (best-effort unlink of buckets + their `.1` siblings older than `retentionHours = 6`; never throws). Used by BOTH the trace writer and the console tee |
 | `utils/consoleFileTap.ts` | TEE of `process.stdout`/`process.stderr` to `DATA_DIR/bot-console-*.log` (hourly bucket): `installConsoleFileTap(dir)` wraps `write` so each chunk ALSO `fs.appendFileSync`s to the bucket (best-effort, swallows IO errors, NO `console.*` inside → no recursion), original write + return value untouched (terminal preserved). Installed as early as possible at the bot entry (`cli/bot.ts`, after env load). Buckets pruned at 6h by the janitor |
-| `installManager.ts` | Install / locate the agent binaries, start OpenCode server |
+| `installManager.ts` | Install / locate agent binaries and manage OpenCode server generations. In hot workers, `startExternallyParentedProcess` launches replacements through a one-shot host so crash recovery / auth reload servers leave nodemon's descendant tree before startup returns; an endpoint + PID/start-token + signal-scope file under `DATA_DIR` transfers safe ownership across worker generations |
 | `utils/startupReadiness.ts` | Pure decision layer for the boot-time readiness status (plan `agent/tasks/actual/2026-07-12-startup-readiness-status.md`): `buildReadinessReport(facts)` → `{isReady, unmetKeys, missingRights}` (required items = paired group + all bot admin rights + a binding + an installed agent CLI; optional groq/owner never block ready), `checkShouldSendStartupStatus` (cold always, hot only-if-missing), `resolveStartupTargets(isReady, hasOwner, hasGeneral)` → ordered `('owner'\|'general')[]` (ready ⇒ owner-DM-only, NEVER General; not-ready ⇒ owner then General), `buildStartupStatusText` (ready line vs numbered checklist, via an injected translate). `bot.ts` gathers the live facts + sends |
 | `utils/resolveBinary.ts` | Resolve `claude` / `opencode` binary paths |
 | `utils/pollBackoff.ts` | Pure adaptive poll cadence: `getNextPollDelay` (300ms while the pane changes → ×2 up to 1.5s after 10 unchanged polls; any write/change snaps back) |
@@ -883,8 +883,20 @@ History was scrubbed of real operator identifiers (2026-07-11) — keep it that 
   on `dist/`. A broken intermediate edit can't take the bot down (no
   emit until the build is green), and `nodemon` waits for the old PID's
   graceful shutdown before respawning so the lock changes hands cleanly.
-  Agents survive the reload (they run in external `tmux`/`opencode`
-  processes); `reattachExistingSessions()` on the next boot re-adopts
+  Agents survive the reload: tmux sessions are external, while the long-lived
+  hot supervisor pre-starts the initial `opencode serve` outside nodemon's
+  replaceable worker subtree (using the checkout `.env`, not the launch-directory
+  config). Any later server generation started by crash recovery, credential
+  reload, or a late install goes through a one-shot host and is reparented
+  outside that subtree before startup returns. An endpoint-bound `DATA_DIR`
+  process-identity file records bot-started generations as `starting` before host
+  release and promotes them to `ready` after health succeeds, so a successor can
+  stop a pre-bind startup by process-group identity. `ready`/adopted ownership is
+  revalidated against the exact hostname+port before signaling, without trusting
+  a reused PID or group-signaling an adopted listener. Hot
+  mode supports Linux/macOS and refuses to start on Windows,
+  where nodemon cannot gracefully drain its worker tree.
+  `reattachExistingSessions()` on the next boot re-adopts
   them silently if the downtime gap is short (hot reload), with a
   per-topic notice if it's long (cold start). Globally-installed bin
   resolves the project root via `fs.realpathSync(__dirname)`, so

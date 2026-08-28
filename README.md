@@ -573,7 +573,22 @@ entry:
 
 Bot restarts are designed to be invisible: agents run in external
 processes (`tmux`, `opencode serve`), so the bot re-adopts them instead
-of killing them. On boot the bot:
+of killing them. In hot mode the long-lived supervisor starts the initial
+`opencode serve` before `nodemon`, outside the replaceable worker's process
+tree. If a worker later starts a replacement server after a crash, credential
+reload, or late install, a one-shot host reparents that generation outside the
+same tree before startup completes. An endpoint-bound process identity file
+under `DATA_DIR` records a bot-started generation as `starting` before its host
+releases it, then promotes it to `ready` after health succeeds. A successor can
+therefore stop a pre-bind startup by its process-group identity, while `ready`
+or adopted ownership is revalidated against the exact hostname and port before
+a signal is sent, without trusting a reused PID or assuming an adopted listener
+owns its process group.
+A source rebuild therefore does not terminate an in-flight OpenCode turn.
+The supervisor reads the same checkout `.env` as the worker before the initial
+start. Hot mode supports Linux and macOS; it refuses to start on Windows because
+nodemon cannot gracefully drain its worker tree there.
+On boot the bot:
 
 1. Loads `state.json` (archives to `state.json.corrupted-<ts>` if parse
    fails, then starts fresh and notifies in General) and classifies the

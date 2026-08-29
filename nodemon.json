@@ -9,5 +9,6 @@
   ],
   "exec": "node dist/cli.js bot",
   "signal": "SIGTERM",
+  "exitcrash": true,
   "delay": "2500"
 }

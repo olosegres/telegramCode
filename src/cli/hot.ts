@@ -46,6 +46,12 @@ type HotChildName = 'tsc' | 'nodemon';
  *     so nodemon has something to launch;
  *   - broken intermediate TS edit → `tsc -w` doesn't emit, so nodemon
  *     never sees a new artifact and the running bot keeps serving;
+ *   - bot crash at runtime (e.g. a second poller appears and Telegram
+ *     answers 409) → nodemon's `exitcrash` exits instead of parking on
+ *     "app crashed - waiting for file changes", so this wrapper tears
+ *     down and the supervisor (systemd) starts a clean generation.
+ *     Without it the wrapper stays alive with no bot under it, and the
+ *     service looks `active (running)` while the bot is dead;
  *   - wrapper termination → tsc receives the original signal, while nodemon
  *     receives its graceful `SIGINT`; we wait for both before exiting.
  *

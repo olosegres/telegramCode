@@ -5,7 +5,8 @@ import { resolveDataDir } from '../state';
 import { installConsoleFileTap } from '../utils/consoleFileTap';
 
 /**
- * @description Wrapper-entry for the `telegramcode` / `telegramcode bot` form.
+ * @description Shared bot startup used by the public no-arg CLI and the
+ * internal hot-worker entry.
  *
  * Responsibilities executed in order:
  *

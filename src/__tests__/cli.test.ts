@@ -5,8 +5,8 @@
  * it) and asserts on stdio + exit code. This catches integration concerns
  * the per-module unit tests miss:
  *
- *   - argv branching (`bot` vs unknown; the removed `cli` passthrough stays
- *     an unknown command)
+ *   - argv branching (no-arg bot startup vs unknown; removed internal/public
+ *     subcommands stay unknown)
  *   - the bot preflight (env load, WORK_ROOT default, lock acquire) runs
  *
  * The bot path is not exercised past preflight — booting the real
@@ -27,11 +27,12 @@ let claudeShim: string;
 // depend on Node's module resolution finding `tsx` from a tmpdir cwd. The
 // `before()` hook guards against running the test against stale output.
 const cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli.js');
+const botEntryPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'botEntry.js');
 
 before(() => {
-  if (!fs.existsSync(cliPath)) {
+  if (!fs.existsSync(cliPath) || !fs.existsSync(botEntryPath)) {
     throw new Error(
-      `dist/cli.js not found at ${cliPath}. Run \`yarn build\` before \`yarn test\`.`,
+      'Built CLI entries are missing. Run `yarn build` before `yarn test`.',
     );
   }
 });
@@ -92,12 +93,40 @@ test('removed `cli` passthrough is an unknown command (exit 2, no claude spawn)'
   assert.match(stderr, /Usage:/);
 });
 
+test('removed `bot` worker entry is an unknown command', () => {
+  const { status, stderr } = runCli(['bot']);
+  assert.equal(status, 2);
+  assert.match(stderr, /Unknown command: bot/);
+  assert.match(stderr, /Usage:/);
+});
+
+test('internal hot worker entry invokes the shared runBot preflight', () => {
+  const missingWorkRoot = path.join(tmpRoot, 'missing-work-root');
+  const result = spawnSync(process.execPath, [botEntryPath], {
+    env: {
+      ...process.env,
+      CLAUDE_BIN: claudeShim,
+      HOME: tmpRoot,
+      DATA_DIR: path.join(tmpRoot, 'data'),
+      TELEGRAM_BOT_TOKEN: 'fake-token-' + Date.now(),
+      WORK_ROOT: missingWorkRoot,
+    },
+    cwd: tmpRoot,
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /WORK_ROOT does not exist or is not a directory/);
+});
+
 test('--help prints usage and exits 0', () => {
   const { status, stderr } = runCli(['--help']);
   assert.equal(status, 0);
   assert.match(stderr, /Usage:/);
   // The removed passthrough must not be advertised any more.
   assert.doesNotMatch(stderr, /cli claude/);
+  assert.doesNotMatch(stderr, /telegramcode bot/);
 });
 
 test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () => {
@@ -106,7 +135,7 @@ test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () 
   // preflight (env load, WORK_ROOT default, lock acquire) happened.
   const projectDir = fs.mkdtempSync(path.join(tmpRoot, 'project-'));
 
-  const r = spawnSync(process.execPath, [cliPath, 'bot'], {
+  const r = spawnSync(process.execPath, [cliPath], {
     env: {
       ...process.env,
       CLAUDE_BIN: claudeShim,
@@ -134,7 +163,7 @@ test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () 
 
 test('runBot exits 1 when WORK_ROOT points at a non-existent directory', () => {
   const bogus = path.join(tmpRoot, 'does-not-exist');
-  const r = spawnSync(process.execPath, [cliPath, 'bot'], {
+  const r = spawnSync(process.execPath, [cliPath], {
     env: {
       ...process.env,
       CLAUDE_BIN: claudeShim,
@@ -167,7 +196,7 @@ test('runBot refuses to start when a foreign lockfile holds the data dir', () =>
     }),
   );
 
-  const r = spawnSync(process.execPath, [cliPath, 'bot'], {
+  const r = spawnSync(process.execPath, [cliPath], {
     env: {
       ...process.env,
       CLAUDE_BIN: claudeShim,
@@ -200,7 +229,7 @@ test('runBot accepts an empty ALLOWED_GROUP_ID and boots into pairing mode', () 
   // pairing mode is the expected state. Fake token ⇒ the bot fails fast after
   // the banner, exactly like the WORK_ROOT-default test above.
   const projectDir = fs.mkdtempSync(path.join(tmpRoot, 'project-'));
-  const r = spawnSync(process.execPath, [cliPath, 'bot'], {
+  const r = spawnSync(process.execPath, [cliPath], {
     env: {
       ...process.env,
       CLAUDE_BIN: claudeShim,

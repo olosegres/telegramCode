@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { spawn, spawnSync, type ChildProcess } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import { loadEnvFiles } from './envLoader';
 import {
   checkIsInstalled,
@@ -21,13 +21,18 @@ interface HotOpenCodeDeps {
 
 type HotChildName = 'tsc' | 'nodemon';
 
+const tscWatchCompleteMarker = 'Watching for file changes.';
+const tscWatchReadyMarker = `Found 0 errors. ${tscWatchCompleteMarker}`;
+const tscWatchTailLength = tscWatchReadyMarker.length - 1;
+
 /**
  * @description Wrapper-entry for `telegramcode hot` — hot-reload mode for
  * the global terminal bin.
  *
- * **What it does:** runs `tsc -w` and `nodemon` side-by-side from the
- * project root, so editing any `src/**` file rebuilds `dist/` and nodemon
- * restarts `node dist/cli.js bot` on the new artifact. The bot's own
+ * **What it does:** starts `tsc -w` from the project root, then starts
+ * `nodemon` only after the watcher's first completed compile. Editing any
+ * `src/**` file rebuilds `dist/` and nodemon restarts the internal
+ * `dist/cli/botEntry.js` worker on the new artifact. The bot's own
  * graceful-shutdown sequence (state flush → lock release → exit) makes the
  * old → new handoff clean enough that mid-work agent sessions are re-attached
  * on the next boot. OpenCode is pre-started by this long-lived supervisor;
@@ -42,8 +47,7 @@ type HotChildName = 'tsc' | 'nodemon';
  * repo is the in-project equivalent.
  *
  * **Failure modes handled:**
- *   - missing `dist/cli.js` (fresh checkout) → run a one-shot `tsc` first
- *     so nodemon has something to launch;
+ *   - fresh checkout → nodemon waits until `tsc -w` produces the worker entry;
  *   - broken intermediate TS edit → `tsc -w` doesn't emit, so nodemon
  *     never sees a new artifact and the running bot keeps serving;
  *   - bot crash at runtime (e.g. a second poller appears and Telegram
@@ -80,7 +84,7 @@ export async function runHot(): Promise<void> {
   // The long-lived supervisor owns the initial server directly.
   delete process.env[openCodeExternalHostEnvName];
   process.env[openCodeOwnershipFileEnvName] = getDefaultOpenCodeOwnershipFilePath(projectRoot);
-  const distEntry = path.join(projectRoot, 'dist', 'cli.js');
+  const distEntry = path.join(projectRoot, 'dist', 'cli', 'botEntry.js');
   const tscBin = localBin(projectRoot, 'tsc');
   const nodemonBin = localBin(projectRoot, 'nodemon');
 
@@ -95,26 +99,6 @@ export async function runHot(): Promise<void> {
     return;
   }
 
-  // First-time bootstrap: nodemon can't launch what doesn't exist. Run a
-  // blocking one-shot `tsc` to populate `dist/`. Incremental builds against
-  // an existing `dist/` are fast (sub-second on this project), so the cost
-  // when the user already has a build is negligible.
-  if (!fs.existsSync(distEntry)) {
-    process.stderr.write(`telegramcode hot: dist/ missing, running initial tsc...\n`);
-    const initial = spawnSync(tscBin, [], {
-      cwd: projectRoot,
-      stdio: 'inherit',
-    });
-    if (initial.status !== 0) {
-      process.stderr.write(
-        `telegramcode hot: initial tsc failed (exit ${initial.status}). ` +
-          `Fix the TypeScript errors above and retry.\n`,
-      );
-      process.exit(initial.status ?? 1);
-      return;
-    }
-  }
-
   // nodemon kills the worker's complete descendant tree on every rebuild.
   // Own OpenCode here, as a sibling of nodemon, so an agent turn survives the
   // relay worker being replaced. The worker's normal ensure call adopts it.
@@ -122,31 +106,27 @@ export async function runHot(): Promise<void> {
 
   process.stderr.write(
     `telegramcode hot: project=${projectRoot}\n` +
-      `telegramcode hot: spawning \`tsc -w\` and \`nodemon\` — Ctrl-C to stop both.\n`,
+      `telegramcode hot: starting \`tsc -w\`; nodemon starts after the first completed compile.\n` +
+      `telegramcode hot: Ctrl-C stops both watchers.\n`,
   );
-
-  // Spawn the two watchers as children of this wrapper. Both inherit
-  // stdio so the user sees tsc errors and nodemon output interleaved in
-  // their terminal. Using `node <bin>` instead of executing the bin
-  // directly avoids any shebang-resolution differences across platforms
-  // (the `.bin` scripts are Node CLI tools, not native binaries).
-  const tscChild = spawn(process.execPath, [tscBin, '-w'], {
-    cwd: projectRoot,
-    stdio: 'inherit',
-  });
-  const nodemonChild = spawn(process.execPath, [nodemonBin], {
-    cwd: projectRoot,
-    stdio: 'inherit',
-    env: buildHotWorkerEnv(process.env, launchCwd),
-  });
-
-  const children: ChildProcess[] = [tscChild, nodemonChild];
 
   // Forward terminating signals. We deliberately do NOT re-raise on
   // ourselves after children exit — once both watchers are down the wrapper
   // resolves normally and Node exits with the recorded code. Re-raising
   // would mask the underlying child exit code.
+  const children = new Set<ChildProcess>();
+  let nodemonChild: ChildProcess | null = null;
   let shuttingDown = false;
+  let finalCode = 0;
+  let resolveChildrenStopped: (() => void) | null = null;
+  const childrenStopped = new Promise<void>((resolve) => {
+    resolveChildrenStopped = resolve;
+  });
+
+  const checkShouldResolveChildren = () => {
+    if (shuttingDown && children.size === 0) resolveChildrenStopped?.();
+  };
+
   const forwardSignal = (sig: NodeJS.Signals) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -155,46 +135,84 @@ export async function runHot(): Promise<void> {
       const childName: HotChildName = child === nodemonChild ? 'nodemon' : 'tsc';
       child.kill(getHotChildShutdownSignal(childName, sig));
     }
+    checkShouldResolveChildren();
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     process.on(sig, () => forwardSignal(sig));
   }
 
-  // If EITHER child dies unexpectedly (e.g. tsc -w crashes on an internal
-  // error, or nodemon is killed by the OOM killer), tear the other one
-  // down too — running half a hot-reload setup is worse than no setup.
-  let finalCode = 0;
-  await Promise.all(
-    children.map(
-      (c, idx) =>
-        new Promise<void>((resolve) => {
-          c.on('exit', (code, signal) => {
-            const label = idx === 0 ? 'tsc -w' : 'nodemon';
-            process.stderr.write(
-              `telegramcode hot: ${label} exited ` +
-                `(code=${code ?? 'null'}, signal=${signal ?? 'null'})\n`,
-            );
-            // Propagate the first non-zero code we see; if we're already
-            // shutting down because of a signal, keep code 0.
-            if (!shuttingDown && code !== null && code !== 0 && finalCode === 0) {
-              finalCode = code;
-            }
-            // Trigger sibling tear-down (idempotent — forwardSignal guards
-            // re-entry; sibling that already exited is a no-op).
-            forwardSignal('SIGTERM');
-            resolve();
-          });
-          c.on('error', (err) => {
-            process.stderr.write(
-              `telegramcode hot: child error (${idx === 0 ? 'tsc' : 'nodemon'}): ${err.message}\n`,
-            );
-            if (finalCode === 0) finalCode = 1;
-            forwardSignal('SIGTERM');
-            resolve();
-          });
-        }),
-    ),
-  );
+  const registerChild = (child: ChildProcess, childName: HotChildName) => {
+    children.add(child);
+    let isSettled = false;
+    const settleChild = (code: number | null, signal: NodeJS.Signals | null, error?: Error) => {
+      if (isSettled) return;
+      isSettled = true;
+      children.delete(child);
+      if (error) {
+        process.stderr.write(`telegramcode hot: child error (${childName}): ${error.message}\n`);
+        if (!shuttingDown && finalCode === 0) finalCode = 1;
+      } else {
+        const label = childName === 'tsc' ? 'tsc -w' : 'nodemon';
+        process.stderr.write(
+          `telegramcode hot: ${label} exited ` +
+            `(code=${code ?? 'null'}, signal=${signal ?? 'null'})\n`,
+        );
+        if (!shuttingDown && finalCode === 0) {
+          finalCode = getUnexpectedHotChildExitCode(code);
+        }
+      }
+      if (!shuttingDown) forwardSignal('SIGTERM');
+      checkShouldResolveChildren();
+    };
+    child.on('exit', (code, signal) => settleChild(code, signal));
+    child.on('error', (error) => settleChild(null, null, error));
+  };
+
+  const startNodemon = () => {
+    if (shuttingDown || nodemonChild !== null) return;
+    nodemonChild = spawn(process.execPath, [nodemonBin], {
+      cwd: projectRoot,
+      stdio: 'inherit',
+      env: buildHotWorkerEnv(process.env, launchCwd),
+    });
+    registerChild(nodemonChild, 'nodemon');
+  };
+
+  // Keep stdout piped so tsc does not clear the terminal between rebuilds and
+  // so nodemon can be gated on the first completed watch compile.
+  const tscChild = spawn(process.execPath, [tscBin, '-w'], {
+    cwd: projectRoot,
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  registerChild(tscChild, 'tsc');
+  let tscOutputTail = '';
+  tscChild.stdout?.on('data', (chunk: Buffer) => {
+    const output = chunk.toString();
+    process.stdout.write(output);
+    const inspectionText = tscOutputTail + output;
+    const isWatchComplete = inspectionText.includes(tscWatchCompleteMarker);
+    const isWatchReady = checkIsTscWatchReady(inspectionText);
+    tscOutputTail = inspectionText.slice(-tscWatchTailLength);
+    if (!isWatchComplete || nodemonChild !== null || shuttingDown) return;
+    tscOutputTail = '';
+    if (!isWatchReady) {
+      process.stderr.write(
+        'telegramcode hot: compile has TypeScript errors; nodemon is waiting for a clean build. ' +
+          'Fix the errors and save.\n',
+      );
+      return;
+    }
+    if (fs.existsSync(distEntry)) {
+      startNodemon();
+      return;
+    }
+    process.stderr.write(
+      'telegramcode hot: clean compile produced no dist worker entry. ' +
+        'Check the TypeScript output path and save; nodemon will keep waiting.\n',
+    );
+  });
+
+  await childrenStopped;
 
   process.exit(finalCode);
 }
@@ -212,8 +230,17 @@ export function getHotChildShutdownSignal(
   return childName === 'nodemon' ? 'SIGINT' : wrapperSignal;
 }
 
+/** Return a failing wrapper code whenever a watcher stops on its own. */
+export function getUnexpectedHotChildExitCode(code: number | null): number {
+  return code !== null && code !== 0 ? code : 1;
+}
+
 export function checkIsHotModeSupported(platform: typeof process.platform): boolean {
   return platform !== 'win32';
+}
+
+export function checkIsTscWatchReady(text: string): boolean {
+  return text.includes(tscWatchReadyMarker);
 }
 
 /**
@@ -249,7 +276,7 @@ export async function prepareHotOpenCodeServer(
  * @description Build the env handed to the hot-mode worker (nodemon → bot).
  *
  * In hot mode the supervisor runs `nodemon` with cwd = projectRoot (it must,
- * to watch `dist/`), and the worker (`node dist/cli.js bot`) inherits that
+ * to watch `dist/`), and the worker (`node dist/cli/botEntry.js`) inherits that
  * cwd. Left alone the worker would default `WORK_ROOT` to `process.cwd()` =
  * the project checkout, so `/bind` would list folders inside the TelegramCode
  * checkout instead of the operator's projects parent. We hand the worker the real

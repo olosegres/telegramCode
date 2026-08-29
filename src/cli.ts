@@ -1,17 +1,10 @@
 #!/usr/bin/env node
 
-// Node 17+ defaults DNS resolution to `verbatim` order, which returns IPv6
-// addresses first when both AAAA and A records exist. On hosts where IPv6
-// advertises but isn't routed (common with consumer ISPs, many cloud VPCs,
-// ARM Linux desktops), every outbound request to api.telegram.org /
-// api.anthropic.com / mcp.* lands in a 60-second `ETIMEDOUT` before the IPv4
-// fallback kicks in. `ipv4first` restores pre-Node-17 behaviour. See
-// rationale comment in the previous `src/index.ts`.
-import * as dns from 'dns';
-dns.setDefaultResultOrder('ipv4first');
-
+import { applyDnsFix } from './cli/applyDnsFix';
 import { runBot } from './cli/bot';
 import { runHot } from './cli/hot';
+
+applyDnsFix();
 
 /**
  * @description Print top-level usage to stderr.
@@ -24,7 +17,6 @@ function printUsage(): void {
   process.stderr.write(
     `Usage:\n` +
       `  telegramcode                  Start the bot (WORK_ROOT defaults to $PWD)\n` +
-      `  telegramcode bot              Same as above\n` +
       `  telegramcode hot              Hot-reload dev mode: tsc -w + nodemon on dist/\n` +
       `                                  (rebuilds + restarts the bot on src/ edits;\n` +
       `                                   in-flight agent sessions are reattached)\n` +
@@ -32,7 +24,7 @@ function printUsage(): void {
       `\n` +
       `Environment:\n` +
       `  Loaded from ~/.config/telegramcode/.env (base) then $PWD/.env (override).\n` +
-      `  Required for 'bot': TELEGRAM_BOT_TOKEN.\n` +
+      `  Required to start: TELEGRAM_BOT_TOKEN.\n` +
       `  Access = creator + admins of the served forum group (read live; no user list).\n` +
       `  ALLOWED_GROUP_ID is optional — leave it empty to auto-pair with your\n` +
       `  forum supergroup on first contact (or use /pair in the group).\n` +
@@ -44,7 +36,7 @@ function printUsage(): void {
  * @description Top-level dispatcher.
  *
  * Branches on `argv[2]`:
- *   - missing | `bot`  → start the Telegram bot
+ *   - missing          → start the Telegram bot
  *   - `hot`            → hot-reload dev mode
  *   - `-h | --help | help` → usage
  *   - anything else → usage + exit 2
@@ -60,7 +52,7 @@ function printUsage(): void {
 async function main(): Promise<void> {
   const [sub] = process.argv.slice(2);
 
-  if (sub === undefined || sub === 'bot') {
+  if (sub === undefined) {
     await runBot();
     return;
   }

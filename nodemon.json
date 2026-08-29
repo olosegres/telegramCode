@@ -7,7 +7,7 @@
     "**/*.map",
     "**/*.d.ts"
   ],
-  "exec": "node dist/cli.js bot",
+  "exec": "node dist/cli/botEntry.js",
   "signal": "SIGTERM",
   "exitcrash": true,
   "delay": "2500"

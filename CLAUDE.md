@@ -105,8 +105,10 @@ config/variants, not a per-message API field).
   project instance via `?directory=<workDir>`.
 - **Launch path defines the work root.** The normal operator workflow is
   `cd <projects-parent> && telegramcode`; when `WORK_ROOT` is unset, the
-  wrapper uses `$PWD`. Treat `WORK_ROOT` as an advanced override for services or
-  containers where the process cwd cannot be controlled.
+  wrapper uses `$PWD`. `telegramcode hot` propagates that launch directory to
+  its compiled worker too, so `/bind` sees the same root in both modes. Treat
+  `WORK_ROOT` as an advanced override for services or containers where the
+  process cwd cannot be controlled.
 - **Per-thread isolation.** Routing, sessions, MCP config, model/effort prefs,
   and history are keyed per topic (`ThreadKey` = `"<chatId>:<threadId>"`).
 - **Terminal sessions (`/terminal`).** A topic can bind to a raw interactive
@@ -395,7 +397,7 @@ config/variants, not a per-message API field).
 
 | File | Responsibility |
 |------|----------------|
-| `cli.ts`, `cli/bot.ts` | CLI entrypoints / wiring |
+| `cli.ts`, `cli/bot.ts`, `cli/botEntry.ts`, `cli/applyDnsFix.ts` | Public CLI dispatch, shared bot startup/DNS setup, and the internal hot worker entry. The old public `bot` subcommand is retired; nodemon runs `botEntry.ts` directly |
 | `cli/envLoader.ts` | Load `.env` (config dir + per-project override) |
 | `cli/lock.ts` | Single-instance lockfile |
 | `bot.ts` | **The bot.** Telegram handlers, all slash commands, output streaming. Large — most logic lives here |
@@ -875,6 +877,8 @@ History was scrubbed of real operator identifiers (2026-07-11) — keep it that 
 
 ## Deployment — only committed `main` ships
 
+After resuming an interrupted session, inspect recent commits and the worktree before continuing; another agent may have already advanced the task.
+
 This checkout is the SOURCE other agent accounts on this host mirror: each has
 its `origin` pointing at this checkout and pulls on a timer via
 `scripts/self-update.sh`. What that means while you work here:
@@ -897,8 +901,10 @@ its `origin` pointing at this checkout and pulls on a timer via
 - `yarn build` — `tsc` → `dist/`
 - `yarn dev` — `tsx watch src/cli.ts` (fast dev — TS errors crash the process)
 - `yarn hot` / `telegramcode hot` — hot-reload mode: `tsc -w` + `nodemon`
-  on `dist/`. A broken intermediate edit can't take the bot down (no
-  emit until the build is green), and `nodemon` waits for the old PID's
+  on compiled `dist/`. The supervisor starts nodemon's internal
+  `dist/cli/botEntry.js` worker only after the first watch compile, avoiding an
+  immediate duplicate boot. A broken intermediate edit can't take the bot down
+  (no emit until the build is green), and `nodemon` waits for the old PID's
   graceful shutdown before respawning so the lock changes hands cleanly.
   Agents survive the reload: tmux sessions are external, while the long-lived
   hot supervisor pre-starts the initial `opencode serve` outside nodemon's

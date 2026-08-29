@@ -18,6 +18,8 @@ import * as path from 'path';
 import {
   buildHotWorkerEnv,
   checkIsHotModeSupported,
+  checkIsTscWatchReady,
+  getUnexpectedHotChildExitCode,
   getHotChildShutdownSignal,
   prepareHotOpenCodeServer,
 } from '../cli/hot';
@@ -191,8 +193,38 @@ test('hot supervisor preserves the incoming signal for the TypeScript watcher', 
   assert.equal(getHotChildShutdownSignal('tsc', 'SIGHUP'), 'SIGHUP');
 });
 
+test('hot supervisor reports every unexpected child termination as failure', () => {
+  assert.equal(getUnexpectedHotChildExitCode(0), 1);
+  assert.equal(getUnexpectedHotChildExitCode(null), 1);
+  assert.equal(getUnexpectedHotChildExitCode(9), 9);
+});
+
 test('hot mode refuses Windows instead of risking an orphaned worker tree', () => {
   assert.equal(checkIsHotModeSupported('win32'), false);
   assert.equal(checkIsHotModeSupported('linux'), true);
   assert.equal(checkIsHotModeSupported('darwin'), true);
+});
+
+test('recognizes the TypeScript watch-ready marker before starting nodemon', () => {
+  assert.equal(
+    checkIsTscWatchReady('Found 0 errors. Watching for file changes.'),
+    true,
+  );
+});
+
+test('does not treat compiler errors or ordinary output as watch readiness', () => {
+  assert.equal(checkIsTscWatchReady('Starting compilation in watch mode...'), false);
+  assert.equal(checkIsTscWatchReady('Found 1 error.'), false);
+  assert.equal(
+    checkIsTscWatchReady('Found 1 error. Watching for file changes.'),
+    false,
+  );
+});
+
+test('hot builds never emit broken artifacts that nodemon could restart', () => {
+  const tsconfigSource = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'tsconfig.json'),
+    'utf8',
+  );
+  assert.match(tsconfigSource, /"noEmitOnError"\s*:\s*true/);
 });

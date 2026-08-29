@@ -873,6 +873,23 @@ History was scrubbed of real operator identifiers (2026-07-11) — keep it that 
   `/home/user/…`); real values live only in untracked `CLAUDE.local.md` / `agent/tmp/`.
 - Pre-commit review sweeps the diff for real-looking identifiers — any hit is a FAIL.
 
+## Deployment — only committed `main` ships
+
+This checkout is the SOURCE other agent accounts on this host mirror: each has
+its `origin` pointing at this checkout and pulls on a timer via
+`scripts/self-update.sh`. What that means while you work here:
+
+- **Only committed `main` propagates.** Anything left uncommitted in this tree
+  never reaches the mirrors, however finished it looks — landing it on `main`
+  IS the deploy step.
+- The pull is **fast-forward only** and skips a dirty or diverged tree, so a
+  rewritten or force-moved `main` silently stalls every mirror until each one
+  is re-pointed by hand.
+- Touching a hot-supervisor file (`src/cli.ts`, `src/cli/hot.ts`,
+  `nodemon.json`) makes the mirrors restart the whole service, because nodemon
+  never reloads the process that spawned it; any other change rides the normal
+  hot reload.
+
 ## Tests & build
 
 - `yarn test` — unit/integration (`src/__tests__/**/*.test.ts`, node test runner + tsx)

@@ -1,8 +1,9 @@
-import { sleep } from './utils';
+import { getAbortError, sleep } from './utils';
 import type { ThreadKey } from './types';
 import { keyToString } from './types';
 import { SendRateTracker } from './utils/sendRateTracker';
 import { formatRateLimit429Line, formatRateSummaryLine } from './utils/rateLimitLog';
+import { AbortableFifo } from './utils/abortableFifo';
 
 /**
  * @description Telegram-side rate limiting for the multi-thread bot.
@@ -81,11 +82,13 @@ const realPacerClock: PacerClock = {
  */
 export class GlobalSendPacer {
   /** Waiters parked for a permit, resolved in FIFO (arrival) order. */
-  private waiters: Array<() => void> = [];
+  private waiters = new AbortableFifo();
   /** Earliest clock time the next permit may be granted. */
   private nextAllowedAt = 0;
   /** A drain timer is already armed for the current waiter set. */
   private timerArmed = false;
+  /** Generation token that makes overdue, logically replaced timers inert. */
+  private timerGeneration = 0;
   /** Shutdown-drain mode: permits are granted immediately, no spacing. */
   private isShutdownDraining = false;
 
@@ -96,7 +99,7 @@ export class GlobalSendPacer {
 
   /** How many sends are currently parked waiting for a permit. */
   getPendingCount(): number {
-    return this.waiters.length;
+    return this.waiters.size;
   }
 
   /**
@@ -109,9 +112,8 @@ export class GlobalSendPacer {
    */
   enterShutdownDrain(): void {
     this.isShutdownDraining = true;
-    const parked = this.waiters;
-    this.waiters = [];
-    for (const waiter of parked) waiter();
+    this.invalidateDrainTimer();
+    this.waiters.resolveAll();
   }
 
   /**
@@ -120,39 +122,47 @@ export class GlobalSendPacer {
    * interval-long idle never eats a needless delay). Otherwise queue FIFO and
    * let the clock-driven drain grant it in turn.
    */
-  acquire(): Promise<void> {
+  acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(getAbortError(signal));
     if (this.isShutdownDraining) return Promise.resolve();
     const now = this.clock.now();
-    if (this.waiters.length === 0 && now >= this.nextAllowedAt) {
+    if (this.waiters.size === 0 && now >= this.nextAllowedAt) {
+      this.invalidateDrainTimer();
       this.nextAllowedAt = now + this.intervalMs;
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.waiters.push(resolve);
-      this.armDrain();
-    });
+    const waiter = this.waiters.wait(signal);
+    this.armDrain();
+    return waiter;
   }
 
   /** Arm a single timer to grant the head waiter when the window next opens. */
   private armDrain(): void {
-    if (this.timerArmed || this.waiters.length === 0) return;
+    if (this.timerArmed || this.waiters.size === 0) return;
     const waitMs = Math.max(this.nextAllowedAt - this.clock.now(), 0);
     this.timerArmed = true;
+    const timerGeneration = ++this.timerGeneration;
     this.clock.setTimeout(() => {
+      if (timerGeneration !== this.timerGeneration) return;
       this.timerArmed = false;
       this.drainOne();
     }, Math.max(waitMs, 1));
   }
 
+  /** Logically cancel an armed timer when the pacing window is replaced. */
+  private invalidateDrainTimer(): void {
+    if (!this.timerArmed) return;
+    this.timerArmed = false;
+    this.timerGeneration += 1;
+  }
+
   /** Grant exactly one permit (the head waiter), advance the clock, re-arm. */
   private drainOne(): void {
-    const waiter = this.waiters.shift();
-    if (!waiter) return;
+    if (!this.waiters.resolveNext()) return;
     // Advance from whichever is later — the scheduled slot or NOW — so a late
     // timer never bunches two grants closer than the interval.
     this.nextAllowedAt = Math.max(this.nextAllowedAt, this.clock.now()) + this.intervalMs;
-    waiter();
-    if (this.waiters.length > 0) this.armDrain();
+    if (this.waiters.size > 0) this.armDrain();
   }
 }
 
@@ -395,17 +405,20 @@ function logRateLimit429(chatId: number, err: TelegramErrorLike, isAfterRetry: b
 export async function withRateLimitRetry<T>(
   chatId: number,
   operation: () => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
+  if (signal?.aborted) throw getAbortError(signal);
   const state = getRateLimitState(chatId);
 
   // If currently rate-limited, wait for cooldown
   const remainingMs = state.blockedUntil - Date.now();
   if (remainingMs > 0) {
     console.log(`[RateLimit] chat ${chatId} blocked for ${Math.ceil(remainingMs / 1000)}s, waiting...`);
-    await sleep(remainingMs);
+    await sleep(remainingMs, signal);
   }
 
   try {
+    if (signal?.aborted) throw getAbortError(signal);
     return await operation();
   } catch (err) {
     if (!checkIsTelegramRateLimitError(err)) throw err;
@@ -414,10 +427,11 @@ export async function withRateLimitRetry<T>(
     state.blockedUntil = Date.now() + waitMs;
     logRateLimit429(chatId, err, /* isAfterRetry */ false);
 
-    await sleep(waitMs);
+    await sleep(waitMs, signal);
 
     // Single retry
     try {
+      if (signal?.aborted) throw getAbortError(signal);
       const result = await operation();
       state.blockedUntil = 0;
       return result;
@@ -443,11 +457,15 @@ export async function withRateLimitRetry<T>(
  * Keeping it in one place stops {@link enqueueSend} and {@link sendUnpaced} from
  * drifting on 429-safety or instrumentation.
  */
-function recordAndRetry<T>(key: ThreadKey, fn: () => Promise<T>): Promise<T> {
+function recordAndRetry<T>(
+  key: ThreadKey,
+  fn: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   // Record exactly one outbound send per logical send (best-effort
   // instrumentation — never let it break a send).
   try { sendRateTracker.recordSend(key.chatId); } catch { /* never throw into the send path */ }
-  return withRateLimitRetry(key.chatId, fn);
+  return withRateLimitRetry(key.chatId, fn, signal);
 }
 
 /**
@@ -470,8 +488,35 @@ function recordAndRetry<T>(key: ThreadKey, fn: () => Promise<T>): Promise<T> {
 export async function sendUnpaced<T>(
   key: ThreadKey,
   fn: () => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return recordAndRetry(key, fn);
+  return recordAndRetry(key, fn, signal);
+}
+
+/** Reject while queued, but never race a started operation's cleanup/result. */
+function waitForQueuedExecution<T>(
+  execution: Promise<T>,
+  checkOperationStarted: () => boolean,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return execution;
+  if (signal.aborted) return Promise.reject(getAbortError(signal));
+  return new Promise((resolve, reject) => {
+    const handleAbort = () => {
+      if (!checkOperationStarted()) reject(getAbortError(signal));
+    };
+    signal.addEventListener('abort', handleAbort, { once: true });
+    execution.then(
+      (result) => {
+        signal.removeEventListener('abort', handleAbort);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener('abort', handleAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -497,34 +542,44 @@ export async function sendUnpaced<T>(
 export async function enqueueSend<T>(
   key: ThreadKey,
   fn: () => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
+  if (signal?.aborted) throw getAbortError(signal);
   const queueKey = keyToString(key);
   const prev = queues.get(queueKey);
+  let isOperationStarted = false;
 
   const exec = async (): Promise<T> => {
-    await globalPacer.acquire();
-    return recordAndRetry(key, fn);
+    await globalPacer.acquire(signal);
+    return recordAndRetry(
+      key,
+      () => {
+        isOperationStarted = true;
+        return fn();
+      },
+      signal,
+    );
   };
 
   // Chain: wait for prev (ignore its errors), then run our exec.
-  const current: Promise<T> = (async () => {
+  const execution: Promise<T> = (async () => {
     if (prev) {
       try { await prev; } catch { /* swallow predecessor errors */ }
     }
+    if (signal?.aborted) throw getAbortError(signal);
     return exec();
   })();
 
-  const tracked = current.then(
+  const tracked = execution.then(
     () => undefined,
     () => undefined,
   );
   queues.set(queueKey, tracked);
-
-  try {
-    return await current;
-  } finally {
+  void tracked.then(() => {
     if (queues.get(queueKey) === tracked) {
       queues.delete(queueKey);
     }
-  }
+  });
+
+  return waitForQueuedExecution(execution, () => isOperationStarted, signal);
 }

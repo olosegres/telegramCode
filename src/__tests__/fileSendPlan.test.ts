@@ -1,12 +1,15 @@
 /**
  * @description Load-bearing tests for the agent→Telegram `send_file_to_user` decision
- * layer (`utils/fileSendPlan.ts`). Three pure concerns: path-safety
+ * layer (`utils/fileSendPlan.ts`). Four pure concerns: path-safety
  * (`resolveSendFileWithinDir`), extension classification (`classifyFileSendKind`),
- * and the single/album send plan (`planFileSend`). The path-safety part is
- * security-critical (it is the only thing stopping the agent from exfiltrating
- * files outside its bound folder), so it is exercised against a REAL temp dir
- * with a real symlink-out, not a mock.
+ * the single/album send plan (`planFileSend`), and the exact Telegram request
+ * shape (`buildTelegramFileSendRequest`). The path-safety part is security-critical
+ * (it is the only thing stopping the agent from exfiltrating files outside its
+ * bound folder), so it is exercised against a REAL temp dir with a real
+ * symlink-out, not a mock.
  */
+
+/** Test case: N/A — TelegramCode has no Jira tracker. */
 
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
@@ -17,6 +20,7 @@ import {
   resolveSendFileWithinDir,
   classifyFileSendKind,
   planFileSend,
+  buildTelegramFileSendRequest,
   trimCaption,
   telegramPhotoMaxBytes,
   telegramSendMaxBytes,
@@ -38,7 +42,11 @@ test('resolveSendFileWithinDir: a regular file inside the folder resolves ok', (
     fs.writeFileSync(filePath, 'x');
     const result = resolveSendFileWithinDir(root, 'chart.png');
     assert.equal(result.ok, true);
-    if (result.ok) assert.equal(result.absPath, fs.realpathSync(filePath));
+    if (result.ok) {
+      const fileStat = fs.statSync(filePath, { bigint: true });
+      assert.equal(result.absPath, fs.realpathSync(filePath));
+      assert.deepEqual(result.identity, { dev: fileStat.dev, ino: fileStat.ino });
+    }
   } finally {
     cleanup();
   }
@@ -138,8 +146,13 @@ test('classifyFileSendKind: .gif → animation (case-insensitive)', () => {
   assert.equal(classifyFileSendKind('LOOP.GIF'), 'animation');
 });
 
+test('classifyFileSendKind: .mp4 → video (case-insensitive)', () => {
+  assert.equal(classifyFileSendKind('recording.mp4'), 'video');
+  assert.equal(classifyFileSendKind('RECORDING.MP4'), 'video');
+});
+
 test('classifyFileSendKind: everything else → document', () => {
-  for (const p of ['a.pdf', 'a.txt', 'a.md', 'noext', 'a.mp4', 'a.zip']) {
+  for (const p of ['a.pdf', 'a.txt', 'a.md', 'noext', 'a.zip']) {
     assert.equal(classifyFileSendKind(p), 'document', p);
   }
 });
@@ -147,7 +160,15 @@ test('classifyFileSendKind: everything else → document', () => {
 // ─── planFileSend ─────────────────────────────────────────────────────
 
 function item(absPath: string, kind: FileSendItem['kind'], sizeBytes = 1000): FileSendItem {
-  return { absPath, kind, sizeBytes };
+  return {
+    absPath,
+    source: {
+      fd: 100,
+      filename: path.basename(absPath),
+      sizeBytes,
+    },
+    kind,
+  };
 }
 
 test('planFileSend: single photo → send photo', () => {
@@ -168,6 +189,12 @@ test('planFileSend: single gif → send animation', () => {
   if (plan.kind === 'send') assert.equal(plan.mode, 'animation');
 });
 
+test('planFileSend: single mp4 → send video', () => {
+  const plan = planFileSend([item('/w/a.mp4', 'video')], false);
+  assert.equal(plan.kind, 'send');
+  if (plan.kind === 'send') assert.equal(plan.mode, 'video');
+});
+
 test('planFileSend: as_file forces an image to document', () => {
   const plan = planFileSend([item('/w/a.png', 'photo')], true);
   assert.equal(plan.kind, 'send');
@@ -176,6 +203,12 @@ test('planFileSend: as_file forces an image to document', () => {
 
 test('planFileSend: as_file forces a gif to document', () => {
   const plan = planFileSend([item('/w/a.gif', 'animation')], true);
+  assert.equal(plan.kind, 'send');
+  if (plan.kind === 'send') assert.equal(plan.mode, 'document');
+});
+
+test('planFileSend: as_file forces a video to document', () => {
+  const plan = planFileSend([item('/w/a.mp4', 'video')], true);
   assert.equal(plan.kind, 'send');
   if (plan.kind === 'send') assert.equal(plan.mode, 'document');
 });
@@ -192,10 +225,22 @@ test('planFileSend: any file over the 50MB send cap → error', () => {
   if (plan.kind === 'error') assert.match(plan.error, /huge\.bin/);
 });
 
-test('planFileSend: all-photo album → albumPhoto', () => {
+test('planFileSend: all-photo album → albumPhotoVideo', () => {
   const plan = planFileSend([item('/w/a.png', 'photo'), item('/w/b.jpg', 'photo')], false);
   assert.equal(plan.kind, 'album');
-  if (plan.kind === 'album') assert.equal(plan.mode, 'albumPhoto');
+  if (plan.kind === 'album') assert.equal(plan.mode, 'albumPhotoVideo');
+});
+
+test('planFileSend: all-video album → albumPhotoVideo', () => {
+  const plan = planFileSend([item('/w/a.mp4', 'video'), item('/w/b.mp4', 'video')], false);
+  assert.equal(plan.kind, 'album');
+  if (plan.kind === 'album') assert.equal(plan.mode, 'albumPhotoVideo');
+});
+
+test('planFileSend: mixed photo/video album → albumPhotoVideo', () => {
+  const plan = planFileSend([item('/w/a.png', 'photo'), item('/w/b.mp4', 'video')], false);
+  assert.equal(plan.kind, 'album');
+  if (plan.kind === 'album') assert.equal(plan.mode, 'albumPhotoVideo');
 });
 
 test('planFileSend: mixed album → albumDocument', () => {
@@ -216,9 +261,24 @@ test('planFileSend: all-photo album with as_file → albumDocument', () => {
   if (plan.kind === 'album') assert.equal(plan.mode, 'albumDocument');
 });
 
+test('planFileSend: all-video album with as_file → albumDocument', () => {
+  const plan = planFileSend([item('/w/a.mp4', 'video'), item('/w/b.mp4', 'video')], true);
+  assert.equal(plan.kind, 'album');
+  if (plan.kind === 'album') assert.equal(plan.mode, 'albumDocument');
+});
+
 test('planFileSend: a photo album where one is over the photo cap → albumDocument', () => {
   const plan = planFileSend(
     [item('/w/a.png', 'photo'), item('/w/b.png', 'photo', telegramPhotoMaxBytes + 1)],
+    false,
+  );
+  assert.equal(plan.kind, 'album');
+  if (plan.kind === 'album') assert.equal(plan.mode, 'albumDocument');
+});
+
+test('planFileSend: an over-cap photo mixed with video → albumDocument', () => {
+  const plan = planFileSend(
+    [item('/w/big.png', 'photo', telegramPhotoMaxBytes + 1), item('/w/a.mp4', 'video')],
     false,
   );
   assert.equal(plan.kind, 'album');
@@ -235,6 +295,136 @@ test('planFileSend: 11 items → error', () => {
   const plan = planFileSend(items, false);
   assert.equal(plan.kind, 'error');
   if (plan.kind === 'error') assert.match(plan.error, /too many/);
+});
+
+// ─── buildTelegramFileSendRequest ─────────────────────────────────────
+
+function buildRequest(fileItems: FileSendItem[], asFile: boolean, caption?: string) {
+  const plan = planFileSend(fileItems, asFile);
+  if (plan.kind === 'error') assert.fail(plan.error);
+  return buildTelegramFileSendRequest(plan, caption);
+}
+
+test('buildTelegramFileSendRequest: single MP4 uses sendVideo with ready source and caption', () => {
+  const videoItem = item('/w/a.mp4', 'video');
+  const request = buildRequest([videoItem], false, 'clip');
+  assert.deepEqual(request, {
+    method: 'sendVideo',
+    source: { fd: 100, filename: 'a.mp4', sizeBytes: 1000 },
+    caption: 'clip',
+  });
+  if (request.method === 'sendMediaGroup') assert.fail('expected a single send request');
+  assert.strictEqual(request.source, videoItem.source, 'the request reuses the replayable snapshot');
+});
+
+test('buildTelegramFileSendRequest: single photo uses sendPhoto', () => {
+  const request = buildRequest([item('/w/a.png', 'photo')], false);
+  assert.deepEqual(request, {
+    method: 'sendPhoto',
+    source: { fd: 100, filename: 'a.png', sizeBytes: 1000 },
+  });
+});
+
+test('buildTelegramFileSendRequest: single GIF uses sendAnimation', () => {
+  const request = buildRequest([item('/w/a.gif', 'animation')], false);
+  assert.deepEqual(request, {
+    method: 'sendAnimation',
+    source: { fd: 100, filename: 'a.gif', sizeBytes: 1000 },
+  });
+});
+
+test('buildTelegramFileSendRequest: as_file MP4 uses sendDocument', () => {
+  const request = buildRequest([item('/w/a.mp4', 'video')], true);
+  assert.deepEqual(request, {
+    method: 'sendDocument',
+    source: { fd: 100, filename: 'a.mp4', sizeBytes: 1000 },
+  });
+});
+
+test('buildTelegramFileSendRequest: all-video album uses video entries and captions only the first', () => {
+  const request = buildRequest(
+    [item('/w/a.mp4', 'video'), item('/w/b.mp4', 'video')],
+    false,
+    'clips',
+  );
+  assert.deepEqual(request, {
+    method: 'sendMediaGroup',
+    mediaGroup: {
+      kind: 'photoVideo',
+      media: [
+        {
+          type: 'video',
+          media: { fd: 100, filename: 'a.mp4', sizeBytes: 1000 },
+          caption: 'clips',
+        },
+        {
+          type: 'video',
+          media: { fd: 100, filename: 'b.mp4', sizeBytes: 1000 },
+        },
+      ],
+    },
+  });
+});
+
+test('buildTelegramFileSendRequest: mixed photo/video album preserves photo then video', () => {
+  const request = buildRequest(
+    [item('/w/a.png', 'photo'), item('/w/b.mp4', 'video')],
+    false,
+  );
+  assert.deepEqual(request, {
+    method: 'sendMediaGroup',
+    mediaGroup: {
+      kind: 'photoVideo',
+      media: [
+        {
+          type: 'photo',
+          media: { fd: 100, filename: 'a.png', sizeBytes: 1000 },
+        },
+        {
+          type: 'video',
+          media: { fd: 100, filename: 'b.mp4', sizeBytes: 1000 },
+        },
+      ],
+    },
+  });
+});
+
+test('buildTelegramFileSendRequest: document fallback converts every album entry to document', () => {
+  const request = buildRequest(
+    [item('/w/a.png', 'photo'), item('/w/b.pdf', 'document')],
+    false,
+  );
+  assert.deepEqual(request, {
+    method: 'sendMediaGroup',
+    mediaGroup: {
+      kind: 'document',
+      media: [
+        {
+          type: 'document',
+          media: { fd: 100, filename: 'a.png', sizeBytes: 1000 },
+        },
+        {
+          type: 'document',
+          media: { fd: 100, filename: 'b.pdf', sizeBytes: 1000 },
+        },
+      ],
+    },
+  });
+});
+
+test('buildTelegramFileSendRequest: rejects an impossible photo/video album item kind', () => {
+  assert.throws(
+    () =>
+      buildTelegramFileSendRequest(
+        {
+          kind: 'album',
+          mode: 'albumPhotoVideo',
+          items: [item('/w/a.pdf', 'document'), item('/w/b.mp4', 'video')],
+        },
+        undefined,
+      ),
+    /albumPhotoVideo cannot contain document: \/w\/a\.pdf/,
+  );
 });
 
 // ─── trimCaption ──────────────────────────────────────────────────────

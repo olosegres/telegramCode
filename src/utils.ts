@@ -1,5 +1,25 @@
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Return the signal's Error reason, including a stable fallback for non-Error reasons. */
+export function getAbortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error('The operation was aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+/** Sleep for the requested duration, rejecting promptly when the caller aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(getAbortError(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', handleAbort);
+      resolve();
+    }, ms);
+    const handleAbort = () => {
+      clearTimeout(timer);
+      if (signal) reject(getAbortError(signal));
+    };
+    signal?.addEventListener('abort', handleAbort, { once: true });
+  });
 }
 
 /**

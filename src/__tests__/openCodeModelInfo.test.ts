@@ -252,6 +252,40 @@ describe('OpenCode fetchModelInfo (B9)', () => {
     });
   });
 
+  it('does not replace measured runtime context with a pending zero-token assistant placeholder', () => {
+    const { adapter } = createAdapterWithSession();
+    const session = adapter['sessions'].get(keyToString(key));
+
+    adapter['handleMessageUpdate'](key, {
+      info: {
+        id: 'msg_measured',
+        sessionID: ownSessionId,
+        role: 'assistant',
+        providerID: 'openai',
+        modelID: 'gpt-test',
+        finish: 'tool-calls',
+        tokens: { input: 1_087, output: 17, cache: { read: 181_760, write: 0 } },
+      },
+    });
+    adapter['handleMessageUpdate'](key, {
+      info: {
+        id: 'msg_pending',
+        sessionID: ownSessionId,
+        role: 'assistant',
+        providerID: 'openai',
+        modelID: 'gpt-test',
+        finish: null,
+        tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+
+    assert.deepEqual(session.latestParentRuntimeContext, {
+      messageId: 'msg_measured',
+      model: { providerID: 'openai', modelID: 'gpt-test' },
+      contextUsedTokens: 182_864,
+    });
+  });
+
   it('fetches the provider config so a cold cache still reports the context limit', async () => {
     const { adapter, setConfigResponse } = createAdapterWithSession();
     let providerRequests = 0;

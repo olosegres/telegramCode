@@ -53,6 +53,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "abort-controller": "^3.0.0",
     "croner": "^10.0.1",
     "dotenv": "^16.4.5",
     "form-data": "^4.0.5",

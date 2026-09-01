@@ -207,7 +207,10 @@ config/variants, not a per-message API field).
   across ALL chats (supergroup + owner DM), FCFS — CLOCK-BASED and non-blocking,
   so a slow/stuck send never head-of-line-blocks others (it replaced the per-chat
   priority `TokenBucket`; `enqueueSend` no longer takes a priority — pure FCFS
-  temporal order, no class jumps the line). Each topic coalesces its own stream
+  temporal order, no class jumps the line). An aborted final waiter cannot leave
+  a stale timer that grants a later send early. Cancellation rejects while a send
+  is parked in the per-thread/pacer queues; once its operation starts, the caller
+  awaits the operation and cleanup instead of racing them. Each topic coalesces its own stream
   at a 3s output debounce (`OUTPUT_DEBOUNCE_MS`, up from 1s; `isFinal` still
   flushes now). When a topic BACKS UP (≥3 messages queued) the flush GLUES the
   backlog into the fewest `\n\n`-joined messages (pure `utils/outputBacklogGlue.ts`,
@@ -283,7 +286,7 @@ config/variants, not a per-message API field).
   bot-independent).
 - **Agent scheduling tools (injected).** Separately from that user hierarchy,
   the bot injects its OWN `telegramBot` MCP server (HTTP, loopback `127.0.0.1`,
-  per-session thread/dir-scoped HMAC tokens) into EVERY bot-started session —
+  per-session thread/dir-scoped HMAC tokens + a fresh client UUID) into EVERY bot-started session —
   Claude via a bot-generated `--mcp-config` file (thread-scoped), OpenCode via
   runtime `POST /mcp?directory=` (dir-scoped, re-registered after a server
   restart AND self-healed on every BOT boot: `reconcileSchedulerMcpForActiveSessions`
@@ -300,7 +303,44 @@ config/variants, not a per-message API field).
   touches the user's group/thread config files. Builders live in
   `scheduler/injection.ts`, configured at boot by `wireScheduler` in `bot.ts`
   (if the MCP server fails to bind its port, the bot still boots — injection
-  stays inert and only the agent-facing tools are unavailable that run).
+  stays inert and only the agent-facing tools are unavailable that run). A
+  single MP4 uses Bot API `sendVideo`; eligible all-video and mixed photo/video
+  albums use `sendMediaGroup` with `InputMediaVideo` entries for MP4s.
+  `as_file:true` is the explicit document override, and a silent MP4 needs no
+  fake audio track. `utils/fileSendService.ts` owns the reusable path/snapshot/
+  plan/request-dispatch pipeline: it captures each canonical file's bigint
+  device/inode identity, pins one canonical root across every album item, and on
+  Linux traverses from a pinned root descriptor with per-component `O_NOFOLLOW`.
+  macOS fails this tool closed until a native descriptor-relative bridge exists.
+  The service verifies the opened identity and owns the pinned
+  file descriptor through gateway completion. `bot.ts` injects the real target
+  resolver, one `executeDelivery` seam backed by `enqueueSend`, and five direct
+  gateway methods. The delivery callback keeps gateway dispatch AND atomic,
+  durable message-id recording inside one per-thread queue transaction; the
+  complete Telegram response-ID batch reaches `state.json` before success. Every retry callback
+  creates a fresh `autoClose:false` positional stream bounded to the validated
+  snapshot size; a zero-byte snapshot uses a fresh in-memory empty `Readable`.
+  Each attempt registers stream completion before sending, destroys unread
+  streams on an early rejection, and waits for every stream to become terminal
+  before `withRateLimitRetry` can start the next attempt. Telegram API errors
+  remain retryable; a non-API failure after invocation becomes a typed
+  delivery-unknown result that says Telegram may already have accepted the send
+  and MUST NOT be retried automatically; the MCP result is non-error structured
+  content `{ kind: 'deliveryUnknown', retryable: false }`. Once the gateway returns, delivery is
+  final: a later message-id recording or descriptor-cleanup
+  failure stays `ok:true` with a warning so the agent cannot duplicate the
+  already-delivered message/album by retrying. Request cancellation removes
+  parked snapshot/pacer/FIFO/retry waiters. While any request-body stream remains
+  unconsumed it destroys the streams and aborts the active Telegraf `callApi`,
+  surfacing `AbortError` only after terminal cleanup. Once every stream has ended,
+  caller cancellation is not forwarded because Telegram may already have accepted
+  the upload; instead an unref'ed 30-second response deadline starts. Expiry aborts
+  Telegraf, awaits sender cleanup, and returns delivery-unknown without retrying;
+  returned message IDs still win at the deadline boundary and are durably recorded.
+  A directory-scoped request carries its
+  canonical authorised directory into the service, which re-resolves the topic
+  after snapshot admission before opening files and again inside `executeDelivery`
+  immediately before dispatch, refusing a binding that changed in either queue.
 - **Scheduled prompts (`src/scheduler/`).** A topic can have scheduled prompts:
   at fire time the bot posts the prompt into the topic, PINS the announcement
   (pins accumulate as run history — the bot never auto-unpins; per-job
@@ -433,13 +473,17 @@ config/variants, not a per-message API field).
 | `utils/claudeChunkClassifier.ts` | Pure classifier for the Claude relay (S3): segments a scraped pane chunk into tagged runs (`classifyClaudeChunk` → thinking / tool-header / tool-body / sub-agent-panel-preview / prose / chrome), threading fence/block context across polls. Conservative default-to-prose so the answer is never swallowed; an orphan "+N tool uses" wall → chrome |
 | `utils/claudeRelayRouting.ts` | Pure per-pref router for the classifier's segments (S4–S6): `routeClaudeChunkSegments` keeps prose always, applies `/tool_results` + `/thinking` per segment (full keep / short truncate-or-collapse / minimal fold), always folds sub-agent panel previews to status, and returns `keptText` (permanent) + the one rolling `activityLine`; `checkIsClaudeRelayFastPath` is the all-`full` byte-identical regression anchor |
 | `utils/claudeSubagentTail.ts` | Pure decision logic for Claude's `/subagent full` transcript tailing: per-file tail state (byte offset + partial-line carry), the scan planner (`getSubagentTailReads`: first scan seeds offsets to EOF with no reads = no backlog replay; non-`full` modes fast-forward without reading; full returns `[offset..size)` ranges), the transcript filename filter (`checkIsSubagentTranscriptName`), and the extractor (`extractAppendedSubagentTexts`: assistant `text` blocks only — thinking/tool_use/user/attachment dropped, malformed JSONL lines skipped). The adapter's poll tick does the fs work |
-| `utils/fileSendPlan.ts` | Pure decision layer for the agent→Telegram `send_file_to_user`: path-safety (`resolveSendFileWithinDir` — realpath containment + regular-file gate inside the bound folder, mirrors `validateSubdir` but for a file, returns a result instead of throwing), extension→render-kind (`classifyFileSendKind`: photo/animation/document), and the single/album send plan (`planFileSend`: `as_file` + >10MB-photo→document downgrade, all-photo→albumPhoto else albumDocument, size/count → error variant) + `trimCaption` (1024 cap) |
+| `utils/canonicalPathContainment.ts` | Shared security boundary for binding and file-send path resolution: canonicalizes a candidate beneath an already-canonical/pinned root and performs separator-safe containment, while each caller retains its own input validation, root error mapping, and file-vs-directory gate |
+| `utils/fileSendPlan.ts` | Pure decision/request layer for the agent→Telegram `send_file_to_user`: path-safety (`resolveSendFileWithinDir` — shared canonical containment + bigint device/inode identity + regular-file gate inside the bound folder), canonical multipart-basename control/quoted-string-metacharacter sanitization (`getTelegramUploadFilename`), extension→render-kind (`classifyFileSendKind`: photo/animation/video/document), the single/album plan (`planFileSend`: `as_file` + >10MB-photo→document downgrade, eligible photos/videos→albumPhotoVideo else albumDocument, size/count → error variant), and `buildTelegramFileSendRequest` (exact `sendPhoto`/`sendAnimation`/`sendVideo`/`sendDocument` or discriminated `sendMediaGroup` request carrying project-owned descriptor snapshots, first-item-only album caption) + `trimCaption` (1024 cap) |
+| `utils/abortableFifo.ts` | Shared abortable FIFO waiter queue used by both the global send pacer and file-snapshot admission: size, wait, resolve-next, and resolve-all; an aborted waiter removes only itself and never consumes the next live permit |
+| `utils/fileSendService.ts` | Reusable impure orchestration for `send_file_to_user`: `createSendFilesToThread(deps)` resolves target+workdir, pins one canonical root for the whole operation, and on Linux traverses each canonical path from a root descriptor with per-component `O_NOFOLLOW`; macOS fails closed until a native descriptor-relative bridge exists. It verifies the opened regular file's bigint device/inode identity and ≤50 MB size, then retains every file descriptor while classifying/planning/building and exhaustively invoking an injected typed `sendPhoto`/`sendAnimation`/`sendVideo`/`sendDocument`/`sendMediaGroup` gateway. Snapshot admission is bounded/FIFO and abortable; a directory-scoped call requires the same canonical authorised workdir both before opening and inside `executeDelivery` immediately before dispatch. Optional `executeDelivery` wraps gateway dispatch plus durable message-id recording in one queue/retry transaction; the default invokes directly. It closes every collected descriptor in `finally` after gateway success/failure. A gateway return is the delivery boundary: later recording/cleanup failures append warnings to an `ok:true` result to prevent duplicate retries, while `FileSendDeliveryUnknownError` becomes a distinct no-auto-retry result. `SchedulerMcpDeps` imports its `SendFilesToThread` type directly; real-HTTP tests compose a recording gateway |
+| `utils/fileSendTelegram.ts` | Telegraf adapter for project-owned file-send descriptors: each gateway invocation creates a fresh bounded input — non-empty snapshots use `fs.createReadStream('', { fd, start: 0, end: sizeBytes - 1, autoClose: false })`, while zero-byte snapshots use an in-memory empty `Readable` — converts discriminated document vs photo/video groups into correctly homogeneous Bot API media arrays, and extracts every returned message id for `/clear` tracking. It registers `finished()` before invoking each attempt; cancellation aborts Telegraf and destroys streams only while any request body remains unconsumed. After every stream ends normally, caller cancellation stays suppressed and an unref'ed 30-second response deadline starts; expiry aborts Telegraf, awaits sender cleanup, and becomes `FileSendDeliveryUnknownError`, while message IDs returned at the boundary still win. Telegram API errors propagate to the outer retry executor; other non-API post-initiation failures also become delivery-unknown. `bot.ts` passes an abort-controller shim signal to Telegraf `callApi`; descriptor closure remains the service's responsibility |
 | `scheduler/recurrence.ts` | Pure schedule math on `croner`: `ScheduleSpec` (cron / once / N-times), validation (min fire interval 5 min), next-occurrence, human description, catch-up decision |
 | `scheduler/store.ts` | Schedule records: create path (slug ids, ≤30/thread cap, `isPinSilent`), persisted in `state.json` `schedules` (lifecycle-independent) |
 | `scheduler/engine.ts` | Timer engine: one unref'd timer per job, boot replay with one-catch-up-per-missed-run, no-overlap guard, N-times/once bookkeeping, `whenIdle` drain |
 | `scheduler/delivery.ts` | Fire pipeline: announce → pin (notify by default) → wait-for-idle (5s polls, 10 min cap) → forward with the `[Scheduled run]` marker; unbound topic → distinct error |
-| `scheduler/mcpSurface.ts` | Bot-owned MCP server (stateless streamable HTTP on an OS-chosen loopback port unless `SCHEDULER_MCP_PORT` pins one): `schedule_create/list/cancel` + `send_file_to_user` (agent→Telegram file/image, separate `registerFileSendTool`), HMAC bearer tokens scoped `thread:`/`dir:`. Reports a short connect-time `instructions` (`mcpServerInstructions`, returned in the MCP `initialize` handshake) — a use-case pointer (when to reach for the server, what it can do); per-tool argument recipes stay in each tool's own `description`. NOTE: connect-time `instructions` + tool descriptions are cached by the client at connect — an already-running agent won't see edits until it reconnects; only tool RESULTS reflect live server code |
-| `scheduler/injection.ts` | Builders for injecting the bot's MCP entry into sessions: Claude `--mcp-config` object, OpenCode `POST /mcp` registration; inert until configured |
+| `scheduler/mcpSurface.ts` | Bot-owned MCP server (stateless streamable HTTP on an OS-chosen loopback port unless `SCHEDULER_MCP_PORT` pins one): `schedule_create/list/cancel` + `send_file_to_user` (agent→Telegram file/image, separate `registerFileSendTool`; an ambiguous post-invocation outcome is non-error structured content `{ kind: 'deliveryUnknown', retryable: false }`), HMAC bearer tokens scoped `thread:`/`dir:`. Because MCP cancellation is a separate HTTP notification while each transport is fresh, the HTTP server correlates by verified token + validated bounded client id + typed request id (verified-token fallback for legacy registrations), retains a bounded 30-second cancellation-before-registration tombstone set, and combines that controller with the SDK handler signal. Reports a short connect-time `instructions` (`mcpServerInstructions`, returned in the MCP `initialize` handshake) — a use-case pointer (when to reach for the server, what it can do); per-tool argument recipes stay in each tool's own `description`. NOTE: connect-time `instructions` + tool descriptions are cached by the client at connect — an already-running agent won't see edits until it reconnects; only tool RESULTS reflect live server code |
+| `scheduler/injection.ts` | Builders for injecting the bot's MCP entry into sessions: Claude `--mcp-config` object, OpenCode `POST /mcp` registration, each with a fresh UUID client header for cancellation isolation; inert until configured |
 | `scheduler/runLedger.ts` | Append-only JSONL run history (`DATA_DIR/scheduler-runs.jsonl`, 10MB→.1 rotation) |
 | `scheduler/directoryThreads.ts` | Inversion: directory → thread keys bound to it (the MCP `dir:` scope resolution). Matches each binding's CANONICAL workDir via `resolveBoundWorkDir`, so it touches the filesystem (`realpathSync`) and can throw — NOT a pure helper |
 | `scheduler/rebindResume.ts` | Pure rebind decision: resume a paused job from now, or drop an expired one-shot |

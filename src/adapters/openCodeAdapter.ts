@@ -1141,6 +1141,10 @@ function getOpenCodeContextUsedTokens(usage: unknown): number | null {
   return usage.input + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) + (outputTokens ?? 0);
 }
 
+function checkIsOpenCodePendingContextPlaceholder(finish: unknown, contextUsedTokens: number): boolean {
+  return contextUsedTokens === 0 && (typeof finish !== 'string' || !finish.trim());
+}
+
 function getOpenCodeRuntimeModel(providerID: unknown, modelID: unknown): OpenCodeModelOverride | null {
   if (
     typeof providerID !== 'string' ||
@@ -1173,6 +1177,7 @@ export function getLatestOpenCodeParentAssistantContext(
     if (info.error !== undefined && checkIsOpenCodeAbortError(getOpenCodeErrorMessage(info.error))) continue;
     const contextUsedTokens = getOpenCodeContextUsedTokens(info.tokens);
     if (contextUsedTokens === null) continue;
+    if (checkIsOpenCodePendingContextPlaceholder(info.finish, contextUsedTokens)) continue;
     const model = getOpenCodeRuntimeModel(info.providerID, info.modelID);
     latestContext = {
       messageId: info.id,
@@ -4356,7 +4361,12 @@ export class OpenCodeAdapter extends EventEmitter implements AgentAdapter {
       this.clearProviderRetryReplacementBoundary(session);
       session.isAwaitingProviderRetryAbortIdle = false;
       const contextUsedTokens = getOpenCodeContextUsedTokens(info.tokens);
-      if (typeof info.id === 'string' && info.id.trim() && contextUsedTokens !== null) {
+      if (
+        typeof info.id === 'string'
+        && info.id.trim()
+        && contextUsedTokens !== null
+        && !checkIsOpenCodePendingContextPlaceholder(info.finish, contextUsedTokens)
+      ) {
         session.parentAssistantObservationVersion += 1;
         const model = getOpenCodeRuntimeModel(info.providerID, info.modelID);
         session.latestParentRuntimeContext = {

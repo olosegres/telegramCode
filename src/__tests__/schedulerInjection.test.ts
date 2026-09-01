@@ -15,6 +15,8 @@
  * just "a string is present".
  */
 
+/** Test case: N/A — TelegramCode has no Jira tracker. */
+
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { keyToString, type ThreadKey } from '../types';
@@ -25,13 +27,17 @@ import {
   buildOpenCodeSchedulerMcpRegistration,
   schedulerMcpServerName,
 } from '../scheduler/injection';
-import { verifySchedulerMcpToken } from '../scheduler/mcpSurface';
+import {
+  schedulerMcpClientIdHeader,
+  verifySchedulerMcpToken,
+} from '../scheduler/mcpSurface';
 
 const secret = 'a'.repeat(64);
 const port = 4097;
 const threadKey: ThreadKey = { chatId: -1001234567890, threadId: 11 };
 const threadKeyString = keyToString(threadKey);
 const directory = '/work/project-x';
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /** Strip the `Bearer ` prefix from an Authorization header. */
 function bearerToken(authorization: string): string {
@@ -71,6 +77,7 @@ describe('scheduler MCP injection — Claude config (configured)', () => {
     assert.ok(entry, 'entry keyed by the scheduler server name');
     assert.equal(entry.type, 'http');
     assert.equal(entry.url, `http://127.0.0.1:${port}/mcp`);
+    assert.match(entry.headers[schedulerMcpClientIdHeader], uuidPattern);
 
     // Token verifies to the EXACT thread scope.
     const scope = verifySchedulerMcpToken(secret, bearerToken(entry.headers.Authorization));
@@ -91,6 +98,22 @@ describe('scheduler MCP injection — Claude config (configured)', () => {
     const token = bearerToken(config.mcpServers[schedulerMcpServerName].headers.Authorization);
     assert.equal(verifySchedulerMcpToken('b'.repeat(64), token), null);
   });
+
+  it('generates a fresh client identity for each Claude config', async () => {
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    const firstConfig = await buildClaudeSchedulerMcpConfig(threadKey);
+    const secondConfig = await buildClaudeSchedulerMcpConfig(threadKey);
+    assert.ok(firstConfig);
+    assert.ok(secondConfig);
+
+    const firstClientId = firstConfig.mcpServers[schedulerMcpServerName]
+      .headers[schedulerMcpClientIdHeader];
+    const secondClientId = secondConfig.mcpServers[schedulerMcpServerName]
+      .headers[schedulerMcpClientIdHeader];
+    assert.match(firstClientId, uuidPattern);
+    assert.match(secondClientId, uuidPattern);
+    assert.notEqual(firstClientId, secondClientId);
+  });
 });
 
 describe('scheduler MCP injection — OpenCode registration (configured)', () => {
@@ -103,6 +126,7 @@ describe('scheduler MCP injection — OpenCode registration (configured)', () =>
     assert.equal(registration.config.type, 'remote');
     assert.equal(registration.config.enabled, true);
     assert.equal(registration.config.url, `http://127.0.0.1:${port}/mcp`);
+    assert.match(registration.config.headers[schedulerMcpClientIdHeader], uuidPattern);
 
     // Token verifies to the EXACT directory scope.
     const scope = verifySchedulerMcpToken(secret, bearerToken(registration.config.headers.Authorization));
@@ -115,5 +139,19 @@ describe('scheduler MCP injection — OpenCode registration (configured)', () =>
     assert.ok(registration);
     const scope = verifySchedulerMcpToken(secret, bearerToken(registration.config.headers.Authorization));
     assert.deepEqual(scope, { kind: 'dir', directory: '/work/other' });
+  });
+
+  it('generates a fresh client identity for each OpenCode registration', async () => {
+    configureSchedulerMcpInjection({ getSecret: async () => secret, port });
+    const firstRegistration = await buildOpenCodeSchedulerMcpRegistration(directory);
+    const secondRegistration = await buildOpenCodeSchedulerMcpRegistration(directory);
+    assert.ok(firstRegistration);
+    assert.ok(secondRegistration);
+
+    const firstClientId = firstRegistration.config.headers[schedulerMcpClientIdHeader];
+    const secondClientId = secondRegistration.config.headers[schedulerMcpClientIdHeader];
+    assert.match(firstClientId, uuidPattern);
+    assert.match(secondClientId, uuidPattern);
+    assert.notEqual(firstClientId, secondClientId);
   });
 });

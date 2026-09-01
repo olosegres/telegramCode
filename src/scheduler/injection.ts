@@ -18,9 +18,11 @@
  * singleton, mirroring how `mcpSurface.ts` takes its deps injected.
  */
 
+import { randomUUID } from 'node:crypto';
 import { keyToString, type ThreadKey } from '../types';
 import {
   buildSchedulerMcpToken,
+  schedulerMcpClientIdHeader,
   schedulerMcpPath,
   type SchedulerScope,
 } from './mcpSurface';
@@ -92,7 +94,10 @@ export interface ClaudeSchedulerMcpConfig {
     [schedulerMcpServerName]: {
       type: 'http';
       url: string;
-      headers: { Authorization: string };
+      headers: {
+        Authorization: string;
+        [schedulerMcpClientIdHeader]: string;
+      };
     };
   };
 }
@@ -116,7 +121,10 @@ export async function buildClaudeSchedulerMcpConfig(
       [schedulerMcpServerName]: {
         type: 'http',
         url: buildSchedulerMcpUrl(injectionConfig.port),
-        headers: { Authorization: authorization },
+        headers: {
+          Authorization: authorization,
+          [schedulerMcpClientIdHeader]: randomUUID(),
+        },
       },
     },
   };
@@ -135,7 +143,10 @@ export interface OpenCodeSchedulerMcpRegistration {
     type: 'remote';
     url: string;
     enabled: true;
-    headers: { Authorization: string };
+    headers: {
+      Authorization: string;
+      [schedulerMcpClientIdHeader]: string;
+    };
   };
 }
 
@@ -159,7 +170,10 @@ export async function buildOpenCodeSchedulerMcpRegistration(
       type: 'remote',
       url: buildSchedulerMcpUrl(injectionConfig.port),
       enabled: true,
-      headers: { Authorization: authorization },
+      headers: {
+        Authorization: authorization,
+        [schedulerMcpClientIdHeader]: randomUUID(),
+      },
     },
   };
 }

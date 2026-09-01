@@ -941,6 +941,15 @@ export class StateStore {
     return this.state.messages[keyToString(key)]?.slice() ?? [];
   }
 
+  /** Append IDs to the bounded in-memory ring while the caller holds the key lock. */
+  private appendMessageIds(keyStr: string, messageIds: number[]): void {
+    const list = (this.state.messages[keyStr] ??= []);
+    list.push(...messageIds);
+    if (list.length > MESSAGE_ID_RING_CAP) {
+      this.state.messages[keyStr] = list.slice(-MESSAGE_ID_RING_CAP);
+    }
+  }
+
   /**
    * @description Append a message id to the per-thread tracking list and
    * trim to the most recent `MESSAGE_ID_RING_CAP`. Anything older falls off
@@ -950,20 +959,31 @@ export class StateStore {
   async pushMessageId(key: ThreadKey, msgId: number): Promise<void> {
     const k = keyToString(key);
     await this.withLock(key, async () => {
-      const list = (this.state.messages[k] ??= []);
-      list.push(msgId);
-      if (list.length > MESSAGE_ID_RING_CAP) {
-        this.state.messages[k] = list.slice(-MESSAGE_ID_RING_CAP);
-      }
+      this.appendMessageIds(k, [msgId]);
       this.scheduleSave();
     });
   }
 
-  async clearMessageIds(key: ThreadKey): Promise<void> {
+  /** Atomically append and durably persist one Telegram response's message IDs. */
+  async pushMessageIds(key: ThreadKey, messageIds: number[]): Promise<void> {
+    if (messageIds.length === 0) return;
     const k = keyToString(key);
     await this.withLock(key, async () => {
-      delete this.state.messages[k];
-      this.scheduleSave();
+      this.appendMessageIds(k, messageIds);
+      await this.flush();
+    });
+  }
+
+  /** Atomically hand tracked IDs to `/clear_messages` while later pushes remain tracked. */
+  async takeMessageIds(key: ThreadKey, additionalIds: number[] = []): Promise<number[]> {
+    const k = keyToString(key);
+    return this.withLock(key, async () => {
+      const messageIds = [...(this.state.messages[k] ?? []), ...additionalIds];
+      if (this.state.messages[k] !== undefined) {
+        delete this.state.messages[k];
+        this.scheduleSave();
+      }
+      return messageIds;
     });
   }
 

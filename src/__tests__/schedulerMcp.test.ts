@@ -12,22 +12,28 @@
  *     SDK Client + StreamableHTTPClientTransport using a valid thread-scope
  *     token → create (cron + once + N-times) → list → cancel → list empty;
  *     invalid token rejected; dir-scope with 2 bound threads requires threadKey;
- *     thread-scope create with a mismatching threadKey arg errors.
+ *     thread-scope create with a mismatching threadKey arg errors; the real
+ *     file-send service routes single MP4, mixed photo/video album, and
+ *     `as_file` MP4 calls through the exact typed Telegram gateway methods.
  *
  * The end-to-end test uses a REAL StateStore (state.test.ts fake-HOME idiom) and
- * fake armJob/disarmJob capturing calls, so the assertions are load-bearing:
- * a broken token verify, scope resolution, or tool handler fails the round-trip.
+ * fake armJob/disarmJob + Telegram gateway capturing calls, so the assertions
+ * are load-bearing: a broken token verify, scope resolution, tool handler, or
+ * MP4/media-group routing fails the round-trip.
  */
 
-import { test, beforeEach, afterEach, describe, it } from 'node:test';
+/** Test case: N/A — TelegramCode has no Jira tracker. */
+
+import { beforeEach, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import { StateStore } from '../state';
-import { keyToString, type ThreadKey } from '../types';
+import { keyToString } from '../types';
 import {
   buildSchedulerMcpToken,
   verifySchedulerMcpToken,
@@ -39,12 +45,25 @@ import {
   getSchedulerMcpPort,
   resolveSchedulerMcpPort,
   defaultSchedulerMcpPort,
+  createSchedulerMcpCancellationLifecycle,
+  schedulerMcpClientIdHeader,
+  schedulerMcpPendingCancellationMax,
+  schedulerMcpPendingCancellationTtlMs,
   type SchedulerScope,
   type SchedulerMcpHandle,
   type SchedulerMcpDeps,
 } from '../scheduler/mcpSurface';
 import { createServer, request, type ClientRequest } from 'node:http';
 import type { ScheduleRecord } from '../scheduler/types';
+import {
+  createSendFilesToThread,
+  type SendFilesToThread,
+  type SendFilesToThreadOptions,
+} from '../utils/fileSendService';
+import {
+  createFileSendTestRecorderGateway,
+  type RecordedFileSendGatewayCall,
+} from './fileSendTestRecorder';
 
 const secret = 'a'.repeat(64);
 const threadAKey = keyToString({ chatId: -1001234567890, threadId: 11 });
@@ -52,6 +71,7 @@ const threadBKey = keyToString({ chatId: -1001234567890, threadId: 22 });
 const nowMs = new Date(2026, 5, 6, 10, 0, 0).getTime();
 const schedulerMcpStopTimeoutMs = 1_000;
 const incompleteRequestBody = '{"jsonrpc":"2.0"';
+const linuxIt = process.platform === 'linux' ? it : it.skip;
 
 interface IncompleteHttpRequest {
   request: ClientRequest;
@@ -129,6 +149,7 @@ describe('createSchedulerMcpServer port binding', () => {
       disarmJob: () => {},
       getThreadsForDirectory: () => [],
       getThreadAdapterName: () => 'claude',
+      sendFilesToThread: async () => ({ ok: true, summary: 'unused' }),
       getSecret: async () => secret,
       port: takenPort,
     };
@@ -141,6 +162,166 @@ describe('createSchedulerMcpServer port binding', () => {
       await handle.stop();
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
+  });
+});
+
+// ─── cancellation correlation lifecycle ─────────────────────────────
+
+describe('scheduler MCP cancellation correlation lifecycle', () => {
+  const clientIdentity = 'token:verified-token:client:test-client';
+  let currentTimeMs = 1_000;
+
+  const invalidMaxTombstoneCases = [
+    { label: 'zero', value: 0 },
+    { label: 'negative', value: -1 },
+    { label: 'fractional', value: 1.5 },
+    { label: 'NaN', value: Number.NaN },
+    { label: 'Infinity', value: Number.POSITIVE_INFINITY },
+    { label: 'unsafe integer', value: Number.MAX_SAFE_INTEGER + 1 },
+  ];
+
+  function getNowMs(): number {
+    return currentTimeMs;
+  }
+
+  beforeEach(() => {
+    currentTimeMs = 1_000;
+  });
+
+  for (const invalidCase of invalidMaxTombstoneCases) {
+    it(`rejects a ${invalidCase.label} maxTombstones bound`, () => {
+      assert.throws(
+        () => createSchedulerMcpCancellationLifecycle({
+          getNowMs,
+          maxTombstones: invalidCase.value,
+        }),
+        /maxTombstones must be a positive safe integer/,
+      );
+    });
+  }
+
+  it('expires a pending cancellation before a later request registers', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({ getNowMs });
+    lifecycle.cancelRequest(clientIdentity, 41, 'cancel before registration');
+    currentTimeMs += schedulerMcpPendingCancellationTtlMs;
+
+    const requestRegistration = lifecycle.registerRequest(clientIdentity, 41);
+    assert.equal(requestRegistration.controller.signal.aborted, false);
+    requestRegistration.unregister();
+  });
+
+  it('bounds pending cancellations and evicts the oldest tombstone first', () => {
+    assert.equal(schedulerMcpPendingCancellationMax, 1_000, 'production keeps the 1,000-entry bound');
+    const lifecycle = createSchedulerMcpCancellationLifecycle({
+      getNowMs,
+      maxTombstones: 2,
+    });
+    lifecycle.cancelRequest(clientIdentity, 1, 'oldest');
+    lifecycle.cancelRequest(clientIdentity, 2, 'middle');
+    lifecycle.cancelRequest(clientIdentity, 3, 'newest');
+
+    const oldest = lifecycle.registerRequest(clientIdentity, 1);
+    const middle = lifecycle.registerRequest(clientIdentity, 2);
+    const newest = lifecycle.registerRequest(clientIdentity, 3);
+    assert.equal(oldest.controller.signal.aborted, false, 'the oldest pending cancellation must be evicted');
+    assert.equal(middle.controller.signal.aborted, true);
+    assert.equal(newest.controller.signal.aborted, true);
+    oldest.unregister();
+    middle.unregister();
+    newest.unregister();
+  });
+
+  it('isolates pending cancellations by token, client, and typed request ID', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({ getNowMs });
+    lifecycle.cancelRequest(clientIdentity, 7, 'exact correlation only');
+
+    const otherToken = lifecycle.registerRequest('token:other-token:client:test-client', 7);
+    const otherClient = lifecycle.registerRequest('token:verified-token:client:other-client', 7);
+    const stringId = lifecycle.registerRequest(clientIdentity, '7');
+    const exactMatch = lifecycle.registerRequest(clientIdentity, 7);
+    assert.equal(otherToken.controller.signal.aborted, false);
+    assert.equal(otherClient.controller.signal.aborted, false);
+    assert.equal(stringId.controller.signal.aborted, false);
+    assert.equal(exactMatch.controller.signal.aborted, true);
+    otherToken.unregister();
+    otherClient.unregister();
+    stringId.unregister();
+    exactMatch.unregister();
+  });
+
+  it('expires a recent completion before an unmatched cancellation arrives', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({ getNowMs });
+    const completed = lifecycle.registerRequest(clientIdentity, 51);
+    completed.markTerminal();
+    completed.unregister();
+    currentTimeMs += schedulerMcpPendingCancellationTtlMs;
+
+    lifecycle.cancelRequest(clientIdentity, 51, 'late cancellation after completion expiry');
+    const laterRequest = lifecycle.registerRequest(clientIdentity, 51);
+    assert.equal(laterRequest.controller.signal.aborted, true, 'the expired completion must not suppress cancellation');
+    laterRequest.unregister();
+  });
+
+  it('cancels an active reused request even while a recent completion remains', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({ getNowMs });
+    const completed = lifecycle.registerRequest(clientIdentity, 52);
+    completed.markTerminal();
+    completed.unregister();
+
+    const reused = lifecycle.registerRequest(clientIdentity, 52);
+    assert.equal(reused.controller.signal.aborted, false);
+    lifecycle.cancelRequest(clientIdentity, 52, 'cancel active reused generation');
+    assert.equal(reused.controller.signal.aborted, true, 'an active controller must take precedence over a tombstone');
+    reused.unregister();
+  });
+
+  it('ignores a late cancellation for an inactive recently completed request', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({ getNowMs });
+    const completed = lifecycle.registerRequest(clientIdentity, 53);
+    completed.markTerminal();
+    completed.unregister();
+
+    lifecycle.cancelRequest(clientIdentity, 53, 'late cancellation for completed generation');
+    const reused = lifecycle.registerRequest(clientIdentity, 53);
+    assert.equal(reused.controller.signal.aborted, false, 'late cancellation must not create a pending tombstone');
+    reused.unregister();
+  });
+
+  it('does not refresh recent-completion expiry when terminal marking repeats', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({ getNowMs });
+    const completed = lifecycle.registerRequest(clientIdentity, 54);
+    const terminalTimeMs = currentTimeMs;
+    completed.markTerminal();
+    currentTimeMs += 1;
+    completed.markTerminal();
+    completed.unregister();
+    currentTimeMs = terminalTimeMs + schedulerMcpPendingCancellationTtlMs;
+
+    lifecycle.cancelRequest(clientIdentity, 54, 'late cancellation after original terminal expiry');
+    const reused = lifecycle.registerRequest(clientIdentity, 54);
+    assert.equal(reused.controller.signal.aborted, true, 'repeated terminal marking must not extend the tombstone TTL');
+    reused.unregister();
+  });
+
+  it('bounds recent completions and evicts the oldest tombstone first', () => {
+    const lifecycle = createSchedulerMcpCancellationLifecycle({
+      getNowMs,
+      maxTombstones: 2,
+    });
+    for (const requestId of [61, 62, 63]) {
+      const registration = lifecycle.registerRequest(clientIdentity, requestId);
+      registration.markTerminal();
+      registration.unregister();
+    }
+
+    lifecycle.cancelRequest(clientIdentity, 62, 'retained completion suppresses this inactive cancellation');
+    lifecycle.cancelRequest(clientIdentity, 61, 'oldest completion was evicted');
+    const oldestReused = lifecycle.registerRequest(clientIdentity, 61);
+    const retainedReused = lifecycle.registerRequest(clientIdentity, 62);
+    assert.equal(oldestReused.controller.signal.aborted, true);
+    assert.equal(retainedReused.controller.signal.aborted, false, 'the retained completion must suppress a late cancellation');
+    oldestReused.unregister();
+    retainedReused.unregister();
   });
 });
 
@@ -374,11 +555,30 @@ interface ServerFixture {
   armed: ScheduleRecord[];
   disarmed: string[];
   boundThreads: Map<string, string[]>;
+  fileWorkDir: string;
+  fileSendGatewayCalls: Array<RecordedFileSendGatewayCall<string>>;
+  recordedMessageIds: number[];
+  fileSendCalls: Array<{ threadKey: string; options: SendFilesToThreadOptions }>;
+  fileSendHandler: { current: SendFilesToThread };
 }
 
-async function buildClient(port: number, token: string | null): Promise<Client> {
+const mcpSingleMessageId = 301;
+const mcpAlbumMessageIds = [401, 402];
+const mcpSingleMessageIds = {
+  sendPhoto: mcpSingleMessageId,
+  sendAnimation: mcpSingleMessageId,
+  sendVideo: mcpSingleMessageId,
+  sendDocument: mcpSingleMessageId,
+};
+
+async function buildClient(
+  port: number,
+  token: string | null,
+  clientId?: string,
+): Promise<Client> {
   const client = new Client({ name: 'test-agent', version: '1.0.0' });
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+  if (clientId !== undefined) headers[schedulerMcpClientIdHeader] = clientId;
   const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
     requestInit: { headers },
   });
@@ -386,10 +586,110 @@ async function buildClient(port: number, token: string | null): Promise<Client> 
   return client;
 }
 
+function sendCancellationNotification(
+  port: number,
+  token: string,
+  clientId: string,
+  requestId: number,
+  reason = 'pre-cancelled by test',
+): Promise<void> {
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'notifications/cancelled',
+    params: { requestId, reason },
+  });
+  return new Promise((resolve, reject) => {
+    const cancellationRequest = request({
+      host: '127.0.0.1',
+      port,
+      path: '/mcp',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        [schedulerMcpClientIdHeader]: clientId,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'Content-Length': Buffer.byteLength(body).toString(),
+      },
+    }, (response) => {
+      response.resume();
+      response.once('end', () => {
+        if ((response.statusCode ?? 500) >= 400) {
+          reject(new Error(`cancellation notification failed with ${response.statusCode}`));
+          return;
+        }
+        resolve();
+      });
+    });
+    cancellationRequest.once('error', reject);
+    cancellationRequest.end(body);
+  });
+}
+
+interface RawHttpResponse {
+  statusCode: number;
+  body: string;
+}
+
+interface RawFileSendCall {
+  request: ClientRequest;
+  response: Promise<RawHttpResponse>;
+}
+
+function startRawFileSendCall(
+  port: number,
+  token: string,
+  clientId: string,
+  requestId: number,
+  filePath: string,
+): RawFileSendCall {
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    id: requestId,
+    method: 'tools/call',
+    params: {
+      name: 'send_file_to_user',
+      arguments: { paths: [filePath] },
+    },
+  });
+  let resolveResponse = (_response: RawHttpResponse): void => {};
+  let rejectResponse = (_error: Error): void => {};
+  const response = new Promise<RawHttpResponse>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  const fileSendRequest = request({
+    host: '127.0.0.1',
+    port,
+    path: '/mcp',
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      [schedulerMcpClientIdHeader]: clientId,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      'Content-Length': Buffer.byteLength(body).toString(),
+    },
+  }, (incomingResponse) => {
+    const chunks: string[] = [];
+    incomingResponse.setEncoding('utf8');
+    incomingResponse.on('data', (chunk: string) => chunks.push(chunk));
+    incomingResponse.once('end', () => {
+      resolveResponse({
+        statusCode: incomingResponse.statusCode ?? 500,
+        body: chunks.join(''),
+      });
+    });
+  });
+  fileSendRequest.once('error', rejectResponse);
+  fileSendRequest.end(body);
+  return { request: fileSendRequest, response };
+}
+
 /** First text content block of a tool result. */
-function firstText(result: { content: unknown }): string {
-  const content = result.content as { type: string; text?: string }[];
-  const block = content.find((c) => c.type === 'text');
+function firstText(result: Awaited<ReturnType<Client['callTool']>>): string {
+  const parsedResult = CallToolResultSchema.parse(result);
+  const block = parsedResult.content.find((content) => content.type === 'text');
   return block?.text ?? '';
 }
 
@@ -407,6 +707,29 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     const armed: ScheduleRecord[] = [];
     const disarmed: string[] = [];
     const boundThreads = new Map<string, string[]>();
+    const fileWorkDir = path.join(fakeHome, 'bound-project');
+    fs.mkdirSync(fileWorkDir);
+    const fileSendGatewayCalls: Array<RecordedFileSendGatewayCall<string>> = [];
+    const recordedMessageIds: number[] = [];
+    const defaultSendFilesToThread = createSendFilesToThread({
+      resolveTargetAndWorkDir: (threadKey) =>
+        threadKey === threadAKey
+          ? { ok: true, target: threadKey, workDir: fileWorkDir }
+          : { ok: false, error: `invalid threadKey "${threadKey}"` },
+      gateway: createFileSendTestRecorderGateway(fileSendGatewayCalls, {
+        singleMessageIds: mcpSingleMessageIds,
+        albumMessageIds: mcpAlbumMessageIds,
+      }),
+      recordMessageIds: async (_target, messageIds) => {
+        recordedMessageIds.push(...messageIds);
+      },
+    });
+    const fileSendCalls: Array<{ threadKey: string; options: SendFilesToThreadOptions }> = [];
+    const fileSendHandler = { current: defaultSendFilesToThread };
+    const sendFilesToThread: SendFilesToThread = (threadKey, options) => {
+      fileSendCalls.push({ threadKey, options });
+      return fileSendHandler.current(threadKey, options);
+    };
 
     const deps: SchedulerMcpDeps = {
       store,
@@ -414,12 +737,24 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
       disarmJob: (jobId) => disarmed.push(jobId),
       getThreadsForDirectory: (directory) => boundThreads.get(directory) ?? [],
       getThreadAdapterName: () => 'claude',
+      sendFilesToThread,
       getSecret: async () => secret,
       port: 0,
     };
     const handle = createSchedulerMcpServer(deps);
     await handle.start();
-    return { handle, store, armed, disarmed, boundThreads };
+    return {
+      handle,
+      store,
+      armed,
+      disarmed,
+      boundThreads,
+      fileWorkDir,
+      fileSendGatewayCalls,
+      recordedMessageIds,
+      fileSendCalls,
+      fileSendHandler,
+    };
   }
 
   beforeEach(async () => {
@@ -491,6 +826,427 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     const toolNames = (await client.listTools()).tools.map((tool) => tool.name);
     assert.ok(toolNames.includes('send_file_to_user'), 'file-send tool should be listed as send_file_to_user');
     assert.ok(!toolNames.includes('send_file'), 'the old send_file name must not be exposed anymore');
+  });
+
+  linuxIt('send_file_to_user routes a single MP4 to sendVideo with its caption', async () => {
+    fs.writeFileSync(path.join(fixture.fileWorkDir, 'clip.mp4'), 'video');
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['clip.mp4'], caption: 'clip caption' },
+      });
+      assert.notEqual(result.isError, true, firstText(result));
+      assert.deepEqual(fixture.fileSendGatewayCalls, [
+        {
+          method: 'sendVideo',
+          target: threadAKey,
+          source: { filename: 'clip.mp4', sizeBytes: 5, contents: 'video' },
+          caption: 'clip caption',
+        },
+      ]);
+      assert.deepEqual(fixture.recordedMessageIds, [mcpSingleMessageId]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  linuxIt('send_file_to_user routes a PNG+MP4 album as photo then video with one caption', async () => {
+    fs.writeFileSync(path.join(fixture.fileWorkDir, 'chart.png'), 'photo');
+    fs.writeFileSync(path.join(fixture.fileWorkDir, 'clip.mp4'), 'video');
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['chart.png', 'clip.mp4'], caption: 'album caption' },
+      });
+      assert.notEqual(result.isError, true, firstText(result));
+      assert.deepEqual(fixture.fileSendGatewayCalls, [
+        {
+          method: 'sendMediaGroup',
+          target: threadAKey,
+          mediaGroup: {
+            kind: 'photoVideo',
+            media: [
+              {
+                type: 'photo',
+                media: { filename: 'chart.png', sizeBytes: 5, contents: 'photo' },
+                caption: 'album caption',
+              },
+              {
+                type: 'video',
+                media: { filename: 'clip.mp4', sizeBytes: 5, contents: 'video' },
+              },
+            ],
+          },
+        },
+      ]);
+      assert.deepEqual(fixture.recordedMessageIds, mcpAlbumMessageIds);
+    } finally {
+      await client.close();
+    }
+  });
+
+  linuxIt('send_file_to_user routes an as_file MP4 to sendDocument', async () => {
+    fs.writeFileSync(path.join(fixture.fileWorkDir, 'clip.mp4'), 'video');
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['clip.mp4'], as_file: true },
+      });
+      assert.notEqual(result.isError, true, firstText(result));
+      assert.deepEqual(fixture.fileSendGatewayCalls, [
+        {
+          method: 'sendDocument',
+          target: threadAKey,
+          source: { filename: 'clip.mp4', sizeBytes: 5, contents: 'video' },
+        },
+      ]);
+      assert.deepEqual(fixture.recordedMessageIds, [mcpSingleMessageId]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  linuxIt('directory-scoped send_file_to_user forwards its canonical authorized directory', async () => {
+    fs.writeFileSync(path.join(fixture.fileWorkDir, 'clip.mp4'), 'video');
+    fixture.boundThreads.set(fixture.fileWorkDir, [threadAKey]);
+    const token = buildSchedulerMcpToken(secret, {
+      kind: 'dir',
+      directory: fixture.fileWorkDir,
+    });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['clip.mp4'] },
+      });
+
+      assert.notEqual(result.isError, true, firstText(result));
+      assert.equal(fixture.fileSendCalls.length, 1);
+      assert.equal(fixture.fileSendCalls[0].threadKey, threadAKey);
+      assert.equal(fixture.fileSendCalls[0].options.authorizedWorkDir, fixture.fileWorkDir);
+      assert.ok(fixture.fileSendCalls[0].options.signal instanceof AbortSignal);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('returns deliveryUnknown as machine-readable non-error output that forbids retry', async () => {
+    fixture.fileSendHandler.current = async () => ({
+      ok: false,
+      kind: 'deliveryUnknown',
+      error: 'Telegram may already have accepted this delivery; MUST NOT retry automatically.',
+    });
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['ambiguous.bin'] },
+      });
+      const parsedResult = CallToolResultSchema.parse(result);
+
+      assert.notEqual(parsedResult.isError, true, firstText(result));
+      assert.deepEqual(parsedResult.structuredContent, {
+        kind: 'deliveryUnknown',
+        retryable: false,
+      });
+      assert.match(firstText(result), /must not retry automatically/i);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('canceling a real HTTP file-send call aborts the service signal', async () => {
+    let markFileSendStarted = () => {};
+    let markServerSignalAborted = () => {};
+    const fileSendStarted = new Promise<void>((resolve) => { markFileSendStarted = resolve; });
+    const serverSignalAborted = new Promise<void>((resolve) => { markServerSignalAborted = resolve; });
+    fixture.fileSendHandler.current = async (_threadKey, options) => {
+      const signal = options.signal;
+      assert.ok(signal, 'the MCP request signal must reach the file-send service');
+      markFileSendStarted();
+      return new Promise((_resolve, reject) => {
+        const handleAbort = () => {
+          markServerSignalAborted();
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', handleAbort, { once: true });
+        if (signal.aborted) handleAbort();
+      });
+    };
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    const controller = new AbortController();
+    try {
+      const result = client.callTool(
+        {
+          name: 'send_file_to_user',
+          arguments: { paths: ['unused.bin'] },
+        },
+        CallToolResultSchema,
+        { signal: controller.signal },
+      );
+      await fileSendStarted;
+      controller.abort();
+
+      await assert.rejects(result, /AbortError: This operation was aborted/);
+      assert.equal(
+        await checkPromiseResolvesWithin(serverSignalAborted, schedulerMcpStopTimeoutMs),
+        true,
+        'the canceled HTTP request must abort the server-side tool signal',
+      );
+    } finally {
+      controller.abort();
+      await client.close();
+    }
+  });
+
+  it('suppresses an inactive late cancellation but cancels the active reused request', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const clientId = 'reused-request-client';
+    fixture.fileSendHandler.current = async () => ({ ok: true, summary: 'first completed' });
+    const firstClient = await buildClient(fixture.handle.port, token, clientId);
+    try {
+      const firstResult = await firstClient.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['first.bin'] },
+      });
+      assert.equal(firstText(firstResult), 'first completed');
+    } finally {
+      await firstClient.close();
+    }
+
+    await sendCancellationNotification(
+      fixture.handle.port,
+      token,
+      clientId,
+      1,
+      'stale cancellation for the inactive completed generation',
+    );
+
+    let markReusedRequestStarted = () => {};
+    let markReusedRequestAborted = () => {};
+    const reusedRequestStarted = new Promise<void>((resolve) => {
+      markReusedRequestStarted = resolve;
+    });
+    const reusedRequestAborted = new Promise<void>((resolve) => {
+      markReusedRequestAborted = resolve;
+    });
+    let reusedRequestSignal: AbortSignal | undefined;
+    fixture.fileSendHandler.current = async (_threadKey, options) => {
+      const signal = options.signal;
+      assert.ok(signal);
+      reusedRequestSignal = signal;
+      markReusedRequestStarted();
+      return new Promise((_resolve, reject) => {
+        const handleAbort = () => {
+          markReusedRequestAborted();
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', handleAbort, { once: true });
+        if (signal.aborted) handleAbort();
+      });
+    };
+
+    const reusedClient = await buildClient(fixture.handle.port, token, clientId);
+    try {
+      const reusedResultSettled = reusedClient.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['reused.bin'] },
+      }).then(() => undefined, () => undefined);
+      await reusedRequestStarted;
+      assert.equal(
+        reusedRequestSignal?.aborted,
+        false,
+        'the inactive late cancellation must not poison the reused request',
+      );
+
+      await sendCancellationNotification(
+        fixture.handle.port,
+        token,
+        clientId,
+        1,
+        'legitimate cancellation for the active reused generation',
+      );
+      assert.equal(
+        await checkPromiseResolvesWithin(reusedRequestAborted, schedulerMcpStopTimeoutMs),
+        true,
+        'the active reused request must receive its legitimate cancellation',
+      );
+      assert.equal(reusedRequestSignal?.aborted, true);
+      await reusedResultSettled;
+    } finally {
+      await reusedClient.close();
+    }
+  });
+
+  it('records abnormal response closure before abort so late cancellation cannot poison ID reuse', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const clientId = 'abnormal-close-client';
+    const requestId = 77;
+    let markFirstRequestStarted = () => {};
+    let markFirstRequestAborted = () => {};
+    const firstRequestStarted = new Promise<void>((resolve) => {
+      markFirstRequestStarted = resolve;
+    });
+    const firstRequestAborted = new Promise<void>((resolve) => {
+      markFirstRequestAborted = resolve;
+    });
+    let firstRequestSignal: AbortSignal | undefined;
+    let wasReusedRequestAbortedOnEntry: boolean | undefined;
+    let serviceCallCount = 0;
+    fixture.fileSendHandler.current = async (_threadKey, options) => {
+      const signal = options.signal;
+      assert.ok(signal);
+      serviceCallCount += 1;
+      if (serviceCallCount === 1) {
+        firstRequestSignal = signal;
+        markFirstRequestStarted();
+        return new Promise((_resolve, reject) => {
+          const handleAbort = () => {
+            markFirstRequestAborted();
+            reject(signal.reason);
+          };
+          signal.addEventListener('abort', handleAbort, { once: true });
+          if (signal.aborted) handleAbort();
+        });
+      }
+
+      wasReusedRequestAbortedOnEntry = signal.aborted;
+      assert.equal(signal.aborted, false, 'the late cancellation must not pre-cancel the reused request');
+      return { ok: true, summary: 'reused request entered un-aborted' };
+    };
+
+    const abnormalCall = startRawFileSendCall(
+      fixture.handle.port,
+      token,
+      clientId,
+      requestId,
+      'abnormal.bin',
+    );
+    void abnormalCall.response.catch(() => undefined);
+    await firstRequestStarted;
+    abnormalCall.request.destroy();
+
+    assert.equal(
+      await checkPromiseResolvesWithin(firstRequestAborted, schedulerMcpStopTimeoutMs),
+      true,
+      'abnormal client closure must abort the active server signal',
+    );
+    assert.equal(firstRequestSignal?.aborted, true);
+
+    await sendCancellationNotification(
+      fixture.handle.port,
+      token,
+      clientId,
+      requestId,
+      'late cancellation after abnormal closure',
+    );
+    const reusedCall = startRawFileSendCall(
+      fixture.handle.port,
+      token,
+      clientId,
+      requestId,
+      'reused-after-abnormal.bin',
+    );
+    const reusedResponse = await reusedCall.response;
+
+    assert.equal(reusedResponse.statusCode, 200, reusedResponse.body);
+    assert.equal(serviceCallCount, 2, 'the reused call must enter the service');
+    assert.equal(wasReusedRequestAbortedOnEntry, false);
+  });
+
+  it('isolates equal request IDs from two clients that share one bearer token', async () => {
+    const serverSignals: AbortSignal[] = [];
+    const startedResolvers: Array<() => void> = [];
+    const abortedResolvers: Array<() => void> = [];
+    const started = [0, 1].map(() => new Promise<void>((resolve) => {
+      startedResolvers.push(resolve);
+    }));
+    const aborted = [0, 1].map(() => new Promise<void>((resolve) => {
+      abortedResolvers.push(resolve);
+    }));
+    let releaseSecond = () => {};
+    fixture.fileSendHandler.current = async (_threadKey, options) => {
+      const signal = options.signal;
+      assert.ok(signal);
+      const callIndex = serverSignals.length;
+      serverSignals.push(signal);
+      startedResolvers[callIndex]();
+      return new Promise((resolve, reject) => {
+        const handleAbort = () => {
+          abortedResolvers[callIndex]();
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', handleAbort, { once: true });
+        if (signal.aborted) handleAbort();
+        if (callIndex === 1) {
+          releaseSecond = () => resolve({ ok: true, summary: 'second delivered' });
+        }
+      });
+    };
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const firstClient = await buildClient(fixture.handle.port, token, 'client-a');
+    const secondClient = await buildClient(fixture.handle.port, token, 'client-b');
+    const firstController = new AbortController();
+    try {
+      const firstResult = firstClient.callTool(
+        { name: 'send_file_to_user', arguments: { paths: ['first.bin'] } },
+        CallToolResultSchema,
+        { signal: firstController.signal },
+      );
+      await started[0];
+      const secondResult = secondClient.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['second.bin'] },
+      });
+      await started[1];
+
+      firstController.abort();
+      await assert.rejects(firstResult, /AbortError: This operation was aborted/);
+      assert.equal(
+        await checkPromiseResolvesWithin(aborted[0], schedulerMcpStopTimeoutMs),
+        true,
+        'the canceled client must abort its server request',
+      );
+      assert.equal(serverSignals[0].aborted, true);
+      assert.equal(serverSignals[1].aborted, false, 'one client must not cancel another client\'s equal request ID');
+
+      releaseSecond();
+      const secondToolResult = await secondResult;
+      assert.notEqual(secondToolResult.isError, true, firstText(secondToolResult));
+      assert.equal(firstText(secondToolResult), 'second delivered');
+    } finally {
+      firstController.abort();
+      releaseSecond();
+      await firstClient.close();
+      await secondClient.close();
+    }
+  });
+
+  it('applies a cancellation notification that arrives before request registration', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const clientId = 'pre-cancel-client';
+    await sendCancellationNotification(fixture.handle.port, token, clientId, 1);
+    const client = await buildClient(fixture.handle.port, token, clientId);
+    try {
+      const result = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: ['must-not-send.bin'] },
+      });
+
+      assert.equal(result.isError, true);
+      assert.match(firstText(result), /abort|cancel/i);
+      assert.equal(fixture.fileSendCalls.length, 0, 'a pre-cancelled request must not enter the service');
+    } finally {
+      await client.close();
+    }
   });
 
   it('thread-scope: create (cron + once + N-times) → list → cancel → list empty', async () => {

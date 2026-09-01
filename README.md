@@ -504,12 +504,36 @@ The bot injects its own `telegramBot` MCP server into every bot-started session
 — for Claude via a generated `--mcp-config`, for OpenCode via runtime
 registration. It is loopback-only (`127.0.0.1`, on an OS-chosen free port unless
 `SCHEDULER_MCP_PORT` explicitly pins one) and authenticated with per-session
-HMAC bearer tokens scoped to the thread / directory. It exposes:
+HMAC bearer tokens scoped to the thread / directory. Every generated registration
+also carries a unique client identity, so cancellation affects only the originating
+agent even when two clients use the same JSON-RPC request id. It exposes:
 
 - `schedule_create` / `schedule_list` / `schedule_cancel` — the agent-side
   scheduling API behind `/schedule`;
-- `send_file_to_user` — lets the agent push a file or image from the bound folder into
-  the topic (photo/animation/document, albums, size caps).
+- `send_file_to_user` — lets the agent push files from the bound folder into the
+  topic. A single MP4 uses Bot API `sendVideo`; eligible all-video and mixed
+  photo/video albums use `sendMediaGroup`, with each MP4 represented by an
+  `InputMediaVideo` entry. `as_file:true` explicitly forces documents. Secure
+  outbound file traversal currently requires Linux; on macOS this tool
+  fails closed until a native descriptor-relative bridge is available. Existing
+  path, count, caption, and size caps apply; canonical upload basenames have
+  control characters and quoted-string metacharacters replaced before they enter multipart headers. Cancelling
+  the MCP call removes queued work. While any upload stream is still being
+  consumed, cancellation destroys the streams and aborts Telegraf, then returns
+  `AbortError` after terminal cleanup. Once every request-body stream has ended,
+  cancellation is too late to abort safely: the operation awaits Telegram's
+  response, and any returned message IDs are durably recorded before success.
+  Directory-scoped
+  calls re-check the topic binding both before opening files and inside the
+  per-topic delivery queue immediately before dispatch, so a queued call cannot
+  continue after the topic is rebound elsewhere. Delivery and its durable
+  `/clear_messages` tracking update share one per-topic queue transaction; the
+  complete response-ID batch is on disk before success is reported. If Telegram
+  has accepted a delivery but local tracking/cleanup then fails, the tool returns
+  success with a warning and never retries. If the connection fails after an
+  upload starts and Telegram's response never arrives, the tool returns a
+  machine-readable, non-error `deliveryUnknown` outcome with `retryable:false`,
+  preventing accidental duplicates.
 
 This server is bot-owned plumbing; if its port fails to bind, the bot still
 boots — only these agent-facing tools go inert. (Your own MCP servers still work

@@ -15,6 +15,8 @@
  * `afterEach`.
  */
 
+/** Test case: N/A — TelegramCode has no Jira tracker. */
+
 import { test, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -713,4 +715,53 @@ test('chatTelegramLocale: persists separately from an explicit override', async 
   await second.init();
   assert.equal(second.getChatTelegramLocale(key1.chatId), 'pt');
   assert.equal(second.getChatLocaleOverride(key1.chatId), 'ru');
+});
+
+test('pushMessageIds and pushMessageId append in response order through the same bounded ring', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+
+  await store.pushMessageIds(key1, [101, 102, 103]);
+  await store.pushMessageId(key1, 104);
+  await store.flush();
+
+  assert.deepEqual(store.getMessageIds(key1), [101, 102, 103, 104]);
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.deepEqual(raw.messages[keyToString(key1)], [101, 102, 103, 104]);
+});
+
+test('pushMessageIds persists the complete response batch before it resolves', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 60_000 });
+  await store.init();
+
+  try {
+    await store.pushMessageIds(key1, [111, 112, 113]);
+
+    const reloaded = new StateStore(dataDir, { saveDebounceMs: 60_000 });
+    await reloaded.init();
+    assert.deepEqual(
+      reloaded.getMessageIds(key1),
+      [111, 112, 113],
+      'a caller may report delivery only after the whole Telegram response is on disk',
+    );
+  } finally {
+    await store.flush();
+  }
+});
+
+test('takeMessageIds atomically hands off tracked plus additional IDs while preserving a concurrent push', async () => {
+  const store = new StateStore(dataDir, { saveDebounceMs: 5 });
+  await store.init();
+  await store.pushMessageIds(key1, [201, 202]);
+
+  const takenPromise = store.takeMessageIds(key1, [203]);
+  const concurrentPush = store.pushMessageIds(key1, [204, 205]);
+
+  assert.deepEqual(await takenPromise, [201, 202, 203]);
+  await concurrentPush;
+  assert.deepEqual(
+    store.getMessageIds(key1),
+    [204, 205],
+    'messages recorded after the handoff must survive for the next clear',
+  );
 });

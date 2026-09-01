@@ -16,6 +16,8 @@
  * inert case asserts the EXACT flag array so a stray flag fails.
  */
 
+/** Test case: N/A — TelegramCode has no Jira tracker. */
+
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'fs';
@@ -28,7 +30,10 @@ import {
   resetSchedulerMcpInjection,
   schedulerMcpServerName,
 } from '../scheduler/injection';
-import { verifySchedulerMcpToken } from '../scheduler/mcpSurface';
+import {
+  schedulerMcpClientIdHeader,
+  verifySchedulerMcpToken,
+} from '../scheduler/mcpSurface';
 
 const secret = 'a'.repeat(64);
 const port = 4097;
@@ -99,6 +104,10 @@ describe('prepareMcpFlags — scheduler injection configured', () => {
     assert.ok(entry);
     assert.equal(entry.type, 'http');
     assert.equal(entry.url, `http://127.0.0.1:${port}/mcp`);
+    assert.match(
+      entry.headers[schedulerMcpClientIdHeader],
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
 
     const authorization: string = entry.headers.Authorization;
     assert.match(authorization, /^Bearer /);

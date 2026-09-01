@@ -15,6 +15,8 @@
  * without waiting real 2 s windows.
  */
 
+/** Test case: N/A — TelegramCode has no Jira tracker. */
+
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
@@ -45,18 +47,29 @@ __setGlobalPacerForTest(new GlobalSendPacer(1));
  * when the test calls `advance`, which both moves `now` and fires every timer
  * whose deadline has passed. No real `setTimeout`, so pacing tests run instantly.
  */
-function createFakeClock(): PacerClock & { advance: (ms: number) => void } {
+interface FakePacerClock extends PacerClock {
+  advance: (ms: number) => void;
+  advanceWithoutRunningTimers: (ms: number) => void;
+  runDueTimers: () => void;
+}
+
+function createFakeClock(): FakePacerClock {
   let current = 0;
   let timers: Array<{ at: number; fn: () => void }> = [];
+  const runDueTimers = () => {
+    const due = timers.filter(t => t.at <= current).sort((a, b) => a.at - b.at);
+    timers = timers.filter(t => t.at > current);
+    for (const t of due) t.fn();
+  };
   return {
     now: () => current,
     setTimeout: (fn, ms) => { timers.push({ at: current + ms, fn }); },
     advance: (ms) => {
       current += ms;
-      const due = timers.filter(t => t.at <= current).sort((a, b) => a.at - b.at);
-      timers = timers.filter(t => t.at > current);
-      for (const t of due) t.fn();
+      runDueTimers();
     },
+    advanceWithoutRunningTimers: (ms) => { current += ms; },
+    runDueTimers,
   };
 }
 
@@ -167,6 +180,64 @@ test('S1: pending count reflects parked waiters', async () => {
   assert.equal(pacer.getPendingCount(), 2, 'two sends parked behind the gate');
 });
 
+test('S1: canceling a parked waiter removes only that waiter and preserves survivor order', async () => {
+  const clock = createFakeClock();
+  const pacer = new GlobalSendPacer(globalSendIntervalMs, clock);
+  const canceledController = new AbortController();
+  const granted: string[] = [];
+
+  await pacer.acquire();
+  const first = pacer.acquire().then(() => granted.push('first'));
+  const canceled = pacer.acquire(canceledController.signal);
+  const third = pacer.acquire().then(() => granted.push('third'));
+
+  assert.equal(pacer.getPendingCount(), 3);
+  canceledController.abort();
+  await assert.rejects(canceled, { name: 'AbortError' });
+  assert.equal(pacer.getPendingCount(), 2, 'the canceled waiter must leave the pacer queue');
+
+  clock.advance(globalSendIntervalMs);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(granted, ['first']);
+
+  clock.advance(globalSendIntervalMs);
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.all([first, third]);
+  assert.deepEqual(granted, ['first', 'third'], 'the surviving waiter must not be overtaken');
+});
+
+test('S1: a canceled last waiter cannot leave a stale timer that grants a later waiter early', async () => {
+  const clock = createFakeClock();
+  const pacer = new GlobalSendPacer(globalSendIntervalMs, clock);
+  const canceledController = new AbortController();
+
+  await pacer.acquire();
+  const canceled = pacer.acquire(canceledController.signal);
+  canceledController.abort();
+  await assert.rejects(canceled, { name: 'AbortError' });
+
+  // Simulate an overdue timer callback whose event-loop turn has not run yet.
+  clock.advanceWithoutRunningTimers(globalSendIntervalMs);
+  await pacer.acquire();
+
+  let survivorGranted = false;
+  const survivor = pacer.acquire().then(() => { survivorGranted = true; });
+  clock.runDueTimers();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(
+    survivorGranted,
+    false,
+    'the canceled waiter\'s stale timer must not grant against the new pacing window',
+  );
+
+  clock.advance(globalSendIntervalMs);
+  await survivor;
+  assert.equal(survivorGranted, true);
+});
+
 // ── enqueueSend: per-thread FIFO ordering + cross-thread independence ───────
 
 test('enqueueSend runs a thread\'s sends in queue order', async () => {
@@ -233,6 +304,91 @@ test('parallel-threads: per-thread ordering preserved even with two threads in s
   assert.deepEqual(bOrder, [1, 2, 3], 'thread B order must be preserved');
 });
 
+test('enqueueSend rejects a canceled queued caller promptly without letting its successor overtake', async () => {
+  const pacer = new GlobalSendPacer(1);
+  pacer.enterShutdownDrain();
+  __setGlobalPacerForTest(pacer);
+  const key = k(7010, 100);
+  const order: string[] = [];
+  const canceledController = new AbortController();
+  let markFirstStarted = () => {};
+  let releaseFirst = () => {};
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+  try {
+    const first = enqueueSend(key, async () => {
+      order.push('first');
+      markFirstStarted();
+      await firstGate;
+    });
+    await firstStarted;
+
+    const canceled = enqueueSend(
+      key,
+      async () => { order.push('canceled'); },
+      canceledController.signal,
+    );
+    const successor = enqueueSend(key, async () => { order.push('successor'); });
+
+    canceledController.abort();
+    await assert.rejects(canceled, { name: 'AbortError' });
+    await Promise.resolve();
+    assert.deepEqual(order, ['first'], 'the successor must remain chained behind the active send');
+
+    releaseFirst();
+    await Promise.all([first, successor]);
+    assert.deepEqual(order, ['first', 'successor']);
+  } finally {
+    releaseFirst();
+    __setGlobalPacerForTest(new GlobalSendPacer(1));
+  }
+});
+
+test('enqueueSend waits for an already-started operation to settle after cancellation', async () => {
+  const pacer = new GlobalSendPacer(1);
+  pacer.enterShutdownDrain();
+  __setGlobalPacerForTest(pacer);
+  const controller = new AbortController();
+  const key = k(7011, 100);
+  let markOperationStarted = () => {};
+  let releaseOperation = () => {};
+  const operationStarted = new Promise<void>((resolve) => { markOperationStarted = resolve; });
+  const operationGate = new Promise<void>((resolve) => { releaseOperation = resolve; });
+
+  try {
+    const send = enqueueSend(
+      key,
+      async () => {
+        markOperationStarted();
+        await operationGate;
+        return 'settled-after-cleanup';
+      },
+      controller.signal,
+    );
+    let didSettle = false;
+    void send.then(
+      () => { didSettle = true; },
+      () => { didSettle = true; },
+    );
+
+    await operationStarted;
+    controller.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      didSettle,
+      false,
+      'cancellation must not report completion while the started operation still owns cleanup',
+    );
+
+    releaseOperation();
+    assert.equal(await send, 'settled-after-cleanup');
+  } finally {
+    releaseOperation();
+    __setGlobalPacerForTest(new GlobalSendPacer(1));
+  }
+});
+
 // ── reactive 429 retry ──────────────────────────────────────────────────────
 
 test('withRateLimitRetry retries once on 429 then succeeds', async () => {
@@ -251,6 +407,32 @@ test('withRateLimitRetry retries once on 429 then succeeds', async () => {
   assert.equal(calls, 2, 'must retry exactly once');
   assert.equal(result, 'ok');
   assert.equal(checkIsRateLimited(chatId), false, 'not blocked after a successful retry');
+});
+
+test('withRateLimitRetry aborts a retry-after wait without starting another attempt', async () => {
+  const chatId = 7006;
+  const controller = new AbortController();
+  let calls = 0;
+  let markFirstAttempt = () => {};
+  const firstAttempt = new Promise<void>((resolve) => { markFirstAttempt = resolve; });
+  const fakeError = {
+    response: { error_code: 429, parameters: { retry_after: 60 } },
+  };
+
+  const result = withRateLimitRetry(
+    chatId,
+    async () => {
+      calls += 1;
+      markFirstAttempt();
+      throw fakeError;
+    },
+    controller.signal,
+  );
+  await firstAttempt;
+  controller.abort();
+
+  await assert.rejects(result, { name: 'AbortError' });
+  assert.equal(calls, 1, 'cancellation during backoff must suppress the retry');
 });
 
 test('withRateLimitRetry surfaces a second 429 as a typed RateLimitedError and leaves cooldown set', async () => {

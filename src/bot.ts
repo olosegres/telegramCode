@@ -1,11 +1,6 @@
 import { Telegraf, Markup, type Context, type NarrowedContext } from 'telegraf';
 import { message } from 'telegraf/filters';
-import type {
-  Update,
-  Message,
-  InputMediaPhoto,
-  InputMediaDocument,
-} from 'telegraf/typings/core/types/typegram';
+import type { Update, Message } from 'telegraf/typings/core/types/typegram';
 import * as fs from 'fs';
 import { promises as fsp } from 'fs';
 import * as os from 'os';
@@ -140,13 +135,8 @@ import { consoleFileBase, consoleFileExt } from './utils/consoleFileTap';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getGroupFinalizePlan } from './utils/groupFinalizePlan';
 import { persistAdapterSessionIds } from './utils/persistAdapterSessionIds';
-import {
-  resolveSendFileWithinDir,
-  classifyFileSendKind,
-  planFileSend,
-  trimCaption,
-  type FileSendItem,
-} from './utils/fileSendPlan';
+import { createSendFilesToThread } from './utils/fileSendService';
+import { createTelegramFileSendGateway } from './utils/fileSendTelegram';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import { getThreadStatusModel, getThreadStatusReport } from './utils/threadStatusReport';
 import { createIdenticalOutputGuard } from './utils/identicalOutputGuard';
@@ -6775,13 +6765,9 @@ command('clear_messages', async (ctx, key) => {
   // agent's concurrent `pushMessageId` writes between snapshot and
   // wipe don't get dropped without being deleted. New ids pushed
   // during the delete loop stay in state and get cleaned by the next
-  // `/clear` invocation.
-  const currentMsgId = ctx.message.message_id;
-  const all = await state.withLock(key, async () => {
-    const snap = state.getMessageIds(key);
-    await state.clearMessageIds(key);
-    return [...snap, currentMsgId];
-  });
+  // `/clear_messages` invocation.
+  const messageIds = [ctx.message.message_id];
+  const all = await state.takeMessageIds(key, messageIds);
   if (all.length === 0) {
     await replyToThread(key, t('clearMessages.no_messages'));
     return;
@@ -10277,87 +10263,82 @@ export function reconcileTransientFrames(
 }
 
 /**
- * @description The bot side of the agent's `send_file_to_user` MCP tool: resolve the
- * thread's bound folder, path-check each file against it, decide the send
- * plan (single method / album / error), and dispatch through `enqueueSend`
- * (per-thread FIFO + 429 retry + output trace). Returns a typed `{ ok }` the
- * MCP surface relays to the agent — every failure mode is reported, never thrown
- * past this boundary, so the agent learns when a send didn't happen.
+ * Bot composition for the reusable file-send service. Every gateway method
+ * stays on the existing per-thread FIFO + global pacer + 429 retry/output-trace
+ * path through `enqueueSend`; `buildSendExtra` preserves topic routing.
  */
-async function sendFilesToThread(
-  threadKeyStr: string,
-  opts: { paths: string[]; caption?: string; asFile?: boolean },
-): Promise<{ ok: true; summary: string } | { ok: false; error: string }> {
-  let key: ThreadKey;
-  try {
-    key = keyFromString(threadKeyStr);
-  } catch {
-    return { ok: false, error: `invalid threadKey "${threadKeyStr}"` };
-  }
-
-  const decision = getWorkDirStartDecision(key);
-  if (!decision.ok) return { ok: false, error: decision.message };
-  const { workDir } = decision;
-
-  const items: FileSendItem[] = [];
-  for (const rawPath of opts.paths) {
-    const resolved = resolveSendFileWithinDir(workDir, rawPath);
-    if (!resolved.ok) return { ok: false, error: resolved.error };
-    let sizeBytes: number;
+const sendFilesToThread = createSendFilesToThread<ThreadKey>({
+  resolveTargetAndWorkDir: (threadKeyStr) => {
+    let key: ThreadKey;
     try {
-      sizeBytes = fs.statSync(resolved.absPath).size;
-    } catch (e) {
-      return { ok: false, error: `cannot read ${rawPath}: ${(e as Error).message}` };
+      key = keyFromString(threadKeyStr);
+    } catch {
+      return { ok: false, error: `invalid threadKey "${threadKeyStr}"` };
     }
-    items.push({ absPath: resolved.absPath, sizeBytes, kind: classifyFileSendKind(resolved.absPath) });
-  }
 
-  const plan = planFileSend(items, opts.asFile ?? false);
-  if (plan.kind === 'error') return { ok: false, error: plan.error };
-
-  const caption = trimCaption(opts.caption);
-
-  try {
-    if (plan.kind === 'send') {
-      const source = { source: plan.item.absPath };
-      const extra = buildSendExtra(key, caption !== undefined ? { caption } : {});
-      switch (plan.mode) {
-        case 'photo':
-          await enqueueSend(key, () => bot.telegram.sendPhoto(key.chatId, source, extra));
-          break;
-        case 'animation':
-          await enqueueSend(key, () => bot.telegram.sendAnimation(key.chatId, source, extra));
-          break;
-        case 'document':
-          await enqueueSend(key, () => bot.telegram.sendDocument(key.chatId, source, extra));
-          break;
-      }
-    } else {
-      // Album: caption rides the first item only; the group extra just carries
-      // the thread routing (no caption field at the group level).
-      const groupExtra = buildSendExtra(key, {});
-      if (plan.mode === 'albumPhoto') {
-        const media: InputMediaPhoto[] = plan.items.map((it, index) => ({
-          type: 'photo',
-          media: { source: it.absPath },
-          ...(index === 0 && caption !== undefined ? { caption } : {}),
-        }));
-        await enqueueSend(key, () => bot.telegram.sendMediaGroup(key.chatId, media, groupExtra));
-      } else {
-        const media: InputMediaDocument[] = plan.items.map((it, index) => ({
-          type: 'document',
-          media: { source: it.absPath },
-          ...(index === 0 && caption !== undefined ? { caption } : {}),
-        }));
-        await enqueueSend(key, () => bot.telegram.sendMediaGroup(key.chatId, media, groupExtra));
-      }
-    }
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-
-  return { ok: true, summary: `Sent ${items.length} file(s) to the topic.` };
-}
+    const decision = getWorkDirStartDecision(key);
+    return decision.ok
+      ? { ok: true, target: key, workDir: decision.workDir }
+      : { ok: false, error: decision.message };
+  },
+  executeDelivery: (key, delivery, signal) => enqueueSend(key, delivery, signal),
+  gateway: createTelegramFileSendGateway({
+    sendPhoto: (key, input, caption, signal) =>
+      bot.telegram.callApi(
+        'sendPhoto',
+        {
+          chat_id: key.chatId,
+          photo: input,
+          ...buildSendExtra(key, caption !== undefined ? { caption } : {}),
+        },
+        { signal },
+      ),
+    sendAnimation: (key, input, caption, signal) =>
+      bot.telegram.callApi(
+        'sendAnimation',
+        {
+          chat_id: key.chatId,
+          animation: input,
+          ...buildSendExtra(key, caption !== undefined ? { caption } : {}),
+        },
+        { signal },
+      ),
+    sendVideo: (key, input, caption, signal) =>
+      bot.telegram.callApi(
+        'sendVideo',
+        {
+          chat_id: key.chatId,
+          video: input,
+          ...buildSendExtra(key, caption !== undefined ? { caption } : {}),
+        },
+        { signal },
+      ),
+    sendDocument: (key, input, caption, signal) =>
+      bot.telegram.callApi(
+        'sendDocument',
+        {
+          chat_id: key.chatId,
+          document: input,
+          ...buildSendExtra(key, caption !== undefined ? { caption } : {}),
+        },
+        { signal },
+      ),
+    sendMediaGroup: (key, mediaGroup, signal) => {
+      // Album captions already ride the first media item; group-level extra only
+      // carries thread routing.
+      return bot.telegram.callApi(
+        'sendMediaGroup',
+        {
+          chat_id: key.chatId,
+          media: mediaGroup,
+          ...buildSendExtra(key, {}),
+        },
+        { signal },
+      );
+    },
+  }),
+  recordMessageIds: (key, messageIds) => state.pushMessageIds(key, messageIds),
+});
 
 /**
  * @description Construct the scheduler stack (S8): run ledger → delivery (thin

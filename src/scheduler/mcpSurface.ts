@@ -3,27 +3,42 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Socket } from 'node:net';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import {
+  CancelledNotificationSchema,
+  JSONRPCRequestSchema,
+  type CallToolResult,
+  type RequestId,
+} from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { StateStore } from '../state';
 import { keyFromString, type ThreadKey } from '../types';
+import type { SendFilesToThread } from '../utils/fileSendService';
+import { getAbortError } from '../utils';
 import { describeSchedule, validateScheduleSpec } from './recurrence';
 import { createScheduleForThread } from './store';
 import type { ScheduleRecord, ScheduleSpec } from './types';
 
 /**
- * @description The bot-owned MCP server (plan S5). It exposes three agent-facing
- * tools — `schedule_create`, `schedule_list`, `schedule_cancel` — over streamable
- * HTTP on a loopback port, so both backends' bot-started sessions can manage
- * schedules in words. The server is INERT until S8 wires `createSchedulerMcpServer`
- * into `bot.ts`; this module imports nothing from `bot.ts` (every side effect is
- * injected via {@link SchedulerMcpDeps}).
+ * @description The bot-owned MCP server exposes four agent-facing tools —
+ * `schedule_create`, `schedule_list`, `schedule_cancel`, and
+ * `send_file_to_user` — over streamable HTTP on a loopback port. The server is
+ * INERT until `bot.ts` wires {@link createSchedulerMcpServer}; this module
+ * imports nothing from `bot.ts` (every side effect is injected via
+ * {@link SchedulerMcpDeps}).
  *
  * Transport: STATELESS streamable HTTP (`sessionIdGenerator: undefined`) — a
  * research-locked choice (plan S5) that dodges the SDK's session-loss bugs and
  * suits a single local host. The SDK binds one `McpServer` to one transport per
  * connection, so every request builds a FRESH `McpServer` + transport (see
- * {@link buildRequestServer}) that registers the same three handlers, and they
- * are closed when the response finishes.
+ * {@link buildRequestServer}) that registers the same four handlers, and they
+ * are closed when the response finishes. MCP cancellation arrives as a separate
+ * HTTP notification, so {@link createSchedulerMcpServer} keeps only the active
+ * request abort controllers plus one bounded, expiring lifecycle-tombstone cache
+ * across those otherwise-stateless transports. A pending-cancellation tombstone
+ * handles a cancellation that genuinely leads first registration; a
+ * recently-completed tombstone suppresses an unmatched late cancellation only
+ * while that key is inactive. An active request always takes precedence so its
+ * own legitimate cancellation can abort it even after typed JSON-RPC id reuse.
  *
  * Auth/scoping: a request carries `Authorization: Bearer <token>`. The token is
  * self-describing — `<scopeB64url>.<hmacHex>` — so the bot need not know every
@@ -45,6 +60,18 @@ export const defaultSchedulerMcpPort = 0;
 
 /** HTTP path the streamable transport is served on (matches the injected `--mcp-config` url, S6). */
 export const schedulerMcpPath = '/mcp';
+
+/** Per-registration identity used to isolate equal JSON-RPC request IDs. */
+export const schedulerMcpClientIdHeader = 'x-telegramcode-mcp-client-id';
+
+/** Pending cancellations and recent completions remain correlatable for this window. */
+export const schedulerMcpPendingCancellationTtlMs = 30_000;
+
+/** Global memory bound shared by pending-cancellation and recent-completion tombstones. */
+export const schedulerMcpPendingCancellationMax = 1_000;
+
+const schedulerMcpClientIdMaxLength = 128;
+const schedulerMcpClientIdPattern = /^[A-Za-z0-9._:-]+$/;
 
 /** Server identity reported in the MCP `initialize` handshake. */
 const mcpServerName = 'telegram-bot-scheduler';
@@ -211,13 +238,10 @@ export interface SchedulerMcpDeps {
   /**
    * Send 1..10 files/images from the thread's bound folder back into the topic.
    * Path-safety, type classification, and the album/size decision live in the
-   * bot's `sendFilesToThread` (it owns Telegraf); this surface only routes the
-   * resolved thread + args and relays the `{ ok }` summary/error to the agent.
+   * reusable `fileSendService`; this surface only routes the resolved thread +
+   * args and relays the `{ ok }` summary/error to the agent.
    */
-  sendFilesToThread: (
-    threadKey: string,
-    opts: { paths: string[]; caption?: string; asFile?: boolean },
-  ) => Promise<{ ok: true; summary: string } | { ok: false; error: string }>;
+  sendFilesToThread: SendFilesToThread;
   getSecret: () => Promise<string>;
   /** Listen port; defaults to {@link getSchedulerMcpPort}. Tests pass `0` for ephemeral. */
   port?: number;
@@ -378,7 +402,9 @@ const sendFileShape = {
   as_file: z
     .boolean()
     .optional()
-    .describe('Force "send as document" (original quality, no inline preview) even for images and gifs.'),
+    .describe(
+      'Explicitly force sendDocument (original quality, no inline preview), including for MP4s that use sendVideo by default.',
+    ),
   threadKey: z
     .string()
     .optional()
@@ -461,16 +487,22 @@ export function buildSpecFromCreateArgs(
 
 // ─── tool result helpers ─────────────────────────────────────────────
 
-type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
-
 /** Wrap text as a successful MCP tool result (plain text content block). */
-function textResult(text: string): ToolResult {
+function textResult(text: string): CallToolResult {
   return { content: [{ type: 'text', text }] };
 }
 
 /** Wrap a readable message as an MCP tool ERROR result the agent relays to the user. */
-function errorResult(message: string): ToolResult {
+function errorResult(message: string): CallToolResult {
   return { content: [{ type: 'text', text: message }], isError: true };
+}
+
+/** Report an ambiguous delivery without inviting MCP clients to retry it. */
+function deliveryUnknownResult(message: string): CallToolResult {
+  return {
+    content: [{ type: 'text', text: message }],
+    structuredContent: { kind: 'deliveryUnknown', retryable: false },
+  };
 }
 
 /** One-line human summary of a record for `schedule_list` / create confirmations. */
@@ -604,7 +636,12 @@ function registerSchedulerTools(server: McpServer, deps: SchedulerMcpDeps, scope
  * thread from `scope` first (scope isolation — the agent can never name another
  * topic); the actual path-safety + Telegraf send live in `deps.sendFilesToThread`.
  */
-function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: SchedulerScope): void {
+function registerFileSendTool(
+  server: McpServer,
+  deps: SchedulerMcpDeps,
+  scope: SchedulerScope,
+  requestSignal: AbortSignal | undefined,
+): void {
   server.registerTool(
     'send_file_to_user',
     {
@@ -613,26 +650,182 @@ function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: 
         'Send one or more files/images from THIS topic\'s bound folder back to the user in the topic. ' +
         'Use it to deliver a generated chart, screenshot, report, etc. Paths are relative to the bound ' +
         'folder; a path outside it is rejected and nothing is sent. Images (.png/.jpg/.jpeg/.webp) preview ' +
-        'inline, .gif autoplays, everything else arrives as a document — pass as_file:true to force document ' +
-        '(full quality) even for images. 2..10 paths are delivered as one album (a mixed or gif-containing ' +
-        'album falls back to documents). Caption is optional (trimmed to 1024 chars; on the first album item).',
+        'inline, .gif autoplays, and a single .mp4 uses sendVideo by default. as_file:true is the explicit sendDocument ' +
+        'override for previewable media; no fake audio track is needed for a silent MP4. Everything else arrives ' +
+        'as a document. 2..10 paths use sendMediaGroup: eligible photos and MP4 videos stay native in ' +
+        'all-video and mixed photo/video groups; as_file:true, any animation/document, or an over-cap photo makes ' +
+        'the whole album documents. Secure outbound traversal currently requires Linux; other platforms fail closed. ' +
+        'Caption is optional (trimmed to 1024 chars; on the first album item).',
       inputSchema: sendFileShape,
     },
-    async (args) => {
+    async (args, extra) => {
+      const signal = requestSignal
+        ? AbortSignal.any([extra.signal, requestSignal])
+        : extra.signal;
       const resolved = resolveTargetThreadKey(scope, args.threadKey, deps.getThreadsForDirectory);
       if (!resolved.ok) return errorResult(resolved.error);
+      if (signal.aborted) throw getAbortError(signal);
 
       const result = await deps.sendFilesToThread(resolved.threadKey, {
         paths: args.paths,
         caption: args.caption,
         asFile: args.as_file,
+        ...(scope.kind === 'dir' ? { authorizedWorkDir: scope.directory } : {}),
+        signal,
       });
-      return result.ok ? textResult(result.summary) : errorResult(result.error);
+      if (result.ok) return textResult(result.summary);
+      return 'kind' in result && result.kind === 'deliveryUnknown'
+        ? deliveryUnknownResult(result.error)
+        : errorResult(result.error);
     },
   );
 }
 
 // ─── server factory ──────────────────────────────────────────────────
+
+type SchedulerMcpCancellationTombstone =
+  | { kind: 'pendingCancellation'; expiresAt: number; reason?: string }
+  | { kind: 'recentlyCompleted'; expiresAt: number };
+
+interface SchedulerMcpRegisteredRequest {
+  controller: AbortController;
+  markTerminal: () => void;
+  unregister: () => void;
+}
+
+interface SchedulerMcpCancellationLifecycle {
+  registerRequest: (clientIdentity: string, requestId: RequestId) => SchedulerMcpRegisteredRequest;
+  cancelRequest: (clientIdentity: string, requestId: RequestId, reason: string | undefined) => void;
+}
+
+/** Deterministic seams for lifecycle-cache expiry and bound verification. */
+export interface SchedulerMcpCancellationLifecycleOptions {
+  getNowMs?: () => number;
+  maxTombstones?: number;
+}
+
+/**
+ * @description Correlate stateless MCP requests with cancellation notifications.
+ * Active controllers are isolated by verified token + validated client identity
+ * + typed JSON-RPC id. One bounded TTL cache stores mutually-exclusive terminal
+ * states for inactive keys:
+ *
+ * - `pendingCancellation` aborts the first matching registration, then is consumed.
+ * - `recentlyCompleted` ignores only an unmatched late cancellation while no
+ *   matching request is active, preventing it from becoming pending poison.
+ *
+ * Active controllers always take precedence over tombstones because generations
+ * that reuse one client identity and request id are otherwise indistinguishable.
+ *
+ * The clock and cache limit are injectable only at construction so expiry and
+ * oldest-entry eviction stay deterministic in tests; production uses the fixed
+ * exported defaults.
+ */
+export function createSchedulerMcpCancellationLifecycle(
+  options: SchedulerMcpCancellationLifecycleOptions = {},
+): SchedulerMcpCancellationLifecycle {
+  const getNowMs = options.getNowMs ?? Date.now;
+  const maxTombstones = options.maxTombstones ?? schedulerMcpPendingCancellationMax;
+  if (!Number.isSafeInteger(maxTombstones) || maxTombstones <= 0) {
+    throw new RangeError('maxTombstones must be a positive safe integer');
+  }
+  const requestAbortControllers = new Map<string, Set<AbortController>>();
+  const tombstones = new Map<string, SchedulerMcpCancellationTombstone>();
+
+  function getRequestCorrelationKey(clientIdentity: string, requestId: RequestId): string {
+    return JSON.stringify([clientIdentity, typeof requestId, requestId]);
+  }
+
+  function pruneTombstones(now: number): void {
+    for (const [correlationKey, tombstone] of tombstones) {
+      if (tombstone.expiresAt <= now) tombstones.delete(correlationKey);
+    }
+  }
+
+  function setTombstone(
+    correlationKey: string,
+    tombstone: SchedulerMcpCancellationTombstone,
+    now: number,
+  ): void {
+    pruneTombstones(now);
+    tombstones.delete(correlationKey);
+    while (tombstones.size >= maxTombstones) {
+      const oldestKey = tombstones.keys().next().value;
+      if (oldestKey === undefined) break;
+      tombstones.delete(oldestKey);
+    }
+    tombstones.set(correlationKey, tombstone);
+  }
+
+  function registerRequest(clientIdentity: string, requestId: RequestId): SchedulerMcpRegisteredRequest {
+    const correlationKey = getRequestCorrelationKey(clientIdentity, requestId);
+    const controller = new AbortController();
+    const controllers = requestAbortControllers.get(correlationKey) ?? new Set();
+    controllers.add(controller);
+    requestAbortControllers.set(correlationKey, controllers);
+
+    const now = getNowMs();
+    pruneTombstones(now);
+    const tombstone = tombstones.get(correlationKey);
+    if (tombstone?.kind === 'pendingCancellation') {
+      tombstones.delete(correlationKey);
+      controller.abort(tombstone.reason);
+    }
+
+    let isTerminal = false;
+
+    return {
+      controller,
+      markTerminal: () => {
+        if (isTerminal) return;
+        isTerminal = true;
+        const completedAt = getNowMs();
+        setTombstone(
+          correlationKey,
+          {
+            kind: 'recentlyCompleted',
+            expiresAt: completedAt + schedulerMcpPendingCancellationTtlMs,
+          },
+          completedAt,
+        );
+      },
+      unregister: () => {
+        controllers.delete(controller);
+        if (controllers.size === 0) requestAbortControllers.delete(correlationKey);
+      },
+    };
+  }
+
+  function cancelRequest(
+    clientIdentity: string,
+    requestId: RequestId,
+    reason: string | undefined,
+  ): void {
+    const correlationKey = getRequestCorrelationKey(clientIdentity, requestId);
+    const now = getNowMs();
+    pruneTombstones(now);
+
+    const controllers = requestAbortControllers.get(correlationKey);
+    if (controllers && controllers.size > 0) {
+      for (const controller of controllers) controller.abort(reason);
+      return;
+    }
+
+    if (tombstones.get(correlationKey)?.kind === 'recentlyCompleted') return;
+
+    setTombstone(
+      correlationKey,
+      {
+        kind: 'pendingCancellation',
+        expiresAt: now + schedulerMcpPendingCancellationTtlMs,
+        ...(reason !== undefined ? { reason } : {}),
+      },
+      now,
+    );
+  }
+
+  return { registerRequest, cancelRequest };
+}
 
 /**
  * @description Build a fresh {@link McpServer} for one request, registering the
@@ -640,13 +833,17 @@ function registerFileSendTool(server: McpServer, deps: SchedulerMcpDeps, scope: 
  * per transport per connection, so a new instance is built (and closed) per
  * request in the stateless flow.
  */
-function buildRequestServer(deps: SchedulerMcpDeps, scope: SchedulerScope): McpServer {
+function buildRequestServer(
+  deps: SchedulerMcpDeps,
+  scope: SchedulerScope,
+  requestSignal: AbortSignal | undefined,
+): McpServer {
   const server = new McpServer(
     { name: mcpServerName, version: mcpServerVersion },
     { instructions: mcpServerInstructions },
   );
   registerSchedulerTools(server, deps, scope);
-  registerFileSendTool(server, deps, scope);
+  registerFileSendTool(server, deps, scope, requestSignal);
   return server;
 }
 
@@ -679,16 +876,31 @@ export function createSchedulerMcpServer(deps: SchedulerMcpDeps): SchedulerMcpHa
   let boundPort = requestedPort;
   let httpServer: Server | null = null;
   const sockets = new Set<Socket>();
+  const cancellationLifecycle = createSchedulerMcpCancellationLifecycle();
+
+  function getClientIdentity(req: IncomingMessage, verifiedToken: string): string {
+    const clientId = req.headers[schedulerMcpClientIdHeader];
+    if (
+      typeof clientId === 'string' &&
+      clientId.length > 0 &&
+      clientId.length <= schedulerMcpClientIdMaxLength &&
+      schedulerMcpClientIdPattern.test(clientId)
+    ) {
+      return `token:${verifiedToken}:client:${clientId}`;
+    }
+    return `token:${verifiedToken}`;
+  }
 
   async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const secret = await deps.getSecret();
     const token = extractBearerToken(req.headers.authorization);
     const scope = token ? verifySchedulerMcpToken(secret, token) : null;
-    if (!scope) {
+    if (!scope || token === null) {
       // -32001 (SDK's "unauthorized" convention) + HTTP 401, no tool touched.
       writeJsonRpcError(res, 401, -32001, 'Unauthorized: missing or invalid scheduler token');
       return;
     }
+    const clientIdentity = getClientIdentity(req, token);
 
     const bodyText = await readRequestBody(req);
     let parsedBody: unknown;
@@ -699,11 +911,30 @@ export function createSchedulerMcpServer(deps: SchedulerMcpDeps): SchedulerMcpHa
       return;
     }
 
+    const cancellation = CancelledNotificationSchema.safeParse(parsedBody);
+    if (cancellation.success && cancellation.data.params.requestId !== undefined) {
+      cancellationLifecycle.cancelRequest(
+        clientIdentity,
+        cancellation.data.params.requestId,
+        cancellation.data.params.reason,
+      );
+    }
+
+    const request = JSONRPCRequestSchema.safeParse(parsedBody);
+    const registeredRequest = request.success
+      ? cancellationLifecycle.registerRequest(clientIdentity, request.data.id)
+      : undefined;
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    const server = buildRequestServer(deps, scope);
+    const server = buildRequestServer(deps, scope, registeredRequest?.controller.signal);
     // Stateless: the transport + server live only for this request; close both
     // when the response finishes so no connection state lingers.
-    res.on('close', () => {
+    const markRequestTerminal = (): void => registeredRequest?.markTerminal();
+    res.once('finish', markRequestTerminal);
+    res.once('close', () => {
+      res.off('finish', markRequestTerminal);
+      registeredRequest?.markTerminal();
+      registeredRequest?.controller.abort();
+      registeredRequest?.unregister();
       void transport.close();
       void server.close();
     });

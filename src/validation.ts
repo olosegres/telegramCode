@@ -28,6 +28,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolveCanonicalPathContainment } from './utils/canonicalPathContainment';
 
 /**
  * @description Error class with a stable `code` field so the bot can map
@@ -74,40 +75,36 @@ export function validateSubdir(workRoot: string, rawSubdir: string): string {
   let realRoot: string;
   try {
     realRoot = fs.realpathSync(workRoot);
-  } catch (e) {
+  } catch (error) {
     // The boot-time check already verified workRoot exists; treat this
     // as a transient (e.g. user removed it after start) and translate
     // to a not-found error so the caller reports a localised message
     // rather than a stack trace.
-    throw new BindError('BIND_NOT_FOUND', `WORK_ROOT vanished: ${(e as Error).message}`);
+    const errorMessage = error instanceof Error ? error.message : 'unknown error';
+    throw new BindError('BIND_NOT_FOUND', `WORK_ROOT vanished: ${errorMessage}`);
   }
 
-  const candidate = path.resolve(realRoot, normalised);
-  let realCandidate: string;
+  let canonicalCandidate: string;
+  let isWithinRoot: boolean;
   try {
-    realCandidate = fs.realpathSync(candidate);
+    ({ canonicalPath: canonicalCandidate, isWithinRoot } =
+      resolveCanonicalPathContainment(realRoot, normalised));
   } catch {
     throw new BindError('BIND_NOT_FOUND', `subdir not found: ${normalised}`);
   }
 
-  // Strict containment: exact equality OR proper prefix with the platform
-  // separator appended. Without the separator, `/work_root_evil` would
-  // satisfy `startsWith('/work_root')` — classic traversal trap.
-  if (
-    realCandidate !== realRoot &&
-    !realCandidate.startsWith(realRoot + path.sep)
-  ) {
-    throw new BindError('BIND_OUTSIDE_ROOT', `subdir resolves outside WORK_ROOT: ${realCandidate}`);
+  if (!isWithinRoot) {
+    throw new BindError('BIND_OUTSIDE_ROOT', `subdir resolves outside WORK_ROOT: ${canonicalCandidate}`);
   }
 
   // Reject /bind . — binding to WORK_ROOT itself is exactly the unbound
   // state we just spent the whole stage stopping users from sliding into.
   // It also has no meaningful project context (no CLAUDE.md / .git scope).
-  if (realCandidate === realRoot) {
+  if (canonicalCandidate === realRoot) {
     throw new BindError('BIND_OUTSIDE_ROOT', 'cannot bind to WORK_ROOT itself; pick a subfolder');
   }
 
-  const stat = fs.statSync(realCandidate);
+  const stat = fs.statSync(canonicalCandidate);
   if (!stat.isDirectory()) {
     throw new BindError('BIND_NOT_DIRECTORY', `${normalised} is not a directory`);
   }
@@ -115,7 +112,7 @@ export function validateSubdir(workRoot: string, rawSubdir: string): string {
   // Store the *relative* form so the on-disk record survives `WORK_ROOT`
   // path changes (e.g. mount point rename). `getWorkDir` re-joins this
   // with the current `ENV.workRoot` at runtime.
-  return path.relative(realRoot, realCandidate);
+  return path.relative(realRoot, canonicalCandidate);
 }
 
 export type BoundWorkDirDecision =

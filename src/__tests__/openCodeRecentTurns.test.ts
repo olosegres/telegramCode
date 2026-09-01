@@ -157,6 +157,39 @@ describe('getLatestOpenCodeParentAssistantContext', () => {
       contextUsedTokens: 155,
     });
   });
+
+  it('keeps the last measured context when a pending assistant placeholder reports zero tokens', () => {
+    const records = [
+      {
+        info: {
+          id: 'msg_measured',
+          sessionID: sessionId,
+          role: 'assistant',
+          providerID: 'openai',
+          modelID: 'gpt-test',
+          finish: 'tool-calls',
+          tokens: { input: 1_087, output: 17, cache: { read: 181_760, write: 0 } },
+        },
+      },
+      {
+        info: {
+          id: 'msg_pending',
+          sessionID: sessionId,
+          role: 'assistant',
+          providerID: 'openai',
+          modelID: 'gpt-test',
+          finish: null,
+          tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        },
+      },
+    ];
+
+    assert.deepEqual(getLatestOpenCodeParentAssistantContext(records, sessionId), {
+      messageId: 'msg_measured',
+      model: { providerID: 'openai', modelID: 'gpt-test' },
+      contextUsedTokens: 182_864,
+    });
+  });
 });
 
 describe('OpenCodeAdapter.getRecentTurns', () => {

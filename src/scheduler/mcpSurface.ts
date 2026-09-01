@@ -652,9 +652,12 @@ function registerFileSendTool(
         'folder; a path outside it is rejected and nothing is sent. Images (.png/.jpg/.jpeg/.webp) preview ' +
         'inline, .gif autoplays, and a single .mp4 uses sendVideo by default. as_file:true is the explicit sendDocument ' +
         'override for previewable media; no fake audio track is needed for a silent MP4. Everything else arrives ' +
-        'as a document. 2..10 paths use sendMediaGroup: eligible photos and MP4 videos stay native in ' +
+        'as a document. VIDEO RULE: to deliver a playable video, pass a .mp4 path and do NOT set as_file — any other ' +
+        'container (.mov/.webm/.mkv) or a document fallback makes Telegram render it as a GIF instead; remux to .mp4 first. ' +
+        '2..10 paths use sendMediaGroup: eligible photos and MP4 videos stay native in ' +
         'all-video and mixed photo/video groups; as_file:true, any animation/document, or an over-cap photo makes ' +
-        'the whole album documents. Secure outbound traversal currently requires Linux; other platforms fail closed. ' +
+        'the whole album documents — which turns its MP4s into GIFs, so send videos in their own call. ' +
+        'Secure outbound traversal currently requires Linux; other platforms fail closed. ' +
         'Caption is optional (trimmed to 1024 chars; on the first album item).',
       inputSchema: sendFileShape,
     },

@@ -13,6 +13,7 @@ import { z } from 'zod';
 import type { StateStore } from '../state';
 import { keyFromString, type ThreadKey } from '../types';
 import type { SendFilesToThread } from '../utils/fileSendService';
+import { maxDiscreteMessages, type SendMessagesToThread } from '../utils/messageSendService';
 import { getAbortError } from '../utils';
 import { describeSchedule, validateScheduleSpec } from './recurrence';
 import { createScheduleForThread } from './store';
@@ -89,6 +90,7 @@ const mcpServerInstructions = `This MCP lets the agent act on its own Telegram t
 When to use it:
 • The user asks to run/finish a plan or task LATER ("in 2h", "tomorrow 9am", "every weekday") → schedule_create. Put the work in \`prompt\`; the future run is a fresh session with no memory of this chat.
 • You produced a file/chart/screenshot to deliver → send_file_to_user.
+• You want to deliver SEVERAL discrete messages (each as its own Telegram message, e.g. a per-item news digest) → send_messages_to_user.
 • You need to review or remove scheduled jobs → schedule_list / schedule_cancel.
 
 Each tool's own description has the exact argument recipe (one-shot vs cron vs N-times).`;
@@ -242,6 +244,14 @@ export interface SchedulerMcpDeps {
    * args and relays the `{ ok }` summary/error to the agent.
    */
   sendFilesToThread: SendFilesToThread;
+  /**
+   * Deliver a batch of DISCRETE messages into the thread's topic — each string
+   * becomes its OWN Telegram message (never merged), for cases where the agent
+   * wants several separate messages (e.g. a per-item news digest). The paced
+   * send + `/clear` tracking live in the injected `bot.ts` closure; this surface
+   * only routes the resolved thread + messages and relays the `{ ok }` summary.
+   */
+  sendMessagesToThread: SendMessagesToThread;
   getSecret: () => Promise<string>;
   /** Listen port; defaults to {@link getSchedulerMcpPort}. Tests pass `0` for ephemeral. */
   port?: number;
@@ -404,6 +414,23 @@ const sendFileShape = {
     .optional()
     .describe(
       'Explicitly force sendDocument (original quality, no inline preview), including for MP4s that use sendVideo by default.',
+    ),
+  threadKey: z
+    .string()
+    .optional()
+    .describe('Target thread "<chatId>:<threadId>". Required when a directory scope has more than one bound thread.'),
+};
+
+const sendMessageShape = {
+  messages: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(maxDiscreteMessages)
+    .describe(
+      `1..${maxDiscreteMessages} messages; EACH element is posted as its OWN separate Telegram message, in order. ` +
+        'Use this when you deliberately want several distinct messages (e.g. a per-item news digest: one message ' +
+        'per headline). Do NOT also print the same content as your normal reply, or it posts twice. Each message ' +
+        'supports the usual markdown (links, bold); one that exceeds the length cap is split automatically.',
     ),
   threadKey: z
     .string()
@@ -684,6 +711,50 @@ function registerFileSendTool(
   );
 }
 
+/**
+ * @description Register the agent→Telegram `send_messages_to_user` tool onto a
+ * fresh {@link McpServer}. The discrete-message sibling of `send_file_to_user`:
+ * each array element is delivered as its OWN Telegram message (never merged),
+ * for a per-item digest and similar. Like every tool here it resolves the target
+ * thread from `scope` first (scope isolation); the paced send lives in
+ * `deps.sendMessagesToThread`.
+ */
+function registerMessageSendTool(
+  server: McpServer,
+  deps: SchedulerMcpDeps,
+  scope: SchedulerScope,
+  requestSignal: AbortSignal | undefined,
+): void {
+  server.registerTool(
+    'send_messages_to_user',
+    {
+      title: 'Send several separate messages to this topic',
+      description:
+        'Deliver a batch of DISCRETE messages into THIS topic — each item of `messages` is posted as its own ' +
+        'separate Telegram message, in order (never merged). Use it when you deliberately want several messages ' +
+        'instead of one, e.g. a per-item news digest (header, a date separator, then one message per headline). ' +
+        'Markdown (links, bold) works per message; an over-long message is split automatically. Note: this does ' +
+        'NOT replace your normal single reply — only reach for it when multiple discrete messages are wanted, and ' +
+        'do not also print the same content as your reply text (that would post it twice).',
+      inputSchema: sendMessageShape,
+    },
+    async (args, extra) => {
+      const signal = requestSignal
+        ? AbortSignal.any([extra.signal, requestSignal])
+        : extra.signal;
+      const resolved = resolveTargetThreadKey(scope, args.threadKey, deps.getThreadsForDirectory);
+      if (!resolved.ok) return errorResult(resolved.error);
+      if (signal.aborted) throw getAbortError(signal);
+
+      const result = await deps.sendMessagesToThread(resolved.threadKey, {
+        messages: args.messages,
+        signal,
+      });
+      return result.ok ? textResult(result.summary) : errorResult(result.error);
+    },
+  );
+}
+
 // ─── server factory ──────────────────────────────────────────────────
 
 type SchedulerMcpCancellationTombstone =
@@ -847,6 +918,7 @@ function buildRequestServer(
   );
   registerSchedulerTools(server, deps, scope);
   registerFileSendTool(server, deps, scope, requestSignal);
+  registerMessageSendTool(server, deps, scope, requestSignal);
   return server;
 }
 

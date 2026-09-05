@@ -60,6 +60,7 @@ import {
   type SendFilesToThread,
   type SendFilesToThreadOptions,
 } from '../utils/fileSendService';
+import type { SendMessagesToThread } from '../utils/messageSendService';
 import {
   createFileSendTestRecorderGateway,
   type RecordedFileSendGatewayCall,
@@ -150,6 +151,7 @@ describe('createSchedulerMcpServer port binding', () => {
       getThreadsForDirectory: () => [],
       getThreadAdapterName: () => 'claude',
       sendFilesToThread: async () => ({ ok: true, summary: 'unused' }),
+      sendMessagesToThread: async () => ({ ok: true, summary: 'unused' }),
       getSecret: async () => secret,
       port: takenPort,
     };
@@ -560,6 +562,7 @@ interface ServerFixture {
   recordedMessageIds: number[];
   fileSendCalls: Array<{ threadKey: string; options: SendFilesToThreadOptions }>;
   fileSendHandler: { current: SendFilesToThread };
+  messageSendCalls: Array<{ threadKey: string; messages: string[] }>;
 }
 
 const mcpSingleMessageId = 301;
@@ -731,6 +734,13 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
       return fileSendHandler.current(threadKey, options);
     };
 
+    const messageSendCalls: Array<{ threadKey: string; messages: string[] }> = [];
+    const sendMessagesToThread: SendMessagesToThread = async (threadKey, { messages }) => {
+      if (threadKey !== threadAKey) return { ok: false, error: `invalid threadKey "${threadKey}"` };
+      messageSendCalls.push({ threadKey, messages });
+      return { ok: true, summary: `Delivered ${messages.length} messages to the topic.` };
+    };
+
     const deps: SchedulerMcpDeps = {
       store,
       armJob: (record) => armed.push(record),
@@ -738,6 +748,7 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
       getThreadsForDirectory: (directory) => boundThreads.get(directory) ?? [],
       getThreadAdapterName: () => 'claude',
       sendFilesToThread,
+      sendMessagesToThread,
       getSecret: async () => secret,
       port: 0,
     };
@@ -754,6 +765,7 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
       recordedMessageIds,
       fileSendCalls,
       fileSendHandler,
+      messageSendCalls,
     };
   }
 
@@ -814,6 +826,7 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
       // Use-case pointer, not recipe repetition: names the tools + the fresh-session caveat.
       assert.match(instructions, /schedule_create/);
       assert.match(instructions, /send_file_to_user/);
+      assert.match(instructions, /send_messages_to_user/);
       assert.match(instructions, /fresh session/);
     } finally {
       await client.close();
@@ -826,6 +839,50 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     const toolNames = (await client.listTools()).tools.map((tool) => tool.name);
     assert.ok(toolNames.includes('send_file_to_user'), 'file-send tool should be listed as send_file_to_user');
     assert.ok(!toolNames.includes('send_file'), 'the old send_file name must not be exposed anymore');
+  });
+
+  it('exposes the discrete-message tool as send_messages_to_user', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const toolNames = (await client.listTools()).tools.map((tool) => tool.name);
+      assert.ok(toolNames.includes('send_messages_to_user'), 'message-send tool should be listed');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('send_messages_to_user routes each message to the scope-resolved thread', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_messages_to_user',
+        arguments: { messages: ['🗞 Digest', '📅 4 September', 'headline one https://t.me/x/1'] },
+      });
+      assert.notEqual(result.isError, true, firstText(result));
+      assert.deepEqual(fixture.messageSendCalls, [
+        { threadKey: threadAKey, messages: ['🗞 Digest', '📅 4 September', 'headline one https://t.me/x/1'] },
+      ]);
+      assert.match(firstText(result), /Delivered 3 messages/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('send_messages_to_user rejects a cross-thread threadKey (scope isolation)', async () => {
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      const result = await client.callTool({
+        name: 'send_messages_to_user',
+        arguments: { messages: ['x'], threadKey: threadBKey },
+      });
+      assert.equal(result.isError, true);
+      assert.equal(fixture.messageSendCalls.length, 0, 'no send when the threadKey is out of scope');
+    } finally {
+      await client.close();
+    }
   });
 
   linuxIt('send_file_to_user routes a single MP4 to sendVideo with its caption', async () => {

@@ -136,6 +136,7 @@ import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
 import { getGroupFinalizePlan } from './utils/groupFinalizePlan';
 import { persistAdapterSessionIds } from './utils/persistAdapterSessionIds';
 import { createSendFilesToThread } from './utils/fileSendService';
+import { createSendMessagesToThread } from './utils/messageSendService';
 import { createTelegramFileSendGateway } from './utils/fileSendTelegram';
 import { getStatusFlushAction } from './utils/statusFlushDecision';
 import { getThreadStatusModel, getThreadStatusReport } from './utils/threadStatusReport';
@@ -10341,6 +10342,30 @@ const sendFilesToThread = createSendFilesToThread<ThreadKey>({
 });
 
 /**
+ * Discrete-message sender behind `send_messages_to_user`. Each message is sent as
+ * its OWN permanent message through `replyChunkWithFallback` (HTML-first with a
+ * plain-text fallback), which paces via the global `enqueueSend` and records the
+ * id for `/clear` — but does NOT touch the streaming edit-in-place state, so a
+ * later agent reply is unaffected. Ordering holds because each chunk is awaited
+ * before the next is enqueued.
+ */
+const sendMessagesToThread = createSendMessagesToThread<ThreadKey>({
+  resolveTarget: (threadKeyStr) => {
+    try {
+      return { ok: true, target: keyFromString(threadKeyStr) };
+    } catch {
+      return { ok: false, error: `invalid threadKey "${threadKeyStr}"` };
+    }
+  },
+  sendChunk: async (key, chunk) => {
+    const id = await replyChunkWithFallback(key, renderAgentHtml(chunk), chunk);
+    return id !== null;
+  },
+  maxMessageLength: MAX_MESSAGE_LEN,
+  measureRendered: (chunk) => renderAgentHtml(chunk).length,
+});
+
+/**
  * @description Construct the scheduler stack (S8): run ledger → delivery (thin
  * lambdas over the bot's existing send/session functions) → timer engine
  * (assigned to the module-level {@link schedulerEngine}) → the bot-owned MCP
@@ -10414,6 +10439,7 @@ function wireScheduler(): SchedulerMcpHandle {
       return getThreadAdapterNameRaw(key) ?? state.getAgent(key)?.name;
     },
     sendFilesToThread,
+    sendMessagesToThread,
     getSecret: () => state.getSchedulerMcpSecret(),
     // Reuse the port persisted from a prior boot (env override wins) so the
     // `telegramBot` registrations injected into agent sessions keep pointing at

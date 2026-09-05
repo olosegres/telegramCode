@@ -89,7 +89,7 @@ const mcpServerInstructions = `This MCP lets the agent act on its own Telegram t
 
 When to use it:
 • The user asks to run/finish a plan or task LATER ("in 2h", "tomorrow 9am", "every weekday") → schedule_create. Put the work in \`prompt\`; the future run is a fresh session with no memory of this chat.
-• You produced a file/chart/screenshot to deliver → send_file_to_user.
+• You produced a file/chart/screenshot/video to deliver → send_file_to_user. Videos MUST be H.264 .mp4 sent as video (never as_file/document, never .webm/.mov — those render as GIFs or don't play); transcode first if needed (the tool description has the ffmpeg recipe).
 • You want to deliver SEVERAL discrete messages (each as its own Telegram message, e.g. a per-item news digest) → send_messages_to_user.
 • You need to review or remove scheduled jobs → schedule_list / schedule_cancel.
 
@@ -395,11 +395,34 @@ const scheduleCancelShape = {
     .describe('Target thread "<chatId>:<threadId>". Required when a directory scope has more than one bound thread.'),
 };
 
+/**
+ * Coerces the `paths` argument into a string array before validation. Some MCP
+ * bridges (observed: Claude-agent harnesses) serialize array tool arguments as a
+ * raw JSON STRING (`'["a","b"]'`) instead of a JSON array, which a plain
+ * `z.array()` rejects. Accept: a real array (pass-through), a JSON-array string
+ * (parsed), or a single plain path string (wrapped into a one-element array).
+ */
+const coercePathsInput = (value: unknown): unknown => {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  }
+  return [value];
+};
+
 const sendFileShape = {
-  paths: z
-    .array(z.string().min(1))
-    .min(1)
-    .max(10)
+  paths: z.preprocess(
+    coercePathsInput,
+    z
+      .array(z.string().min(1))
+      .min(1)
+      .max(10),
+  )
     .describe(
       'Files to send, as 1..10 paths RELATIVE to this topic\'s bound folder (absolute paths are accepted ' +
         'only if they resolve inside it). A path outside the folder is rejected and nothing is sent. ' +
@@ -680,7 +703,9 @@ function registerFileSendTool(
         'inline, .gif autoplays, and a single .mp4 uses sendVideo by default. as_file:true is the explicit sendDocument ' +
         'override for previewable media; no fake audio track is needed for a silent MP4. Everything else arrives ' +
         'as a document. VIDEO RULE: to deliver a playable video, pass a .mp4 path and do NOT set as_file — any other ' +
-        'container (.mov/.webm/.mkv) or a document fallback makes Telegram render it as a GIF instead; remux to .mp4 first. ' +
+        'container (.mov/.webm/.mkv) or a document fallback makes Telegram render it as a GIF instead; remux to .mp4 first ' +
+        '(e.g. `ffmpeg -i in.webm -c:v libx264 -pix_fmt yuv420p -movflags +faststart out.mp4`; if no full ffmpeg is ' +
+        'installed, `npm i ffmpeg-static` provides one — Playwright\'s bundled ffmpeg has no H.264 encoder). ' +
         '2..10 paths use sendMediaGroup: eligible photos and MP4 videos stay native in ' +
         'all-video and mixed photo/video groups; as_file:true, any animation/document, or an over-cap photo makes ' +
         'the whole album documents — which turns its MP4s into GIFs, so send videos in their own call. ' +

@@ -909,6 +909,33 @@ describe('scheduler MCP server end-to-end (real HTTP)', () => {
     }
   });
 
+  linuxIt('send_file_to_user coerces bridge-stringified paths (JSON string and bare string)', async () => {
+    fs.writeFileSync(path.join(fixture.fileWorkDir, 'clip.mp4'), 'video');
+    const token = buildSchedulerMcpToken(secret, { kind: 'thread', threadKey: threadAKey });
+    const client = await buildClient(fixture.handle.port, token);
+    try {
+      // Some MCP bridges serialize array arguments as a raw JSON STRING.
+      const jsonStringResult = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: '["clip.mp4"]', caption: 'stringified array' },
+      });
+      assert.notEqual(jsonStringResult.isError, true, firstText(jsonStringResult));
+      assert.equal(fixture.fileSendGatewayCalls.length, 1);
+      assert.equal(fixture.fileSendGatewayCalls[0]?.method, 'sendVideo');
+
+      // A bare single path string wraps into a one-element array.
+      const bareStringResult = await client.callTool({
+        name: 'send_file_to_user',
+        arguments: { paths: 'clip.mp4' },
+      });
+      assert.notEqual(bareStringResult.isError, true, firstText(bareStringResult));
+      assert.equal(fixture.fileSendGatewayCalls.length, 2);
+      assert.equal(fixture.fileSendGatewayCalls[1]?.method, 'sendVideo');
+    } finally {
+      await client.close();
+    }
+  });
+
   linuxIt('send_file_to_user routes a PNG+MP4 album as photo then video with one caption', async () => {
     fs.writeFileSync(path.join(fixture.fileWorkDir, 'chart.png'), 'photo');
     fs.writeFileSync(path.join(fixture.fileWorkDir, 'clip.mp4'), 'video');

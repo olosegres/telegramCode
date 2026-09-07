@@ -9,8 +9,8 @@ data/
 .idea/
 *.tsbuildinfo
 coverage/
-agent/tmp/
-agent/NOTES.md
+# AI working docs (plans, roadmaps, notes) live in the private repo, never here
+agent/
 CLAUDE.local.md
 .playwright-mcp/
 .yarn/install-state.gz

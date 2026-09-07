@@ -130,6 +130,7 @@ import {
   traceAgentEmit,
   traceRecvUpdate,
 } from './outputTrace';
+import { installLinkPreviewSuppression } from './utils/linkPreviewSuppression';
 import { pruneExpiredBuckets, retentionMs as logBucketRetentionMs } from './utils/rotatingLogFile';
 import { consoleFileBase, consoleFileExt } from './utils/consoleFileTap';
 import { clearThreadOutputQueues } from './utils/clearThreadOutputQueues';
@@ -481,6 +482,12 @@ const updateDrainTimeoutMs = 2000;
 // window is not lost on shutdown.
 installCallApiTrace(bot.telegram);
 process.on('exit', flushTraceBufferSyncOnExit);
+
+// Default every text message/edit to NO link preview: a bare URL in agent
+// output otherwise expanded into a large preview card, one per message, in the
+// muted topic (operator complaint 2026-09-07). Installed OUTSIDE the trace wrap
+// so the trace records the payload actually sent.
+installLinkPreviewSuppression(bot.telegram);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Access control — who may talk to the agent

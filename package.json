@@ -1,6 +1,6 @@
 {
   "name": "telegramcode",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "license": "MIT",
   "author": "Sergei Solo",
   "description": "Telegram forum-supergroup bot for Claude Code / OpenCode — one topic per task, isolated sessions, per-thread MCP",

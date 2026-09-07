@@ -1,7 +1,7 @@
 <h2 align="center">Telegram bot/group as a terminal for OpenCode, Claude Code — every thread like a terminal tab + scheduling, voice control</h2>
 
 <p align="center">
-  <img src="docs/images/hero.png" alt="TelegramCode — all your agents in Telegram; chat, code, ship; powerful slash commands" width="900" />
+  <img src="docs/images/hero-v2.png" alt="TelegramCode — all your agents in Telegram; chat, code, ship; powerful slash commands" width="900" />
 </p>
 
 TelegramCode turns Telegram into a terminal for running agentic CLIs. Open as

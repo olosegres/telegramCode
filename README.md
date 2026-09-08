@@ -705,6 +705,14 @@ different port for the second instance (e.g. `4097`).
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** — architecture and local development (build, test, hot-reload, Docker dev loop).
 - **[MIGRATION_1_TO_2.md](MIGRATION_1_TO_2.md)** — upgrading a 1.x install to 2.0.
 
+## The story behind it
+
+I started running Claude Code on my own machine, and I kept wanting to check on it after I stepped away from the desk. Back then there was no way to reach it from a phone, so I put together a small bot that launched the agent and let me talk to it over Telegram. It ran on my own computer, which had to stay on the whole time.
+
+Then I moved the whole thing onto a server that never sleeps, added OpenCode next to Claude Code, and it grew into what it is now: voice control, file intake, scheduling, a raw terminal, and sessions that survive restarts. These days I run it every day and drive everything from my phone or tablet, no laptop required.
+
+Full write-up: [Vibe-coding by voice, from my phone](https://dev.to/olosegres/vibe-coding-by-voice-from-my-phone-claude-code-and-opencode-over-telegram-j75).
+
 ## License
 
 MIT

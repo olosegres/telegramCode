@@ -1,10 +1,30 @@
 #!/usr/bin/env node
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { applyDnsFix } from './cli/applyDnsFix';
 import { runBot } from './cli/bot';
 import { runHot } from './cli/hot';
 
 applyDnsFix();
+
+/**
+ * @description Print the package version to stdout for `telegramcode --version`.
+ *
+ * Reads it from the shipped package.json (`__dirname` is `dist/`, so the file
+ * sits one level up) — the same idiom the `/version` bot command uses — so the
+ * number never drifts from a hardcoded string.
+ */
+function printVersion(): void {
+  let version = 'unknown';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    version = pkg.version || version;
+  } catch {
+    /* fall through to unknown */
+  }
+  process.stdout.write(`${version}\n`);
+}
 
 /**
  * @description Print top-level usage to stderr.
@@ -21,6 +41,7 @@ function printUsage(): void {
       `                                  (rebuilds + restarts the bot on src/ edits;\n` +
       `                                   in-flight agent sessions are reattached)\n` +
       `  telegramcode --help, -h       Show this help\n` +
+      `  telegramcode --version, -v    Print the version\n` +
       `\n` +
       `Environment:\n` +
       `  Loaded from ~/.config/telegramcode/.env (base) then $PWD/.env (override).\n` +
@@ -39,6 +60,7 @@ function printUsage(): void {
  *   - missing          → start the Telegram bot
  *   - `hot`            → hot-reload dev mode
  *   - `-h | --help | help` → usage
+ *   - `-v | --version | version` → print the package version
  *   - anything else → usage + exit 2
  *
  * The old `cli claude` passthrough is REMOVED: running plain
@@ -64,6 +86,11 @@ async function main(): Promise<void> {
 
   if (sub === '--help' || sub === '-h' || sub === 'help') {
     printUsage();
+    return;
+  }
+
+  if (sub === '--version' || sub === '-v' || sub === 'version') {
+    printVersion();
     return;
   }
 

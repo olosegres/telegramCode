@@ -129,6 +129,17 @@ test('--help prints usage and exits 0', () => {
   assert.doesNotMatch(stderr, /telegramcode bot/);
 });
 
+test('--version prints the package version to stdout and exits 0', () => {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8'),
+  );
+  for (const flag of ['--version', '-v', 'version']) {
+    const { status, stdout } = runCli([flag]);
+    assert.equal(status, 0, `exit code for ${flag}`);
+    assert.equal(stdout.trim(), pkg.version, `stdout for ${flag}`);
+  }
+});
+
 test('runBot uses $PWD as WORK_ROOT when unset and proceeds past preflight', () => {
   // Use a fake telegram token so the bot can't actually start polling — it'll
   // fail at the Telegram API call. That's fine: we only care that the

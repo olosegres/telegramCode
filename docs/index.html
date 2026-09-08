@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TelegramCode — run Claude Code and OpenCode from Telegram, on your own VPS</title>
+  <meta name="description" content="Self-hosted Telegram bot that runs OpenCode and Claude Code coding agents on your own machine or VPS, driven from your phone. One topic per project, voice input, scheduled prompts, no open ports. MIT." />
+  <link rel="canonical" href="https://github.com/olosegres/telegramcode" />
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 4rem;
+      color: #1b1f24;
+      background: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { color: #e6edf3; background: #0d1117; }
+      a { color: #58a6ff; }
+      code { background: #161b22; }
+    }
+    h1 { font-size: 2rem; line-height: 1.2; margin-bottom: 0.25rem; }
+    .tagline { font-size: 1.15rem; opacity: 0.85; margin-top: 0; }
+    h2 { margin-top: 2.25rem; font-size: 1.3rem; }
+    a { color: #0969da; }
+    code {
+      background: #f2f4f7;
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    ul { padding-left: 1.2rem; }
+    li { margin: 0.35rem 0; }
+    .cta { margin-top: 1.5rem; }
+    footer { margin-top: 3rem; opacity: 0.7; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>TelegramCode</h1>
+  <p class="tagline">Run OpenCode and Claude Code coding agents on your own machine or VPS, driven from Telegram on your phone.</p>
+
+  <p>
+    TelegramCode is a self-hosted Telegram bot that turns Telegram into a terminal
+    for agentic coding CLIs. It runs on your own machine or server and connects out
+    to Telegram only, so there are no open inbound ports. You bind each forum topic
+    (or the bot's own DM) to a project folder, and each topic runs its own isolated
+    OpenCode or Claude Code session that you drive by chat, voice, or file. Topics
+    work like terminal tabs: one topic is one project, and two topics can share a
+    folder for parallel work.
+  </p>
+
+  <h2>What it does</h2>
+  <ul>
+    <li><strong>Both agents.</strong> OpenCode over its native HTTP+SSE server, and Claude Code via tmux or json-stream.</li>
+    <li><strong>From your phone.</strong> Type, send a voice note (transcribed with Whisper), or drop in a photo, file, or PDF.</li>
+    <li><strong>No open ports.</strong> Outbound-only to Telegram, so it is comfortable to leave on a VPS.</li>
+    <li><strong>Pinned question alerts.</strong> When the agent asks something, the bot pins it so even a muted topic notifies you once.</li>
+    <li><strong>Scheduled and self-driving runs.</strong> Cron, one-shot, or N-times jobs per topic, and the agent can schedule itself.</li>
+    <li><strong>Restart-safe.</strong> Sessions survive both a bot restart and an agent-server restart.</li>
+    <li><strong>Raw terminal.</strong> <code>/terminal</code> binds a topic to a real shell in the project folder.</li>
+    <li><strong>Agent-facing MCP.</strong> The agent sends files, images, and video back to you, posts multiple messages, and schedules itself.</li>
+    <li><strong>12 UI languages.</strong> MIT licensed, Node 22+.</li>
+  </ul>
+
+  <h2>Install</h2>
+  <p><code>npm install -g telegramcode</code></p>
+  <p>Put your bot token in one <code>.env</code>, launch from your projects folder, and bind a topic. Full quick start is in the README.</p>
+
+  <h2>Links</h2>
+  <ul class="cta">
+    <li><a href="https://github.com/olosegres/telegramcode">GitHub repository</a></li>
+    <li><a href="https://github.com/olosegres/telegramcode#readme">README</a> (features, quick start, commands, troubleshooting)</li>
+    <li><a href="https://github.com/olosegres/telegramcode#quick-start">Quick start</a></li>
+    <li><a href="https://github.com/olosegres/telegramcode#faq">FAQ</a></li>
+    <li><a href="https://www.npmjs.com/package/telegramcode">npm package</a></li>
+    <li><a href="https://github.com/olosegres/telegramcode/discussions">Discussions</a></li>
+  </ul>
+
+  <footer>MIT licensed. Built to be driven from a phone.</footer>
+</body>
+</html>

@@ -700,6 +700,26 @@ first use, see `src/installManager.ts`).
 Two instances on the same host with the same `OPENCODE_URL`. Pick a
 different port for the second instance (e.g. `4097`).
 
+## FAQ
+
+**How do I run Claude Code from my phone?**
+Install `telegramcode` on your own machine or VPS, create a Telegram bot, and bind a forum topic (or the bot's DM) to a project folder. Start a Claude Code session in that topic and you drive it entirely from Telegram: type prompts, send voice notes, or drop in files, and the agent's output streams back into the same topic. Your phone never runs the agent; it stays on your machine.
+
+**Can I control OpenCode without opening any ports?**
+Yes. The bot only makes outbound connections to Telegram, so nothing listens for inbound traffic and you never expose a port. OpenCode runs as a local HTTP server that the bot talks to on loopback, and you reach it from anywhere through Telegram.
+
+**How do I run a coding agent on a VPS and drive it from Telegram?**
+Set up your VPS once with git, your repos, the agent CLIs, and `telegramcode`, then launch the bot from your projects folder. You get an always-on dev box you drive from any device: phone, tablet, or voice. Because the agent lives on the server, it keeps working even when your laptop sleeps, and the same sessions are still reachable over plain SSH.
+
+**Does my session survive a restart?**
+Yes, both a bot restart and an agent-server restart. State is persisted to disk; on restart the bot re-attaches to the running Claude session in tmux or re-connects to OpenCode, and an in-flight turn is delivered once it is back. A prompt sent during startup is buffered and replayed, never dropped.
+
+**Does it run both Claude Code and OpenCode?**
+Yes. Each topic picks its backend independently: OpenCode over its native HTTP+SSE server, or Claude Code (tmux or json-stream). One topic is one project with its own isolated session, like terminal tabs, and two topics can point at the same folder for parallel work.
+
+**Can I talk to the agent by voice?**
+Yes. Send a voice message to a topic and it is transcribed with Whisper (via Groq or OpenAI) and forwarded to the agent as a normal prompt, so you can vibe code hands-free from your phone.
+
 ## Documentation
 
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** — architecture and local development (build, test, hot-reload, Docker dev loop).

@@ -1,9 +1,13 @@
 name: Publish to npm
 
+# Manual trigger. Publishing uses npm trusted publishing (OIDC provenance).
+# To enable it, add a Trusted Publisher for this package on npmjs.com pointing at
+# this repo, this workflow, and the `release` environment, then run this workflow
+# from the Actions tab. Until trusted publishing is configured, releases are
+# published from the maintainer host, so a tag push intentionally does NOT auto-run
+# this (which would otherwise fail before the publisher exists).
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 jobs:
   publish:

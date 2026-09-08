@@ -5,12 +5,19 @@
   "author": "Sergei Solo",
   "description": "Telegram forum-supergroup bot for Claude Code / OpenCode — one topic per task, isolated sessions, per-thread MCP",
   "keywords": [
-    "claude-code",
-    "opencode",
     "telegram-bot",
-    "ai-agents",
+    "telegram",
+    "opencode",
+    "claude-code",
+    "coding-agent",
+    "ai-agent",
+    "self-hosted",
     "vibe-coding",
+    "voice",
+    "mcp",
+    "cli",
     "remote-development",
+    "vps",
     "tmux"
   ],
   "files": [
